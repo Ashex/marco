@@ -155,6 +155,9 @@ struct Base {
     store: Store,
     /// Ids with a status in a shard file.
     status_bits: Vec<u64>,
+    /// Whether any bit of `status_bits` is set: reads ask on every DID, and
+    /// scanning the bits for it costs ~150 µs on the whole network.
+    any_status: bool,
     /// Per relation, the shard files' tombstones: a lookup on every add.
     tombs: Vec<FxHashMap<(u32, u64), i64>>,
 }
@@ -282,7 +285,8 @@ impl Graph {
                 *w |= 1 << (id % 64);
             }
         }
-        g.base = Some(Arc::new(Base { store, status_bits, tombs }));
+        let any_status = status_bits.iter().any(|&w| w != 0);
+        g.base = Some(Arc::new(Base { store, status_bits, any_status, tombs }));
         Ok(g)
     }
 
@@ -440,7 +444,7 @@ impl Graph {
 
     /// Whether any actor has a status: reads skip the lookups when none does.
     pub fn any_status(&self) -> bool {
-        !self.status.is_empty() || self.base.as_ref().is_some_and(|b| b.status_bits.iter().any(|&w| w != 0))
+        !self.status.is_empty() || self.base.as_ref().is_some_and(|b| b.any_status)
     }
 
     /// Hidden from reads: deleted or taken down.

@@ -8,11 +8,15 @@
 //! marco-harness bench --snapshot DIR --capture F --work DIR                    consumer + App throughput on a capture
 //! marco-harness lag --snapshot DIR --jetstream URL --work DIR --seconds S      live tail lag
 //! marco-harness retention --jetstream URL | --firehose URL                     how far back a source replays
+//! marco-harness perf-inputs --snapshot DIR --out F.json                        read inputs for perf, as DIDs
+//! marco-harness perf --inputs F --target engine|stack|h2 --out F.json          Graph read throughput and latency
 //! ```
 
 mod capture;
 mod fake;
+mod hist;
 mod killtest;
+mod perf;
 mod synth;
 
 use std::net::SocketAddr;
@@ -27,6 +31,8 @@ use marco_ingest::{Proto, Source, SourceState};
 use marco_server::app::{App, Config};
 use marco_server::auth::AuthConfig;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+marco_ops::jemalloc!();
 
 pub const TOKEN: &str = "marco-harness-token-0123456789";
 
@@ -164,13 +170,30 @@ enum Cmd {
         #[command(flatten)]
         src: SourceArg,
     },
+    /// Draw perf's inputs from a snapshot (P0's seed and choices), as DIDs.
+    PerfInputs {
+        #[arg(long)]
+        snapshot: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+    },
+    /// Graph read throughput and latency per query shape: in-process, through
+    /// the RPC stack in-process, or over HTTP/2; closed or open loop.
+    Perf(Box<perf::Args>),
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let cmd = match cli.cmd {
+        Cmd::PerfInputs { snapshot, out, seed } => return perf::inputs_cmd(&snapshot, &out, seed),
+        Cmd::Perf(a) => return perf::run(*a),
+        c => c,
+    };
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     rt.block_on(async move {
-        match cli.cmd {
+        match cmd {
             Cmd::Capture { src, seconds, out, sample } => {
                 let (proto, url) = src.get();
                 capture::run(capture::Args { proto, url, duration: Duration::from_secs(seconds), out, sample }).await
@@ -235,6 +258,7 @@ fn main() -> Result<()> {
                 let (proto, url) = src.get();
                 retention(proto, &url).await
             }
+            Cmd::PerfInputs { .. } | Cmd::Perf(_) => unreachable!("run before the runtime"),
         }
     })
 }

@@ -267,6 +267,26 @@ async fn graph_reads() {
     assert_eq!(f.dropped[0].rel, "block");
 }
 
+/// A page of edges over HTTP/2 goes out as two frames; without TCP_NODELAY
+/// the second waits for the client's delayed ACK (~40 ms).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pages_dont_wait_on_delayed_acks() {
+    let s = start(true, false).await;
+    let g = GraphClient::new(HttpClient::plaintext_http2_only(), cfg(s.api, None));
+    let mut times = Vec::new();
+    for i in 0..21 {
+        let t = std::time::Instant::now();
+        let r = g
+            .list_out(ListOutRequest { rel: "follow".into(), actor: did(i), limit: 50, ..Default::default() })
+            .await
+            .unwrap();
+        times.push(t.elapsed());
+        assert!(!r.view().edges.is_empty());
+    }
+    times.sort();
+    assert!(times[10] < Duration::from_millis(20), "median page {:?}", times[10]);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn graph_writes() {
     let s = start(false, false).await;
