@@ -1311,6 +1311,35 @@ pub struct Durability {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_f64"
     )]
     pub replay_seconds: f64,
+    /// A segment write failing (it's retried until it lands), empty when none is.
+    ///
+    /// Field 19: `segment_error`
+    #[serde(
+        rename = "segmentError",
+        alias = "segment_error",
+        with = "::buffa::json_helpers::proto_string",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    )]
+    pub segment_error: ::buffa::alloc::string::String,
+    /// The last checkpoint's error, or one after its commit (cleanup, reopen);
+    /// cleared by the next that commits.
+    ///
+    /// Field 20: `checkpoint_error`
+    #[serde(
+        rename = "checkpointError",
+        alias = "checkpoint_error",
+        with = "::buffa::json_helpers::proto_string",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    )]
+    pub checkpoint_error: ::buffa::alloc::string::String,
+    /// Field 21: `checkpoint_failures`
+    #[serde(
+        rename = "checkpointFailures",
+        alias = "checkpoint_failures",
+        with = "::buffa::json_helpers::uint64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
+    )]
+    pub checkpoint_failures: u64,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -1336,6 +1365,9 @@ impl ::core::fmt::Debug for Durability {
             .field("replayed_segments", &self.replayed_segments)
             .field("replayed_ops", &self.replayed_ops)
             .field("replay_seconds", &self.replay_seconds)
+            .field("segment_error", &self.segment_error)
+            .field("checkpoint_error", &self.checkpoint_error)
+            .field("checkpoint_failures", &self.checkpoint_failures)
             .finish()
     }
 }
@@ -1427,6 +1459,21 @@ impl ::buffa::Message for Durability {
         if self.replay_seconds.to_bits() != 0u64 {
             size += 2u64 + ::buffa::types::FIXED64_ENCODED_LEN as u64;
         }
+        if !self.segment_error.is_empty() {
+            size
+                += 2u64 + ::buffa::types::string_encoded_len(&self.segment_error) as u64;
+        }
+        if !self.checkpoint_error.is_empty() {
+            size
+                += 2u64
+                    + ::buffa::types::string_encoded_len(&self.checkpoint_error) as u64;
+        }
+        if self.checkpoint_failures != 0u64 {
+            size
+                += 2u64
+                    + ::buffa::types::uint64_encoded_len(self.checkpoint_failures)
+                        as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -1490,6 +1537,15 @@ impl ::buffa::Message for Durability {
         }
         if self.replay_seconds.to_bits() != 0u64 {
             ::buffa::types::put_double_field(18u32, self.replay_seconds, buf);
+        }
+        if !self.segment_error.is_empty() {
+            ::buffa::types::put_string_field(19u32, &self.segment_error, buf);
+        }
+        if !self.checkpoint_error.is_empty() {
+            ::buffa::types::put_string_field(20u32, &self.checkpoint_error, buf);
+        }
+        if self.checkpoint_failures != 0u64 {
+            ::buffa::types::put_uint64_field(21u32, self.checkpoint_failures, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -1630,6 +1686,27 @@ impl ::buffa::Message for Durability {
                 )?;
                 self.replay_seconds = ::buffa::types::decode_double(buf)?;
             }
+            19u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.segment_error, buf)?;
+            }
+            20u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.checkpoint_error, buf)?;
+            }
+            21u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.checkpoint_failures = ::buffa::types::decode_uint64(buf)?;
+            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -1656,6 +1733,9 @@ impl ::buffa::Message for Durability {
         self.replayed_segments = 0u32;
         self.replayed_ops = 0u64;
         self.replay_seconds = 0f64;
+        self.segment_error.clear();
+        self.checkpoint_error.clear();
+        self.checkpoint_failures = 0u64;
         self.__buffa_unknown_fields.clear();
     }
 }

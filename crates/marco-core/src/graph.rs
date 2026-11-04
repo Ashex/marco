@@ -1419,6 +1419,9 @@ impl Graph {
     ) -> Result<Manifest> {
         let t = std::time::Instant::now();
         let Some(store) = self.snapshot() else { bail!("no snapshot to checkpoint over") };
+        if checkpoint <= store.manifest.checkpoint {
+            bail!("checkpoint {checkpoint} isn't past the committed {}", store.manifest.checkpoint);
+        }
         let dirty = self.dirty_shards();
         let w = self.width;
         let mut m = Manifest {
@@ -1441,6 +1444,9 @@ impl Graph {
             let lo = k as u32 * w;
             let hi = ((k as u64 + 1) * w as u64).min(self.n_ids() as u64) as u32;
             let name = shard_file(k, checkpoint);
+            if store.manifest.shards.values().any(|n| *n == name) {
+                bail!("{name} is in the committed manifest: checkpoint {checkpoint} was used before");
+            }
             let mut wr = Writer::create(&path.join(&name))?;
             let body = self.write_shard_body(&mut wr, lo, hi, old, true)?;
             let meta = ShardMeta {

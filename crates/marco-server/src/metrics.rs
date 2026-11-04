@@ -75,6 +75,15 @@ pub static CHECKPOINT_SECONDS: LazyLock<Histogram> = LazyLock::new(|| {
     .unwrap()
 });
 
+pub static CHECKPOINT_ERRORS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "marco_checkpoint_errors_total",
+        "Checkpoint failures, and failures after a commit (cleanup, reopen), by stage",
+        &["stage"]
+    )
+    .unwrap()
+});
+
 pub fn init(version: &str, commit: &str) {
     BUILD.with_label_values(&[version, commit]).set(1);
     let _ = prometheus::register(Box::new(prometheus::process_collector::ProcessCollector::for_self()));
@@ -87,6 +96,7 @@ pub fn init(version: &str, commit: &str) {
     LazyLock::force(&SEGMENT_BYTES);
     LazyLock::force(&SEGMENT_ERRORS);
     LazyLock::force(&CHECKPOINT_SECONDS);
+    LazyLock::force(&CHECKPOINT_ERRORS);
 }
 
 /// `Graph/Has` from `/marco.v1.Graph/Has`.

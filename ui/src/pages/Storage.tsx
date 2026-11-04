@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, type ReactNode } from 'react'
 import { DataTable } from '../components/DataTable'
 import { confirmAction } from '../components/dialogs'
 import { Banners, Chip, Glyph, KV, Legend, Loaded, Meter, PageHead, Panel, PanelBody, Seg, Spark, Swatch, Tiles, Updated, Arrow, Dot, oldest } from '../components/kit'
@@ -336,6 +336,10 @@ export function DurabilityPanel({ d }: { d: Durability }) {
             ['Checkpoint took', <span className="mono">{dur(d.checkpointSeconds * 1000)} · {bytes(d.checkpointBytes)} · {d.checkpointShards} shards</span>],
             ['Next checkpoint at', next, <span className="muted sm">whichever first</span>],
             ['Replay at start', <span className="mono">{fmtCount(d.replayedSegments)} segments · {fmtCount(d.replayedOps)} ops · {d.replaySeconds.toFixed(2)} s</span>],
+            ...(d.segmentError ? [['Segment error', <span className="err">{d.segmentError}</span>, <span className="muted sm">retrying</span>] as [ReactNode, ReactNode, ReactNode]] : []),
+            ...(d.checkpointError
+              ? [['Checkpoint error', <span className="err">{d.checkpointError}</span>, <span className="muted sm">{fmtCount(d.checkpointFailures)} failed</span>] as [ReactNode, ReactNode, ReactNode]]
+              : []),
           ]}
         />
       </PanelBody>

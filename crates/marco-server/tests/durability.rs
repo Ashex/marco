@@ -18,7 +18,7 @@ const SRC: &str = "jetstream";
 /// (some recreated under the same rkey), unknown deletes, new DIDs, statuses.
 enum W {
     Ops(Vec<Op>),
-    Status(String, Option<Status>),
+    Status(String, Option<Status>, i64),
 }
 
 fn stream(n: usize) -> Vec<W> {
@@ -37,7 +37,7 @@ fn stream(n: usize) -> Vec<W> {
         let t = t0 + i as i64 * 1000;
         if rnd(40) == 0 {
             let st = [None, Some(Status::Takendown), Some(Status::Deleted)][rnd(3) as usize];
-            v.push(W::Status(did(rnd(N as u64 + 20) as u32), st));
+            v.push(W::Status(did(rnd(N as u64 + 20) as u32), st, t0 + i as i64 * 1000));
             continue;
         }
         let mut ops = Vec::new();
@@ -85,8 +85,8 @@ async fn feed(app: &App, s: &[W], from: usize, to: usize) {
             W::Ops(ops) => {
                 app.apply_from(SRC, &c, ops).await.unwrap();
             }
-            W::Status(d, st) => {
-                app.status_from(SRC, &c, d, *st).await.unwrap();
+            W::Status(d, st, t) => {
+                app.status_from(SRC, &c, d, *st, *t).await.unwrap();
             }
         }
     }
@@ -266,7 +266,9 @@ async fn checkpoints_keep_up_with_writes_and_fold_the_segments() {
 async fn a_new_sources_first_cursor_is_durable_on_return() {
     let (_d, snap) = snapshot();
     let app = App::open(cfg(&snap)).unwrap();
-    app.apply_from("relay", "start", &[]).await.unwrap();
+    // a first call with ops: its segment is written before they apply
+    let u = uri(&did(1), FOLLOW, &tid(70_000_000, 1));
+    app.apply_from("relay", "start", &[Op::Add { uri: u.clone(), subject: did(2), time_us: 0 }]).await.unwrap();
     assert_eq!(app.source_cursor("relay").as_deref(), Some("start"));
     app.apply_from("relay", "next", &[]).await.unwrap();
     assert_eq!(app.latest_cursor("relay").as_deref(), Some("next"));
@@ -274,6 +276,7 @@ async fn a_new_sources_first_cursor_is_durable_on_return() {
     drop(app);
     let app = App::open(cfg(&snap)).unwrap();
     assert_eq!(app.source_cursor("relay").as_deref(), Some("start"));
+    assert!(app.graph().has(0, &did(1), &did(2)).is_some(), "the first call's ops came back with its cursor");
     // the operator's status is durable on return too
     app.set_status(&did(3), Some(Status::Takendown)).await.unwrap();
     drop(app);
@@ -325,4 +328,110 @@ async fn ready_once_the_expected_sources_catch_up() {
     app.report_source(SRC, SourceReport { lag_seconds: 30.0, ..Default::default() });
     assert!(app.is_ready(), "a later lag doesn't take readiness back");
     assert_eq!(app.reads_before_ready.load(std::sync::atomic::Ordering::Relaxed), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replayed_account_deletion_keeps_its_own_time() {
+    // the source re-sends an #account deletion and the creates after it, as a
+    // consumer does resuming from its durable cursor after a kill
+    let (_d, snap) = snapshot();
+    let app = App::open(cfg(&snap)).unwrap();
+    let t = marco_server::app::now_ms() * 1000 - 60_000_000;
+    let a = "did:web:gone.example";
+    let later = uri(a, FOLLOW, &tid(71_000_000, 1));
+    for _ in 0..2 {
+        app.status_from(SRC, "1", a, Some(Status::Deleted), t).await.unwrap();
+        app.status_from(SRC, "2", a, None, t + 1_000).await.unwrap();
+        app.apply_from(SRC, "3", &[Op::Add { uri: later.clone(), subject: did(2), time_us: t + 2_000 }]).await.unwrap();
+        assert!(app.graph().has(0, a, &did(2)).is_some(), "the create after the deletion stays");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn checkpoint_ids_are_never_reused_and_failures_show() {
+    let s = stream(600);
+    let want = uninterrupted(&s).await;
+    let (_d, snap) = snapshot();
+    let app = App::open(cfg(&snap)).unwrap();
+    feed(&app, &s, 0, 200).await;
+    // checkpoint 1 can't rename its first shard into place: it fails before its commit
+    let blocker = snap.join(marco_core::store::shard_file(0, 1));
+    std::fs::create_dir(&blocker).unwrap();
+    assert!(app.checkpoint().await.is_err());
+    let d = app.durability.lock().unwrap().clone();
+    assert_eq!((d.checkpoint, d.checkpoint_failures), (0, 1));
+    assert!(d.checkpoint_error.starts_with("failed"), "{}", d.checkpoint_error);
+    feed(&app, &s, 200, 400).await;
+    // checkpoint 2 commits under a new id; the blocker can't be removed after it, which shows but doesn't fail it
+    app.checkpoint().await.unwrap();
+    let d = app.durability.lock().unwrap().clone();
+    assert_eq!(d.checkpoint, 2);
+    assert!(d.checkpoint_error.starts_with("cleanup after commit"), "{}", d.checkpoint_error);
+    assert_eq!(Manifest::read(&snap).unwrap().checkpoint, 2);
+    std::fs::remove_dir(&blocker).unwrap();
+    feed(&app, &s, 400, 500).await;
+    app.checkpoint().await.unwrap();
+    assert_eq!(app.durability.lock().unwrap().checkpoint, 3);
+    feed(&app, &s, 500, s.len()).await;
+    drop(app);
+    let app = App::open(cfg(&snap)).unwrap();
+    assert_eq!(resume(&app), 500, "a kill after the last checkpoint replays from its cut");
+    feed(&app, &s, resume(&app), s.len()).await;
+    assert_eq!(dump(&app.graph()), want);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_checkpoint_slot_always_clears() {
+    let (_d, snap) = snapshot();
+    let mut c = cfg(&snap);
+    c.checkpoint_ops = 20;
+    let app = App::open(c).unwrap();
+    let s = stream(400);
+    for round in 0..20 {
+        // a verify holds the slot while an automatic checkpoint starts, then the operator asks for one
+        let _ = app.start_verify();
+        feed(&app, &s, round * 20, round * 20 + 20).await;
+        while app.job().running && app.job().kind == "verify" {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let r = tokio::time::timeout(Duration::from_secs(20), app.checkpoint()).await;
+        assert!(r.is_ok(), "round {round}: the slot never cleared");
+    }
+    // an automatic one may have started since; it clears the slot when it's done
+    for _ in 0..2000 {
+        if !app.job().running {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the slot never cleared");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failing_segment_write_shows_and_lands_once_it_can() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_d, snap) = snapshot();
+    let app = App::open(cfg(&snap)).unwrap();
+    app.apply_from(SRC, "1", &[]).await.unwrap();
+    std::fs::set_permissions(&snap, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let u = uri(&did(1), FOLLOW, &tid(72_000_000, 1));
+    app.apply_from(SRC, "2", &[Op::Add { uri: u, subject: did(2), time_us: 0 }]).await.unwrap();
+    let flush = {
+        let app = app.clone();
+        tokio::spawn(async move { app.flush().await })
+    };
+    let mut seen = String::new();
+    for _ in 0..500 {
+        seen = app.durability.lock().unwrap().segment_error.clone();
+        if !seen.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    std::fs::set_permissions(&snap, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(!seen.is_empty(), "the failing write shows in the durability state");
+    flush.await.unwrap().unwrap();
+    assert!(app.durability.lock().unwrap().segment_error.is_empty());
+    assert_eq!(app.source_cursor(SRC).as_deref(), Some("2"));
 }

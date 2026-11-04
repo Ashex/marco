@@ -131,6 +131,9 @@ fn durability_pb(app: &App) -> Durability {
         replayed_segments: d.replayed_segments,
         replayed_ops: d.replayed_ops,
         replay_seconds: d.replay_seconds,
+        segment_error: d.segment_error,
+        checkpoint_error: d.checkpoint_error,
+        checkpoint_failures: d.checkpoint_failures,
         ..Default::default()
     }
 }

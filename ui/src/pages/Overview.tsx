@@ -48,6 +48,9 @@ export function banners(o?: GetOverviewResponse, _sh?: ListShardsResponse): Bann
     })
   else if (job?.error)
     b.push({ id: 'jobfail', tone: 'err', title: job.kind === 'checkpoint' ? 'Checkpoint failed' : 'Checksums failed', desc: job.error, right: <Link to="/admin/storage">Storage ›</Link> })
+  const du = o?.durability
+  if (du?.segmentError) b.push({ id: 'segerr', tone: 'err', title: 'Segment write failing', desc: du.segmentError, right: <Link to="/admin/storage">Storage ›</Link> })
+  if (du?.checkpointError) b.push({ id: 'ckerr', tone: 'warn', title: 'Checkpoint error', desc: du.checkpointError, right: <Link to="/admin/storage">Storage ›</Link> })
   if (o && !o.ready)
     b.push({
       id: 'notready',

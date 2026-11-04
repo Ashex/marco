@@ -178,7 +178,7 @@ fn checkpoints_drop_tombstones_past_their_ttl() {
     g.delete_at(&follow(&did(3), &tid(2)), now - day).unwrap();
     g.tombstone_ttl_us = 7 * day;
     let m = g.write_checkpoint(&p, 1, 0, Default::default()).unwrap();
-    marco_core::store::remove_unlisted(&p, &m).unwrap();
+    marco_core::store::remove_unlisted(&p, &m, true).unwrap();
     assert_eq!(Graph::open(&p).unwrap().tombstones(FOLLOW), 1);
 }
 
@@ -452,7 +452,7 @@ fn run_model(subj_index: usize) {
             } else {
                 ckpt += 1;
                 let m = g.write_checkpoint(&snap, ckpt, 0, Default::default()).unwrap();
-                marco_core::store::remove_unlisted(&snap, &m).unwrap();
+                marco_core::store::remove_unlisted(&snap, &m, true).unwrap();
                 let g2 = Graph::open(&snap).unwrap();
                 g2.snapshot().unwrap().verify_checksums().unwrap();
                 g2
@@ -530,4 +530,25 @@ fn shards_must_belong_to_the_snapshot() {
     g.write_snapshot(&b).unwrap();
     std::fs::copy(b.join(marco_core::store::shard_file(1, 0)), a.join(marco_core::store::shard_file(1, 0))).unwrap();
     assert!(Graph::open(&a).is_err());
+}
+
+#[test]
+fn a_checkpoint_id_is_never_written_twice() {
+    let mut g = graph();
+    g.add(&follow(&did(1), &tid(1)), &did(2)).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("g");
+    g.write_snapshot(&p).unwrap();
+    let mut g = Graph::open(&p).unwrap();
+    g.add(&follow(&did(1), &tid(2)), &did(3)).unwrap();
+    let m = g.write_checkpoint(&p, 1, 0, Default::default()).unwrap();
+    let mut g = Graph::open(&p).unwrap();
+    g.add(&follow(&did(1), &tid(3)), &did(4)).unwrap();
+    let before: Vec<Vec<u8>> = m.shards.values().map(|n| std::fs::read(p.join(n)).unwrap()).collect();
+    for id in [0, 1] {
+        assert!(g.write_checkpoint(&p, id, 0, Default::default()).is_err(), "id {id}");
+    }
+    let after: Vec<Vec<u8>> = m.shards.values().map(|n| std::fs::read(p.join(n)).unwrap()).collect();
+    assert!(before == after, "the committed files are untouched");
+    g.write_checkpoint(&p, 2, 0, Default::default()).unwrap();
 }

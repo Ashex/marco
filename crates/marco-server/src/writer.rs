@@ -13,13 +13,18 @@
 //! manifest, deletes what the manifest no longer names, then opens the new
 //! snapshot and replays the segments written since. The writer folds in the
 //! writes after those and switches to the new copies: writes and reads never
-//! wait on the checkpoint.
+//! wait on the checkpoint. Every checkpoint takes a new id, so its files
+//! never land on names a committed manifest uses, and anything that goes
+//! wrong after the manifest's rename is cleanup, not a failed checkpoint.
+//!
+//! If the writer or segment thread panics, the process aborts: a writer
+//! that answers writes no segment will hold must not keep running.
 
 use std::collections::BTreeMap;
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use marco_core::store::{remove_unlisted, Manifest};
 use marco_core::{segment, Graph, Rec};
 
@@ -33,16 +38,36 @@ pub enum Req {
     Rewritten(Box<Result<Rewritten>>),
 }
 
+/// A committed checkpoint.
 pub struct Rewritten {
-    g: Graph,
-    twin: Graph,
-    /// The newest segment the new copies replayed.
-    last: u64,
     manifest: Manifest,
     seconds: f64,
     bytes: u64,
     shards: u32,
+    /// The new copies to serve, or why opening them failed after the commit.
+    switch: Result<Switch, String>,
+    /// What failed in the cleanup after the commit.
+    cleanup: Option<String>,
+}
+
+struct Switch {
+    g: Graph,
+    twin: Graph,
+    /// The newest segment the new copies replayed.
+    last: u64,
     segments_after: (u32, u64),
+}
+
+/// Aborts the process if the thread that holds it panics.
+struct AbortOnPanic(&'static str);
+
+impl Drop for AbortOnPanic {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!("marco: the {} thread panicked; stopping rather than answer writes no segment holds", self.0);
+            std::process::abort();
+        }
+    }
 }
 
 enum Waiter {
@@ -99,7 +124,6 @@ pub fn spawn(app: Arc<App>, spare: Graph, init: Init) -> mpsc::Sender<Req> {
         ops_since_ckpt: init.ops,
         ckpt_at: Instant::now().checked_sub(age).unwrap_or_else(Instant::now),
         ckpt_running: false,
-        ckpt_job: false,
         next_ckpt: m.checkpoint + 1,
     };
     std::thread::Builder::new().name("marco-writer".into()).spawn(move || w.run(rx)).unwrap();
@@ -108,6 +132,7 @@ pub fn spawn(app: Arc<App>, spare: Graph, init: Init) -> mpsc::Sender<Req> {
 
 /// Writes segments in order; a failed write is retried until it lands.
 fn segments(app: Arc<App>, rx: mpsc::Receiver<SegJob>) {
+    let _guard = AbortOnPanic("segment");
     let dir = app.cfg.snapshot.clone();
     for job in rx {
         if let Some(h) = &job.header {
@@ -122,7 +147,7 @@ fn segments(app: Arc<App>, rx: mpsc::Receiver<SegJob>) {
                         d.segments += 1;
                         d.segment_bytes += bytes;
                         d.segment_ops += h.ops;
-                        d.error.clear();
+                        d.segment_error.clear();
                         crate::metrics::SEGMENT_SECONDS.observe(t.elapsed().as_secs_f64());
                         crate::metrics::SEGMENT_BYTES.inc_by(bytes);
                         break;
@@ -131,7 +156,7 @@ fn segments(app: Arc<App>, rx: mpsc::Receiver<SegJob>) {
                         let msg = format!("change segment {}: {e:#}", h.segment);
                         eprintln!("marco: {msg}; retrying");
                         crate::metrics::SEGMENT_ERRORS.inc();
-                        app.durability.lock().unwrap().error = msg;
+                        app.durability.lock().unwrap().segment_error = msg;
                         std::thread::sleep(Duration::from_secs(1));
                     }
                 }
@@ -174,8 +199,6 @@ struct Writer {
     ops_since_ckpt: u64,
     ckpt_at: Instant,
     ckpt_running: bool,
-    /// The checkpoint holds the app's job slot.
-    ckpt_job: bool,
     next_ckpt: u64,
     interval: Duration,
     deadline: Instant,
@@ -183,6 +206,7 @@ struct Writer {
 
 impl Writer {
     fn run(mut self, rx: mpsc::Receiver<Req>) {
+        let _guard = AbortOnPanic("writer");
         loop {
             let wait = self.deadline.saturating_duration_since(Instant::now());
             let mut batch = Vec::new();
@@ -236,30 +260,54 @@ impl Writer {
         }
     }
 
-    fn apply(
-        &mut self,
-        applies: Vec<(Rec, bool, tokio::sync::oneshot::Sender<Result<Applied>>)>,
-        waiters: &mut Vec<Waiter>,
-    ) {
+    fn apply(&mut self, applies: Vec<(Rec, bool, Reply)>, waiters: &mut Vec<Waiter>) {
+        let mut chunk = Vec::with_capacity(applies.len());
+        for a in applies {
+            let (source, cursor) = source_cursor(&a.0);
+            if !cursor.is_empty() && !self.cursors.contains_key(source) {
+                self.apply_chunk(std::mem::take(&mut chunk), waiters, true);
+                self.first(a, waiters);
+            } else {
+                chunk.push(a);
+            }
+        }
+        self.apply_chunk(chunk, waiters, true);
+    }
+
+    /// A source's first cursor: its record goes out in a segment, written,
+    /// before it's applied, so a source never restarts from nothing.
+    fn first(&mut self, a: (Rec, bool, Reply), waiters: &mut Vec<Waiter>) {
+        let (source, cursor) = source_cursor(&a.0);
+        self.cursors.insert(source.to_string(), cursor.to_string());
+        self.buf_ops += a.0.ops() as u64;
+        self.buf.push(a.0.clone());
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.cut(vec![Waiter::Unit(tx)]);
+        let _ = rx.blocking_recv();
+        self.apply_chunk(vec![a], waiters, false);
+    }
+
+    /// Applies records to both copies; `buffer`: and keeps them for the next segment.
+    fn apply_chunk(&mut self, applies: Vec<(Rec, bool, Reply)>, waiters: &mut Vec<Waiter>, buffer: bool) {
+        if applies.is_empty() {
+            return;
+        }
         let mut g = self.spare.take().expect("the spare copy");
         let mut outs = Vec::with_capacity(applies.len());
         {
             let gm = exclusive(&mut g);
             gm.quiet = false;
-            for (rec, durable, _) in &applies {
-                let (source, cursor) = match rec {
-                    Rec::Apply { source, cursor, .. } | Rec::Status { source, cursor, .. } => (source, cursor),
-                };
-                let first = !cursor.is_empty() && !self.cursors.contains_key(source);
-                outs.push((apply_rec(gm, rec), *durable || first));
+            for (rec, _, _) in &applies {
+                outs.push(apply_rec(gm, rec));
+                let (source, cursor) = source_cursor(rec);
                 if !cursor.is_empty() {
-                    self.cursors.insert(source.clone(), cursor.clone());
+                    self.cursors.insert(source.to_string(), cursor.to_string());
                 }
             }
         }
         let mut old = self.app.publish(g);
         let mut recs = Vec::with_capacity(applies.len());
-        for ((rec, _, reply), (out, durable)) in applies.into_iter().zip(outs) {
+        for ((rec, durable, reply), out) in applies.into_iter().zip(outs) {
             self.app.note_applied(&rec, &out);
             if durable {
                 waiters.push(Waiter::Apply(reply, out));
@@ -275,14 +323,23 @@ impl Writer {
         }
         om.quiet = false;
         self.spare = Some(old);
-        self.buf_ops += recs.iter().map(|r| r.ops() as u64).sum::<u64>();
-        self.buf.extend(recs);
+        if buffer {
+            self.buf_ops += recs.iter().map(|r| r.ops() as u64).sum::<u64>();
+            self.buf.extend(recs);
+        }
+    }
+
+    fn send_segment(&self, job: SegJob) {
+        if self.seg_tx.send(job).is_err() {
+            eprintln!("marco: the segment thread is gone; stopping rather than answer writes no segment holds");
+            std::process::abort();
+        }
     }
 
     fn cut(&mut self, waiters: Vec<Waiter>) {
         if self.buf.is_empty() {
             if !waiters.is_empty() {
-                let _ = self.seg_tx.send(SegJob { header: None, recs: Arc::default(), waiters });
+                self.send_segment(SegJob { header: None, recs: Arc::default(), waiters });
             }
             return;
         }
@@ -301,7 +358,7 @@ impl Writer {
         }
         self.next_seg += 1;
         self.ops_since_ckpt += ops;
-        let _ = self.seg_tx.send(SegJob { header: Some(h), recs, waiters });
+        self.send_segment(SegJob { header: Some(h), recs, waiters });
     }
 
     fn start_checkpoint(&mut self, asked: bool) {
@@ -309,20 +366,41 @@ impl Writer {
             return;
         }
         self.cut(Vec::new());
-        self.ckpt_job = asked || self.app.begin_job("checkpoint", self.app.graph().n_shards() as u32).is_ok();
+        if !asked {
+            // the operator's call took the slot already; with a verify in it, this one runs unlisted
+            let _ = self.app.begin_job("checkpoint", self.app.graph().n_shards() as u32);
+        }
         let upto = self.next_seg - 1;
         let cursors = self.cursors.clone();
         let id = self.next_ckpt;
+        self.next_ckpt += 1;
         self.since_cut = Some(Vec::new());
         self.ckpt_running = true;
         let (app, tx) = (self.app.clone(), self.tx.clone());
         std::thread::Builder::new()
             .name("marco-checkpoint".into())
             .spawn(move || {
-                let r = rewrite(&app, id, upto, cursors);
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rewrite(&app, id, upto, cursors)))
+                    .unwrap_or_else(|_| Err(anyhow!("the checkpoint thread panicked")));
                 let _ = tx.send(Req::Rewritten(Box::new(r)));
             })
             .unwrap();
+    }
+
+    /// Clears the job slot if a checkpoint holds it, whoever started it.
+    fn finish_job(&self, r: Result<()>) {
+        let j = self.app.job();
+        if j.running && j.kind == "checkpoint" {
+            self.app.end_job(r);
+        }
+    }
+
+    fn note_error(&self, stage: &str, msg: String) {
+        eprintln!("marco: checkpoint {stage}: {msg}");
+        crate::metrics::CHECKPOINT_ERRORS.with_label_values(&[stage]).inc();
+        let mut d = self.app.durability.lock().unwrap();
+        d.checkpoint_error = format!("{stage}: {msg}");
+        d.checkpoint_failures += 1;
     }
 
     fn rewritten(&mut self, r: Result<Rewritten>) {
@@ -331,25 +409,45 @@ impl Writer {
         let r = match r {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("marco: checkpoint failed: {e:#}");
-                if self.ckpt_job {
-                    self.app.end_job(Err(e));
-                }
+                self.note_error("failed", format!("{e:#}"));
+                self.finish_job(Err(e));
                 return;
             }
         };
-        let (mut g, mut t) = (r.g, r.twin);
+        self.ckpt_at = Instant::now();
+        let ops: u64 = since.iter().map(|(_, recs)| recs.iter().map(|r| r.ops() as u64).sum::<u64>()).sum();
+        self.ops_since_ckpt = ops;
+        {
+            let mut d = self.app.durability.lock().unwrap();
+            d.checkpoint = r.manifest.checkpoint;
+            d.checkpoint_ms = r.manifest.written_ms;
+            d.checkpoint_seconds = r.seconds;
+            d.checkpoint_bytes = r.bytes;
+            d.checkpoint_shards = r.shards;
+            d.segment_ops = ops;
+            d.checkpoint_error.clear();
+        }
+        crate::metrics::CHECKPOINT_SECONDS.observe(r.seconds);
+        if let Some(e) = r.cleanup {
+            self.note_error("cleanup after commit", e);
+        }
+        let sw = match r.switch {
+            Ok(sw) => sw,
+            Err(e) => {
+                // the committed snapshot holds what the copies served hold; they carry on
+                self.note_error("reopen after commit", e.clone());
+                self.finish_job(Err(anyhow!("committed checkpoint {}; reopen failed: {e}", r.manifest.checkpoint)));
+                return;
+            }
+        };
+        let (mut g, mut t) = (sw.g, sw.twin);
         g.quiet = true;
         t.quiet = true;
-        let mut ops = 0;
-        for (_, recs) in since.iter().filter(|(k, _)| *k > r.last) {
+        for (_, recs) in since.iter().filter(|(k, _)| *k > sw.last) {
             for rec in recs.iter() {
                 apply_rec(&mut g, rec);
                 apply_rec(&mut t, rec);
             }
-        }
-        for (_, recs) in &since {
-            ops += recs.iter().map(|r| r.ops() as u64).sum::<u64>();
         }
         for rec in &self.buf {
             apply_rec(&mut g, rec);
@@ -360,29 +458,28 @@ impl Writer {
         let old = (self.app.publish(Arc::new(g)), self.spare.replace(Arc::new(t)));
         // freeing a day of deltas twice takes long enough to stall writes
         std::thread::Builder::new().name("marco-free".into()).spawn(move || drop(old)).ok();
-        self.ops_since_ckpt = ops;
-        self.ckpt_at = Instant::now();
-        self.next_ckpt = r.manifest.checkpoint + 1;
         {
             let mut d = self.app.durability.lock().unwrap();
-            d.checkpoint = r.manifest.checkpoint;
-            d.checkpoint_ms = r.manifest.written_ms;
-            d.checkpoint_seconds = r.seconds;
-            d.checkpoint_bytes = r.bytes;
-            d.checkpoint_shards = r.shards;
-            d.segments = r.segments_after.0;
-            d.segment_bytes = r.segments_after.1;
-            d.segment_ops = ops;
+            d.segments = sw.segments_after.0;
+            d.segment_bytes = sw.segments_after.1;
         }
-        crate::metrics::CHECKPOINT_SECONDS.observe(r.seconds);
         *self.app.verify.lock().unwrap() = vec![Default::default(); self.app.snapshot_files()];
         self.app.list_stats.clear();
-        if self.ckpt_job {
-            self.app.end_job(Ok(()));
-        }
+        self.finish_job(Ok(()));
     }
 }
 
+fn source_cursor(r: &Rec) -> (&str, &str) {
+    match r {
+        Rec::Apply { source, cursor, .. } | Rec::Status { source, cursor, .. } => (source, cursor),
+    }
+}
+
+type Reply = tokio::sync::oneshot::Sender<Result<Applied>>;
+
+/// Writes and commits checkpoint `id` at segment `upto`. An error means
+/// nothing was committed; what fails after the commit comes back in
+/// `Rewritten`.
 fn rewrite(app: &App, id: u64, upto: u64, cursors: BTreeMap<String, String>) -> Result<Rewritten> {
     let t = Instant::now();
     let cfg = &app.cfg;
@@ -390,26 +487,28 @@ fn rewrite(app: &App, id: u64, upto: u64, cursors: BTreeMap<String, String>) -> 
         std::thread::sleep(Duration::from_millis(5));
     }
     let g = open_replayed(cfg, Some(upto))?.graph;
-    let m = g.write_checkpoint(&cfg.snapshot, id, upto, cursors)?;
-    let new: Vec<&String> = m.shards.values().filter(|n| n.ends_with(&format!("-{id:08}.marco"))).collect();
+    let manifest = g.write_checkpoint(&cfg.snapshot, id, upto, cursors)?;
+    drop(g);
+    let new: Vec<&String> = manifest.shards.values().filter(|n| n.ends_with(&format!("-{id:08}.marco"))).collect();
     let bytes = new.iter().map(|n| std::fs::metadata(cfg.snapshot.join(n)).map_or(0, |x| x.len())).sum();
     let shards = new.len() as u32;
-    drop(g);
-    remove_unlisted(&cfg.snapshot, &m)?;
-    let r = open_replayed(cfg, None)?;
-    let (g, n, last) = (r.graph, r.segments, r.last);
-    if cfg.prefault {
-        // before the switch: the new files' first reads would fault every page
-        if let Some(s) = g.snapshot() {
-            s.populate();
+    let cleanup = remove_unlisted(&cfg.snapshot, &manifest, false).err().map(|e| format!("{e:#}"));
+    let switch = (|| -> Result<Switch> {
+        let r = open_replayed(cfg, None)?;
+        if cfg.prefault {
+            // before the switch: the new files' first reads would fault every page
+            if let Some(s) = r.graph.snapshot() {
+                s.populate();
+            }
         }
-    }
-    let seconds = t.elapsed().as_secs_f64();
-    let seg_bytes = segment::list(&cfg.snapshot)?
-        .iter()
-        .filter(|(k, _)| *k > upto)
-        .map(|(_, p)| std::fs::metadata(p).map_or(0, |x| x.len()))
-        .sum();
-    let twin = g.clone();
-    Ok(Rewritten { g, twin, last, manifest: m, seconds, bytes, shards, segments_after: (n, seg_bytes) })
+        let seg_bytes = segment::list(&cfg.snapshot)?
+            .iter()
+            .filter(|(k, _)| *k > upto)
+            .map(|(_, p)| std::fs::metadata(p).map_or(0, |x| x.len()))
+            .sum();
+        let twin = r.graph.clone();
+        Ok(Switch { g: r.graph, twin, last: r.last, segments_after: (r.segments, seg_bytes) })
+    })()
+    .map_err(|e| format!("{e:#}"));
+    Ok(Rewritten { manifest, seconds: t.elapsed().as_secs_f64(), bytes, shards, switch, cleanup })
 }

@@ -248,17 +248,22 @@ impl Store {
     }
 }
 
-/// Deletes shard files `m` doesn't name and temp files: what a checkpoint
-/// that didn't commit, or one whose old files weren't removed yet, leaves.
-pub fn remove_unlisted(path: &Path, m: &Manifest) -> Result<usize> {
+/// Deletes the shard files `m` doesn't name and the segments it folded in:
+/// what a checkpoint leaves behind, committed or not. `temps` deletes temp
+/// files too, which only a process with no writer running may do (open).
+pub fn remove_unlisted(path: &Path, m: &Manifest, temps: bool) -> Result<usize> {
     let keep: std::collections::HashSet<&str> = m.shards.values().map(String::as_str).collect();
     let mut n = 0;
     for e in std::fs::read_dir(path)? {
         let name = e?.file_name().to_string_lossy().to_string();
-        let shard = name.starts_with("shard-") && name.ends_with(".marco");
+        let temp = name.contains(".tmp");
+        let shard = !temp && name.starts_with("shard-") && name.ends_with(".marco");
         let old_seg = crate::segment::parse_name(&name).is_some_and(|n| n <= m.segment);
-        if (shard && !keep.contains(name.as_str())) || old_seg || name.contains(".tmp") {
-            std::fs::remove_file(path.join(&name))?;
+        if (shard && !keep.contains(name.as_str())) || old_seg || (temps && temp) {
+            match std::fs::remove_file(path.join(&name)) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                r => r.with_context(|| format!("remove {name}"))?,
+            }
             n += 1;
         }
     }

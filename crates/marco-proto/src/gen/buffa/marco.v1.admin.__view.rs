@@ -1948,6 +1948,17 @@ pub struct DurabilityView<'a> {
     pub replayed_ops: u64,
     /// Field 18: `replay_seconds`
     pub replay_seconds: f64,
+    /// A segment write failing (it's retried until it lands), empty when none is.
+    ///
+    /// Field 19: `segment_error`
+    pub segment_error: &'a str,
+    /// The last checkpoint's error, or one after its commit (cleanup, reopen);
+    /// cleared by the next that commits.
+    ///
+    /// Field 20: `checkpoint_error`
+    pub checkpoint_error: &'a str,
+    /// Field 21: `checkpoint_failures`
+    pub checkpoint_failures: u64,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for DurabilityView<'a> {
@@ -2106,6 +2117,27 @@ impl<'a> ::buffa::MessageView<'a> for DurabilityView<'a> {
                 )?;
                 view.replay_seconds = ::buffa::types::decode_double(&mut cur)?;
             }
+            19u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                view.segment_error = ::buffa::types::borrow_str(&mut cur)?;
+            }
+            20u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                view.checkpoint_error = ::buffa::types::borrow_str(&mut cur)?;
+            }
+            21u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.checkpoint_failures = ::buffa::types::decode_uint64(&mut cur)?;
+            }
             _ => {
                 ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
                 let span_len = before_tag.len() - cur.len();
@@ -2146,6 +2178,9 @@ impl<'a> ::buffa::MessageView<'a> for DurabilityView<'a> {
             replayed_segments: self.replayed_segments,
             replayed_ops: self.replayed_ops,
             replay_seconds: self.replay_seconds,
+            segment_error: self.segment_error.to_string(),
+            checkpoint_error: self.checkpoint_error.to_string(),
+            checkpoint_failures: self.checkpoint_failures,
             __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
@@ -2218,6 +2253,21 @@ impl<'a> ::buffa::ViewEncode<'a> for DurabilityView<'a> {
         if self.replay_seconds.to_bits() != 0u64 {
             size += 2u64 + ::buffa::types::FIXED64_ENCODED_LEN as u64;
         }
+        if !self.segment_error.is_empty() {
+            size
+                += 2u64 + ::buffa::types::string_encoded_len(&self.segment_error) as u64;
+        }
+        if !self.checkpoint_error.is_empty() {
+            size
+                += 2u64
+                    + ::buffa::types::string_encoded_len(&self.checkpoint_error) as u64;
+        }
+        if self.checkpoint_failures != 0u64 {
+            size
+                += 2u64
+                    + ::buffa::types::uint64_encoded_len(self.checkpoint_failures)
+                        as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -2282,6 +2332,15 @@ impl<'a> ::buffa::ViewEncode<'a> for DurabilityView<'a> {
         }
         if self.replay_seconds.to_bits() != 0u64 {
             ::buffa::types::put_double_field(18u32, self.replay_seconds, buf);
+        }
+        if !self.segment_error.is_empty() {
+            ::buffa::types::put_string_field(19u32, &self.segment_error, buf);
+        }
+        if !self.checkpoint_error.is_empty() {
+            ::buffa::types::put_string_field(20u32, &self.checkpoint_error, buf);
+        }
+        if self.checkpoint_failures != 0u64 {
+            ::buffa::types::put_uint64_field(21u32, self.checkpoint_failures, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -2428,6 +2487,19 @@ impl<'__a> ::serde::Serialize for DurabilityView<'__a> {
                 .serialize_entry(
                     "replaySeconds",
                     &::buffa::json_helpers::ProtoJson(&self.replay_seconds),
+                )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.segment_error) {
+            __map.serialize_entry("segmentError", self.segment_error)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.checkpoint_error) {
+            __map.serialize_entry("checkpointError", self.checkpoint_error)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.checkpoint_failures) {
+            __map
+                .serialize_entry(
+                    "checkpointFailures",
+                    &::buffa::json_helpers::ProtoJson(&self.checkpoint_failures),
                 )?;
         }
         __map.end()
@@ -2622,6 +2694,26 @@ impl DurabilityOwnedView {
     #[must_use]
     pub fn replay_seconds(&self) -> f64 {
         self.0.reborrow().replay_seconds
+    }
+    /// A segment write failing (it's retried until it lands), empty when none is.
+    ///
+    /// Field 19: `segment_error`
+    #[must_use]
+    pub fn segment_error(&self) -> &'_ str {
+        self.0.reborrow().segment_error
+    }
+    /// The last checkpoint's error, or one after its commit (cleanup, reopen);
+    /// cleared by the next that commits.
+    ///
+    /// Field 20: `checkpoint_error`
+    #[must_use]
+    pub fn checkpoint_error(&self) -> &'_ str {
+        self.0.reborrow().checkpoint_error
+    }
+    /// Field 21: `checkpoint_failures`
+    #[must_use]
+    pub fn checkpoint_failures(&self) -> u64 {
+        self.0.reborrow().checkpoint_failures
     }
 }
 impl ::core::convert::From<::buffa::OwnedView<DurabilityView<'static>>>

@@ -147,6 +147,12 @@ message Durability {
   uint32 replayed_segments = 16;
   uint64 replayed_ops = 17;
   double replay_seconds = 18;
+  // A segment write failing (it's retried until it lands), empty when none is.
+  string segment_error = 19;
+  // The last checkpoint's error, or one after its commit (cleanup, reopen);
+  // cleared by the next that commits.
+  string checkpoint_error = 20;
+  uint64 checkpoint_failures = 21;
 }
 
 message SnapshotInfo {

@@ -237,7 +237,10 @@ pub struct Durability {
     pub replayed_ops: u64,
     pub replay_seconds: f64,
     /// The last segment write's error, while it's being retried.
-    pub error: String,
+    pub segment_error: String,
+    /// The last checkpoint's error, cleared by the next that commits.
+    pub checkpoint_error: String,
+    pub checkpoint_failures: u64,
 }
 
 pub struct App {
@@ -321,7 +324,9 @@ impl App {
         let t = Instant::now();
         if !cfg.read_only {
             let m = marco_core::store::Manifest::read(&cfg.snapshot)?;
-            marco_core::store::remove_unlisted(&cfg.snapshot, &m)?;
+            if let Err(e) = marco_core::store::remove_unlisted(&cfg.snapshot, &m, true) {
+                eprintln!("marco: removing leftovers in {}: {e:#}", cfg.snapshot.display());
+            }
         }
         let Replayed { graph: g, cursors, segments: segs, ops, last } = open_replayed(&cfg, None)?;
         let open_seconds = t.elapsed().as_secs_f64();
@@ -443,8 +448,8 @@ impl App {
     /// the next change segment (a few seconds). An empty `cursor` leaves the
     /// source's cursor as it was; empty `ops` just advance it. A source's
     /// first call that sets a cursor returns once that's in a segment, so a
-    /// source never restarts from nothing after it began. An op's `time_us`
-    /// of 0 becomes now.
+    /// source never restarts from nothing after it began: that segment is
+    /// written before its ops apply. An op's `time_us` of 0 becomes now.
     pub async fn apply_from(&self, source: &str, cursor: &str, ops: &[Op]) -> Result<Vec<Outcome>> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         let now = now_ms() * 1000;
@@ -457,10 +462,18 @@ impl App {
         }
     }
 
-    /// Sets an actor's status from `source`, with the cursor that carried it.
-    /// Deleted drops its records. Returns how many it removed.
-    pub async fn status_from(&self, source: &str, cursor: &str, did: &str, status: Option<Status>) -> Result<u64> {
-        self.status_(source, cursor, did, status, false).await
+    /// Sets an actor's status from `source`, with the cursor that carried it
+    /// and the time the source saw it (0: now). Deleted drops its records,
+    /// with tombstones at that time. Returns how many it removed.
+    pub async fn status_from(
+        &self,
+        source: &str,
+        cursor: &str,
+        did: &str,
+        status: Option<Status>,
+        time_us: i64,
+    ) -> Result<u64> {
+        self.status_(source, cursor, did, status, time_us, false).await
     }
 
     async fn status_(
@@ -469,6 +482,7 @@ impl App {
         cursor: &str,
         did: &str,
         status: Option<Status>,
+        time_us: i64,
         durable: bool,
     ) -> Result<u64> {
         if classify(did).is_none() {
@@ -480,7 +494,7 @@ impl App {
             cursor: cursor.into(),
             did: did.into(),
             status,
-            time_us: now_ms() * 1000,
+            time_us: if time_us == 0 { now_ms() * 1000 } else { time_us },
         };
         self.send(Req::Apply { rec, durable, reply })?;
         match rx.await.context("the writer dropped the write")?? {
@@ -570,7 +584,7 @@ impl App {
 
     /// The operator's status: durable when it answers.
     pub async fn set_status(&self, did: &str, status: Option<Status>) -> Result<u64, String> {
-        self.status_(ADMIN_SOURCE, "", did, status, true).await.map_err(|e| format!("{e:#}"))
+        self.status_(ADMIN_SOURCE, "", did, status, 0, true).await.map_err(|e| format!("{e:#}"))
     }
 
     /// Writes a change segment now and waits for it.
