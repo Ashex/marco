@@ -112,7 +112,8 @@ svg .bar3 { fill: var(--muted); opacity: .55; }
 <tr><td>In lists (followers) in time order</td><td><span class="tag no">out</span></td><td>Followers come back in id order with an id cursor. A time log per subject would add ~21 GB.</td></tr>
 <tr><td>Intersections: mutuals, "followed by people you know", block filters</td><td><span class="tag yes">in</span></td><td>The hot read for social proof and moderation.</td></tr>
 <tr><td>Built-in Jetstream / firehose consumer with a durable cursor</td><td><span class="tag yes">in</span></td><td>Shipping it means it fills itself. The API path stays for people with their own pipeline.</td></tr>
-<tr><td>Record-to-record edges (likes on posts, list items to lists)</td><td><span class="tag no">out</span></td><td>Post-keyed sets are 5x the size (12.2B likes). That's vlDB.</td></tr>
+<tr><td>Record-to-record edges (likes on posts)</td><td><span class="tag no">out</span></td><td>Post-keyed sets are 5x the size (12.2B likes). That's vlDB.</td></tr>
+<tr><td>Lists: list items as list → member edges, lists as set operands</td><td><span class="tag yes">in</span></td><td>61M items, ~1.3 GB. See <a href="#lists">Lists</a>.</td></tr>
 <tr><td>Record bodies, profiles, search</td><td><span class="tag no">out</span></td><td>marco stores ids, rkeys and nothing else.</td></tr>
 <tr><td>Sharding across nodes</td><td><span class="tag later">later</span></td><td>The whole network fits one box. Actor-range shards only if a deployment needs it.</td></tr>
 </table></div>
@@ -246,6 +247,161 @@ subject = "subject"</pre>
 <tr><td>Date strings, hex, random, <code>test</code></td><td class="n">121</td><td class="n">≤15</td><td><code>20250221110652</code></td></tr>
 </table></div>
 <p>Blocks have the same mix: 2,010 of them, mostly <code>m9i94nup-niiane1z</code>-style keys from 27 repos. They're all valid record keys, so dropping them would make 370 accounts' counts disagree with every other appview. They don't get to shape the core either. A TID's top bit is always 0, so a non-TID rkey becomes <code>1 ‖ hash63(rkey)</code> in the same u64 column, and one function at the edge of the API does the mapping. A small side table keeps the strings so URIs come back exact. These sort as newest in lists, which is the one place they behave differently.</p>
+
+<h2 id="lists">Lists</h2>
+<p class="sub">Designed 2026-11-04 from the ClickHouse archive (crawl_records + repo_records, latest op per key). Lists are sets: membership, counts and set operations with a list as an operand. Kinds, the list record and list blocks stay out.</p>
+<div class="kpis">
+  <div class="kpi"><b>60.8M</b><span>live listitems, from 693k repos</span></div>
+  <div class="kpi"><b>1.26M</b><span>lists with at least one item</span></div>
+  <div class="kpi"><b>7.9M</b><span>DIDs on at least one list</span></div>
+  <div class="kpi"><b>~1.3 GB</b><span>estimated, ~21 B per list edge</span></div>
+</div>
+
+<h3>A list is a node</h3>
+<div class="fig">
+<svg viewBox="0 0 900 330" role="img" aria-label="A listitem record becomes two out-log rows and an in-set entry, keyed by a list node in the directory">
+  <defs><marker id="arL" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10z" fill="currentColor" style="color:var(--accent)"/></marker></defs>
+  <g font-size="13">
+  <rect class="box" x="10" y="14" width="420" height="58" rx="6"/>
+  <text x="22" y="36" class="mono" font-size="12">at://<tspan font-weight="700">owner</tspan>/app.bsky.graph.listitem/<tspan font-weight="700">rkey</tspan></text>
+  <text x="22" y="58" class="mono" font-size="12">{ list: at://owner/app.bsky.graph.list/L, subject: did:m }</text>
+
+  <rect class="acc" x="520" y="14" width="370" height="58" rx="6"/>
+  <text x="532" y="36">directory: DIDs, then list URIs as nodes</text>
+  <text x="532" y="58" class="m" font-size="12">one u32 id space; a list URI interns like a non-plc DID</text>
+  <path class="aline" d="M430 43 H520" marker-end="url(#arL)"/>
+
+  <rect class="acc" x="10" y="110" width="270" height="88" rx="6"/>
+  <text x="22" y="132" font-weight="600">owner log  (listitem.owner)</text>
+  <text x="22" y="154" class="mono" font-size="12">owner, rkey → list id</text>
+  <text x="22" y="176" class="m" font-size="12">the record: tombstones, delete</text>
+  <text x="22" y="192" class="m" font-size="12">by URI, deleted accounts</text>
+
+  <rect class="acc" x="315" y="110" width="270" height="88" rx="6"/>
+  <text x="327" y="132" font-weight="600">list log  (listitem)</text>
+  <text x="327" y="154" class="mono" font-size="12">list, rkey → member id</text>
+  <text x="327" y="176" class="m" font-size="12">members newest first, has() URI,</text>
+  <text x="327" y="192" class="m" font-size="12">counts, the list as a set operand</text>
+
+  <rect class="acc" x="620" y="110" width="270" height="88" rx="6"/>
+  <text x="632" y="132" font-weight="600">member's in set  (listitem)</text>
+  <text x="632" y="154" class="mono" font-size="12">member → list ids, Elias-Fano</text>
+  <text x="632" y="176" class="m" font-size="12">lists a DID is on; x ∈ L is one</text>
+  <text x="632" y="192" class="m" font-size="12">probe of x's set (p50 2 lists)</text>
+  <path class="line" d="M220 72 V110 M450 72 V110 M760 72 V110"/>
+
+  <text x="10" y="236" font-weight="600">Delete by URI</text>
+  <rect class="box" x="10" y="248" width="190" height="40" rx="6"/><text x="22" y="273">delete owner/…/rkey</text>
+  <rect class="acc" x="240" y="248" width="200" height="40" rx="6"/><text x="252" y="273">owner log: rkey → list L</text>
+  <rect class="acc" x="480" y="248" width="190" height="40" rx="6"/><text x="492" y="273">L's log: rkey → member</text>
+  <rect class="box" x="710" y="248" width="180" height="40" rx="6"/><text x="722" y="273">in(member) −= L</text>
+  <path class="aline" d="M200 268 H240 M440 268 H480 M670 268 H710"/>
+  <text x="10" y="316" class="m" font-size="12">Two binary searches, whatever the owner's list count. Not found: a tombstone on (owner, rkey), as for every relation.</text>
+  </g>
+</svg>
+</div>
+<p>A listitem is three ids, not two: owner, list and member. The list gets an id in the directory, keyed by its AT URI, so the list → member edge reuses the out log and the in set unchanged. A delete only names the owner and the rkey, so a companion relation, <code>listitem.owner</code>, keeps the record itself: owner and rkey to list. That's the per-(owner, rkey) map, in the out-log format that already does tombstones, non-TID rkeys and deleted accounts. Every listitem must name a list in its own repo, as the appview requires. The 43k that don't are refused.</p>
+<pre>[[relation]]
+name = "listitem"
+collection = "app.bsky.graph.listitem"
+subject = "subject"
+list = "list"     # the edge starts at this record, which must be in the same repo</pre>
+
+<h3>What the archive holds</h3>
+<div class="tw"><table>
+<tr><th>Measure</th><th class="n">Value</th></tr>
+<tr><td>Live listitems / deleted keys</td><td class="n">60,833,013 / 4,868,971</td></tr>
+<tr><td>Live list records (not stored, below)</td><td class="n">1,277,332</td></tr>
+<tr><td>Lists with items / repos with items</td><td class="n">1,262,107 / 693,326</td></tr>
+<tr><td>Members per list, p50 / p90 / p99 / p99.9 / max</td><td class="n">13 / 65 / 321 / 2,802 / 697,862</td></tr>
+<tr><td>Lists at or over 4,096 items (they get a by-subject index)</td><td class="n">829, holding 16.9M items</td></tr>
+<tr><td>Lists a DID is on, p50 / p90 / p99 / p99.9 / max</td><td class="n">2 / 11 / 78 / 434 / 200,713</td></tr>
+<tr><td>Lists per owner, item-weighted mean / p99 / max</td><td class="n">14 / 236 / 550</td></tr>
+<tr><td>Records repeating a (list, member) pair</td><td class="n">4,538,858 (7.5%), in 26,538 lists</td></tr>
+<tr><td>Worst list: records / distinct members</td><td class="n">640,733 / 119</td></tr>
+<tr><td>Items whose list is in another repo (refused)</td><td class="n">43,382</td></tr>
+<tr><td>Non-TID rkeys / subjects that aren't did:plc</td><td class="n">313,899 / 15,454</td></tr>
+<tr><td>Last 30 days: creates / deletes</td><td class="n">2.00M / 0.41M (0.9 ops/s)</td></tr>
+</table></div>
+<p>Two numbers shape the design. The average listitem's owner has 14 lists, and one has 550, so finding the list by trying each of the owner's lists costs up to 550 lookups a delete; the owner log makes it two. And 7.5% of records repeat a pair, one list holding 640k records for 119 members, so counts and member pages have to count members, not records. The appview keeps the first record of a pair and counts rows, which is the member count.</p>
+
+<h3>Options</h3>
+<div class="tw"><table>
+<tr><th>Option</th><th class="n">B / list edge</th><th>Delete by URI</th><th>List as a set operand</th></tr>
+<tr class="pick"><td><b>List node + list log + owner log</b></td><td class="n">~21</td><td>2 binary searches</td><td>out log of the list; probes go to the member's in set</td></tr>
+<tr><td>List node + list log, no owner log: try each of the owner's lists</td><td class="n">~13</td><td>mean 14 lookups, p99 236, max 550</td><td>same</td></tr>
+<tr><td>Above + an Elias-Fano member set per list</td><td class="n">~24</td><td>2 binary searches</td><td>probe-able on both sides; buys nothing the in set doesn't</td></tr>
+<tr><td>No list node: owner log tagged with the list</td><td class="n">~10</td><td>1 binary search</td><td>a scan of the owner's whole log per list read</td></tr>
+</table></div>
+<p>The owner log costs ~8 B per edge, ~500 MB at today's size, about 1.5% of the graph. It keeps deletes inside the P0 delete target for every owner and gives the record one identity for tombstones. A separate member set per list isn't needed. Membership of x in L is a probe of x's own in set, which is short (p99 78 lists), and materializing a list's members reads its out log: a gather through the by-subject index for the 829 big lists, a sort of at most 4,096 for the rest.</p>
+
+<h3>Sets and operations</h3>
+<div class="fig">
+<svg viewBox="0 0 900 250" role="img" aria-label="Set operands and how an intersection or difference runs">
+  <g font-size="13">
+  <text x="10" y="20" font-weight="600">Operands: (rel, dir, node)</text>
+  <rect class="acc" x="10" y="32" width="260" height="34" rx="6"/><text x="22" y="54">members(L) = listitem, out, L</text>
+  <rect class="acc" x="10" y="72" width="260" height="34" rx="6"/><text x="22" y="94">lists(x) = listitem, in, x</text>
+  <rect class="box" x="10" y="112" width="260" height="34" rx="6"/><text x="22" y="134">follows(X) = follow, out, X</text>
+  <rect class="box" x="10" y="152" width="260" height="34" rx="6"/><text x="22" y="174">followers(X) = follow, in, X</text>
+  <rect class="box" x="10" y="192" width="260" height="34" rx="6"/><text x="22" y="214">blocks(X) = block, out, X</text>
+
+  <text x="330" y="20" font-weight="600">A ∩ B,  A − B</text>
+  <rect class="box" x="330" y="32" width="250" height="40" rx="6"/><text x="342" y="57">materialize the smaller side A</text>
+  <path class="aline" d="M455 72 V96" marker-end="url(#arL)"/>
+  <rect class="box" x="330" y="96" width="250" height="68" rx="6"/>
+  <text x="342" y="118">B is an in set: probe its blocks</text>
+  <text x="342" y="138">B is an out set, much bigger:</text>
+  <text x="342" y="156" class="m" font-size="12">probe each x in A: is B's node in in(x)?</text>
+  <path class="aline" d="M455 164 V188" marker-end="url(#arL)"/>
+  <rect class="box" x="330" y="188" width="250" height="40" rx="6"/><text x="342" y="213">else decode B and merge</text>
+
+  <text x="630" y="20" font-weight="600">Examples</text>
+  <text x="630" y="48" class="mono" font-size="12">L1 ∩ L2</text>
+  <text x="630" y="72" class="mono" font-size="12">L1 − L2</text>
+  <text x="630" y="96" class="mono" font-size="12">members(L) ∩ follows(X)</text>
+  <text x="630" y="120" class="mono" font-size="12">members(L) ∩ followers(X)</text>
+  <text x="630" y="144" class="mono" font-size="12">members(L) − blocks(X)</text>
+  <text x="630" y="168" class="mono" font-size="12">Filter(actors) − members(L)</text>
+  <text x="630" y="200" class="m" font-size="12">x ∈ out(rel, N) ⟺ N ∈ in(rel, x):</text>
+  <text x="630" y="218" class="m" font-size="12">every out edge has its pair in an in set</text>
+  </g>
+</svg>
+</div>
+<p>A list is just another (rel, dir, node) side, so <code>Intersect</code> takes it as is and gains a difference. The one new trick is the identity at the bottom right: any out set can be probed through its members' in sets, so a small side against a huge list never decodes the list. <code>Filter</code> gains a drop rule for "in this set", which is how a feed drops a list's members.</p>
+
+<div class="tw"><table>
+<tr><th>Lookup</th><th>How</th></tr>
+<tr><td>A list's members, paged</td><td><code>ListOut(listitem, L)</code>: newest first, rkey cursor. <code>distinct</code> keeps the newest record per member.</td></tr>
+<tr><td>The lists a DID is on</td><td><code>ListIn(listitem, did)</code>: list URIs in id order, URI cursor</td></tr>
+<tr><td>Counts</td><td><code>Counts</code> gains <code>out_subjects</code>: distinct members, from a per-list repeat count in the out-log header</td></tr>
+<tr><td>has(list, did)</td><td><code>Has(listitem, L, did)</code>: the newest listitem URI</td></tr>
+<tr><td>L1 ∩ L2, L1 − L2, L against a relation</td><td><code>Intersect</code> with an op (and, and-not) and an id cursor</td></tr>
+<tr><td>Drop a list's members from a page of actors</td><td><code>Filter</code> drop rule <code>member_of</code></td></tr>
+<tr><td>The owner's listitems</td><td><code>ListOut(listitem.owner, owner)</code>: listitem URI and list</td></tr>
+</table></div>
+
+<h3>Size</h3>
+<div class="tw"><table>
+<tr><th>Part</th><th class="n">Est. B / edge</th><th class="n">Est. total</th></tr>
+<tr><td>List log: member u32 + rkey delta</td><td class="n">~9</td><td class="n">~550 MB</td></tr>
+<tr><td>Owner log: list u32 + rkey delta</td><td class="n">~8</td><td class="n">~500 MB</td></tr>
+<tr><td>Member in sets (list ids cluster at the top of the id space)</td><td class="n">~2.5</td><td class="n">~140 MB</td></tr>
+<tr><td>Directory: 1.26M list URIs (~71 B each)</td><td class="n">~1.5</td><td class="n">~95 MB</td></tr>
+<tr><td><b>Total</b>, against ~31 GB for follows and blocks</td><td class="n"><b>~21</b></td><td class="n"><b>~1.3 GB</b></td></tr>
+</table></div>
+<p>Lists grow ~19M items a year at the last 30 days' rate (+32%), so they stay a few percent of the graph. List ids take the top of the u32 space after the DIDs, so all list logs land in the last snapshot shards. That's ~61M records, about two follow shards' worth, so the imbalance is small.</p>
+
+<h3>Ingest, build and durability</h3>
+<p>Jetstream and the firehose read the list path from the record next to the subject, and an add op carries it (<code>AddOp.list</code>, segment op 3). The bulk build reads listitem chunks with a fourth string column, the list URI, after the subject. It resolves each (owner, rkey) to its latest op, as for every relation, then writes the record twice: by owner into the owner log and by list into the list log. Since a list's URI starts with its owner's DID, a repo-prefix chunk's lists are a contiguous id range too, so the out pass places them the same way. Deletes, tombstones, deleted accounts and change segments all go through the owner log, so the durability tests run unchanged with listitems mixed in.</p>
+
+<h3>Left out</h3>
+<div class="tw"><table>
+<tr><th>Question</th><th>Answer (2026-11-04)</th></tr>
+<tr><td>List kinds (modlist, curatelist, reference)</td><td>Not stored. Lists are sets; callers that care about kinds hold the list records.</td></tr>
+<tr><td>The <code>app.bsky.graph.list</code> record</td><td>Not stored. Nothing here needs it: the appview doesn't cascade a list's delete to its items either, and the list node exists while it has items.</td></tr>
+<tr><td>Later: list subjects (listblock)</td><td>Every subject stays a DID. Because a list is already a directory node, <code>app.bsky.graph.listblock</code> could become an ordinary relation whose subject is a list, and blockingByList / blockedByList become set ops: t's lists against the viewer's subscriptions, and the viewer's lists against t's.</td></tr>
+</table></div>
 
 <h2>API</h2>
 <p>One ConnectRPC service, defined in protobuf and served by connectrpc + buffa. A Connect server answers three protocols on the same port: gRPC, gRPC-Web, and Connect's own HTTP POST with JSON or binary bodies. So <code>curl</code> with JSON works, hydration paths get protobuf, and every language gets generated clients from one <code>.proto</code>. Ingest is a client stream, so a pipeline pushes ops without a round trip per batch. Every write carries an optional source cursor, so a pipeline can resume and replay without double-applying.</p>
