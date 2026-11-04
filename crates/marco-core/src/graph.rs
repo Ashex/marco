@@ -17,16 +17,22 @@ use anyhow::{bail, Result};
 
 use crate::did::{classify, unpack_plc, DidKey, DidRef};
 use crate::inset::{self, InList};
+use crate::obs::{self, Applied, Op};
 use crate::outlog::{self, OutBytes, OutList};
 use crate::relation::{parse_uri, RelId, Relations};
 use crate::rkey::{self, is_tid, key_of};
 use crate::snapshot::{
-    encode_index, encode_side, rel_section, write_directory, BaseDir, DidAt, DirParts, Index, Meta, RelStats, Side,
-    Snapshot, Writer, FORMAT,
+    encode_index, encode_side, rel_section, write_directory, BaseDir, DidAt, DirParts, Index, Meta, RelStats,
+    ShardMeta, Side, Snapshot, Writer, FORMAT,
 };
+use crate::store::{SetWriter, Store, DEFAULT_SHARDS};
 
 /// Out logs at least this long get a by-subject index in a snapshot.
 pub const DEFAULT_SUBJ_INDEX: usize = 4096;
+
+/// `relationships` scans an actor's out log once up to this length, rather
+/// than looking each other up.
+const RELATIONSHIPS_SCAN: u64 = 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Added {
@@ -70,6 +76,36 @@ struct OutDelta {
     adds: BTreeMap<u64, u32>,
     /// Base records deleted, with their subjects.
     dels: BTreeMap<u64, u32>,
+    /// Both again as (subject, key), so "this actor's records naming s" is a
+    /// range, not a scan of a delta that can hold every record of a mass unfollow.
+    adds_s: BTreeSet<(u32, u64)>,
+    dels_s: BTreeSet<(u32, u64)>,
+}
+
+impl OutDelta {
+    fn add(&mut self, key: u64, subject: u32) {
+        self.adds.insert(key, subject);
+        self.adds_s.insert((subject, key));
+    }
+
+    fn remove_add(&mut self, key: u64) -> Option<u32> {
+        let s = self.adds.remove(&key)?;
+        self.adds_s.remove(&(s, key));
+        Some(s)
+    }
+
+    fn del(&mut self, key: u64, subject: u32) {
+        self.dels.insert(key, subject);
+        self.dels_s.insert((subject, key));
+    }
+
+    fn adds_naming(&self, s: u32) -> impl DoubleEndedIterator<Item = u64> + '_ {
+        self.adds_s.range((s, 0)..=(s, u64::MAX)).map(|&(_, k)| k)
+    }
+
+    fn dels_name(&self, s: u32) -> bool {
+        self.dels_s.range((s, 0)..=(s, u64::MAX)).next().is_some()
+    }
 }
 
 #[derive(Default)]
@@ -100,8 +136,13 @@ struct RelRanges {
 }
 
 pub struct Graph {
-    snap: Option<Snapshot>,
-    ranges: Vec<RelRanges>,
+    snap: Option<Store>,
+    dir_ranges: crate::snapshot::DirRanges,
+    /// Per shard, per relation.
+    ranges: Vec<Vec<RelRanges>>,
+    width: u32,
+    /// Shard files `write_snapshot` writes.
+    pub shards: usize,
     rels: Relations,
     subj_index: usize,
     base_n: u32,
@@ -111,14 +152,19 @@ pub struct Graph {
     /// A list's delta merges into an override once it's this big and over
     /// an eighth of the base.
     pub compact_min: usize,
+    obs: obs::Metrics,
 }
 
 impl Graph {
     pub fn new(rels: Relations) -> Graph {
+        let names: Vec<String> = rels.list.iter().map(|r| r.name.clone()).collect();
         let state = rels.list.iter().map(|_| RelState::default()).collect();
         Graph {
             snap: None,
+            dir_ranges: Default::default(),
             ranges: Vec::new(),
+            width: 1,
+            shards: DEFAULT_SHARDS,
             rels,
             subj_index: DEFAULT_SUBJ_INDEX,
             base_n: 0,
@@ -126,34 +172,52 @@ impl Graph {
             live_dids: Vec::new(),
             state,
             compact_min: 64,
+            obs: obs::Metrics::new(&names),
         }
     }
 
     pub fn open(path: &Path) -> Result<Graph> {
-        Graph::from_snapshot(Snapshot::open(path)?)
+        let t = std::time::Instant::now();
+        let g = Graph::from_store(Store::open(path)?)?;
+        obs::snapshot_timed("open", t.elapsed().as_secs_f64());
+        Ok(g)
     }
 
-    pub fn from_snapshot(snap: Snapshot) -> Result<Graph> {
-        let rels = Relations::new(snap.meta.relations.clone())?;
-        let mut ranges = Vec::new();
-        for i in 0..rels.len() {
-            let r = |p: &str| snap.range(&rel_section(i, p)).unwrap_or(0..0);
-            ranges.push(RelRanges {
-                out_dat: r("out.dat"),
-                out_idx: r("out.idx"),
-                in_dat: r("in.dat"),
-                in_idx: r("in.idx"),
-                side: r("side"),
-            });
-        }
+    pub fn from_store(store: Store) -> Result<Graph> {
+        let rels = Relations::new(store.meta.relations.clone())?;
+        let ranges = store
+            .shards
+            .iter()
+            .map(|snap| {
+                (0..rels.len())
+                    .map(|i| {
+                        let r = |p: &str| snap.range(&rel_section(i, p)).unwrap_or(0..0);
+                        RelRanges {
+                            out_dat: r("out.dat"),
+                            out_idx: r("out.idx"),
+                            in_dat: r("in.dat"),
+                            in_idx: r("in.idx"),
+                            side: r("side"),
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
         let mut g = Graph::new(rels);
-        g.subj_index = snap.meta.subj_index as usize;
-        g.base_n = snap.meta.n_ids;
-        if BaseDir::new(&snap).len() != g.base_n as usize {
-            bail!("directory holds {} DIDs, meta says {}", BaseDir::new(&snap).len(), g.base_n);
+        g.subj_index = store.meta.subj_index as usize;
+        g.base_n = store.meta.n_ids;
+        g.width = store.meta.shard_width.max(1);
+        g.shards = store.meta.shards as usize;
+        let n = BaseDir::new(&store.dir).len();
+        if n != g.base_n as usize {
+            bail!("directory holds {n} DIDs, meta says {}", g.base_n);
+        }
+        if (g.shards as u64) * (g.width as u64) < g.base_n as u64 {
+            bail!("{} shards of {} ids don't cover {} ids", g.shards, g.width, g.base_n);
         }
         g.ranges = ranges;
-        g.snap = Some(snap);
+        g.dir_ranges = crate::snapshot::DirRanges::new(&store.dir);
+        g.snap = Some(store);
         Ok(g)
     }
 
@@ -161,7 +225,7 @@ impl Graph {
         &self.rels
     }
 
-    pub fn snapshot(&self) -> Option<&Snapshot> {
+    pub fn snapshot(&self) -> Option<&Store> {
         self.snap.as_ref()
     }
 
@@ -172,7 +236,21 @@ impl Graph {
     // ------------------------------------------------------------ directory
 
     fn base_dir(&self) -> Option<BaseDir<'_>> {
-        self.snap.as_ref().map(BaseDir::new)
+        self.snap.as_ref().map(|s| BaseDir::with(&s.dir, &self.dir_ranges))
+    }
+
+    /// The shard file holding `id`'s lists, its relation sections and the
+    /// shard-local id.
+    #[inline]
+    fn shard(&self, rel: RelId, id: u32) -> Option<(&Snapshot, &RelRanges, u32, usize)> {
+        let store = self.snap.as_ref()?;
+        if id >= self.base_n {
+            return None;
+        }
+        let k = (id / self.width) as usize;
+        let lo = k as u32 * self.width;
+        let n = (lo + self.width).min(self.base_n) - lo;
+        Some((&store.shards[k], &self.ranges[k][rel as usize], id - lo, n as usize))
     }
 
     pub fn id_of(&self, did: &str) -> Option<u32> {
@@ -228,10 +306,12 @@ impl Graph {
         if let Some(b) = st.out_over.get(&id) {
             return Some(OutList::parse(b, self.subj_index));
         }
-        let snap = self.snap.as_ref()?;
-        let r = &self.ranges[rel as usize];
+        let (snap, r, local, n) = self.shard(rel, id)?;
+        if r.out_idx.is_empty() {
+            return None;
+        }
         let b = snap.bytes();
-        let range = Index::parse(&b[r.out_idx.clone()], self.base_n as usize).range(id)?;
+        let range = Index::parse(&b[r.out_idx.clone()], n).range(local)?;
         Some(OutList::parse(&b[r.out_dat.start + range.start..r.out_dat.start + range.end], self.subj_index))
     }
 
@@ -240,16 +320,17 @@ impl Graph {
         if let Some(b) = st.in_over.get(&id) {
             return Some(InList::parse(b));
         }
-        let snap = self.snap.as_ref()?;
-        let r = &self.ranges[rel as usize];
+        let (snap, r, local, n) = self.shard(rel, id)?;
+        if r.in_idx.is_empty() {
+            return None;
+        }
         let b = snap.bytes();
-        let range = Index::parse(&b[r.in_idx.clone()], self.base_n as usize).range(id)?;
+        let range = Index::parse(&b[r.in_idx.clone()], n).range(local)?;
         Some(InList::parse(&b[r.in_dat.start + range.start..r.in_dat.start + range.end]))
     }
 
-    fn base_side(&self, rel: RelId) -> Option<Side<'_>> {
-        let snap = self.snap.as_ref()?;
-        let r = &self.ranges[rel as usize];
+    fn base_side(&self, rel: RelId, actor: u32) -> Option<Side<'_>> {
+        let (snap, r, _, _) = self.shard(rel, actor)?;
         (!r.side.is_empty()).then(|| Side::parse(&snap.bytes()[r.side.clone()]))
     }
 
@@ -260,7 +341,7 @@ impl Graph {
         if let Some(s) = self.state[rel as usize].side.get(&(actor, key)) {
             return Some(s.to_string());
         }
-        self.base_side(rel)?.get(actor, key).map(str::to_string)
+        self.base_side(rel, actor)?.get(actor, key).map(str::to_string)
     }
 
     pub fn uri(&self, rel: RelId, actor: u32, key: u64) -> Option<String> {
@@ -288,18 +369,20 @@ impl Graph {
         l.find_key(key).map(|p| l.subject(p))
     }
 
-    /// Live records of `actor` naming `subject`.
+    /// Live records of `actor` naming `subject`. Every delta delete is of a
+    /// base record, so the base's count less those is the base's live count.
     fn out_count_subject(&self, rel: RelId, actor: u32, subject: u32) -> usize {
         let d = self.state[rel as usize].out.get(&actor);
-        let mut n = d.map_or(0, |d| d.adds.values().filter(|&&s| s == subject).count());
+        let mut n = 0;
         if let Some(l) = self.base_out(rel, actor) {
-            let dels = d.map(|d| &d.dels).filter(|m| m.values().any(|&s| s == subject));
-            l.for_subject(subject, |p| {
-                if dels.is_none_or(|m| !m.contains_key(&l.key_at(p))) {
-                    n += 1;
-                }
+            l.for_subject(subject, |_| {
+                n += 1;
                 true
             });
+        }
+        if let Some(d) = d {
+            n -= d.dels_s.range((subject, 0)..=(subject, u64::MAX)).count();
+            n += d.adds_naming(subject).count();
         }
         n
     }
@@ -307,9 +390,9 @@ impl Graph {
     /// The newest live record of `actor` naming `subject`.
     pub fn out_find_subject(&self, rel: RelId, actor: u32, subject: u32) -> Option<u64> {
         let d = self.state[rel as usize].out.get(&actor);
-        let mut best = d.and_then(|d| d.adds.iter().rev().find(|(_, &s)| s == subject).map(|(&k, _)| k));
+        let mut best = d.and_then(|d| d.adds_naming(subject).next_back());
         if let Some(l) = self.base_out(rel, actor) {
-            let dels = d.map(|d| &d.dels).filter(|m| m.values().any(|&s| s == subject));
+            let dels = d.filter(|d| d.dels_name(subject)).map(|d| &d.dels);
             l.for_subject(subject, |p| {
                 let k = l.key_at(p);
                 if dels.is_some_and(|m| m.contains_key(&k)) {
@@ -462,41 +545,80 @@ impl Graph {
     }
 
     pub fn has(&self, rel: RelId, from: &str, to: &str) -> Option<String> {
-        let (a, b) = (self.id_of(from)?, self.id_of(to)?);
-        let k = self.has_id(rel, a, b)?;
-        self.uri(rel, a, k)
+        let g = self.obs.op(Op::Has, rel as usize, 1);
+        let r = (|| {
+            let (a, b) = (self.id_of(from)?, self.id_of(to)?);
+            let k = self.has_id(rel, a, b)?;
+            self.uri(rel, a, k)
+        })();
+        self.obs.done(g, r.is_some() as usize);
+        r
     }
 
-    /// Per other and relation: (actor's record naming other, other's naming actor).
+    /// Per other and relation: (actor's record naming other, other's naming
+    /// actor). The in side is one pass over the actor's in set with the
+    /// others sorted; the out side scans the actor's out log once when it's
+    /// short, and only hits pay a lookup in another list.
     pub fn relationships_id(&self, actor: u32, others: &[u32], rels: &[RelId]) -> Vec<Vec<(Option<u64>, Option<u64>)>> {
-        others
-            .iter()
-            .map(|&o| rels.iter().map(|&r| (self.has_id(r, actor, o), self.has_id(r, o, actor))).collect())
-            .collect()
+        let mut probes: Vec<u32> = others.to_vec();
+        probes.sort_unstable();
+        probes.dedup();
+        let at = |o: u32| probes.binary_search(&o).unwrap();
+        let mut res = vec![vec![(None, None); rels.len()]; others.len()];
+        let mut per = vec![(None, None); probes.len()];
+        for (ri, &rel) in rels.iter().enumerate() {
+            per.iter_mut().for_each(|p| *p = (None, None));
+            for o in self.in_intersect(rel, actor, &probes, usize::MAX) {
+                per[at(o)].1 = self.out_find_subject(rel, o, actor);
+            }
+            let scan =
+                self.out_count(rel, actor) <= RELATIONSHIPS_SCAN && !self.state[rel as usize].out.contains_key(&actor);
+            match self.base_out(rel, actor) {
+                Some(l) if scan => l.for_each_desc(None, |k, s| {
+                    if let Ok(i) = probes.binary_search(&s) {
+                        if per[i].0.is_none() {
+                            per[i].0 = Some(k);
+                        }
+                    }
+                    true
+                }),
+                _ => {
+                    for (i, &o) in probes.iter().enumerate() {
+                        per[i].0 = self.has_id(rel, actor, o);
+                    }
+                }
+            }
+            for (j, &o) in others.iter().enumerate() {
+                res[j][ri] = per[at(o)];
+            }
+        }
+        res
     }
 
     pub fn relationships(&self, actor: &str, others: &[&str], rels: &[RelId]) -> Vec<Vec<Relationship>> {
-        let a = self.id_of(actor);
-        others
-            .iter()
-            .map(|o| {
-                let o = self.id_of(o);
-                rels.iter()
-                    .map(|&r| match (a, o) {
-                        (Some(a), Some(o)) => Relationship {
-                            out: self.has_id(r, a, o).and_then(|k| self.uri(r, a, k)),
-                            inn: self.has_id(r, o, a).and_then(|k| self.uri(r, o, k)),
-                        },
-                        _ => Relationship::default(),
-                    })
-                    .collect()
-            })
-            .collect()
+        let g = self.obs.op(Op::Relationships, self.obs.multi(), others.len() * rels.len());
+        let mut out = vec![vec![Relationship::default(); rels.len()]; others.len()];
+        let mut hits = 0;
+        if let Some(a) = self.id_of(actor) {
+            let known: Vec<(usize, u32)> =
+                others.iter().enumerate().filter_map(|(i, o)| self.id_of(o).map(|id| (i, id))).collect();
+            let ids: Vec<u32> = known.iter().map(|k| k.1).collect();
+            let r = self.relationships_id(a, &ids, rels);
+            for ((i, o), per) in known.iter().zip(r) {
+                for (ri, (fwd, back)) in per.into_iter().enumerate() {
+                    let rel = rels[ri];
+                    let x = &mut out[*i][ri];
+                    x.out = fwd.and_then(|k| self.uri(rel, a, k));
+                    x.inn = back.and_then(|k| self.uri(rel, *o, k));
+                    hits += x.out.is_some() as usize + x.inn.is_some() as usize;
+                }
+            }
+        }
+        self.obs.done(g, hits);
+        out
     }
 
-    /// One page of `actor`'s records, newest first: (URI, subject DID), and
-    /// the cursor for the next page (an rkey).
-    pub fn out_list(
+    fn out_list_(
         &self,
         rel: RelId,
         actor: &str,
@@ -511,15 +633,7 @@ impl Graph {
         (items, next)
     }
 
-    /// One page of the actors naming `subject`, in id order, and the cursor
-    /// for the next page (a DID).
-    pub fn in_list(
-        &self,
-        rel: RelId,
-        subject: &str,
-        limit: usize,
-        cursor: Option<&str>,
-    ) -> (Vec<String>, Option<String>) {
+    fn in_list_(&self, rel: RelId, subject: &str, limit: usize, cursor: Option<&str>) -> (Vec<String>, Option<String>) {
         let Some(b) = self.id_of(subject) else { return (Vec::new(), None) };
         let after = match cursor {
             Some(c) => match self.id_of(c) {
@@ -533,8 +647,7 @@ impl Graph {
         (page.into_iter().filter_map(|x| self.did_of(x)).collect(), next)
     }
 
-    /// (records out, actors in).
-    pub fn counts(&self, rel: RelId, actor: &str) -> (u64, u64) {
+    fn counts_(&self, rel: RelId, actor: &str) -> (u64, u64) {
         self.id_of(actor).map_or((0, 0), |a| (self.out_count(rel, a), self.in_count(rel, a)))
     }
 
@@ -552,9 +665,7 @@ impl Graph {
         }
     }
 
-    /// Ids in both sides, ascending. The smaller side is materialized; an in
-    /// set on the other side is probed block by block rather than decoded.
-    pub fn intersect(&self, a: ListRef, b: ListRef, limit: usize) -> Vec<u32> {
+    fn intersect_(&self, a: ListRef, b: ListRef, limit: usize) -> Vec<u32> {
         let (small, big) = if self.side_len(a) <= self.side_len(b) { (a, b) } else { (b, a) };
         let probes = self.side_set(small);
         match big.dir {
@@ -568,9 +679,7 @@ impl Graph {
         }
     }
 
-    /// `actors` without those any of `drop` hits: (rel, Out) drops the
-    /// viewer's subjects, (rel, In) drops those naming the viewer.
-    pub fn filter_id(&self, viewer: u32, actors: &[u32], drop: &[(RelId, Dir)]) -> Vec<u32> {
+    fn filter_id_(&self, viewer: u32, actors: &[u32], drop: &[(RelId, Dir)]) -> Vec<u32> {
         let outs: Vec<Vec<u32>> =
             drop.iter().map(|&(r, d)| if d == Dir::Out { self.out_set(r, viewer) } else { Vec::new() }).collect();
         actors
@@ -585,9 +694,131 @@ impl Graph {
             .collect()
     }
 
-    // ------------------------------------------------------------ writes
+    // ------------------------------------------------------------ the API (instrumented)
+
+    /// One page of `actor`'s records, newest first: (URI, subject DID), and
+    /// the cursor for the next page (an rkey).
+    pub fn out_list(
+        &self,
+        rel: RelId,
+        actor: &str,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> (Vec<(String, String)>, Option<String>) {
+        let g = self.obs.op(Op::OutList, rel as usize, limit);
+        let r = self.out_list_(rel, actor, limit, cursor);
+        self.obs.done(g, r.0.len());
+        r
+    }
+
+    /// One page of the actors naming `subject`, in id order, and the cursor
+    /// for the next page (a DID).
+    pub fn in_list(
+        &self,
+        rel: RelId,
+        subject: &str,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> (Vec<String>, Option<String>) {
+        let g = self.obs.op(Op::InList, rel as usize, limit);
+        let r = self.in_list_(rel, subject, limit, cursor);
+        self.obs.done(g, r.0.len());
+        r
+    }
+
+    /// (records out, actors in).
+    pub fn counts(&self, rel: RelId, actor: &str) -> (u64, u64) {
+        let g = self.obs.op(Op::Counts, rel as usize, 1);
+        let r = self.counts_(rel, actor);
+        self.obs.done(g, 1);
+        r
+    }
+
+    /// Ids in both sides, ascending. The smaller side is materialized; an in
+    /// set on the other side is probed block by block rather than decoded.
+    pub fn intersect(&self, a: ListRef, b: ListRef, limit: usize) -> Vec<u32> {
+        let rel = if a.rel == b.rel { a.rel as usize } else { self.obs.multi() };
+        let g = self.obs.op(Op::Intersect, rel, limit);
+        let r = self.intersect_(a, b, limit);
+        self.obs.done(g, r.len());
+        r
+    }
+
+    /// `actors` without those any of `drop` hits: (rel, Out) drops the
+    /// viewer's subjects, (rel, In) drops those naming the viewer.
+    pub fn filter_id(&self, viewer: u32, actors: &[u32], drop: &[(RelId, Dir)]) -> Vec<u32> {
+        let g = self.obs.op(Op::Filter, self.obs.multi(), actors.len());
+        let r = self.filter_id_(viewer, actors, drop);
+        self.obs.done(g, r.len());
+        r
+    }
 
     pub fn add(&mut self, uri: &str, subject: &str) -> Result<Added> {
+        let g = self.obs.op(Op::Add, self.obs.multi(), 1);
+        let r = self.add_(uri, subject);
+        if let Ok((rel, a)) = &r {
+            let o = match a {
+                Added::Added => Applied::Added,
+                Added::Exists => Applied::Exists,
+                Added::Deleted => Applied::Deleted,
+            };
+            self.obs.applied(*rel as usize, o);
+        }
+        self.obs.done(g, matches!(r, Ok((_, Added::Added))) as usize);
+        r.map(|(_, a)| a)
+    }
+
+    pub fn delete(&mut self, uri: &str) -> Result<Removed> {
+        let g = self.obs.op(Op::Delete, self.obs.multi(), 1);
+        let r = self.delete_(uri);
+        if let Ok((rel, d)) = &r {
+            self.obs.applied(
+                *rel as usize,
+                if matches!(d, Removed::NotFound) { Applied::NotFound } else { Applied::Removed },
+            );
+        }
+        self.obs.done(g, matches!(r, Ok((_, Removed::Subject(_)))) as usize);
+        r.map(|(_, d)| d)
+    }
+
+    /// Sets the gauges a scrape reads: delta and override sizes, tombstones,
+    /// the directory and the snapshot.
+    pub fn refresh_gauges(&self) {
+        #[cfg(feature = "metrics")]
+        {
+            use obs::gauges::*;
+            for (i, rel) in self.rels.list.iter().enumerate() {
+                let st = &self.state[i];
+                let n = &rel.name;
+                let od: usize = st.out.values().map(|d| d.adds.len() + d.dels.len()).sum();
+                let id: usize = st.inn.values().map(|d| d.adds.len() + d.dels.len()).sum();
+                DELTA.with_label_values(&[n, "out"]).set(od as i64);
+                DELTA.with_label_values(&[n, "in"]).set(id as i64);
+                DELTA_LISTS.with_label_values(&[n, "out"]).set(st.out.len() as i64);
+                DELTA_LISTS.with_label_values(&[n, "in"]).set(st.inn.len() as i64);
+                OVERRIDES
+                    .with_label_values(&[n, "out"])
+                    .set(st.out_over.values().map(|b| b.len()).sum::<usize>() as i64);
+                OVERRIDES.with_label_values(&[n, "in"]).set(st.in_over.values().map(|b| b.len()).sum::<usize>() as i64);
+                TOMBSTONES.with_label_values(&[n]).set(st.tomb.len() as i64);
+                if let Some(s) = self.snap.as_ref().and_then(|s| s.meta.stats.get(i)) {
+                    EDGES.with_label_values(&[n, "out"]).set(s.out_records as i64);
+                    EDGES.with_label_values(&[n, "in"]).set(s.in_pairs as i64);
+                }
+            }
+            DIRECTORY.with_label_values(&["base"]).set(self.base_n as i64);
+            DIRECTORY.with_label_values(&["live"]).set(self.live_dids.len() as i64);
+            if let Some(s) = &self.snap {
+                for (name, len) in s.section_bytes() {
+                    SNAPSHOT_BYTES.with_label_values(&[&name]).set(len as i64);
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ writes
+
+    fn add_(&mut self, uri: &str, subject: &str) -> Result<(RelId, Added)> {
         let Some((did, coll, rkey_s)) = parse_uri(uri) else { bail!("{uri:?} isn't a record URI") };
         let Some(rel) = self.rels.by_collection(coll) else { bail!("no relation for {coll}") };
         let a = self.intern(did)?;
@@ -604,7 +835,7 @@ impl Graph {
         if side && r == Added::Added {
             self.state[rel as usize].side.insert((a, key), rkey_s.into());
         }
-        Ok(r)
+        Ok((rel, r))
     }
 
     pub fn add_id(&mut self, rel: RelId, actor: u32, key: u64, subject: u32) -> Added {
@@ -616,7 +847,7 @@ impl Graph {
         }
         let pair = self.in_contains(rel, subject, actor);
         let st = &mut self.state[rel as usize];
-        st.out.entry(actor).or_default().adds.insert(key, subject);
+        st.out.entry(actor).or_default().add(key, subject);
         if !pair {
             let d = st.inn.entry(subject).or_default();
             if !d.dels.remove(&actor) {
@@ -627,15 +858,18 @@ impl Graph {
         Added::Added
     }
 
-    pub fn delete(&mut self, uri: &str) -> Result<Removed> {
+    fn delete_(&mut self, uri: &str) -> Result<(RelId, Removed)> {
         let Some((did, coll, rkey_s)) = parse_uri(uri) else { bail!("{uri:?} isn't a record URI") };
         let Some(rel) = self.rels.by_collection(coll) else { bail!("no relation for {coll}") };
         let a = self.intern(did)?;
         let (key, _) = key_of(rkey_s);
-        Ok(match self.delete_id(rel, a, key) {
-            Some(s) => Removed::Subject(self.did_of(s).unwrap_or_default()),
-            None => Removed::NotFound,
-        })
+        Ok((
+            rel,
+            match self.delete_id(rel, a, key) {
+                Some(s) => Removed::Subject(self.did_of(s).unwrap_or_default()),
+                None => Removed::NotFound,
+            },
+        ))
     }
 
     /// Removes `actor`'s record `key`, returning its subject. Unknown records
@@ -645,7 +879,7 @@ impl Graph {
         let subject = match in_adds {
             Some(s) => {
                 let st = &mut self.state[rel as usize];
-                st.out.get_mut(&actor).unwrap().adds.remove(&key);
+                st.out.get_mut(&actor).unwrap().remove_add(key);
                 st.side.remove(&(actor, key));
                 s
             }
@@ -658,7 +892,7 @@ impl Graph {
                 };
                 match base {
                     Some(s) => {
-                        self.state[rel as usize].out.entry(actor).or_default().dels.insert(key, s);
+                        self.state[rel as usize].out.entry(actor).or_default().del(key, s);
                         s
                     }
                     None => {
@@ -690,6 +924,7 @@ impl Graph {
             n >= min && n * 8 > self.base_out(rel, actor).map_or(0, |l| l.len())
         });
         if out_due {
+            let t = self.obs.merge_start();
             let v = self.out_all(rel, actor);
             let mut buf = Vec::new();
             if v.is_empty() {
@@ -697,6 +932,7 @@ impl Graph {
             } else {
                 outlog::encode(&v, self.subj_index, &mut buf, &mut OutBytes::default());
             }
+            self.obs.merged(t, r, false, buf.len());
             let st = &mut self.state[r];
             st.out.remove(&actor);
             st.out_over.insert(actor, buf.into());
@@ -706,6 +942,7 @@ impl Graph {
             n >= min && n * 8 > self.base_in(rel, subject).map_or(0, |l| l.len())
         });
         if in_due {
+            let t = self.obs.merge_start();
             let v = self.in_set(rel, subject);
             let mut buf = Vec::new();
             if v.is_empty() {
@@ -713,6 +950,7 @@ impl Graph {
             } else {
                 inset::encode(&v, &mut buf);
             }
+            self.obs.merged(t, r, true, buf.len());
             let st = &mut self.state[r];
             st.inn.remove(&subject);
             st.in_over.insert(subject, buf.into());
@@ -723,6 +961,13 @@ impl Graph {
 
     /// Writes base + deltas as a new snapshot. Ids don't change.
     pub fn write_snapshot(&self, path: &Path) -> Result<Meta> {
+        let t = std::time::Instant::now();
+        let m = self.write_snapshot_(path)?;
+        obs::snapshot_timed("write", t.elapsed().as_secs_f64());
+        Ok(m)
+    }
+
+    fn write_snapshot_(&self, path: &Path) -> Result<Meta> {
         let n = self.n_ids();
         let mut plc: Vec<(u128, u32)> = Vec::new();
         let mut oth: Vec<(String, u32)> = Vec::new();
@@ -748,62 +993,30 @@ impl Graph {
         let oth_v: Vec<&str> = oth.iter().map(|p| p.0.as_str()).collect();
         let plc_ids: Vec<u32> = plc.iter().map(|p| p.1).collect();
         let oth_ids: Vec<u32> = oth.iter().map(|p| p.1).collect();
-        let mut w = Writer::create(path)?;
+        let mut set = SetWriter::create(path, n, self.shards)?;
+        let w = set.dir.as_mut().unwrap();
         write_directory(
-            &mut w,
+            w,
             &DirParts { plc: &plc_v, other: &oth_v, ids: (!identity).then_some((&plc_ids[..], &oth_ids[..])) },
         )?;
-        let mut stats = Vec::new();
-        for rel in 0..self.rels.len() as RelId {
-            let mut st = RelStats::default();
-            let mut offsets = Vec::with_capacity(n as usize + 1);
-            let mut side: Vec<(u32, u64, String)> = Vec::new();
-            let mut buf = Vec::new();
-            w.begin(&rel_section(rel as usize, "out.dat"));
-            for id in 0..n {
-                offsets.push(w.section_len());
-                let v = self.out_all(rel, id);
-                if v.is_empty() {
-                    continue;
-                }
-                for &(k, _) in &v {
-                    if !is_tid(k) {
-                        side.push((id, k, self.rkey_string(rel, id, k).unwrap_or_default()));
-                    }
-                }
-                buf.clear();
-                outlog::encode(&v, self.subj_index, &mut buf, &mut st.out_bytes);
-                w.write(&buf)?;
-                st.out_records += v.len() as u64;
-                st.out_lists += 1;
+        let mut stats = vec![RelStats::default(); self.rels.len()];
+        for k in 0..self.shards {
+            let (lo, hi) = set.shard_range(k);
+            let mut w = set.shards[k].take().unwrap();
+            let mut shard_stats = Vec::new();
+            for rel in 0..self.rels.len() as RelId {
+                let st = self.write_shard_rel(&mut w, rel, lo, hi)?;
+                stats[rel as usize].add(&st);
+                shard_stats.push(st);
             }
-            offsets.push(w.section_len());
-            w.end()?;
-            w.section(&rel_section(rel as usize, "out.idx"), &encode_index(&offsets)?)?;
-            st.non_tid = side.len() as u64;
-            let side_ref: Vec<(u32, u64, &str)> = side.iter().map(|(a, k, s)| (*a, *k, s.as_str())).collect();
-            w.section(&rel_section(rel as usize, "side"), &encode_side(&side_ref))?;
-            offsets.clear();
-            w.begin(&rel_section(rel as usize, "in.dat"));
-            for id in 0..n {
-                offsets.push(w.section_len());
-                let v = self.in_set(rel, id);
-                if v.is_empty() {
-                    continue;
-                }
-                buf.clear();
-                inset::encode(&v, &mut buf);
-                w.write(&buf)?;
-                st.in_pairs += v.len() as u64;
-                st.in_lists += 1;
-            }
-            offsets.push(w.section_len());
-            w.end()?;
-            w.section(&rel_section(rel as usize, "in.idx"), &encode_index(&offsets)?)?;
-            stats.push(st);
+            let m = ShardMeta { format: FORMAT, build: set.build, shard: k as u32, lo, hi, stats: shard_stats };
+            SetWriter::finish_shard(w, &m)?;
         }
         let meta = Meta {
             format: FORMAT,
+            build: set.build,
+            shards: self.shards as u32,
+            shard_width: set.width,
             n_ids: n,
             n_plc: plc_v.len() as u32,
             n_other: oth_v.len() as u32,
@@ -811,8 +1024,57 @@ impl Graph {
             relations: self.rels.list.clone(),
             stats,
         };
-        w.finish(meta.clone())?;
+        set.finish(&meta)?;
         Ok(meta)
+    }
+
+    fn write_shard_rel(&self, w: &mut Writer, rel: RelId, lo: u32, hi: u32) -> Result<RelStats> {
+        let mut st = RelStats::default();
+        let mut offsets = Vec::with_capacity((hi - lo) as usize + 1);
+        let mut side: Vec<(u32, u64, String)> = Vec::new();
+        let mut buf = Vec::new();
+        w.begin(&rel_section(rel as usize, "out.dat"));
+        for id in lo..hi {
+            offsets.push(w.section_len());
+            let v = self.out_all(rel, id);
+            if v.is_empty() {
+                continue;
+            }
+            for &(k, _) in &v {
+                if !is_tid(k) {
+                    side.push((id, k, self.rkey_string(rel, id, k).unwrap_or_default()));
+                }
+            }
+            buf.clear();
+            outlog::encode(&v, self.subj_index, &mut buf, &mut st.out_bytes);
+            w.write(&buf)?;
+            st.out_records += v.len() as u64;
+            st.out_lists += 1;
+        }
+        offsets.push(w.section_len());
+        w.end()?;
+        w.section(&rel_section(rel as usize, "out.idx"), &encode_index(&offsets)?)?;
+        st.non_tid = side.len() as u64;
+        let side_ref: Vec<(u32, u64, &str)> = side.iter().map(|(a, k, s)| (*a, *k, s.as_str())).collect();
+        w.section(&rel_section(rel as usize, "side"), &encode_side(&side_ref))?;
+        offsets.clear();
+        w.begin(&rel_section(rel as usize, "in.dat"));
+        for id in lo..hi {
+            offsets.push(w.section_len());
+            let v = self.in_set(rel, id);
+            if v.is_empty() {
+                continue;
+            }
+            buf.clear();
+            inset::encode(&v, &mut buf);
+            w.write(&buf)?;
+            st.in_pairs += v.len() as u64;
+            st.in_lists += 1;
+        }
+        offsets.push(w.section_len());
+        w.end()?;
+        w.section(&rel_section(rel as usize, "in.idx"), &encode_index(&offsets)?)?;
+        Ok(st)
     }
 
     /// Sets the by-subject index threshold for snapshots this graph writes.

@@ -1,0 +1,31 @@
+[package]
+name = "marco-ops"
+version = "0.1.0"
+edition = "2021"
+description = "marco's ops endpoint: Prometheus /metrics, pprof CPU and heap profiles on demand, the tracing switch, OTLP export"
+license = "MIT"
+publish = false
+
+[features]
+default = ["cpu-profile", "jemalloc"]
+# GET /debug/pprof/profile?seconds=N (pprof-rs, SIGPROF sampling only while a profile runs)
+cpu-profile = ["dep:pprof"]
+# GET /debug/pprof/heap: jemalloc's heap sampler as pprof; the binary sets the allocator with `marco_ops::jemalloc!()`
+jemalloc = ["dep:jemalloc_pprof", "dep:tikv-jemallocator"]
+
+[dependencies]
+marco-core = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+prometheus = { workspace = true, features = ["process"] }
+tracing = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+tracing-subscriber = { workspace = true }
+pprof = { workspace = true, optional = true }
+jemalloc_pprof = { workspace = true, optional = true }
+tikv-jemallocator = { workspace = true, optional = true }

@@ -6,10 +6,14 @@
 pub mod did;
 pub mod graph;
 pub mod inset;
+pub mod obs;
+#[cfg(feature = "metrics")]
+mod obs_hist;
 pub mod outlog;
 pub mod relation;
 pub mod rkey;
 pub mod snapshot;
+pub mod store;
 pub mod varint;
 
 pub use graph::{Added, Dir, Graph, ListRef, Relationship, Removed};

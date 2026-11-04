@@ -1,8 +1,11 @@
-//! The snapshot file: named sections, each 64-byte aligned, then a JSON
-//! footer (meta + section table), its length as u64 and a magic. Opening is
-//! an mmap and a footer parse; nothing is read until a query touches it.
+//! Snapshot files: named sections, each 64-byte aligned and xxh3-summed,
+//! then a JSON footer (kind, meta, section table), its length as u64 and a
+//! magic. Opening is an mmap and a footer parse; nothing is read until a
+//! query touches it. A snapshot is a set of them (store.rs): one directory
+//! file and a shard file per id range.
 //!
-//! Sections:
+//! Sections (the dir.* in the directory file, the r{i}.* in each shard, for
+//! the shard's ids):
 //!
 //! ```text
 //! dir.plc        P x 15 B   packed did:plc, sorted
@@ -32,7 +35,7 @@ use crate::relation::Relation;
 use crate::varint::{self, u32_at, u64_at};
 
 pub const MAGIC: &[u8; 8] = b"MARCOSN1";
-pub const FORMAT: u32 = 1;
+pub const FORMAT: u32 = 2;
 const ALIGN: u64 = 64;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -45,9 +48,26 @@ pub struct RelStats {
     pub out_bytes: OutBytes,
 }
 
+impl RelStats {
+    pub fn add(&mut self, o: &RelStats) {
+        self.out_records += o.out_records;
+        self.out_lists += o.out_lists;
+        self.in_pairs += o.in_pairs;
+        self.in_lists += o.in_lists;
+        self.non_tid += o.non_tid;
+        self.out_bytes.add(&o.out_bytes);
+    }
+}
+
+/// The directory file's meta: the whole snapshot.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Meta {
     pub format: u32,
+    /// Shared by every file of one snapshot.
+    pub build: u64,
+    pub shards: u32,
+    /// Shard k holds ids k*shard_width .. (k+1)*shard_width.
+    pub shard_width: u32,
     pub n_ids: u32,
     pub n_plc: u32,
     pub n_other: u32,
@@ -58,15 +78,29 @@ pub struct Meta {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ShardMeta {
+    pub format: u32,
+    pub build: u64,
+    pub shard: u32,
+    pub lo: u32,
+    pub hi: u32,
+    pub stats: Vec<RelStats>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SectionInfo {
     pub name: String,
     pub off: u64,
     pub len: u64,
+    /// xxh3-64 of the section's bytes, checked by [`Snapshot::verify_checksums`].
+    pub xxh3: u64,
 }
 
 #[derive(Serialize, Deserialize)]
 struct Footer {
-    meta: Meta,
+    format: u32,
+    kind: String,
+    meta: serde_json::Value,
     sections: Vec<SectionInfo>,
 }
 
@@ -75,20 +109,25 @@ pub struct Writer {
     pos: u64,
     sections: Vec<SectionInfo>,
     open: Option<(String, u64)>,
+    hasher: xxhash_rust::xxh3::Xxh3,
     tmp: PathBuf,
     path: PathBuf,
 }
 
 impl Writer {
-    /// Writes to `path.tmp`; `finish` renames it into place.
+    /// Writes to a temp file beside `path`; `finish` renames it into place.
     pub fn create(path: &Path) -> Result<Writer> {
-        let tmp = path.with_extension("tmp");
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+        let mut name = path.file_name().context("snapshot path has no file name")?.to_os_string();
+        name.push(format!(".tmp.{}.{nanos}", std::process::id()));
+        let tmp = path.with_file_name(name);
         let f = File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
         Ok(Writer {
             f: BufWriter::with_capacity(8 << 20, f),
             pos: 0,
             sections: Vec::new(),
             open: None,
+            hasher: xxhash_rust::xxh3::Xxh3::new(),
             tmp,
             path: path.to_path_buf(),
         })
@@ -97,11 +136,15 @@ impl Writer {
     pub fn begin(&mut self, name: &str) {
         assert!(self.open.is_none(), "section {name} begun inside another");
         self.open = Some((name.to_string(), self.pos));
+        self.hasher.reset();
     }
 
     pub fn write(&mut self, b: &[u8]) -> Result<()> {
         self.f.write_all(b)?;
         self.pos += b.len() as u64;
+        if self.open.is_some() {
+            self.hasher.update(b);
+        }
         Ok(())
     }
 
@@ -113,7 +156,7 @@ impl Writer {
     pub fn end(&mut self) -> Result<u64> {
         let (name, start) = self.open.take().expect("no open section");
         let len = self.pos - start;
-        self.sections.push(SectionInfo { name, off: start, len });
+        self.sections.push(SectionInfo { name, off: start, len, xxh3: self.hasher.digest() });
         let pad = (ALIGN - self.pos % ALIGN) % ALIGN;
         self.write(&vec![0u8; pad as usize])?;
         Ok(len)
@@ -126,14 +169,21 @@ impl Writer {
         Ok(())
     }
 
-    pub fn finish(mut self, meta: Meta) -> Result<Vec<SectionInfo>> {
-        let footer = serde_json::to_vec(&Footer { meta, sections: self.sections.clone() })?;
+    pub fn finish(mut self, kind: &str, meta: &impl Serialize) -> Result<Vec<SectionInfo>> {
+        let footer = serde_json::to_vec(&Footer {
+            format: FORMAT,
+            kind: kind.into(),
+            meta: serde_json::to_value(meta)?,
+            sections: self.sections.clone(),
+        })?;
         self.f.write_all(&footer)?;
         self.f.write_all(&(footer.len() as u64).to_le_bytes())?;
         self.f.write_all(MAGIC)?;
         let f = self.f.into_inner().map_err(|e| e.into_error())?;
         f.sync_all()?;
         std::fs::rename(&self.tmp, &self.path)?;
+        let parent = self.path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        File::open(parent)?.sync_all()?;
         Ok(self.sections)
     }
 }
@@ -155,7 +205,8 @@ impl std::ops::Deref for Bytes {
 
 pub struct Snapshot {
     bytes: Bytes,
-    pub meta: Meta,
+    pub kind: String,
+    pub meta: serde_json::Value,
     pub sections: Vec<SectionInfo>,
     by_name: HashMap<String, Range<usize>>,
 }
@@ -178,10 +229,13 @@ impl Snapshot {
         if flen + 16 > n {
             bail!("snapshot footer out of range");
         }
-        let footer: Footer = serde_json::from_slice(&bytes[n - 16 - flen..n - 16]).context("snapshot footer")?;
-        if footer.meta.format != FORMAT {
-            bail!("snapshot format {} (this build reads {FORMAT})", footer.meta.format);
+        let footer: serde_json::Value =
+            serde_json::from_slice(&bytes[n - 16 - flen..n - 16]).context("snapshot footer")?;
+        let format = footer.get("format").and_then(|f| f.as_u64()).unwrap_or(0);
+        if format != FORMAT as u64 {
+            bail!("snapshot format {format}, this build reads {FORMAT}: rebuild the snapshot");
         }
+        let footer: Footer = serde_json::from_value(footer).context("snapshot footer")?;
         let mut by_name = HashMap::new();
         for s in &footer.sections {
             let r = s.off as usize..(s.off + s.len) as usize;
@@ -190,7 +244,7 @@ impl Snapshot {
             }
             by_name.insert(s.name.clone(), r);
         }
-        Ok(Snapshot { bytes, meta: footer.meta, sections: footer.sections, by_name })
+        Ok(Snapshot { bytes, kind: footer.kind, meta: footer.meta, sections: footer.sections, by_name })
     }
 
     pub fn len(&self) -> usize {
@@ -207,6 +261,19 @@ impl Snapshot {
 
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    /// Hashes every section and compares it with the footer: catches a
+    /// truncated copy or a bad disk. Reads the whole file.
+    pub fn verify_checksums(&self) -> Result<()> {
+        for s in &self.sections {
+            let r = &self.by_name[&s.name];
+            let h = xxhash_rust::xxh3::xxh3_64(&self.bytes[r.clone()]);
+            if h != s.xxh3 {
+                bail!("section {} checksum {h:016x}, footer says {:016x}", s.name, s.xxh3);
+            }
+        }
+        Ok(())
     }
 
     /// Asks the kernel to read the whole file ahead (MADV_WILLNEED).
@@ -290,6 +357,7 @@ pub fn write_directory(w: &mut Writer, d: &DirParts) -> Result<()> {
         w.write(&buf)?;
     }
     w.end()?;
+    w.section("dir.plc.radix", &encode_radix(d.plc))?;
     let mut off = Vec::with_capacity(8 * (d.other.len() + 1));
     let mut strs = Vec::new();
     for s in d.other {
@@ -319,9 +387,47 @@ pub fn write_directory(w: &mut Writer, d: &DirParts) -> Result<()> {
     Ok(())
 }
 
+pub fn encode_radix(plc: &[u128]) -> Vec<u8> {
+    let r = crate::did::Radix::build(plc);
+    let mut out = Vec::with_capacity(8 + 4 * r.starts.len());
+    out.extend_from_slice(&r.bits.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    for s in r.starts {
+        out.extend_from_slice(&s.to_le_bytes());
+    }
+    out
+}
+
+/// Where a snapshot's directory sections are, resolved once at open.
+#[derive(Clone, Default)]
+pub struct DirRanges {
+    plc: Range<usize>,
+    plc_ids: Option<Range<usize>>,
+    radix: Option<Range<usize>>,
+    oth_off: Range<usize>,
+    oth_str: Range<usize>,
+    oth_ids: Option<Range<usize>>,
+    byid: Option<Range<usize>>,
+}
+
+impl DirRanges {
+    pub fn new(s: &Snapshot) -> DirRanges {
+        DirRanges {
+            plc: s.range("dir.plc").unwrap_or(0..0),
+            plc_ids: s.range("dir.plc.ids"),
+            radix: s.range("dir.plc.radix"),
+            oth_off: s.range("dir.oth.off").unwrap_or(0..0),
+            oth_str: s.range("dir.oth.str").unwrap_or(0..0),
+            oth_ids: s.range("dir.oth.ids"),
+            byid: s.range("dir.byid"),
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct BaseDir<'a> {
     plc: &'a [u8],
+    radix: Option<(u32, &'a [u8])>,
     plc_ids: Option<&'a [u8]>,
     oth_off: &'a [u8],
     oth_str: &'a [u8],
@@ -338,18 +444,22 @@ pub enum DidAt<'a> {
 
 impl<'a> BaseDir<'a> {
     pub fn new(s: &'a Snapshot) -> BaseDir<'a> {
+        BaseDir::with(s, &DirRanges::new(s))
+    }
+
+    pub fn with(s: &'a Snapshot, r: &DirRanges) -> BaseDir<'a> {
         let b = s.bytes();
-        let sec = |n: &str| s.range(n).map(|r| &b[r]);
-        let empty: &[u8] = &[];
-        let plc = sec("dir.plc").unwrap_or(empty);
-        let oth_off = sec("dir.oth.off").unwrap_or(empty);
+        let opt = |r: &Option<Range<usize>>| r.clone().map(|r| &b[r]);
+        let plc = &b[r.plc.clone()];
+        let oth_off = &b[r.oth_off.clone()];
         BaseDir {
             plc,
-            plc_ids: sec("dir.plc.ids"),
+            radix: opt(&r.radix).filter(|x| x.len() >= 8).map(|x| (u32_at(x, 0), &x[8..])),
+            plc_ids: opt(&r.plc_ids),
             oth_off,
-            oth_str: sec("dir.oth.str").unwrap_or(empty),
-            oth_ids: sec("dir.oth.ids"),
-            byid: sec("dir.byid"),
+            oth_str: &b[r.oth_str.clone()],
+            oth_ids: opt(&r.oth_ids),
+            byid: opt(&r.byid),
             n_plc: plc.len() / PACKED_LEN,
             n_oth: (oth_off.len() / 8).saturating_sub(1),
         }
@@ -374,48 +484,13 @@ impl<'a> BaseDir<'a> {
         std::str::from_utf8(&self.oth_str[a..b]).unwrap_or("")
     }
 
-    /// Interpolation search: packed did:plc values are uniform, so this
-    /// lands in a few probes. Falls back to bisection after eight.
     pub fn find_plc(&self, v: u128) -> Option<u32> {
-        if self.n_plc == 0 {
-            return None;
-        }
-        let (mut lo, mut hi) = (0usize, self.n_plc - 1);
-        let (mut klo, mut khi) = (self.plc_key(lo), self.plc_key(hi));
-        let mut steps = 0;
-        loop {
-            if v < klo || v > khi {
-                return None;
-            }
-            if v == klo {
-                return Some(self.plc_id(lo));
-            }
-            if v == khi {
-                return Some(self.plc_id(hi));
-            }
-            if hi - lo <= 1 {
-                return None;
-            }
-            let mid = if steps < 8 {
-                let f = (v - klo) as f64 / (khi - klo) as f64;
-                (lo + (f * (hi - lo) as f64) as usize).clamp(lo + 1, hi - 1)
-            } else {
-                lo + (hi - lo) / 2
-            };
-            steps += 1;
-            let km = self.plc_key(mid);
-            match km.cmp(&v) {
-                std::cmp::Ordering::Equal => return Some(self.plc_id(mid)),
-                std::cmp::Ordering::Less => {
-                    lo = mid;
-                    klo = km;
-                }
-                std::cmp::Ordering::Greater => {
-                    hi = mid;
-                    khi = km;
-                }
-            }
-        }
+        let Some((bits, starts)) = self.radix else {
+            return crate::did::interp_find(self.n_plc, |i| self.plc_key(i), v).map(|i| self.plc_id(i));
+        };
+        let top = (v >> (120 - bits)) as usize;
+        let (lo, hi) = (u32_at(starts, 4 * top) as usize, u32_at(starts, 4 * top + 4) as usize);
+        crate::did::radix_scan(lo, hi, |i| self.plc_key(i), v).map(|i| self.plc_id(i))
     }
 
     fn plc_id(&self, i: usize) -> u32 {

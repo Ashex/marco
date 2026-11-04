@@ -33,7 +33,9 @@ fn block(a: &str, rkey: &str) -> String {
 }
 
 fn graph() -> Graph {
-    Graph::new(Relations::bsky_default())
+    let mut g = Graph::new(Relations::bsky_default());
+    g.shards = 3;
+    g
 }
 
 /// The graph written to a snapshot and opened again.
@@ -41,8 +43,12 @@ fn reopen(g: &Graph) -> Graph {
     let dir = tempfile::tempdir().unwrap();
     let p = dir.path().join("g.marco");
     g.write_snapshot(&p).unwrap();
-    let g2 = Graph::open(&p).unwrap();
-    // the mmap outlives the directory entry
+    // overwriting a snapshot in place works too
+    g.write_snapshot(&p).unwrap();
+    let mut g2 = Graph::open(&p).unwrap();
+    g2.snapshot().unwrap().verify_checksums().unwrap();
+    g2.shards = g.shards;
+    // the mmaps outlive the directory entries
     drop(dir);
     g2
 }
@@ -391,8 +397,55 @@ fn run_model(subj_index: usize) {
                     let got: Vec<(u64, String)> =
                         page.into_iter().map(|(u, s)| (key_of(u.rsplit('/').next().unwrap()).0, s)).collect();
                     assert_eq!(got, want, "out list {rel} {x} step {step}");
+                    if let Some(xi) = g.id_of(&d) {
+                        let others: Vec<u32> = (0..12).filter_map(|_| g.id_of(&did(rnd(actors) as u32))).collect();
+                        let r = g.relationships_id(xi, &others, &[FOLLOW, BLOCK]);
+                        for (j, &o) in others.iter().enumerate() {
+                            for (ri, rl) in [FOLLOW, BLOCK].into_iter().enumerate() {
+                                assert_eq!(
+                                    r[j][ri],
+                                    (g.has_id(rl, xi, o), g.has_id(rl, o, xi)),
+                                    "relationships step {step}"
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
     }
+}
+
+#[test]
+fn checksums_catch_a_flipped_byte() {
+    let mut g = graph();
+    g.add(&follow(&did(1), &tid(1)), &did(2)).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("g.marco");
+    g.write_snapshot(&p).unwrap();
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "no temp dir left");
+    assert_eq!(std::fs::read_dir(&p).unwrap().count(), 4, "directory + 3 shards");
+    let id = Graph::open(&p).unwrap().id_of(&did(1)).unwrap();
+    let store = marco_core::store::Store::open(&p).unwrap();
+    let k = (id / store.meta.shard_width) as usize;
+    let f = p.join(marco_core::store::shard_file(k));
+    let sec = store.shards[k].sections.iter().find(|s| s.name == "r0.out.dat").unwrap().clone();
+    drop(store);
+    let mut b = std::fs::read(&f).unwrap();
+    b[sec.off as usize] ^= 1;
+    std::fs::write(&f, b).unwrap();
+    let err = marco_core::store::Store::open(&p).unwrap().verify_checksums().unwrap_err();
+    assert!(format!("{err:#}").contains("r0.out.dat"), "{err:#}");
+}
+
+#[test]
+fn shards_must_belong_to_the_snapshot() {
+    let mut g = graph();
+    g.add(&follow(&did(1), &tid(1)), &did(2)).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+    g.write_snapshot(&a).unwrap();
+    g.write_snapshot(&b).unwrap();
+    std::fs::copy(b.join(marco_core::store::shard_file(1)), a.join(marco_core::store::shard_file(1))).unwrap();
+    assert!(Graph::open(&a).is_err());
 }
