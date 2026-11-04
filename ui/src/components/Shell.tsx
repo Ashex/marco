@@ -167,7 +167,7 @@ export function Shell({ crumbs, children }: { crumbs: ReactNode[]; children: Rea
     document.documentElement.classList.toggle('dark', dark)
   }, [dark])
   const o = ov.data
-  const dirty = o ? o.dirtyShards + o.overShards : 0
+  const dirty = o ? o.dirtyShards : 0
   const streamTitle = live.stale ? `not answering: ${live.staleError ?? ''}` : live.paused ? 'paused (space)' : 'reads every 2 s · writes every 1 s'
   return (
     <div className={`cx${dark ? ' dark' : ''}${live.stale ? ' stale' : ''}`}>
@@ -190,6 +190,11 @@ export function Shell({ crumbs, children }: { crumbs: ReactNode[]; children: Rea
           {live.stale ? 'offline' : live.paused ? 'paused' : 'live'}
           {o && <span className="muted mono">seq {fmtCount(o.writeSeq)}</span>}
         </button>
+        {o && !o.ready && (
+          <span className="cx-badge info" title={`${o.readyReason} · ${fmtCount(o.readsBeforeReady)} reads before ready`}>
+            catching up
+          </span>
+        )}
         <button type="button" className="cx-kbtn" onClick={openPalette} aria-label="Command palette">
           <Icon name="search" />
           <span className="lbl">Jump to DID, at:// URI, shard…</span>
@@ -207,7 +212,7 @@ export function Shell({ crumbs, children }: { crumbs: ReactNode[]; children: Rea
               const on = s.id === sec.id
               const badge =
                 s.id === 'storage' && dirty > 0 ? (
-                  <span className="cx-badge info" title={o && o.overShards ? `dirty shards, ${o.overShards} over threshold` : 'dirty shards'}>
+                  <span className="cx-badge info" title="dirty shards">
                     ◆ {dirty}
                   </span>
                 ) : null

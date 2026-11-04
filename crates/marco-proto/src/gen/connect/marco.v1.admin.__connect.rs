@@ -46,14 +46,6 @@ pub type OwnedGetStorageRequestView = ::buffa::view::OwnedView<
 pub type OwnedGetStorageResponseView = ::buffa::view::OwnedView<
     crate::proto::marco::v1::__buffa::view::GetStorageResponseView<'static>,
 >;
-///Shorthand for `OwnedView<GetWalRequestView<'static>>`.
-pub type OwnedGetWalRequestView = ::buffa::view::OwnedView<
-    crate::proto::marco::v1::__buffa::view::GetWalRequestView<'static>,
->;
-///Shorthand for `OwnedView<GetWalResponseView<'static>>`.
-pub type OwnedGetWalResponseView = ::buffa::view::OwnedView<
-    crate::proto::marco::v1::__buffa::view::GetWalResponseView<'static>,
->;
 ///Shorthand for `OwnedView<ListRelationsRequestView<'static>>`.
 pub type OwnedListRelationsRequestView = ::buffa::view::OwnedView<
     crate::proto::marco::v1::__buffa::view::ListRelationsRequestView<'static>,
@@ -110,13 +102,13 @@ pub type OwnedGetSettingsRequestView = ::buffa::view::OwnedView<
 pub type OwnedGetSettingsResponseView = ::buffa::view::OwnedView<
     crate::proto::marco::v1::__buffa::view::GetSettingsResponseView<'static>,
 >;
-///Shorthand for `OwnedView<WriteShardsRequestView<'static>>`.
-pub type OwnedWriteShardsRequestView = ::buffa::view::OwnedView<
-    crate::proto::marco::v1::__buffa::view::WriteShardsRequestView<'static>,
+///Shorthand for `OwnedView<CheckpointRequestView<'static>>`.
+pub type OwnedCheckpointRequestView = ::buffa::view::OwnedView<
+    crate::proto::marco::v1::__buffa::view::CheckpointRequestView<'static>,
 >;
-///Shorthand for `OwnedView<WriteShardsResponseView<'static>>`.
-pub type OwnedWriteShardsResponseView = ::buffa::view::OwnedView<
-    crate::proto::marco::v1::__buffa::view::WriteShardsResponseView<'static>,
+///Shorthand for `OwnedView<CheckpointResponseView<'static>>`.
+pub type OwnedCheckpointResponseView = ::buffa::view::OwnedView<
+    crate::proto::marco::v1::__buffa::view::CheckpointResponseView<'static>,
 >;
 ///Shorthand for `OwnedView<VerifyShardsRequestView<'static>>`.
 pub type OwnedVerifyShardsRequestView = ::buffa::view::OwnedView<
@@ -324,40 +316,6 @@ for crate::proto::marco::v1::__buffa::view::GetStorageResponseView<'_> {
 impl ::connectrpc::Encodable<crate::proto::marco::v1::GetStorageResponse>
 for ::buffa::view::OwnedView<
     crate::proto::marco::v1::__buffa::view::GetStorageResponseView<'static>,
-> {
-    fn encode(
-        &self,
-        codec: ::connectrpc::CodecFormat,
-    ) -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError> {
-        ::connectrpc::__codegen::encode_view_body(self.reborrow(), codec)
-    }
-    /// An `OwnedView` still holds the buffer it was decoded from, so
-    /// its large fields can be handed to the response body by
-    /// reference count instead of copied. The bare view impl above
-    /// cannot do this: it has borrows but no buffer to name.
-    fn encode_segments(
-        &self,
-        codec: ::connectrpc::CodecFormat,
-    ) -> ::std::result::Result<::connectrpc::EncodedBody, ::connectrpc::ConnectError> {
-        ::connectrpc::__codegen::encode_view_body_segments(
-            self.reborrow(),
-            self.bytes(),
-            codec,
-        )
-    }
-}
-impl ::connectrpc::Encodable<crate::proto::marco::v1::GetWalResponse>
-for crate::proto::marco::v1::__buffa::view::GetWalResponseView<'_> {
-    fn encode(
-        &self,
-        codec: ::connectrpc::CodecFormat,
-    ) -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError> {
-        ::connectrpc::__codegen::encode_view_body(self, codec)
-    }
-}
-impl ::connectrpc::Encodable<crate::proto::marco::v1::GetWalResponse>
-for ::buffa::view::OwnedView<
-    crate::proto::marco::v1::__buffa::view::GetWalResponseView<'static>,
 > {
     fn encode(
         &self,
@@ -618,8 +576,8 @@ for ::buffa::view::OwnedView<
         )
     }
 }
-impl ::connectrpc::Encodable<crate::proto::marco::v1::WriteShardsResponse>
-for crate::proto::marco::v1::__buffa::view::WriteShardsResponseView<'_> {
+impl ::connectrpc::Encodable<crate::proto::marco::v1::CheckpointResponse>
+for crate::proto::marco::v1::__buffa::view::CheckpointResponseView<'_> {
     fn encode(
         &self,
         codec: ::connectrpc::CodecFormat,
@@ -627,9 +585,9 @@ for crate::proto::marco::v1::__buffa::view::WriteShardsResponseView<'_> {
         ::connectrpc::__codegen::encode_view_body(self, codec)
     }
 }
-impl ::connectrpc::Encodable<crate::proto::marco::v1::WriteShardsResponse>
+impl ::connectrpc::Encodable<crate::proto::marco::v1::CheckpointResponse>
 for ::buffa::view::OwnedView<
-    crate::proto::marco::v1::__buffa::view::WriteShardsResponseView<'static>,
+    crate::proto::marco::v1::__buffa::view::CheckpointResponseView<'static>,
 > {
     fn encode(
         &self,
@@ -792,12 +750,6 @@ pub const ADMIN_GET_STORAGE_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::serve
         ::connectrpc::StreamType::Unary,
     )
     .with_idempotency_level(::connectrpc::IdempotencyLevel::NoSideEffects);
-/// Static [`Spec`](::connectrpc::Spec) for the `GetWal` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
-pub const ADMIN_GET_WAL_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
-        "/marco.v1.Admin/GetWal",
-        ::connectrpc::StreamType::Unary,
-    )
-    .with_idempotency_level(::connectrpc::IdempotencyLevel::NoSideEffects);
 /// Static [`Spec`](::connectrpc::Spec) for the `ListRelations` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
 pub const ADMIN_LIST_RELATIONS_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
         "/marco.v1.Admin/ListRelations",
@@ -840,9 +792,9 @@ pub const ADMIN_GET_SETTINGS_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::serv
         ::connectrpc::StreamType::Unary,
     )
     .with_idempotency_level(::connectrpc::IdempotencyLevel::NoSideEffects);
-/// Static [`Spec`](::connectrpc::Spec) for the `WriteShards` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
-pub const ADMIN_WRITE_SHARDS_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
-        "/marco.v1.Admin/WriteShards",
+/// Static [`Spec`](::connectrpc::Spec) for the `Checkpoint` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
+pub const ADMIN_CHECKPOINT_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
+        "/marco.v1.Admin/Checkpoint",
         ::connectrpc::StreamType::Unary,
     )
     .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
@@ -868,9 +820,6 @@ pub const ADMIN_SET_ACTOR_STATUS_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::
 /// Graph, /metrics and /debug/*. Every call needs the admin token
 /// (`Authorization: Bearer <token>`) or a login from the trusted proxy
 /// header, except GetSession, which says which of the two a caller has.
-///
-/// GetWal and ListSources answer Unimplemented until marco has a WAL and its
-/// own ingest (P1).
 ///
 /// # Implementing handlers
 ///
@@ -1059,26 +1008,6 @@ pub trait Admin: Send + Sync + 'static {
             > + Send + use<'a, Self>,
         >,
     > + Send;
-    /// Handle the GetWal RPC.
-    ///
-    /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
-    ///
-    /// `request` is borrowed from the request body and is valid for the
-    /// duration of the call; message fields are read directly on it
-    /// (zero-copy). The response cannot borrow from `request` — use
-    /// `.to_owned_message()` (or copy the specific fields) for anything
-    /// returned, stored, or moved into `tokio::spawn`.
-    fn get_wal<'a>(
-        &'a self,
-        ctx: ::connectrpc::RequestContext,
-        request: ::connectrpc::ServiceRequest<'_, crate::proto::marco::v1::GetWalRequest>,
-    ) -> impl ::std::future::Future<
-        Output = ::connectrpc::ServiceResult<
-            impl ::connectrpc::Encodable<
-                crate::proto::marco::v1::GetWalResponse,
-            > + Send + use<'a, Self>,
-        >,
-    > + Send;
     /// Handle the ListRelations RPC.
     ///
     /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
@@ -1241,8 +1170,9 @@ pub trait Admin: Send + Sync + 'static {
             > + Send + use<'a, Self>,
         >,
     > + Send;
-    /// Writes the snapshot (base + deltas) in place and serves it. Starts a job
-    /// and answers at once; GetOverview and ListShards show its progress.
+    /// Folds the change segments into new shard files now: one cut of the whole
+    /// graph, the dirty shards rewritten, the manifest renamed. Starts a job and
+    /// answers at once; GetOverview and ListShards show its progress.
     ///
     /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
     ///
@@ -1251,17 +1181,17 @@ pub trait Admin: Send + Sync + 'static {
     /// (zero-copy). The response cannot borrow from `request` — use
     /// `.to_owned_message()` (or copy the specific fields) for anything
     /// returned, stored, or moved into `tokio::spawn`.
-    fn write_shards<'a>(
+    fn checkpoint<'a>(
         &'a self,
         ctx: ::connectrpc::RequestContext,
         request: ::connectrpc::ServiceRequest<
             '_,
-            crate::proto::marco::v1::WriteShardsRequest,
+            crate::proto::marco::v1::CheckpointRequest,
         >,
     ) -> impl ::std::future::Future<
         Output = ::connectrpc::ServiceResult<
             impl ::connectrpc::Encodable<
-                crate::proto::marco::v1::WriteShardsResponse,
+                crate::proto::marco::v1::CheckpointResponse,
             > + Send + use<'a, Self>,
         >,
     > + Send;
@@ -1312,7 +1242,8 @@ pub trait Admin: Send + Sync + 'static {
         >,
     > + Send;
     /// deleted drops the actor's records and hides it as a subject; takendown
-    /// hides both; active undoes either.
+    /// hides both; active undoes either. Durable when it answers: it writes a
+    /// change segment at once.
     ///
     /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
     ///
@@ -1543,33 +1474,6 @@ impl<S: Admin> AdminExt for S {
             .with_spec(ADMIN_GET_STORAGE_SPEC)
             .route_view_idempotent(
                 ADMIN_SERVICE_NAME,
-                "GetWal",
-                {
-                    let svc = ::std::sync::Arc::clone(&self);
-                    ::connectrpc::view_handler_fn(move |
-                        ctx,
-                        req: ::buffa::view::OwnedView<
-                            crate::proto::marco::v1::__buffa::view::GetWalRequestView<
-                                'static,
-                            >,
-                        >,
-                        format|
-                    {
-                        let svc = ::std::sync::Arc::clone(&svc);
-                        async move {
-                            let sreq = ::connectrpc::ServiceRequest::<
-                                crate::proto::marco::v1::GetWalRequest,
-                            >::from_parts(req.reborrow(), req.bytes());
-                            svc.get_wal(ctx, sreq)
-                                .await?
-                                .encode::<crate::proto::marco::v1::GetWalResponse>(format)
-                        }
-                    })
-                },
-            )
-            .with_spec(ADMIN_GET_WAL_SPEC)
-            .route_view_idempotent(
-                ADMIN_SERVICE_NAME,
                 "ListRelations",
                 {
                     let svc = ::std::sync::Arc::clone(&self);
@@ -1771,13 +1675,13 @@ impl<S: Admin> AdminExt for S {
             .with_spec(ADMIN_GET_SETTINGS_SPEC)
             .route_view(
                 ADMIN_SERVICE_NAME,
-                "WriteShards",
+                "Checkpoint",
                 {
                     let svc = ::std::sync::Arc::clone(&self);
                     ::connectrpc::view_handler_fn(move |
                         ctx,
                         req: ::buffa::view::OwnedView<
-                            crate::proto::marco::v1::__buffa::view::WriteShardsRequestView<
+                            crate::proto::marco::v1::__buffa::view::CheckpointRequestView<
                                 'static,
                             >,
                         >,
@@ -1786,18 +1690,18 @@ impl<S: Admin> AdminExt for S {
                         let svc = ::std::sync::Arc::clone(&svc);
                         async move {
                             let sreq = ::connectrpc::ServiceRequest::<
-                                crate::proto::marco::v1::WriteShardsRequest,
+                                crate::proto::marco::v1::CheckpointRequest,
                             >::from_parts(req.reborrow(), req.bytes());
-                            svc.write_shards(ctx, sreq)
+                            svc.checkpoint(ctx, sreq)
                                 .await?
                                 .encode::<
-                                    crate::proto::marco::v1::WriteShardsResponse,
+                                    crate::proto::marco::v1::CheckpointResponse,
                                 >(format)
                         }
                     })
                 },
             )
-            .with_spec(ADMIN_WRITE_SHARDS_SPEC)
+            .with_spec(ADMIN_CHECKPOINT_SPEC)
             .route_view(
                 ADMIN_SERVICE_NAME,
                 "VerifyShards",
@@ -1975,12 +1879,6 @@ impl<T: Admin> ::connectrpc::Dispatcher for AdminServer<T> {
                         .with_spec(ADMIN_GET_STORAGE_SPEC),
                 )
             }
-            "GetWal" => {
-                Some(
-                    ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(true)
-                        .with_spec(ADMIN_GET_WAL_SPEC),
-                )
-            }
             "ListRelations" => {
                 Some(
                     ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(true)
@@ -2023,10 +1921,10 @@ impl<T: Admin> ::connectrpc::Dispatcher for AdminServer<T> {
                         .with_spec(ADMIN_GET_SETTINGS_SPEC),
                 )
             }
-            "WriteShards" => {
+            "Checkpoint" => {
                 Some(
                     ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false)
-                        .with_spec(ADMIN_WRITE_SHARDS_SPEC),
+                        .with_spec(ADMIN_CHECKPOINT_SPEC),
                 )
             }
             "VerifyShards" => {
@@ -2184,26 +2082,6 @@ impl<T: Admin> ::connectrpc::Dispatcher for AdminServer<T> {
                         .encode::<crate::proto::marco::v1::GetStorageResponse>(format)
                 })
             }
-            "GetWal" => {
-                let svc = ::std::sync::Arc::clone(&self.inner);
-                Box::pin(async move {
-                    let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<
-                        crate::proto::marco::v1::GetWalRequest,
-                    >(request.encoded()?, format)?;
-                    let req: crate::proto::marco::v1::__buffa::view::GetWalRequestView<
-                        '_,
-                    > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
-                        &body,
-                        ctx.decode_options(),
-                    )?;
-                    let req = ::connectrpc::ServiceRequest::<
-                        crate::proto::marco::v1::GetWalRequest,
-                    >::from_parts(&req, &body);
-                    svc.get_wal(ctx, req)
-                        .await?
-                        .encode::<crate::proto::marco::v1::GetWalResponse>(format)
-                })
-            }
             "ListRelations" => {
                 let svc = ::std::sync::Arc::clone(&self.inner);
                 Box::pin(async move {
@@ -2344,24 +2222,24 @@ impl<T: Admin> ::connectrpc::Dispatcher for AdminServer<T> {
                         .encode::<crate::proto::marco::v1::GetSettingsResponse>(format)
                 })
             }
-            "WriteShards" => {
+            "Checkpoint" => {
                 let svc = ::std::sync::Arc::clone(&self.inner);
                 Box::pin(async move {
                     let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<
-                        crate::proto::marco::v1::WriteShardsRequest,
+                        crate::proto::marco::v1::CheckpointRequest,
                     >(request.encoded()?, format)?;
-                    let req: crate::proto::marco::v1::__buffa::view::WriteShardsRequestView<
+                    let req: crate::proto::marco::v1::__buffa::view::CheckpointRequestView<
                         '_,
                     > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
                         &body,
                         ctx.decode_options(),
                     )?;
                     let req = ::connectrpc::ServiceRequest::<
-                        crate::proto::marco::v1::WriteShardsRequest,
+                        crate::proto::marco::v1::CheckpointRequest,
                     >::from_parts(&req, &body);
-                    svc.write_shards(ctx, req)
+                    svc.checkpoint(ctx, req)
                         .await?
-                        .encode::<crate::proto::marco::v1::WriteShardsResponse>(format)
+                        .encode::<crate::proto::marco::v1::CheckpointResponse>(format)
                 })
             }
             "VerifyShards" => {
@@ -2799,43 +2677,6 @@ where
             )
             .await
     }
-    /// Call the GetWal RPC. Sends a request to /marco.v1.Admin/GetWal.
-    pub async fn get_wal(
-        &self,
-        request: crate::proto::marco::v1::GetWalRequest,
-    ) -> Result<
-        ::connectrpc::client::UnaryResponse<
-            ::buffa::view::OwnedView<
-                crate::proto::marco::v1::__buffa::view::GetWalResponseView<'static>,
-            >,
-        >,
-        ::connectrpc::ConnectError,
-    > {
-        self.get_wal_with_options(request, ::connectrpc::client::CallOptions::default())
-            .await
-    }
-    /// Call the GetWal RPC with explicit per-call options. Options override [`ClientConfig`](::connectrpc::client::ClientConfig) defaults.
-    pub async fn get_wal_with_options(
-        &self,
-        request: crate::proto::marco::v1::GetWalRequest,
-        options: ::connectrpc::client::CallOptions,
-    ) -> Result<
-        ::connectrpc::client::UnaryResponse<
-            ::buffa::view::OwnedView<
-                crate::proto::marco::v1::__buffa::view::GetWalResponseView<'static>,
-            >,
-        >,
-        ::connectrpc::ConnectError,
-    > {
-        ::connectrpc::client::call_unary(
-                &self.transport,
-                &self.config,
-                ADMIN_GET_WAL_SPEC.with_origin(::connectrpc::SpecOrigin::Client),
-                request,
-                options,
-            )
-            .await
-    }
     /// Call the ListRelations RPC. Sends a request to /marco.v1.Admin/ListRelations.
     pub async fn list_relations(
         &self,
@@ -3120,33 +2961,33 @@ where
             )
             .await
     }
-    /// Call the WriteShards RPC. Sends a request to /marco.v1.Admin/WriteShards.
-    pub async fn write_shards(
+    /// Call the Checkpoint RPC. Sends a request to /marco.v1.Admin/Checkpoint.
+    pub async fn checkpoint(
         &self,
-        request: crate::proto::marco::v1::WriteShardsRequest,
+        request: crate::proto::marco::v1::CheckpointRequest,
     ) -> Result<
         ::connectrpc::client::UnaryResponse<
             ::buffa::view::OwnedView<
-                crate::proto::marco::v1::__buffa::view::WriteShardsResponseView<'static>,
+                crate::proto::marco::v1::__buffa::view::CheckpointResponseView<'static>,
             >,
         >,
         ::connectrpc::ConnectError,
     > {
-        self.write_shards_with_options(
+        self.checkpoint_with_options(
                 request,
                 ::connectrpc::client::CallOptions::default(),
             )
             .await
     }
-    /// Call the WriteShards RPC with explicit per-call options. Options override [`ClientConfig`](::connectrpc::client::ClientConfig) defaults.
-    pub async fn write_shards_with_options(
+    /// Call the Checkpoint RPC with explicit per-call options. Options override [`ClientConfig`](::connectrpc::client::ClientConfig) defaults.
+    pub async fn checkpoint_with_options(
         &self,
-        request: crate::proto::marco::v1::WriteShardsRequest,
+        request: crate::proto::marco::v1::CheckpointRequest,
         options: ::connectrpc::client::CallOptions,
     ) -> Result<
         ::connectrpc::client::UnaryResponse<
             ::buffa::view::OwnedView<
-                crate::proto::marco::v1::__buffa::view::WriteShardsResponseView<'static>,
+                crate::proto::marco::v1::__buffa::view::CheckpointResponseView<'static>,
             >,
         >,
         ::connectrpc::ConnectError,
@@ -3154,7 +2995,7 @@ where
         ::connectrpc::client::call_unary(
                 &self.transport,
                 &self.config,
-                ADMIN_WRITE_SHARDS_SPEC.with_origin(::connectrpc::SpecOrigin::Client),
+                ADMIN_CHECKPOINT_SPEC.with_origin(::connectrpc::SpecOrigin::Client),
                 request,
                 options,
             )

@@ -1,20 +1,22 @@
 import { DataTable } from '../components/DataTable'
-import { Loaded, NeedsVersion, PageHead, Panel, Spark, Tiles, Updated, Dot } from '../components/kit'
+import { Chip, Loaded, Glyph, PageHead, Panel, Spark, Tiles, Updated } from '../components/kit'
 import { fmtCount, rate } from '../lib/fmt'
-import { last, mean, sum, unsupported, useOverview, useSeries, useSources, useWal } from '../lib/queries'
+import { last, mean, sum, useOverview, useSeries, useSources } from '../lib/queries'
 import { OUTCOMES } from '../lib/tone'
-import { useWindow, windowLabel } from './common'
+import { cursorText, lagText, sourceNamed, useWindow, windowLabel } from './common'
 
 export function Ingest() {
   const ov = useOverview()
   const src = useSources()
-  const wal = useWal()
   const [win, winSeg] = useWindow()
   const se = useSeries(win)
   const s = se.data
   const o = ov.data
   const applied = sum(s, { metric: 'applied' })
-  const noSources = src.data && unsupported(src.data)
+  const lagTile = (label: string, name: string) => {
+    const x = sourceNamed(src.data?.sources, name)
+    return x ? { label, value: lagText(x.lagSeconds), sec: `${rate(x.opsPerSecond)} ops/s`, title: 'now − cursor time_us' } : { label, value: '—', sec: 'not configured' }
+  }
   return (
     <>
       <PageHead
@@ -22,14 +24,6 @@ export function Ingest() {
         sub={
           <>
             <span>writes through marco.v1.Graph</span>
-            <Dot />
-            <span>{noSources ? 'no sources of its own yet' : ''}</span>
-            {wal.data && unsupported(wal.data) && (
-              <>
-                <Dot />
-                <span>no WAL yet</span>
-              </>
-            )}
             <Updated l={se} />
           </>
         }
@@ -38,14 +32,34 @@ export function Ingest() {
       <Tiles
         cols={4}
         tiles={[
-          { label: 'Jetstream lag', value: '—', sec: 'needs a newer marco' },
-          { label: 'Firehose lag', value: '—', sec: 'needs a newer marco' },
+          lagTile('Jetstream lag', 'jetstream'),
+          lagTile('Firehose lag', 'firehose'),
           { label: 'Applied', value: rate(last(applied)), unit: 'ops/s', sec: s?.tMs.length ? `${rate(mean(applied))} avg ${windowLabel(win)}` : undefined, spark: <Spark data={applied} color="signal" /> },
           { label: 'Non-TID rkeys', value: fmtCount(o?.relations.reduce((a, r) => a + Number(r.nonTid), 0)), sec: 'in the snapshot' },
         ]}
       />
       <Panel title="Sources" right={<span title="key (actor, rel, rkey) · repeats land as exists">one write path</span>}>
-        {noSources ? <NeedsVersion what="Jetstream and firehose sources" rpc="ListSources" /> : <Loaded load={src}>{() => null}</Loaded>}
+        <Loaded load={src}>
+          {(d) => (
+            <DataTable
+              compact
+              rows={d.sources}
+              rowKey={(x) => x.name}
+              cols={[
+                { id: 'name', label: 'Source', fill: true, render: (x) => <span title={x.url}><b className="mono">{x.name}</b>{x.url && <div className="cx-did">{x.url}</div>}</span> },
+                { id: 'st', label: 'State', render: (x) => <Chip k={x.state === 'connected' || x.state === 'serving' ? 'ok' : x.state === 'idle' ? 'idle' : 'warn'}>{x.state}</Chip> },
+                { id: 'cur', label: 'Cursor', className: 'hide-phone', title: 'last applied', render: (x) => <span className="mono t2" title={x.cursor}>{cursorText(x.cursor, x.cursorKind)}</span> },
+                { id: 'dur', label: 'Durable', className: 'hide-phone', title: 'in the newest segment: what a restart resumes from', render: (x) => <span className="mono t2" title={x.durableCursor}>{cursorText(x.durableCursor, x.cursorKind)}</span> },
+                { id: 'lag', label: 'Lag', r: true, render: (x) => (x.cursorKind === 'time_us' ? lagText(x.lagSeconds) : '—') },
+                { id: 'ops', label: 'ops/s', r: true, render: (x) => rate(x.opsPerSecond) },
+                { id: 'err', label: 'Errors', r: true, className: 'hide-phone', render: (x) => fmtCount(x.errors) },
+                { id: 'rc', label: 'Reconn.', r: true, className: 'hide-phone', render: (x) => fmtCount(x.reconnects) },
+                { id: 'ex', label: 'Expected', className: 'hide-phone', title: 'readiness waits for it', render: (x) => (x.expected ? 'yes' : '—') },
+                { id: 'cu', label: 'Caught up', render: (x) => <Glyph k={x.caughtUp ? 'ok' : 'warn'} /> },
+              ]}
+            />
+          )}
+        </Loaded>
       </Panel>
       <div style={{ height: 14 }} />
       <div className="cx-grid2">

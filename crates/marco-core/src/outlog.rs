@@ -89,6 +89,22 @@ pub fn encode(edges: &[(u64, u32)], subj_index: usize, out: &mut Vec<u8>, bytes:
     }
 }
 
+/// An encoded list's record count and bytes by part, from its header.
+pub fn bytes_of(b: &[u8], subj_index: usize) -> (usize, OutBytes) {
+    let mut pos = 0;
+    let n = varint::get(b, &mut pos) as usize;
+    let nb = n.div_ceil(BLOCK);
+    let mut o = OutBytes { header: pos as u64, subjects: 4 * n as u64, ..Default::default() };
+    if nb > 1 {
+        o.skip = 12 * nb as u64;
+    }
+    if n >= subj_index {
+        o.bysubj = 4 * n as u64;
+    }
+    o.rkeys = b.len() as u64 - o.header - o.skip - o.bysubj - o.subjects;
+    (n, o)
+}
+
 #[derive(Clone, Copy)]
 pub struct OutList<'a> {
     n: usize,
@@ -289,6 +305,7 @@ mod tests {
         let mut bytes = OutBytes::default();
         encode(edges, subj_index, &mut enc, &mut bytes);
         assert_eq!(bytes.total(), enc.len() as u64);
+        assert_eq!(bytes_of(&enc, subj_index), (edges.len(), bytes));
         let l = OutList::parse(&enc, subj_index);
         assert_eq!(l.to_vec(), edges);
         for (i, &(k, s)) in edges.iter().enumerate() {

@@ -800,6 +800,20 @@ pub struct GetOverviewResponseView<'a> {
     pub api_listen: &'a str,
     /// Field 22: `admin_listen`
     pub admin_listen: &'a str,
+    /// Field 23: `durability`
+    pub durability: ::buffa::MessageFieldView<
+        super::super::__buffa::view::DurabilityView<'a>,
+    >,
+    /// Every expected source caught up since start; reads before it are flagged.
+    ///
+    /// Field 24: `ready`
+    pub ready: bool,
+    /// Why not ready, empty when ready.
+    ///
+    /// Field 25: `ready_reason`
+    pub ready_reason: &'a str,
+    /// Field 26: `reads_before_ready`
+    pub reads_before_ready: u64,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for GetOverviewResponseView<'a> {
@@ -1035,6 +1049,48 @@ impl<'a> ::buffa::MessageView<'a> for GetOverviewResponseView<'a> {
                 )?;
                 view.admin_listen = ::buffa::types::borrow_str(&mut cur)?;
             }
+            23u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                let __sub_ctx = ctx.descend()?;
+                let sub = ::buffa::types::borrow_bytes(&mut cur)?;
+                match view.durability.as_mut() {
+                    Some(existing) => {
+                        ::buffa::MessageView::merge_into_view(existing, sub, __sub_ctx)?
+                    }
+                    None => {
+                        view.durability = ::buffa::MessageFieldView::set(
+                            <super::super::__buffa::view::DurabilityView as ::buffa::MessageView>::decode_view_ctx(
+                                sub,
+                                __sub_ctx,
+                            )?,
+                        );
+                    }
+                }
+            }
+            24u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.ready = ::buffa::types::decode_bool(&mut cur)?;
+            }
+            25u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                view.ready_reason = ::buffa::types::borrow_str(&mut cur)?;
+            }
+            26u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.reads_before_ready = ::buffa::types::decode_uint64(&mut cur)?;
+            }
             7u32 => {
                 ::buffa::encoding::check_wire_type(
                     tag,
@@ -1141,6 +1197,18 @@ impl<'a> ::buffa::MessageView<'a> for GetOverviewResponseView<'a> {
             write_seq: self.write_seq,
             api_listen: self.api_listen.to_string(),
             admin_listen: self.admin_listen.to_string(),
+            durability: match self.durability.as_option() {
+                Some(v) => {
+                    ::buffa::MessageField::<
+                        super::super::Durability,
+                        ::buffa::Inline<super::super::Durability>,
+                    >::some(v.to_owned_from_source(__buffa_src)?)
+                }
+                None => ::buffa::MessageField::none(),
+            },
+            ready: self.ready,
+            ready_reason: self.ready_reason.to_string(),
+            reads_before_ready: self.reads_before_ready,
             __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
@@ -1243,6 +1311,25 @@ impl<'a> ::buffa::ViewEncode<'a> for GetOverviewResponseView<'a> {
         if !self.admin_listen.is_empty() {
             size += 2u64 + ::buffa::types::string_encoded_len(&self.admin_listen) as u64;
         }
+        if self.durability.is_set() {
+            let __slot = __cache.reserve();
+            let inner_size = self.durability.compute_size(__cache);
+            __cache.set(__slot, inner_size);
+            size
+                += 2u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
+                    + inner_size as u64;
+        }
+        if self.ready {
+            size += 2u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
+        }
+        if !self.ready_reason.is_empty() {
+            size += 2u64 + ::buffa::types::string_encoded_len(&self.ready_reason) as u64;
+        }
+        if self.reads_before_ready != 0u64 {
+            size
+                += 2u64
+                    + ::buffa::types::uint64_encoded_len(self.reads_before_ready) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -1344,6 +1431,23 @@ impl<'a> ::buffa::ViewEncode<'a> for GetOverviewResponseView<'a> {
         }
         if !self.admin_listen.is_empty() {
             ::buffa::types::put_string_field(22u32, &self.admin_listen, buf);
+        }
+        if self.durability.is_set() {
+            ::buffa::types::put_len_delimited_header(
+                23u32,
+                u64::from(__cache.consume_next()),
+                buf,
+            );
+            self.durability.write_to(__cache, buf);
+        }
+        if self.ready {
+            ::buffa::types::put_bool_field(24u32, self.ready, buf);
+        }
+        if !self.ready_reason.is_empty() {
+            ::buffa::types::put_string_field(25u32, &self.ready_reason, buf);
+        }
+        if self.reads_before_ready != 0u64 {
+            ::buffa::types::put_uint64_field(26u32, self.reads_before_ready, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -1483,6 +1587,24 @@ impl<'__a> ::serde::Serialize for GetOverviewResponseView<'__a> {
         }
         if !::buffa::json_helpers::skip_if::is_empty_str(self.admin_listen) {
             __map.serialize_entry("adminListen", self.admin_listen)?;
+        }
+        {
+            if let ::core::option::Option::Some(__v) = self.durability.as_option() {
+                __map.serialize_entry("durability", __v)?;
+            }
+        }
+        if self.ready {
+            __map.serialize_entry("ready", &self.ready)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.ready_reason) {
+            __map.serialize_entry("readyReason", self.ready_reason)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.reads_before_ready) {
+            __map
+                .serialize_entry(
+                    "readsBeforeReady",
+                    &::buffa::json_helpers::ProtoJson(&self.reads_before_ready),
+                )?;
         }
         __map.end()
     }
@@ -1715,6 +1837,32 @@ impl GetOverviewResponseOwnedView {
     pub fn admin_listen(&self) -> &'_ str {
         self.0.reborrow().admin_listen
     }
+    /// Field 23: `durability`
+    #[must_use]
+    pub fn durability(
+        &self,
+    ) -> &::buffa::MessageFieldView<super::super::__buffa::view::DurabilityView<'_>> {
+        &self.0.reborrow().durability
+    }
+    /// Every expected source caught up since start; reads before it are flagged.
+    ///
+    /// Field 24: `ready`
+    #[must_use]
+    pub fn ready(&self) -> bool {
+        self.0.reborrow().ready
+    }
+    /// Why not ready, empty when ready.
+    ///
+    /// Field 25: `ready_reason`
+    #[must_use]
+    pub fn ready_reason(&self) -> &'_ str {
+        self.0.reborrow().ready_reason
+    }
+    /// Field 26: `reads_before_ready`
+    #[must_use]
+    pub fn reads_before_ready(&self) -> u64 {
+        self.0.reborrow().reads_before_ready
+    }
 }
 impl ::core::convert::From<::buffa::OwnedView<GetOverviewResponseView<'static>>>
 for GetOverviewResponseOwnedView {
@@ -1739,6 +1887,766 @@ impl ::buffa::HasMessageView for super::super::GetOverviewResponse {
     type ViewHandle = GetOverviewResponseOwnedView;
 }
 impl ::serde::Serialize for GetOverviewResponseOwnedView {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        ::serde::Serialize::serialize(&self.0, __s)
+    }
+}
+/// Writes are applied in memory, then written every few seconds as a change
+/// segment (the ops and every source's cursor at that cut). A checkpoint
+/// folds the segments into new shard files when replaying them would take
+/// too long, or daily.
+#[derive(Clone, Debug, Default)]
+pub struct DurabilityView<'a> {
+    /// Field 1: `segment_interval_seconds`
+    pub segment_interval_seconds: f64,
+    /// The newest segment written, its time, and how long its write took.
+    ///
+    /// Field 2: `segment`
+    pub segment: u64,
+    /// Field 3: `segment_ms`
+    pub segment_ms: i64,
+    /// Field 4: `segment_write_seconds`
+    pub segment_write_seconds: f64,
+    /// Segments (and their bytes and ops) since the checkpoint: what a restart replays.
+    ///
+    /// Field 5: `segments`
+    pub segments: u32,
+    /// Field 6: `segment_bytes`
+    pub segment_bytes: u64,
+    /// Field 7: `segment_ops`
+    pub segment_ops: u64,
+    /// Ops applied but not in a segment yet.
+    ///
+    /// Field 8: `pending_ops`
+    pub pending_ops: u64,
+    /// Field 9: `checkpoint`
+    pub checkpoint: u64,
+    /// Field 10: `checkpoint_ms`
+    pub checkpoint_ms: i64,
+    /// A checkpoint starts once segment_ops passes this, or the checkpoint is this old.
+    ///
+    /// Field 11: `checkpoint_ops`
+    pub checkpoint_ops: u64,
+    /// Field 12: `checkpoint_age_seconds`
+    pub checkpoint_age_seconds: f64,
+    /// The last checkpoint's wall time and bytes written.
+    ///
+    /// Field 13: `checkpoint_seconds`
+    pub checkpoint_seconds: f64,
+    /// Field 14: `checkpoint_bytes`
+    pub checkpoint_bytes: u64,
+    /// Field 15: `checkpoint_shards`
+    pub checkpoint_shards: u32,
+    /// The replay at start: segments, ops and seconds.
+    ///
+    /// Field 16: `replayed_segments`
+    pub replayed_segments: u32,
+    /// Field 17: `replayed_ops`
+    pub replayed_ops: u64,
+    /// Field 18: `replay_seconds`
+    pub replay_seconds: f64,
+    pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
+}
+impl<'a> ::buffa::MessageView<'a> for DurabilityView<'a> {
+    type Owned = super::super::Durability;
+    fn decode_view(buf: &'a [u8]) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        let __limit = ::core::cell::Cell::new(::buffa::DEFAULT_UNKNOWN_FIELD_LIMIT);
+        let __elem = ::core::cell::Cell::new(::buffa::DEFAULT_ELEMENT_MEMORY_LIMIT);
+        <Self as ::buffa::MessageView>::decode_view_ctx(
+            buf,
+            ::buffa::DecodeContext::new(::buffa::RECURSION_LIMIT, &__limit)
+                .with_element_memory(&__elem),
+        )
+    }
+    fn decode_view_with_ctx(
+        buf: &'a [u8],
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        <Self as ::buffa::MessageView>::decode_view_ctx(buf, ctx)
+    }
+    #[inline]
+    fn merge_view_field(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        cur: &'a [u8],
+        before_tag: &'a [u8],
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<&'a [u8], ::buffa::DecodeError> {
+        let _ = ctx;
+        #[allow(unused_variables)]
+        let view = self;
+        let mut cur = cur;
+        match tag.field_number() {
+            1u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Fixed64,
+                )?;
+                view.segment_interval_seconds = ::buffa::types::decode_double(&mut cur)?;
+            }
+            2u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.segment = ::buffa::types::decode_uint64(&mut cur)?;
+            }
+            3u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.segment_ms = ::buffa::types::decode_int64(&mut cur)?;
+            }
+            4u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Fixed64,
+                )?;
+                view.segment_write_seconds = ::buffa::types::decode_double(&mut cur)?;
+            }
+            5u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.segments = ::buffa::types::decode_uint32(&mut cur)?;
+            }
+            6u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.segment_bytes = ::buffa::types::decode_uint64(&mut cur)?;
+            }
+            7u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.segment_ops = ::buffa::types::decode_uint64(&mut cur)?;
+            }
+            8u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.pending_ops = ::buffa::types::decode_uint64(&mut cur)?;
+            }
+            9u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.checkpoint = ::buffa::types::decode_uint64(&mut cur)?;
+            }
+            10u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.checkpoint_ms = ::buffa::types::decode_int64(&mut cur)?;
+            }
+            11u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.checkpoint_ops = ::buffa::types::decode_uint64(&mut cur)?;
+            }
+            12u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Fixed64,
+                )?;
+                view.checkpoint_age_seconds = ::buffa::types::decode_double(&mut cur)?;
+            }
+            13u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Fixed64,
+                )?;
+                view.checkpoint_seconds = ::buffa::types::decode_double(&mut cur)?;
+            }
+            14u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.checkpoint_bytes = ::buffa::types::decode_uint64(&mut cur)?;
+            }
+            15u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.checkpoint_shards = ::buffa::types::decode_uint32(&mut cur)?;
+            }
+            16u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.replayed_segments = ::buffa::types::decode_uint32(&mut cur)?;
+            }
+            17u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.replayed_ops = ::buffa::types::decode_uint64(&mut cur)?;
+            }
+            18u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Fixed64,
+                )?;
+                view.replay_seconds = ::buffa::types::decode_double(&mut cur)?;
+            }
+            _ => {
+                ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
+                let span_len = before_tag.len() - cur.len();
+                view.__buffa_unknown_fields.push_record(before_tag, span_len, ctx)?;
+            }
+        }
+        ::core::result::Result::Ok(cur)
+    }
+    fn to_owned_message(
+        &self,
+    ) -> ::core::result::Result<super::super::Durability, ::buffa::DecodeError> {
+        self.to_owned_from_source(None)
+    }
+    #[allow(clippy::useless_conversion, clippy::needless_update)]
+    fn to_owned_from_source(
+        &self,
+        __buffa_src: ::core::option::Option<&::buffa::bytes::Bytes>,
+    ) -> ::core::result::Result<super::super::Durability, ::buffa::DecodeError> {
+        #[allow(unused_imports)]
+        use ::buffa::alloc::string::ToString as _;
+        let _ = __buffa_src;
+        ::core::result::Result::Ok(super::super::Durability {
+            segment_interval_seconds: self.segment_interval_seconds,
+            segment: self.segment,
+            segment_ms: self.segment_ms,
+            segment_write_seconds: self.segment_write_seconds,
+            segments: self.segments,
+            segment_bytes: self.segment_bytes,
+            segment_ops: self.segment_ops,
+            pending_ops: self.pending_ops,
+            checkpoint: self.checkpoint,
+            checkpoint_ms: self.checkpoint_ms,
+            checkpoint_ops: self.checkpoint_ops,
+            checkpoint_age_seconds: self.checkpoint_age_seconds,
+            checkpoint_seconds: self.checkpoint_seconds,
+            checkpoint_bytes: self.checkpoint_bytes,
+            checkpoint_shards: self.checkpoint_shards,
+            replayed_segments: self.replayed_segments,
+            replayed_ops: self.replayed_ops,
+            replay_seconds: self.replay_seconds,
+            __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
+            ..::core::default::Default::default()
+        })
+    }
+}
+impl<'a> ::buffa::ViewEncode<'a> for DurabilityView<'a> {
+    #[allow(clippy::needless_borrow, clippy::let_and_return)]
+    fn compute_size(&self, _cache: &mut ::buffa::SizeCache) -> u32 {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        let mut size = 0u64;
+        if self.segment_interval_seconds.to_bits() != 0u64 {
+            size += 1u64 + ::buffa::types::FIXED64_ENCODED_LEN as u64;
+        }
+        if self.segment != 0u64 {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(self.segment) as u64;
+        }
+        if self.segment_ms != 0i64 {
+            size += 1u64 + ::buffa::types::int64_encoded_len(self.segment_ms) as u64;
+        }
+        if self.segment_write_seconds.to_bits() != 0u64 {
+            size += 1u64 + ::buffa::types::FIXED64_ENCODED_LEN as u64;
+        }
+        if self.segments != 0u32 {
+            size += 1u64 + ::buffa::types::uint32_encoded_len(self.segments) as u64;
+        }
+        if self.segment_bytes != 0u64 {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(self.segment_bytes) as u64;
+        }
+        if self.segment_ops != 0u64 {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(self.segment_ops) as u64;
+        }
+        if self.pending_ops != 0u64 {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(self.pending_ops) as u64;
+        }
+        if self.checkpoint != 0u64 {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(self.checkpoint) as u64;
+        }
+        if self.checkpoint_ms != 0i64 {
+            size += 1u64 + ::buffa::types::int64_encoded_len(self.checkpoint_ms) as u64;
+        }
+        if self.checkpoint_ops != 0u64 {
+            size
+                += 1u64 + ::buffa::types::uint64_encoded_len(self.checkpoint_ops) as u64;
+        }
+        if self.checkpoint_age_seconds.to_bits() != 0u64 {
+            size += 1u64 + ::buffa::types::FIXED64_ENCODED_LEN as u64;
+        }
+        if self.checkpoint_seconds.to_bits() != 0u64 {
+            size += 1u64 + ::buffa::types::FIXED64_ENCODED_LEN as u64;
+        }
+        if self.checkpoint_bytes != 0u64 {
+            size
+                += 1u64
+                    + ::buffa::types::uint64_encoded_len(self.checkpoint_bytes) as u64;
+        }
+        if self.checkpoint_shards != 0u32 {
+            size
+                += 1u64
+                    + ::buffa::types::uint32_encoded_len(self.checkpoint_shards) as u64;
+        }
+        if self.replayed_segments != 0u32 {
+            size
+                += 2u64
+                    + ::buffa::types::uint32_encoded_len(self.replayed_segments) as u64;
+        }
+        if self.replayed_ops != 0u64 {
+            size += 2u64 + ::buffa::types::uint64_encoded_len(self.replayed_ops) as u64;
+        }
+        if self.replay_seconds.to_bits() != 0u64 {
+            size += 2u64 + ::buffa::types::FIXED64_ENCODED_LEN as u64;
+        }
+        size += self.__buffa_unknown_fields.encoded_len() as u64;
+        ::buffa::saturate_size(size)
+    }
+    #[allow(clippy::needless_borrow)]
+    fn write_to(
+        &self,
+        _cache: &mut ::buffa::SizeCache,
+        buf: &mut impl ::buffa::EncodeSink,
+    ) {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        if self.segment_interval_seconds.to_bits() != 0u64 {
+            ::buffa::types::put_double_field(1u32, self.segment_interval_seconds, buf);
+        }
+        if self.segment != 0u64 {
+            ::buffa::types::put_uint64_field(2u32, self.segment, buf);
+        }
+        if self.segment_ms != 0i64 {
+            ::buffa::types::put_int64_field(3u32, self.segment_ms, buf);
+        }
+        if self.segment_write_seconds.to_bits() != 0u64 {
+            ::buffa::types::put_double_field(4u32, self.segment_write_seconds, buf);
+        }
+        if self.segments != 0u32 {
+            ::buffa::types::put_uint32_field(5u32, self.segments, buf);
+        }
+        if self.segment_bytes != 0u64 {
+            ::buffa::types::put_uint64_field(6u32, self.segment_bytes, buf);
+        }
+        if self.segment_ops != 0u64 {
+            ::buffa::types::put_uint64_field(7u32, self.segment_ops, buf);
+        }
+        if self.pending_ops != 0u64 {
+            ::buffa::types::put_uint64_field(8u32, self.pending_ops, buf);
+        }
+        if self.checkpoint != 0u64 {
+            ::buffa::types::put_uint64_field(9u32, self.checkpoint, buf);
+        }
+        if self.checkpoint_ms != 0i64 {
+            ::buffa::types::put_int64_field(10u32, self.checkpoint_ms, buf);
+        }
+        if self.checkpoint_ops != 0u64 {
+            ::buffa::types::put_uint64_field(11u32, self.checkpoint_ops, buf);
+        }
+        if self.checkpoint_age_seconds.to_bits() != 0u64 {
+            ::buffa::types::put_double_field(12u32, self.checkpoint_age_seconds, buf);
+        }
+        if self.checkpoint_seconds.to_bits() != 0u64 {
+            ::buffa::types::put_double_field(13u32, self.checkpoint_seconds, buf);
+        }
+        if self.checkpoint_bytes != 0u64 {
+            ::buffa::types::put_uint64_field(14u32, self.checkpoint_bytes, buf);
+        }
+        if self.checkpoint_shards != 0u32 {
+            ::buffa::types::put_uint32_field(15u32, self.checkpoint_shards, buf);
+        }
+        if self.replayed_segments != 0u32 {
+            ::buffa::types::put_uint32_field(16u32, self.replayed_segments, buf);
+        }
+        if self.replayed_ops != 0u64 {
+            ::buffa::types::put_uint64_field(17u32, self.replayed_ops, buf);
+        }
+        if self.replay_seconds.to_bits() != 0u64 {
+            ::buffa::types::put_double_field(18u32, self.replay_seconds, buf);
+        }
+        self.__buffa_unknown_fields.write_to(buf);
+    }
+}
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for DurabilityView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        if !::buffa::json_helpers::skip_if::is_zero_f64(&self.segment_interval_seconds) {
+            __map
+                .serialize_entry(
+                    "segmentIntervalSeconds",
+                    &::buffa::json_helpers::ProtoJson(&self.segment_interval_seconds),
+                )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.segment) {
+            __map
+                .serialize_entry(
+                    "segment",
+                    &::buffa::json_helpers::ProtoJson(&self.segment),
+                )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_i64(&self.segment_ms) {
+            __map
+                .serialize_entry(
+                    "segmentMs",
+                    &::buffa::json_helpers::ProtoJson(&self.segment_ms),
+                )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_f64(&self.segment_write_seconds) {
+            __map
+                .serialize_entry(
+                    "segmentWriteSeconds",
+                    &::buffa::json_helpers::ProtoJson(&self.segment_write_seconds),
+                )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u32(&self.segments) {
+            __map
+                .serialize_entry(
+                    "segments",
+                    &::buffa::json_helpers::ProtoJson(&self.segments),
+                )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.segment_bytes) {
+            __map
+                .serialize_entry(
+                    "segmentBytes",
+                    &::buffa::json_helpers::ProtoJson(&self.segment_bytes),
+                )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.segment_ops) {
+            __map
+                .serialize_entry(
+                    "segmentOps",
+                    &::buffa::json_helpers::ProtoJson(&self.segment_ops),
+                )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.pending_ops) {
+            __map
+                .serialize_entry(
+                    "pendingOps",
+                    &::buffa::json_helpers::ProtoJson(&self.pending_ops),
+                )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.checkpoint) {
+            __map
+                .serialize_entry(
+                    "checkpoint",
+                    &::buffa::json_helpers::ProtoJson(&self.checkpoint),
+                )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_i64(&self.checkpoint_ms) {
+            __map
+                .serialize_entry(
+                    "checkpointMs",
+                    &::buffa::json_helpers::ProtoJson(&self.checkpoint_ms),
+                )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.checkpoint_ops) {
+            __map
+                .serialize_entry(
+                    "checkpointOps",
+                    &::buffa::json_helpers::ProtoJson(&self.checkpoint_ops),
+                )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_f64(&self.checkpoint_age_seconds) {
+            __map
+                .serialize_entry(
+                    "checkpointAgeSeconds",
+                    &::buffa::json_helpers::ProtoJson(&self.checkpoint_age_seconds),
+                )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_f64(&self.checkpoint_seconds) {
+            __map
+                .serialize_entry(
+                    "checkpointSeconds",
+                    &::buffa::json_helpers::ProtoJson(&self.checkpoint_seconds),
+                )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.checkpoint_bytes) {
+            __map
+                .serialize_entry(
+                    "checkpointBytes",
+                    &::buffa::json_helpers::ProtoJson(&self.checkpoint_bytes),
+                )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u32(&self.checkpoint_shards) {
+            __map
+                .serialize_entry(
+                    "checkpointShards",
+                    &::buffa::json_helpers::ProtoJson(&self.checkpoint_shards),
+                )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u32(&self.replayed_segments) {
+            __map
+                .serialize_entry(
+                    "replayedSegments",
+                    &::buffa::json_helpers::ProtoJson(&self.replayed_segments),
+                )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.replayed_ops) {
+            __map
+                .serialize_entry(
+                    "replayedOps",
+                    &::buffa::json_helpers::ProtoJson(&self.replayed_ops),
+                )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_f64(&self.replay_seconds) {
+            __map
+                .serialize_entry(
+                    "replaySeconds",
+                    &::buffa::json_helpers::ProtoJson(&self.replay_seconds),
+                )?;
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for DurabilityView<'a> {
+    const PACKAGE: &'static str = "marco.v1";
+    const NAME: &'static str = "Durability";
+    const FULL_NAME: &'static str = "marco.v1.Durability";
+    const TYPE_URL: &'static str = "type.googleapis.com/marco.v1.Durability";
+}
+::buffa::impl_default_view_instance!(DurabilityView);
+::buffa::impl_view_reborrow!(DurabilityView);
+/** Self-contained, `'static` owned view of a `Durability` message.
+
+ Wraps [`::buffa::OwnedView`]`<`[`DurabilityView`]`<'static>>`: the decoded view and the [`::buffa::bytes::Bytes`] buffer it borrows from travel together, so the handle is `'static` and `Send + Sync` — suitable for async handlers, spawned tasks, and anywhere a `'static` bound is required.
+
+ Field accessors return borrows tied to `&self`. Use [`Self::view`] to get the full [`DurabilityView`] when you need struct patterns, iteration helpers, or to pass the view to lifetime-parameterised code.*/
+#[derive(Clone, Debug)]
+pub struct DurabilityOwnedView(::buffa::OwnedView<DurabilityView<'static>>);
+impl DurabilityOwnedView {
+    /// Decode an owned view from a [`::buffa::bytes::Bytes`] buffer.
+    ///
+    /// The view borrows directly from the buffer's data; the buffer is
+    /// retained inside the returned handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer contains invalid
+    /// protobuf data.
+    pub fn decode(
+        bytes: ::buffa::bytes::Bytes,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            DurabilityOwnedView(::buffa::OwnedView::decode(bytes)?),
+        )
+    }
+    /// Decode with custom [`::buffa::DecodeOptions`] (recursion limit,
+    /// max message size).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer is invalid or
+    /// exceeds the configured limits.
+    pub fn decode_with_options(
+        bytes: ::buffa::bytes::Bytes,
+        opts: &::buffa::DecodeOptions,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            DurabilityOwnedView(::buffa::OwnedView::decode_with_options(bytes, opts)?),
+        )
+    }
+    /// Build from an owned message via an encode → decode round-trip.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError::MessageTooLarge`] if the
+    /// message's encoded size exceeds the 2 GiB protobuf limit, or
+    /// another [`::buffa::DecodeError`] if the re-encoded bytes are
+    /// somehow invalid (should not happen for well-formed messages).
+    pub fn from_owned(
+        msg: &super::super::Durability,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            DurabilityOwnedView(::buffa::OwnedView::from_owned(msg)?),
+        )
+    }
+    /// Borrow the full [`DurabilityView`] with its lifetime tied to `&self`.
+    #[must_use]
+    pub fn view(&self) -> &DurabilityView<'_> {
+        self.0.reborrow()
+    }
+    /// Convert to the owned message type.
+    ///
+    /// Infallible: this type's constructors wire-decode their
+    /// buffer, and a view produced by wire decoding always
+    /// converts. Delegates to [`::buffa::OwnedView::to_owned_message`],
+    /// whose contract also governs handles converted from a raw
+    /// [`::buffa::OwnedView`].
+    #[must_use]
+    pub fn to_owned_message(&self) -> super::super::Durability {
+        self.0.to_owned_message()
+    }
+    /// The underlying bytes buffer.
+    #[must_use]
+    pub fn bytes(&self) -> &::buffa::bytes::Bytes {
+        self.0.bytes()
+    }
+    /// Consume the handle, returning the underlying bytes buffer.
+    #[must_use]
+    pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
+        self.0.into_bytes()
+    }
+    /// Field 1: `segment_interval_seconds`
+    #[must_use]
+    pub fn segment_interval_seconds(&self) -> f64 {
+        self.0.reborrow().segment_interval_seconds
+    }
+    /// The newest segment written, its time, and how long its write took.
+    ///
+    /// Field 2: `segment`
+    #[must_use]
+    pub fn segment(&self) -> u64 {
+        self.0.reborrow().segment
+    }
+    /// Field 3: `segment_ms`
+    #[must_use]
+    pub fn segment_ms(&self) -> i64 {
+        self.0.reborrow().segment_ms
+    }
+    /// Field 4: `segment_write_seconds`
+    #[must_use]
+    pub fn segment_write_seconds(&self) -> f64 {
+        self.0.reborrow().segment_write_seconds
+    }
+    /// Segments (and their bytes and ops) since the checkpoint: what a restart replays.
+    ///
+    /// Field 5: `segments`
+    #[must_use]
+    pub fn segments(&self) -> u32 {
+        self.0.reborrow().segments
+    }
+    /// Field 6: `segment_bytes`
+    #[must_use]
+    pub fn segment_bytes(&self) -> u64 {
+        self.0.reborrow().segment_bytes
+    }
+    /// Field 7: `segment_ops`
+    #[must_use]
+    pub fn segment_ops(&self) -> u64 {
+        self.0.reborrow().segment_ops
+    }
+    /// Ops applied but not in a segment yet.
+    ///
+    /// Field 8: `pending_ops`
+    #[must_use]
+    pub fn pending_ops(&self) -> u64 {
+        self.0.reborrow().pending_ops
+    }
+    /// Field 9: `checkpoint`
+    #[must_use]
+    pub fn checkpoint(&self) -> u64 {
+        self.0.reborrow().checkpoint
+    }
+    /// Field 10: `checkpoint_ms`
+    #[must_use]
+    pub fn checkpoint_ms(&self) -> i64 {
+        self.0.reborrow().checkpoint_ms
+    }
+    /// A checkpoint starts once segment_ops passes this, or the checkpoint is this old.
+    ///
+    /// Field 11: `checkpoint_ops`
+    #[must_use]
+    pub fn checkpoint_ops(&self) -> u64 {
+        self.0.reborrow().checkpoint_ops
+    }
+    /// Field 12: `checkpoint_age_seconds`
+    #[must_use]
+    pub fn checkpoint_age_seconds(&self) -> f64 {
+        self.0.reborrow().checkpoint_age_seconds
+    }
+    /// The last checkpoint's wall time and bytes written.
+    ///
+    /// Field 13: `checkpoint_seconds`
+    #[must_use]
+    pub fn checkpoint_seconds(&self) -> f64 {
+        self.0.reborrow().checkpoint_seconds
+    }
+    /// Field 14: `checkpoint_bytes`
+    #[must_use]
+    pub fn checkpoint_bytes(&self) -> u64 {
+        self.0.reborrow().checkpoint_bytes
+    }
+    /// Field 15: `checkpoint_shards`
+    #[must_use]
+    pub fn checkpoint_shards(&self) -> u32 {
+        self.0.reborrow().checkpoint_shards
+    }
+    /// The replay at start: segments, ops and seconds.
+    ///
+    /// Field 16: `replayed_segments`
+    #[must_use]
+    pub fn replayed_segments(&self) -> u32 {
+        self.0.reborrow().replayed_segments
+    }
+    /// Field 17: `replayed_ops`
+    #[must_use]
+    pub fn replayed_ops(&self) -> u64 {
+        self.0.reborrow().replayed_ops
+    }
+    /// Field 18: `replay_seconds`
+    #[must_use]
+    pub fn replay_seconds(&self) -> f64 {
+        self.0.reborrow().replay_seconds
+    }
+}
+impl ::core::convert::From<::buffa::OwnedView<DurabilityView<'static>>>
+for DurabilityOwnedView {
+    fn from(inner: ::buffa::OwnedView<DurabilityView<'static>>) -> Self {
+        DurabilityOwnedView(inner)
+    }
+}
+impl ::core::convert::From<DurabilityOwnedView>
+for ::buffa::OwnedView<DurabilityView<'static>> {
+    fn from(wrapper: DurabilityOwnedView) -> Self {
+        wrapper.0
+    }
+}
+impl ::core::convert::AsRef<::buffa::OwnedView<DurabilityView<'static>>>
+for DurabilityOwnedView {
+    fn as_ref(&self) -> &::buffa::OwnedView<DurabilityView<'static>> {
+        &self.0
+    }
+}
+impl ::buffa::HasMessageView for super::super::Durability {
+    type View<'a> = DurabilityView<'a>;
+    type ViewHandle = DurabilityOwnedView;
+}
+impl ::serde::Serialize for DurabilityOwnedView {
     fn serialize<__S: ::serde::Serializer>(
         &self,
         __s: __S,
@@ -3456,7 +4364,7 @@ impl ::serde::Serialize for ProcessInfoOwnedView {
 }
 #[derive(Clone, Debug, Default)]
 pub struct JobView<'a> {
-    /// "write" or "verify"; empty when none has run.
+    /// "checkpoint" or "verify"; empty when none has run.
     ///
     /// Field 1: `kind`
     pub kind: &'a str,
@@ -3790,7 +4698,7 @@ impl JobOwnedView {
     pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
         self.0.into_bytes()
     }
-    /// "write" or "verify"; empty when none has run.
+    /// "checkpoint" or "verify"; empty when none has run.
     ///
     /// Field 1: `kind`
     #[must_use]
@@ -6592,7 +7500,7 @@ pub struct ShardView<'a> {
     pub merged_bytes: u64,
     /// Field 11: `tombstones`
     pub tombstones: u32,
-    /// clean, dirty, over or writing.
+    /// clean, dirty or writing (a checkpoint is rewriting it).
     ///
     /// Field 12: `state`
     pub state: &'a str,
@@ -6602,6 +7510,13 @@ pub struct ShardView<'a> {
     pub verify: &'a str,
     /// Field 14: `verify_error`
     pub verify_error: &'a str,
+    /// Its file and the checkpoint that wrote it; empty for a shard of new ids
+    /// with no file yet.
+    ///
+    /// Field 15: `file`
+    pub file: &'a str,
+    /// Field 16: `checkpoint`
+    pub checkpoint: u64,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for ShardView<'a> {
@@ -6732,6 +7647,20 @@ impl<'a> ::buffa::MessageView<'a> for ShardView<'a> {
                 )?;
                 view.verify_error = ::buffa::types::borrow_str(&mut cur)?;
             }
+            15u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                view.file = ::buffa::types::borrow_str(&mut cur)?;
+            }
+            16u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.checkpoint = ::buffa::types::decode_uint64(&mut cur)?;
+            }
             _ => {
                 ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
                 let span_len = before_tag.len() - cur.len();
@@ -6768,6 +7697,8 @@ impl<'a> ::buffa::MessageView<'a> for ShardView<'a> {
             state: self.state.to_string(),
             verify: self.verify.to_string(),
             verify_error: self.verify_error.to_string(),
+            file: self.file.to_string(),
+            checkpoint: self.checkpoint,
             __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
@@ -6821,6 +7752,12 @@ impl<'a> ::buffa::ViewEncode<'a> for ShardView<'a> {
         if !self.verify_error.is_empty() {
             size += 1u64 + ::buffa::types::string_encoded_len(&self.verify_error) as u64;
         }
+        if !self.file.is_empty() {
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.file) as u64;
+        }
+        if self.checkpoint != 0u64 {
+            size += 2u64 + ::buffa::types::uint64_encoded_len(self.checkpoint) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -6873,6 +7810,12 @@ impl<'a> ::buffa::ViewEncode<'a> for ShardView<'a> {
         }
         if !self.verify_error.is_empty() {
             ::buffa::types::put_string_field(14u32, &self.verify_error, buf);
+        }
+        if !self.file.is_empty() {
+            ::buffa::types::put_string_field(15u32, &self.file, buf);
+        }
+        if self.checkpoint != 0u64 {
+            ::buffa::types::put_uint64_field(16u32, self.checkpoint, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -6972,6 +7915,16 @@ impl<'__a> ::serde::Serialize for ShardView<'__a> {
         }
         if !::buffa::json_helpers::skip_if::is_empty_str(self.verify_error) {
             __map.serialize_entry("verifyError", self.verify_error)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.file) {
+            __map.serialize_entry("file", self.file)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.checkpoint) {
+            __map
+                .serialize_entry(
+                    "checkpoint",
+                    &::buffa::json_helpers::ProtoJson(&self.checkpoint),
+                )?;
         }
         __map.end()
     }
@@ -7119,7 +8072,7 @@ impl ShardOwnedView {
     pub fn tombstones(&self) -> u32 {
         self.0.reborrow().tombstones
     }
-    /// clean, dirty, over or writing.
+    /// clean, dirty or writing (a checkpoint is rewriting it).
     ///
     /// Field 12: `state`
     #[must_use]
@@ -7137,6 +8090,19 @@ impl ShardOwnedView {
     #[must_use]
     pub fn verify_error(&self) -> &'_ str {
         self.0.reborrow().verify_error
+    }
+    /// Its file and the checkpoint that wrote it; empty for a shard of new ids
+    /// with no file yet.
+    ///
+    /// Field 15: `file`
+    #[must_use]
+    pub fn file(&self) -> &'_ str {
+        self.0.reborrow().file
+    }
+    /// Field 16: `checkpoint`
+    #[must_use]
+    pub fn checkpoint(&self) -> u64 {
+        self.0.reborrow().checkpoint
     }
 }
 impl ::core::convert::From<::buffa::OwnedView<ShardView<'static>>> for ShardOwnedView {
@@ -8484,675 +9450,6 @@ impl ::buffa::HasMessageView for super::super::DeltaList {
     type ViewHandle = DeltaListOwnedView;
 }
 impl ::serde::Serialize for DeltaListOwnedView {
-    fn serialize<__S: ::serde::Serializer>(
-        &self,
-        __s: __S,
-    ) -> ::core::result::Result<__S::Ok, __S::Error> {
-        ::serde::Serialize::serialize(&self.0, __s)
-    }
-}
-#[derive(Clone, Debug, Default)]
-pub struct GetWalRequestView<'a> {
-    pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
-}
-impl<'a> ::buffa::MessageView<'a> for GetWalRequestView<'a> {
-    type Owned = super::super::GetWalRequest;
-    fn decode_view(buf: &'a [u8]) -> ::core::result::Result<Self, ::buffa::DecodeError> {
-        let __limit = ::core::cell::Cell::new(::buffa::DEFAULT_UNKNOWN_FIELD_LIMIT);
-        let __elem = ::core::cell::Cell::new(::buffa::DEFAULT_ELEMENT_MEMORY_LIMIT);
-        <Self as ::buffa::MessageView>::decode_view_ctx(
-            buf,
-            ::buffa::DecodeContext::new(::buffa::RECURSION_LIMIT, &__limit)
-                .with_element_memory(&__elem),
-        )
-    }
-    fn decode_view_with_ctx(
-        buf: &'a [u8],
-        ctx: ::buffa::DecodeContext<'_>,
-    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
-        <Self as ::buffa::MessageView>::decode_view_ctx(buf, ctx)
-    }
-    #[inline]
-    fn merge_view_field(
-        &mut self,
-        tag: ::buffa::encoding::Tag,
-        cur: &'a [u8],
-        before_tag: &'a [u8],
-        ctx: ::buffa::DecodeContext<'_>,
-    ) -> ::core::result::Result<&'a [u8], ::buffa::DecodeError> {
-        let _ = ctx;
-        #[allow(unused_variables)]
-        let view = self;
-        let mut cur = cur;
-        match tag.field_number() {
-            _ => {
-                ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
-                let span_len = before_tag.len() - cur.len();
-                view.__buffa_unknown_fields.push_record(before_tag, span_len, ctx)?;
-            }
-        }
-        ::core::result::Result::Ok(cur)
-    }
-    fn to_owned_message(
-        &self,
-    ) -> ::core::result::Result<super::super::GetWalRequest, ::buffa::DecodeError> {
-        self.to_owned_from_source(None)
-    }
-    #[allow(clippy::useless_conversion, clippy::needless_update)]
-    fn to_owned_from_source(
-        &self,
-        __buffa_src: ::core::option::Option<&::buffa::bytes::Bytes>,
-    ) -> ::core::result::Result<super::super::GetWalRequest, ::buffa::DecodeError> {
-        #[allow(unused_imports)]
-        use ::buffa::alloc::string::ToString as _;
-        let _ = __buffa_src;
-        ::core::result::Result::Ok(super::super::GetWalRequest {
-            __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
-            ..::core::default::Default::default()
-        })
-    }
-}
-impl<'a> ::buffa::ViewEncode<'a> for GetWalRequestView<'a> {
-    #[allow(clippy::needless_borrow, clippy::let_and_return)]
-    fn compute_size(&self, _cache: &mut ::buffa::SizeCache) -> u32 {
-        #[allow(unused_imports)]
-        use ::buffa::Enumeration as _;
-        let mut size = 0u64;
-        size += self.__buffa_unknown_fields.encoded_len() as u64;
-        ::buffa::saturate_size(size)
-    }
-    #[allow(clippy::needless_borrow)]
-    fn write_to(
-        &self,
-        _cache: &mut ::buffa::SizeCache,
-        buf: &mut impl ::buffa::EncodeSink,
-    ) {
-        #[allow(unused_imports)]
-        use ::buffa::Enumeration as _;
-        self.__buffa_unknown_fields.write_to(buf);
-    }
-}
-/// Serializes this view as protobuf JSON.
-///
-/// Implicit-presence fields with default values are omitted, `required`
-/// fields are always emitted, explicit-presence (`optional`) fields are
-/// emitted only when set, bytes fields are base64-encoded, and enum
-/// values are their proto name strings.
-///
-/// This impl uses `serialize_map(None)` because the number of emitted
-/// fields depends on default-omission rules; serializers that require
-/// known map lengths (e.g. `bincode`) will return a runtime error.
-/// Use the owned message type for those formats.
-impl<'__a> ::serde::Serialize for GetWalRequestView<'__a> {
-    fn serialize<__S: ::serde::Serializer>(
-        &self,
-        __s: __S,
-    ) -> ::core::result::Result<__S::Ok, __S::Error> {
-        use ::serde::ser::SerializeMap as _;
-        let mut __map = __s.serialize_map(::core::option::Option::None)?;
-        __map.end()
-    }
-}
-impl<'a> ::buffa::MessageName for GetWalRequestView<'a> {
-    const PACKAGE: &'static str = "marco.v1";
-    const NAME: &'static str = "GetWalRequest";
-    const FULL_NAME: &'static str = "marco.v1.GetWalRequest";
-    const TYPE_URL: &'static str = "type.googleapis.com/marco.v1.GetWalRequest";
-}
-::buffa::impl_default_view_instance!(GetWalRequestView);
-::buffa::impl_view_reborrow!(GetWalRequestView);
-/** Self-contained, `'static` owned view of a `GetWalRequest` message.
-
- Wraps [`::buffa::OwnedView`]`<`[`GetWalRequestView`]`<'static>>`: the decoded view and the [`::buffa::bytes::Bytes`] buffer it borrows from travel together, so the handle is `'static` and `Send + Sync` — suitable for async handlers, spawned tasks, and anywhere a `'static` bound is required.
-
- Field accessors return borrows tied to `&self`. Use [`Self::view`] to get the full [`GetWalRequestView`] when you need struct patterns, iteration helpers, or to pass the view to lifetime-parameterised code.*/
-#[derive(Clone, Debug)]
-pub struct GetWalRequestOwnedView(::buffa::OwnedView<GetWalRequestView<'static>>);
-impl GetWalRequestOwnedView {
-    /// Decode an owned view from a [`::buffa::bytes::Bytes`] buffer.
-    ///
-    /// The view borrows directly from the buffer's data; the buffer is
-    /// retained inside the returned handle.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`::buffa::DecodeError`] if the buffer contains invalid
-    /// protobuf data.
-    pub fn decode(
-        bytes: ::buffa::bytes::Bytes,
-    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
-        ::core::result::Result::Ok(
-            GetWalRequestOwnedView(::buffa::OwnedView::decode(bytes)?),
-        )
-    }
-    /// Decode with custom [`::buffa::DecodeOptions`] (recursion limit,
-    /// max message size).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`::buffa::DecodeError`] if the buffer is invalid or
-    /// exceeds the configured limits.
-    pub fn decode_with_options(
-        bytes: ::buffa::bytes::Bytes,
-        opts: &::buffa::DecodeOptions,
-    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
-        ::core::result::Result::Ok(
-            GetWalRequestOwnedView(::buffa::OwnedView::decode_with_options(bytes, opts)?),
-        )
-    }
-    /// Build from an owned message via an encode → decode round-trip.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`::buffa::DecodeError::MessageTooLarge`] if the
-    /// message's encoded size exceeds the 2 GiB protobuf limit, or
-    /// another [`::buffa::DecodeError`] if the re-encoded bytes are
-    /// somehow invalid (should not happen for well-formed messages).
-    pub fn from_owned(
-        msg: &super::super::GetWalRequest,
-    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
-        ::core::result::Result::Ok(
-            GetWalRequestOwnedView(::buffa::OwnedView::from_owned(msg)?),
-        )
-    }
-    /// Borrow the full [`GetWalRequestView`] with its lifetime tied to `&self`.
-    #[must_use]
-    pub fn view(&self) -> &GetWalRequestView<'_> {
-        self.0.reborrow()
-    }
-    /// Convert to the owned message type.
-    ///
-    /// Infallible: this type's constructors wire-decode their
-    /// buffer, and a view produced by wire decoding always
-    /// converts. Delegates to [`::buffa::OwnedView::to_owned_message`],
-    /// whose contract also governs handles converted from a raw
-    /// [`::buffa::OwnedView`].
-    #[must_use]
-    pub fn to_owned_message(&self) -> super::super::GetWalRequest {
-        self.0.to_owned_message()
-    }
-    /// The underlying bytes buffer.
-    #[must_use]
-    pub fn bytes(&self) -> &::buffa::bytes::Bytes {
-        self.0.bytes()
-    }
-    /// Consume the handle, returning the underlying bytes buffer.
-    #[must_use]
-    pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
-        self.0.into_bytes()
-    }
-}
-impl ::core::convert::From<::buffa::OwnedView<GetWalRequestView<'static>>>
-for GetWalRequestOwnedView {
-    fn from(inner: ::buffa::OwnedView<GetWalRequestView<'static>>) -> Self {
-        GetWalRequestOwnedView(inner)
-    }
-}
-impl ::core::convert::From<GetWalRequestOwnedView>
-for ::buffa::OwnedView<GetWalRequestView<'static>> {
-    fn from(wrapper: GetWalRequestOwnedView) -> Self {
-        wrapper.0
-    }
-}
-impl ::core::convert::AsRef<::buffa::OwnedView<GetWalRequestView<'static>>>
-for GetWalRequestOwnedView {
-    fn as_ref(&self) -> &::buffa::OwnedView<GetWalRequestView<'static>> {
-        &self.0
-    }
-}
-impl ::buffa::HasMessageView for super::super::GetWalRequest {
-    type View<'a> = GetWalRequestView<'a>;
-    type ViewHandle = GetWalRequestOwnedView;
-}
-impl ::serde::Serialize for GetWalRequestOwnedView {
-    fn serialize<__S: ::serde::Serializer>(
-        &self,
-        __s: __S,
-    ) -> ::core::result::Result<__S::Ok, __S::Error> {
-        ::serde::Serialize::serialize(&self.0, __s)
-    }
-}
-#[derive(Clone, Debug, Default)]
-pub struct GetWalResponseView<'a> {
-    /// Field 1: `head_seq`
-    pub head_seq: u64,
-    /// Field 2: `trim_seq`
-    pub trim_seq: u64,
-    /// Field 3: `held_ops`
-    pub held_ops: u64,
-    /// Field 4: `held_bytes`
-    pub held_bytes: u64,
-    /// Field 5: `files`
-    pub files: ::buffa::RepeatedView<'a, &'a str>,
-    /// Field 6: `fsync_p99_seconds`
-    pub fsync_p99_seconds: f64,
-    /// The seq each shard is persisted to.
-    ///
-    /// Field 7: `shard_seqs`
-    pub shard_seqs: ::buffa::RepeatedView<'a, u64>,
-    pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
-}
-impl<'a> ::buffa::MessageView<'a> for GetWalResponseView<'a> {
-    type Owned = super::super::GetWalResponse;
-    fn decode_view(buf: &'a [u8]) -> ::core::result::Result<Self, ::buffa::DecodeError> {
-        let __limit = ::core::cell::Cell::new(::buffa::DEFAULT_UNKNOWN_FIELD_LIMIT);
-        let __elem = ::core::cell::Cell::new(::buffa::DEFAULT_ELEMENT_MEMORY_LIMIT);
-        <Self as ::buffa::MessageView>::decode_view_ctx(
-            buf,
-            ::buffa::DecodeContext::new(::buffa::RECURSION_LIMIT, &__limit)
-                .with_element_memory(&__elem),
-        )
-    }
-    fn decode_view_with_ctx(
-        buf: &'a [u8],
-        ctx: ::buffa::DecodeContext<'_>,
-    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
-        <Self as ::buffa::MessageView>::decode_view_ctx(buf, ctx)
-    }
-    #[inline]
-    fn merge_view_field(
-        &mut self,
-        tag: ::buffa::encoding::Tag,
-        cur: &'a [u8],
-        before_tag: &'a [u8],
-        ctx: ::buffa::DecodeContext<'_>,
-    ) -> ::core::result::Result<&'a [u8], ::buffa::DecodeError> {
-        let _ = ctx;
-        #[allow(unused_variables)]
-        let view = self;
-        let mut cur = cur;
-        match tag.field_number() {
-            1u32 => {
-                ::buffa::encoding::check_wire_type(
-                    tag,
-                    ::buffa::encoding::WireType::Varint,
-                )?;
-                view.head_seq = ::buffa::types::decode_uint64(&mut cur)?;
-            }
-            2u32 => {
-                ::buffa::encoding::check_wire_type(
-                    tag,
-                    ::buffa::encoding::WireType::Varint,
-                )?;
-                view.trim_seq = ::buffa::types::decode_uint64(&mut cur)?;
-            }
-            3u32 => {
-                ::buffa::encoding::check_wire_type(
-                    tag,
-                    ::buffa::encoding::WireType::Varint,
-                )?;
-                view.held_ops = ::buffa::types::decode_uint64(&mut cur)?;
-            }
-            4u32 => {
-                ::buffa::encoding::check_wire_type(
-                    tag,
-                    ::buffa::encoding::WireType::Varint,
-                )?;
-                view.held_bytes = ::buffa::types::decode_uint64(&mut cur)?;
-            }
-            6u32 => {
-                ::buffa::encoding::check_wire_type(
-                    tag,
-                    ::buffa::encoding::WireType::Fixed64,
-                )?;
-                view.fsync_p99_seconds = ::buffa::types::decode_double(&mut cur)?;
-            }
-            5u32 => {
-                ::buffa::encoding::check_wire_type(
-                    tag,
-                    ::buffa::encoding::WireType::LengthDelimited,
-                )?;
-                let __elem = ::buffa::types::borrow_str(&mut cur)?;
-                ctx.register_element_memory(
-                    ::buffa::__private::element_footprint(&__elem),
-                )?;
-                view.files.push(__elem);
-            }
-            7u32 => {
-                if tag.wire_type() == ::buffa::encoding::WireType::LengthDelimited {
-                    let payload = ::buffa::types::borrow_bytes(&mut cur)?;
-                    ::buffa::types::extend_packed_uint64(
-                        payload,
-                        view.shard_seqs.as_mut_vec(),
-                        ::buffa::encoding::count_varints(payload),
-                    )?;
-                } else if tag.wire_type() == ::buffa::encoding::WireType::Varint {
-                    view.shard_seqs.push(::buffa::types::decode_uint64(&mut cur)?);
-                } else {
-                    return Err(
-                        ::buffa::encoding::wire_type_mismatch(
-                            tag,
-                            ::buffa::encoding::WireType::LengthDelimited,
-                        ),
-                    );
-                }
-            }
-            _ => {
-                ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
-                let span_len = before_tag.len() - cur.len();
-                view.__buffa_unknown_fields.push_record(before_tag, span_len, ctx)?;
-            }
-        }
-        ::core::result::Result::Ok(cur)
-    }
-    fn to_owned_message(
-        &self,
-    ) -> ::core::result::Result<super::super::GetWalResponse, ::buffa::DecodeError> {
-        self.to_owned_from_source(None)
-    }
-    #[allow(clippy::useless_conversion, clippy::needless_update)]
-    fn to_owned_from_source(
-        &self,
-        __buffa_src: ::core::option::Option<&::buffa::bytes::Bytes>,
-    ) -> ::core::result::Result<super::super::GetWalResponse, ::buffa::DecodeError> {
-        #[allow(unused_imports)]
-        use ::buffa::alloc::string::ToString as _;
-        let _ = __buffa_src;
-        ::core::result::Result::Ok(super::super::GetWalResponse {
-            head_seq: self.head_seq,
-            trim_seq: self.trim_seq,
-            held_ops: self.held_ops,
-            held_bytes: self.held_bytes,
-            files: self.files.iter().map(|s| s.to_string()).collect(),
-            fsync_p99_seconds: self.fsync_p99_seconds,
-            shard_seqs: self.shard_seqs.to_vec(),
-            __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
-            ..::core::default::Default::default()
-        })
-    }
-}
-impl<'a> ::buffa::ViewEncode<'a> for GetWalResponseView<'a> {
-    #[allow(clippy::needless_borrow, clippy::let_and_return)]
-    fn compute_size(&self, _cache: &mut ::buffa::SizeCache) -> u32 {
-        #[allow(unused_imports)]
-        use ::buffa::Enumeration as _;
-        let mut size = 0u64;
-        if self.head_seq != 0u64 {
-            size += 1u64 + ::buffa::types::uint64_encoded_len(self.head_seq) as u64;
-        }
-        if self.trim_seq != 0u64 {
-            size += 1u64 + ::buffa::types::uint64_encoded_len(self.trim_seq) as u64;
-        }
-        if self.held_ops != 0u64 {
-            size += 1u64 + ::buffa::types::uint64_encoded_len(self.held_ops) as u64;
-        }
-        if self.held_bytes != 0u64 {
-            size += 1u64 + ::buffa::types::uint64_encoded_len(self.held_bytes) as u64;
-        }
-        for v in &self.files {
-            size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
-        }
-        if self.fsync_p99_seconds.to_bits() != 0u64 {
-            size += 1u64 + ::buffa::types::FIXED64_ENCODED_LEN as u64;
-        }
-        if !self.shard_seqs.is_empty() {
-            let payload: u64 = self
-                .shard_seqs
-                .iter()
-                .map(|&v| ::buffa::types::uint64_encoded_len(v) as u64)
-                .sum::<u64>();
-            size += 1u64 + ::buffa::encoding::varint_len(payload) as u64 + payload;
-        }
-        size += self.__buffa_unknown_fields.encoded_len() as u64;
-        ::buffa::saturate_size(size)
-    }
-    #[allow(clippy::needless_borrow)]
-    fn write_to(
-        &self,
-        _cache: &mut ::buffa::SizeCache,
-        buf: &mut impl ::buffa::EncodeSink,
-    ) {
-        #[allow(unused_imports)]
-        use ::buffa::Enumeration as _;
-        if self.head_seq != 0u64 {
-            ::buffa::types::put_uint64_field(1u32, self.head_seq, buf);
-        }
-        if self.trim_seq != 0u64 {
-            ::buffa::types::put_uint64_field(2u32, self.trim_seq, buf);
-        }
-        if self.held_ops != 0u64 {
-            ::buffa::types::put_uint64_field(3u32, self.held_ops, buf);
-        }
-        if self.held_bytes != 0u64 {
-            ::buffa::types::put_uint64_field(4u32, self.held_bytes, buf);
-        }
-        for v in &self.files {
-            ::buffa::types::put_string_field(5u32, v, buf);
-        }
-        if self.fsync_p99_seconds.to_bits() != 0u64 {
-            ::buffa::types::put_double_field(6u32, self.fsync_p99_seconds, buf);
-        }
-        if !self.shard_seqs.is_empty() {
-            let payload: u64 = self
-                .shard_seqs
-                .iter()
-                .map(|&v| ::buffa::types::uint64_encoded_len(v) as u64)
-                .sum::<u64>();
-            ::buffa::types::put_len_delimited_header(7u32, payload, buf);
-            for &v in &self.shard_seqs {
-                ::buffa::types::encode_uint64(v, buf);
-            }
-        }
-        self.__buffa_unknown_fields.write_to(buf);
-    }
-}
-/// Serializes this view as protobuf JSON.
-///
-/// Implicit-presence fields with default values are omitted, `required`
-/// fields are always emitted, explicit-presence (`optional`) fields are
-/// emitted only when set, bytes fields are base64-encoded, and enum
-/// values are their proto name strings.
-///
-/// This impl uses `serialize_map(None)` because the number of emitted
-/// fields depends on default-omission rules; serializers that require
-/// known map lengths (e.g. `bincode`) will return a runtime error.
-/// Use the owned message type for those formats.
-impl<'__a> ::serde::Serialize for GetWalResponseView<'__a> {
-    fn serialize<__S: ::serde::Serializer>(
-        &self,
-        __s: __S,
-    ) -> ::core::result::Result<__S::Ok, __S::Error> {
-        use ::serde::ser::SerializeMap as _;
-        let mut __map = __s.serialize_map(::core::option::Option::None)?;
-        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.head_seq) {
-            __map
-                .serialize_entry(
-                    "headSeq",
-                    &::buffa::json_helpers::ProtoJson(&self.head_seq),
-                )?;
-        }
-        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.trim_seq) {
-            __map
-                .serialize_entry(
-                    "trimSeq",
-                    &::buffa::json_helpers::ProtoJson(&self.trim_seq),
-                )?;
-        }
-        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.held_ops) {
-            __map
-                .serialize_entry(
-                    "heldOps",
-                    &::buffa::json_helpers::ProtoJson(&self.held_ops),
-                )?;
-        }
-        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.held_bytes) {
-            __map
-                .serialize_entry(
-                    "heldBytes",
-                    &::buffa::json_helpers::ProtoJson(&self.held_bytes),
-                )?;
-        }
-        if !self.files.is_empty() {
-            __map.serialize_entry("files", &*self.files)?;
-        }
-        if !::buffa::json_helpers::skip_if::is_zero_f64(&self.fsync_p99_seconds) {
-            __map
-                .serialize_entry(
-                    "fsyncP99Seconds",
-                    &::buffa::json_helpers::ProtoJson(&self.fsync_p99_seconds),
-                )?;
-        }
-        if !self.shard_seqs.is_empty() {
-            __map
-                .serialize_entry(
-                    "shardSeqs",
-                    &::buffa::json_helpers::RepeatedJson(&self.shard_seqs),
-                )?;
-        }
-        __map.end()
-    }
-}
-impl<'a> ::buffa::MessageName for GetWalResponseView<'a> {
-    const PACKAGE: &'static str = "marco.v1";
-    const NAME: &'static str = "GetWalResponse";
-    const FULL_NAME: &'static str = "marco.v1.GetWalResponse";
-    const TYPE_URL: &'static str = "type.googleapis.com/marco.v1.GetWalResponse";
-}
-::buffa::impl_default_view_instance!(GetWalResponseView);
-::buffa::impl_view_reborrow!(GetWalResponseView);
-/** Self-contained, `'static` owned view of a `GetWalResponse` message.
-
- Wraps [`::buffa::OwnedView`]`<`[`GetWalResponseView`]`<'static>>`: the decoded view and the [`::buffa::bytes::Bytes`] buffer it borrows from travel together, so the handle is `'static` and `Send + Sync` — suitable for async handlers, spawned tasks, and anywhere a `'static` bound is required.
-
- Field accessors return borrows tied to `&self`. Use [`Self::view`] to get the full [`GetWalResponseView`] when you need struct patterns, iteration helpers, or to pass the view to lifetime-parameterised code.*/
-#[derive(Clone, Debug)]
-pub struct GetWalResponseOwnedView(::buffa::OwnedView<GetWalResponseView<'static>>);
-impl GetWalResponseOwnedView {
-    /// Decode an owned view from a [`::buffa::bytes::Bytes`] buffer.
-    ///
-    /// The view borrows directly from the buffer's data; the buffer is
-    /// retained inside the returned handle.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`::buffa::DecodeError`] if the buffer contains invalid
-    /// protobuf data.
-    pub fn decode(
-        bytes: ::buffa::bytes::Bytes,
-    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
-        ::core::result::Result::Ok(
-            GetWalResponseOwnedView(::buffa::OwnedView::decode(bytes)?),
-        )
-    }
-    /// Decode with custom [`::buffa::DecodeOptions`] (recursion limit,
-    /// max message size).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`::buffa::DecodeError`] if the buffer is invalid or
-    /// exceeds the configured limits.
-    pub fn decode_with_options(
-        bytes: ::buffa::bytes::Bytes,
-        opts: &::buffa::DecodeOptions,
-    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
-        ::core::result::Result::Ok(
-            GetWalResponseOwnedView(
-                ::buffa::OwnedView::decode_with_options(bytes, opts)?,
-            ),
-        )
-    }
-    /// Build from an owned message via an encode → decode round-trip.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`::buffa::DecodeError::MessageTooLarge`] if the
-    /// message's encoded size exceeds the 2 GiB protobuf limit, or
-    /// another [`::buffa::DecodeError`] if the re-encoded bytes are
-    /// somehow invalid (should not happen for well-formed messages).
-    pub fn from_owned(
-        msg: &super::super::GetWalResponse,
-    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
-        ::core::result::Result::Ok(
-            GetWalResponseOwnedView(::buffa::OwnedView::from_owned(msg)?),
-        )
-    }
-    /// Borrow the full [`GetWalResponseView`] with its lifetime tied to `&self`.
-    #[must_use]
-    pub fn view(&self) -> &GetWalResponseView<'_> {
-        self.0.reborrow()
-    }
-    /// Convert to the owned message type.
-    ///
-    /// Infallible: this type's constructors wire-decode their
-    /// buffer, and a view produced by wire decoding always
-    /// converts. Delegates to [`::buffa::OwnedView::to_owned_message`],
-    /// whose contract also governs handles converted from a raw
-    /// [`::buffa::OwnedView`].
-    #[must_use]
-    pub fn to_owned_message(&self) -> super::super::GetWalResponse {
-        self.0.to_owned_message()
-    }
-    /// The underlying bytes buffer.
-    #[must_use]
-    pub fn bytes(&self) -> &::buffa::bytes::Bytes {
-        self.0.bytes()
-    }
-    /// Consume the handle, returning the underlying bytes buffer.
-    #[must_use]
-    pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
-        self.0.into_bytes()
-    }
-    /// Field 1: `head_seq`
-    #[must_use]
-    pub fn head_seq(&self) -> u64 {
-        self.0.reborrow().head_seq
-    }
-    /// Field 2: `trim_seq`
-    #[must_use]
-    pub fn trim_seq(&self) -> u64 {
-        self.0.reborrow().trim_seq
-    }
-    /// Field 3: `held_ops`
-    #[must_use]
-    pub fn held_ops(&self) -> u64 {
-        self.0.reborrow().held_ops
-    }
-    /// Field 4: `held_bytes`
-    #[must_use]
-    pub fn held_bytes(&self) -> u64 {
-        self.0.reborrow().held_bytes
-    }
-    /// Field 5: `files`
-    #[must_use]
-    pub fn files(&self) -> &::buffa::RepeatedView<'_, &'_ str> {
-        &self.0.reborrow().files
-    }
-    /// Field 6: `fsync_p99_seconds`
-    #[must_use]
-    pub fn fsync_p99_seconds(&self) -> f64 {
-        self.0.reborrow().fsync_p99_seconds
-    }
-    /// The seq each shard is persisted to.
-    ///
-    /// Field 7: `shard_seqs`
-    #[must_use]
-    pub fn shard_seqs(&self) -> &::buffa::RepeatedView<'_, u64> {
-        &self.0.reborrow().shard_seqs
-    }
-}
-impl ::core::convert::From<::buffa::OwnedView<GetWalResponseView<'static>>>
-for GetWalResponseOwnedView {
-    fn from(inner: ::buffa::OwnedView<GetWalResponseView<'static>>) -> Self {
-        GetWalResponseOwnedView(inner)
-    }
-}
-impl ::core::convert::From<GetWalResponseOwnedView>
-for ::buffa::OwnedView<GetWalResponseView<'static>> {
-    fn from(wrapper: GetWalResponseOwnedView) -> Self {
-        wrapper.0
-    }
-}
-impl ::core::convert::AsRef<::buffa::OwnedView<GetWalResponseView<'static>>>
-for GetWalResponseOwnedView {
-    fn as_ref(&self) -> &::buffa::OwnedView<GetWalResponseView<'static>> {
-        &self.0
-    }
-}
-impl ::buffa::HasMessageView for super::super::GetWalResponse {
-    type View<'a> = GetWalResponseView<'a>;
-    type ViewHandle = GetWalResponseOwnedView;
-}
-impl ::serde::Serialize for GetWalResponseOwnedView {
     fn serialize<__S: ::serde::Serializer>(
         &self,
         __s: __S,
@@ -12160,10 +12457,14 @@ impl ::serde::Serialize for ListSourcesResponseOwnedView {
 pub struct SourceView<'a> {
     /// Field 1: `name`
     pub name: &'a str,
+    /// url, state, cursor_kind, lag, errors and reconnects are the source's own report.
+    ///
     /// Field 2: `url`
     pub url: &'a str,
     /// Field 3: `state`
     pub state: &'a str,
+    /// The cursor of the last write applied.
+    ///
     /// Field 4: `cursor`
     pub cursor: &'a str,
     /// Field 5: `cursor_kind`
@@ -12176,6 +12477,20 @@ pub struct SourceView<'a> {
     pub errors: u64,
     /// Field 9: `reconnects`
     pub reconnects: u64,
+    /// The cursor in the newest change segment: a restart resumes after it.
+    ///
+    /// Field 10: `durable_cursor`
+    pub durable_cursor: &'a str,
+    /// Configured: readiness waits for it to catch up.
+    ///
+    /// Field 11: `expected`
+    pub expected: bool,
+    /// Field 12: `caught_up`
+    pub caught_up: bool,
+    /// Field 13: `last_ms`
+    pub last_ms: i64,
+    /// Field 14: `ops`
+    pub ops: u64,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for SourceView<'a> {
@@ -12271,6 +12586,41 @@ impl<'a> ::buffa::MessageView<'a> for SourceView<'a> {
                 )?;
                 view.reconnects = ::buffa::types::decode_uint64(&mut cur)?;
             }
+            10u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                view.durable_cursor = ::buffa::types::borrow_str(&mut cur)?;
+            }
+            11u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.expected = ::buffa::types::decode_bool(&mut cur)?;
+            }
+            12u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.caught_up = ::buffa::types::decode_bool(&mut cur)?;
+            }
+            13u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.last_ms = ::buffa::types::decode_int64(&mut cur)?;
+            }
+            14u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.ops = ::buffa::types::decode_uint64(&mut cur)?;
+            }
             _ => {
                 ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
                 let span_len = before_tag.len() - cur.len();
@@ -12302,6 +12652,11 @@ impl<'a> ::buffa::MessageView<'a> for SourceView<'a> {
             ops_per_second: self.ops_per_second,
             errors: self.errors,
             reconnects: self.reconnects,
+            durable_cursor: self.durable_cursor.to_string(),
+            expected: self.expected,
+            caught_up: self.caught_up,
+            last_ms: self.last_ms,
+            ops: self.ops,
             __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
@@ -12340,6 +12695,23 @@ impl<'a> ::buffa::ViewEncode<'a> for SourceView<'a> {
         if self.reconnects != 0u64 {
             size += 1u64 + ::buffa::types::uint64_encoded_len(self.reconnects) as u64;
         }
+        if !self.durable_cursor.is_empty() {
+            size
+                += 1u64
+                    + ::buffa::types::string_encoded_len(&self.durable_cursor) as u64;
+        }
+        if self.expected {
+            size += 1u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
+        }
+        if self.caught_up {
+            size += 1u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
+        }
+        if self.last_ms != 0i64 {
+            size += 1u64 + ::buffa::types::int64_encoded_len(self.last_ms) as u64;
+        }
+        if self.ops != 0u64 {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(self.ops) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -12377,6 +12749,21 @@ impl<'a> ::buffa::ViewEncode<'a> for SourceView<'a> {
         }
         if self.reconnects != 0u64 {
             ::buffa::types::put_uint64_field(9u32, self.reconnects, buf);
+        }
+        if !self.durable_cursor.is_empty() {
+            ::buffa::types::put_string_field(10u32, &self.durable_cursor, buf);
+        }
+        if self.expected {
+            ::buffa::types::put_bool_field(11u32, self.expected, buf);
+        }
+        if self.caught_up {
+            ::buffa::types::put_bool_field(12u32, self.caught_up, buf);
+        }
+        if self.last_ms != 0i64 {
+            ::buffa::types::put_int64_field(13u32, self.last_ms, buf);
+        }
+        if self.ops != 0u64 {
+            ::buffa::types::put_uint64_field(14u32, self.ops, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -12441,6 +12828,25 @@ impl<'__a> ::serde::Serialize for SourceView<'__a> {
                     "reconnects",
                     &::buffa::json_helpers::ProtoJson(&self.reconnects),
                 )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.durable_cursor) {
+            __map.serialize_entry("durableCursor", self.durable_cursor)?;
+        }
+        if self.expected {
+            __map.serialize_entry("expected", &self.expected)?;
+        }
+        if self.caught_up {
+            __map.serialize_entry("caughtUp", &self.caught_up)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_i64(&self.last_ms) {
+            __map
+                .serialize_entry(
+                    "lastMs",
+                    &::buffa::json_helpers::ProtoJson(&self.last_ms),
+                )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.ops) {
+            __map.serialize_entry("ops", &::buffa::json_helpers::ProtoJson(&self.ops))?;
         }
         __map.end()
     }
@@ -12534,6 +12940,8 @@ impl SourceOwnedView {
     pub fn name(&self) -> &'_ str {
         self.0.reborrow().name
     }
+    /// url, state, cursor_kind, lag, errors and reconnects are the source's own report.
+    ///
     /// Field 2: `url`
     #[must_use]
     pub fn url(&self) -> &'_ str {
@@ -12544,6 +12952,8 @@ impl SourceOwnedView {
     pub fn state(&self) -> &'_ str {
         self.0.reborrow().state
     }
+    /// The cursor of the last write applied.
+    ///
     /// Field 4: `cursor`
     #[must_use]
     pub fn cursor(&self) -> &'_ str {
@@ -12573,6 +12983,35 @@ impl SourceOwnedView {
     #[must_use]
     pub fn reconnects(&self) -> u64 {
         self.0.reborrow().reconnects
+    }
+    /// The cursor in the newest change segment: a restart resumes after it.
+    ///
+    /// Field 10: `durable_cursor`
+    #[must_use]
+    pub fn durable_cursor(&self) -> &'_ str {
+        self.0.reborrow().durable_cursor
+    }
+    /// Configured: readiness waits for it to catch up.
+    ///
+    /// Field 11: `expected`
+    #[must_use]
+    pub fn expected(&self) -> bool {
+        self.0.reborrow().expected
+    }
+    /// Field 12: `caught_up`
+    #[must_use]
+    pub fn caught_up(&self) -> bool {
+        self.0.reborrow().caught_up
+    }
+    /// Field 13: `last_ms`
+    #[must_use]
+    pub fn last_ms(&self) -> i64 {
+        self.0.reborrow().last_ms
+    }
+    /// Field 14: `ops`
+    #[must_use]
+    pub fn ops(&self) -> u64 {
+        self.0.reborrow().ops
     }
 }
 impl ::core::convert::From<::buffa::OwnedView<SourceView<'static>>> for SourceOwnedView {
@@ -16908,15 +17347,11 @@ impl ::serde::Serialize for BuildInfoOwnedView {
     }
 }
 #[derive(Clone, Debug, Default)]
-pub struct WriteShardsRequestView<'a> {
-    /// "dirty" (default) or "all". This build rewrites every shard either way.
-    ///
-    /// Field 1: `shards`
-    pub shards: &'a str,
+pub struct CheckpointRequestView<'a> {
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
-impl<'a> ::buffa::MessageView<'a> for WriteShardsRequestView<'a> {
-    type Owned = super::super::WriteShardsRequest;
+impl<'a> ::buffa::MessageView<'a> for CheckpointRequestView<'a> {
+    type Owned = super::super::CheckpointRequest;
     fn decode_view(buf: &'a [u8]) -> ::core::result::Result<Self, ::buffa::DecodeError> {
         let __limit = ::core::cell::Cell::new(::buffa::DEFAULT_UNKNOWN_FIELD_LIMIT);
         let __elem = ::core::cell::Cell::new(::buffa::DEFAULT_ELEMENT_MEMORY_LIMIT);
@@ -16945,13 +17380,6 @@ impl<'a> ::buffa::MessageView<'a> for WriteShardsRequestView<'a> {
         let view = self;
         let mut cur = cur;
         match tag.field_number() {
-            1u32 => {
-                ::buffa::encoding::check_wire_type(
-                    tag,
-                    ::buffa::encoding::WireType::LengthDelimited,
-                )?;
-                view.shards = ::buffa::types::borrow_str(&mut cur)?;
-            }
             _ => {
                 ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
                 let span_len = before_tag.len() - cur.len();
@@ -16962,33 +17390,29 @@ impl<'a> ::buffa::MessageView<'a> for WriteShardsRequestView<'a> {
     }
     fn to_owned_message(
         &self,
-    ) -> ::core::result::Result<super::super::WriteShardsRequest, ::buffa::DecodeError> {
+    ) -> ::core::result::Result<super::super::CheckpointRequest, ::buffa::DecodeError> {
         self.to_owned_from_source(None)
     }
     #[allow(clippy::useless_conversion, clippy::needless_update)]
     fn to_owned_from_source(
         &self,
         __buffa_src: ::core::option::Option<&::buffa::bytes::Bytes>,
-    ) -> ::core::result::Result<super::super::WriteShardsRequest, ::buffa::DecodeError> {
+    ) -> ::core::result::Result<super::super::CheckpointRequest, ::buffa::DecodeError> {
         #[allow(unused_imports)]
         use ::buffa::alloc::string::ToString as _;
         let _ = __buffa_src;
-        ::core::result::Result::Ok(super::super::WriteShardsRequest {
-            shards: self.shards.to_string(),
+        ::core::result::Result::Ok(super::super::CheckpointRequest {
             __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
     }
 }
-impl<'a> ::buffa::ViewEncode<'a> for WriteShardsRequestView<'a> {
+impl<'a> ::buffa::ViewEncode<'a> for CheckpointRequestView<'a> {
     #[allow(clippy::needless_borrow, clippy::let_and_return)]
     fn compute_size(&self, _cache: &mut ::buffa::SizeCache) -> u32 {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
         let mut size = 0u64;
-        if !self.shards.is_empty() {
-            size += 1u64 + ::buffa::types::string_encoded_len(&self.shards) as u64;
-        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -17000,9 +17424,6 @@ impl<'a> ::buffa::ViewEncode<'a> for WriteShardsRequestView<'a> {
     ) {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
-        if !self.shards.is_empty() {
-            ::buffa::types::put_string_field(1u32, &self.shards, buf);
-        }
         self.__buffa_unknown_fields.write_to(buf);
     }
 }
@@ -17017,37 +17438,34 @@ impl<'a> ::buffa::ViewEncode<'a> for WriteShardsRequestView<'a> {
 /// fields depends on default-omission rules; serializers that require
 /// known map lengths (e.g. `bincode`) will return a runtime error.
 /// Use the owned message type for those formats.
-impl<'__a> ::serde::Serialize for WriteShardsRequestView<'__a> {
+impl<'__a> ::serde::Serialize for CheckpointRequestView<'__a> {
     fn serialize<__S: ::serde::Serializer>(
         &self,
         __s: __S,
     ) -> ::core::result::Result<__S::Ok, __S::Error> {
         use ::serde::ser::SerializeMap as _;
         let mut __map = __s.serialize_map(::core::option::Option::None)?;
-        if !::buffa::json_helpers::skip_if::is_empty_str(self.shards) {
-            __map.serialize_entry("shards", self.shards)?;
-        }
         __map.end()
     }
 }
-impl<'a> ::buffa::MessageName for WriteShardsRequestView<'a> {
+impl<'a> ::buffa::MessageName for CheckpointRequestView<'a> {
     const PACKAGE: &'static str = "marco.v1";
-    const NAME: &'static str = "WriteShardsRequest";
-    const FULL_NAME: &'static str = "marco.v1.WriteShardsRequest";
-    const TYPE_URL: &'static str = "type.googleapis.com/marco.v1.WriteShardsRequest";
+    const NAME: &'static str = "CheckpointRequest";
+    const FULL_NAME: &'static str = "marco.v1.CheckpointRequest";
+    const TYPE_URL: &'static str = "type.googleapis.com/marco.v1.CheckpointRequest";
 }
-::buffa::impl_default_view_instance!(WriteShardsRequestView);
-::buffa::impl_view_reborrow!(WriteShardsRequestView);
-/** Self-contained, `'static` owned view of a `WriteShardsRequest` message.
+::buffa::impl_default_view_instance!(CheckpointRequestView);
+::buffa::impl_view_reborrow!(CheckpointRequestView);
+/** Self-contained, `'static` owned view of a `CheckpointRequest` message.
 
- Wraps [`::buffa::OwnedView`]`<`[`WriteShardsRequestView`]`<'static>>`: the decoded view and the [`::buffa::bytes::Bytes`] buffer it borrows from travel together, so the handle is `'static` and `Send + Sync` — suitable for async handlers, spawned tasks, and anywhere a `'static` bound is required.
+ Wraps [`::buffa::OwnedView`]`<`[`CheckpointRequestView`]`<'static>>`: the decoded view and the [`::buffa::bytes::Bytes`] buffer it borrows from travel together, so the handle is `'static` and `Send + Sync` — suitable for async handlers, spawned tasks, and anywhere a `'static` bound is required.
 
- Field accessors return borrows tied to `&self`. Use [`Self::view`] to get the full [`WriteShardsRequestView`] when you need struct patterns, iteration helpers, or to pass the view to lifetime-parameterised code.*/
+ Field accessors return borrows tied to `&self`. Use [`Self::view`] to get the full [`CheckpointRequestView`] when you need struct patterns, iteration helpers, or to pass the view to lifetime-parameterised code.*/
 #[derive(Clone, Debug)]
-pub struct WriteShardsRequestOwnedView(
-    ::buffa::OwnedView<WriteShardsRequestView<'static>>,
+pub struct CheckpointRequestOwnedView(
+    ::buffa::OwnedView<CheckpointRequestView<'static>>,
 );
-impl WriteShardsRequestOwnedView {
+impl CheckpointRequestOwnedView {
     /// Decode an owned view from a [`::buffa::bytes::Bytes`] buffer.
     ///
     /// The view borrows directly from the buffer's data; the buffer is
@@ -17061,7 +17479,7 @@ impl WriteShardsRequestOwnedView {
         bytes: ::buffa::bytes::Bytes,
     ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
         ::core::result::Result::Ok(
-            WriteShardsRequestOwnedView(::buffa::OwnedView::decode(bytes)?),
+            CheckpointRequestOwnedView(::buffa::OwnedView::decode(bytes)?),
         )
     }
     /// Decode with custom [`::buffa::DecodeOptions`] (recursion limit,
@@ -17076,7 +17494,7 @@ impl WriteShardsRequestOwnedView {
         opts: &::buffa::DecodeOptions,
     ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
         ::core::result::Result::Ok(
-            WriteShardsRequestOwnedView(
+            CheckpointRequestOwnedView(
                 ::buffa::OwnedView::decode_with_options(bytes, opts)?,
             ),
         )
@@ -17090,15 +17508,15 @@ impl WriteShardsRequestOwnedView {
     /// another [`::buffa::DecodeError`] if the re-encoded bytes are
     /// somehow invalid (should not happen for well-formed messages).
     pub fn from_owned(
-        msg: &super::super::WriteShardsRequest,
+        msg: &super::super::CheckpointRequest,
     ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
         ::core::result::Result::Ok(
-            WriteShardsRequestOwnedView(::buffa::OwnedView::from_owned(msg)?),
+            CheckpointRequestOwnedView(::buffa::OwnedView::from_owned(msg)?),
         )
     }
-    /// Borrow the full [`WriteShardsRequestView`] with its lifetime tied to `&self`.
+    /// Borrow the full [`CheckpointRequestView`] with its lifetime tied to `&self`.
     #[must_use]
-    pub fn view(&self) -> &WriteShardsRequestView<'_> {
+    pub fn view(&self) -> &CheckpointRequestView<'_> {
         self.0.reborrow()
     }
     /// Convert to the owned message type.
@@ -17109,7 +17527,7 @@ impl WriteShardsRequestOwnedView {
     /// whose contract also governs handles converted from a raw
     /// [`::buffa::OwnedView`].
     #[must_use]
-    pub fn to_owned_message(&self) -> super::super::WriteShardsRequest {
+    pub fn to_owned_message(&self) -> super::super::CheckpointRequest {
         self.0.to_owned_message()
     }
     /// The underlying bytes buffer.
@@ -17122,37 +17540,30 @@ impl WriteShardsRequestOwnedView {
     pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
         self.0.into_bytes()
     }
-    /// "dirty" (default) or "all". This build rewrites every shard either way.
-    ///
-    /// Field 1: `shards`
-    #[must_use]
-    pub fn shards(&self) -> &'_ str {
-        self.0.reborrow().shards
+}
+impl ::core::convert::From<::buffa::OwnedView<CheckpointRequestView<'static>>>
+for CheckpointRequestOwnedView {
+    fn from(inner: ::buffa::OwnedView<CheckpointRequestView<'static>>) -> Self {
+        CheckpointRequestOwnedView(inner)
     }
 }
-impl ::core::convert::From<::buffa::OwnedView<WriteShardsRequestView<'static>>>
-for WriteShardsRequestOwnedView {
-    fn from(inner: ::buffa::OwnedView<WriteShardsRequestView<'static>>) -> Self {
-        WriteShardsRequestOwnedView(inner)
-    }
-}
-impl ::core::convert::From<WriteShardsRequestOwnedView>
-for ::buffa::OwnedView<WriteShardsRequestView<'static>> {
-    fn from(wrapper: WriteShardsRequestOwnedView) -> Self {
+impl ::core::convert::From<CheckpointRequestOwnedView>
+for ::buffa::OwnedView<CheckpointRequestView<'static>> {
+    fn from(wrapper: CheckpointRequestOwnedView) -> Self {
         wrapper.0
     }
 }
-impl ::core::convert::AsRef<::buffa::OwnedView<WriteShardsRequestView<'static>>>
-for WriteShardsRequestOwnedView {
-    fn as_ref(&self) -> &::buffa::OwnedView<WriteShardsRequestView<'static>> {
+impl ::core::convert::AsRef<::buffa::OwnedView<CheckpointRequestView<'static>>>
+for CheckpointRequestOwnedView {
+    fn as_ref(&self) -> &::buffa::OwnedView<CheckpointRequestView<'static>> {
         &self.0
     }
 }
-impl ::buffa::HasMessageView for super::super::WriteShardsRequest {
-    type View<'a> = WriteShardsRequestView<'a>;
-    type ViewHandle = WriteShardsRequestOwnedView;
+impl ::buffa::HasMessageView for super::super::CheckpointRequest {
+    type View<'a> = CheckpointRequestView<'a>;
+    type ViewHandle = CheckpointRequestOwnedView;
 }
-impl ::serde::Serialize for WriteShardsRequestOwnedView {
+impl ::serde::Serialize for CheckpointRequestOwnedView {
     fn serialize<__S: ::serde::Serializer>(
         &self,
         __s: __S,
@@ -17161,13 +17572,13 @@ impl ::serde::Serialize for WriteShardsRequestOwnedView {
     }
 }
 #[derive(Clone, Debug, Default)]
-pub struct WriteShardsResponseView<'a> {
+pub struct CheckpointResponseView<'a> {
     /// Field 1: `job`
     pub job: ::buffa::MessageFieldView<super::super::__buffa::view::JobView<'a>>,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
-impl<'a> ::buffa::MessageView<'a> for WriteShardsResponseView<'a> {
-    type Owned = super::super::WriteShardsResponse;
+impl<'a> ::buffa::MessageView<'a> for CheckpointResponseView<'a> {
+    type Owned = super::super::CheckpointResponse;
     fn decode_view(buf: &'a [u8]) -> ::core::result::Result<Self, ::buffa::DecodeError> {
         let __limit = ::core::cell::Cell::new(::buffa::DEFAULT_UNKNOWN_FIELD_LIMIT);
         let __elem = ::core::cell::Cell::new(::buffa::DEFAULT_ELEMENT_MEMORY_LIMIT);
@@ -17227,24 +17638,18 @@ impl<'a> ::buffa::MessageView<'a> for WriteShardsResponseView<'a> {
     }
     fn to_owned_message(
         &self,
-    ) -> ::core::result::Result<
-        super::super::WriteShardsResponse,
-        ::buffa::DecodeError,
-    > {
+    ) -> ::core::result::Result<super::super::CheckpointResponse, ::buffa::DecodeError> {
         self.to_owned_from_source(None)
     }
     #[allow(clippy::useless_conversion, clippy::needless_update)]
     fn to_owned_from_source(
         &self,
         __buffa_src: ::core::option::Option<&::buffa::bytes::Bytes>,
-    ) -> ::core::result::Result<
-        super::super::WriteShardsResponse,
-        ::buffa::DecodeError,
-    > {
+    ) -> ::core::result::Result<super::super::CheckpointResponse, ::buffa::DecodeError> {
         #[allow(unused_imports)]
         use ::buffa::alloc::string::ToString as _;
         let _ = __buffa_src;
-        ::core::result::Result::Ok(super::super::WriteShardsResponse {
+        ::core::result::Result::Ok(super::super::CheckpointResponse {
             job: match self.job.as_option() {
                 Some(v) => {
                     ::buffa::MessageField::<
@@ -17259,7 +17664,7 @@ impl<'a> ::buffa::MessageView<'a> for WriteShardsResponseView<'a> {
         })
     }
 }
-impl<'a> ::buffa::ViewEncode<'a> for WriteShardsResponseView<'a> {
+impl<'a> ::buffa::ViewEncode<'a> for CheckpointResponseView<'a> {
     #[allow(clippy::needless_borrow, clippy::let_and_return)]
     fn compute_size(&self, __cache: &mut ::buffa::SizeCache) -> u32 {
         #[allow(unused_imports)]
@@ -17306,7 +17711,7 @@ impl<'a> ::buffa::ViewEncode<'a> for WriteShardsResponseView<'a> {
 /// fields depends on default-omission rules; serializers that require
 /// known map lengths (e.g. `bincode`) will return a runtime error.
 /// Use the owned message type for those formats.
-impl<'__a> ::serde::Serialize for WriteShardsResponseView<'__a> {
+impl<'__a> ::serde::Serialize for CheckpointResponseView<'__a> {
     fn serialize<__S: ::serde::Serializer>(
         &self,
         __s: __S,
@@ -17321,24 +17726,24 @@ impl<'__a> ::serde::Serialize for WriteShardsResponseView<'__a> {
         __map.end()
     }
 }
-impl<'a> ::buffa::MessageName for WriteShardsResponseView<'a> {
+impl<'a> ::buffa::MessageName for CheckpointResponseView<'a> {
     const PACKAGE: &'static str = "marco.v1";
-    const NAME: &'static str = "WriteShardsResponse";
-    const FULL_NAME: &'static str = "marco.v1.WriteShardsResponse";
-    const TYPE_URL: &'static str = "type.googleapis.com/marco.v1.WriteShardsResponse";
+    const NAME: &'static str = "CheckpointResponse";
+    const FULL_NAME: &'static str = "marco.v1.CheckpointResponse";
+    const TYPE_URL: &'static str = "type.googleapis.com/marco.v1.CheckpointResponse";
 }
-::buffa::impl_default_view_instance!(WriteShardsResponseView);
-::buffa::impl_view_reborrow!(WriteShardsResponseView);
-/** Self-contained, `'static` owned view of a `WriteShardsResponse` message.
+::buffa::impl_default_view_instance!(CheckpointResponseView);
+::buffa::impl_view_reborrow!(CheckpointResponseView);
+/** Self-contained, `'static` owned view of a `CheckpointResponse` message.
 
- Wraps [`::buffa::OwnedView`]`<`[`WriteShardsResponseView`]`<'static>>`: the decoded view and the [`::buffa::bytes::Bytes`] buffer it borrows from travel together, so the handle is `'static` and `Send + Sync` — suitable for async handlers, spawned tasks, and anywhere a `'static` bound is required.
+ Wraps [`::buffa::OwnedView`]`<`[`CheckpointResponseView`]`<'static>>`: the decoded view and the [`::buffa::bytes::Bytes`] buffer it borrows from travel together, so the handle is `'static` and `Send + Sync` — suitable for async handlers, spawned tasks, and anywhere a `'static` bound is required.
 
- Field accessors return borrows tied to `&self`. Use [`Self::view`] to get the full [`WriteShardsResponseView`] when you need struct patterns, iteration helpers, or to pass the view to lifetime-parameterised code.*/
+ Field accessors return borrows tied to `&self`. Use [`Self::view`] to get the full [`CheckpointResponseView`] when you need struct patterns, iteration helpers, or to pass the view to lifetime-parameterised code.*/
 #[derive(Clone, Debug)]
-pub struct WriteShardsResponseOwnedView(
-    ::buffa::OwnedView<WriteShardsResponseView<'static>>,
+pub struct CheckpointResponseOwnedView(
+    ::buffa::OwnedView<CheckpointResponseView<'static>>,
 );
-impl WriteShardsResponseOwnedView {
+impl CheckpointResponseOwnedView {
     /// Decode an owned view from a [`::buffa::bytes::Bytes`] buffer.
     ///
     /// The view borrows directly from the buffer's data; the buffer is
@@ -17352,7 +17757,7 @@ impl WriteShardsResponseOwnedView {
         bytes: ::buffa::bytes::Bytes,
     ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
         ::core::result::Result::Ok(
-            WriteShardsResponseOwnedView(::buffa::OwnedView::decode(bytes)?),
+            CheckpointResponseOwnedView(::buffa::OwnedView::decode(bytes)?),
         )
     }
     /// Decode with custom [`::buffa::DecodeOptions`] (recursion limit,
@@ -17367,7 +17772,7 @@ impl WriteShardsResponseOwnedView {
         opts: &::buffa::DecodeOptions,
     ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
         ::core::result::Result::Ok(
-            WriteShardsResponseOwnedView(
+            CheckpointResponseOwnedView(
                 ::buffa::OwnedView::decode_with_options(bytes, opts)?,
             ),
         )
@@ -17381,15 +17786,15 @@ impl WriteShardsResponseOwnedView {
     /// another [`::buffa::DecodeError`] if the re-encoded bytes are
     /// somehow invalid (should not happen for well-formed messages).
     pub fn from_owned(
-        msg: &super::super::WriteShardsResponse,
+        msg: &super::super::CheckpointResponse,
     ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
         ::core::result::Result::Ok(
-            WriteShardsResponseOwnedView(::buffa::OwnedView::from_owned(msg)?),
+            CheckpointResponseOwnedView(::buffa::OwnedView::from_owned(msg)?),
         )
     }
-    /// Borrow the full [`WriteShardsResponseView`] with its lifetime tied to `&self`.
+    /// Borrow the full [`CheckpointResponseView`] with its lifetime tied to `&self`.
     #[must_use]
-    pub fn view(&self) -> &WriteShardsResponseView<'_> {
+    pub fn view(&self) -> &CheckpointResponseView<'_> {
         self.0.reborrow()
     }
     /// Convert to the owned message type.
@@ -17400,7 +17805,7 @@ impl WriteShardsResponseOwnedView {
     /// whose contract also governs handles converted from a raw
     /// [`::buffa::OwnedView`].
     #[must_use]
-    pub fn to_owned_message(&self) -> super::super::WriteShardsResponse {
+    pub fn to_owned_message(&self) -> super::super::CheckpointResponse {
         self.0.to_owned_message()
     }
     /// The underlying bytes buffer.
@@ -17421,29 +17826,29 @@ impl WriteShardsResponseOwnedView {
         &self.0.reborrow().job
     }
 }
-impl ::core::convert::From<::buffa::OwnedView<WriteShardsResponseView<'static>>>
-for WriteShardsResponseOwnedView {
-    fn from(inner: ::buffa::OwnedView<WriteShardsResponseView<'static>>) -> Self {
-        WriteShardsResponseOwnedView(inner)
+impl ::core::convert::From<::buffa::OwnedView<CheckpointResponseView<'static>>>
+for CheckpointResponseOwnedView {
+    fn from(inner: ::buffa::OwnedView<CheckpointResponseView<'static>>) -> Self {
+        CheckpointResponseOwnedView(inner)
     }
 }
-impl ::core::convert::From<WriteShardsResponseOwnedView>
-for ::buffa::OwnedView<WriteShardsResponseView<'static>> {
-    fn from(wrapper: WriteShardsResponseOwnedView) -> Self {
+impl ::core::convert::From<CheckpointResponseOwnedView>
+for ::buffa::OwnedView<CheckpointResponseView<'static>> {
+    fn from(wrapper: CheckpointResponseOwnedView) -> Self {
         wrapper.0
     }
 }
-impl ::core::convert::AsRef<::buffa::OwnedView<WriteShardsResponseView<'static>>>
-for WriteShardsResponseOwnedView {
-    fn as_ref(&self) -> &::buffa::OwnedView<WriteShardsResponseView<'static>> {
+impl ::core::convert::AsRef<::buffa::OwnedView<CheckpointResponseView<'static>>>
+for CheckpointResponseOwnedView {
+    fn as_ref(&self) -> &::buffa::OwnedView<CheckpointResponseView<'static>> {
         &self.0
     }
 }
-impl ::buffa::HasMessageView for super::super::WriteShardsResponse {
-    type View<'a> = WriteShardsResponseView<'a>;
-    type ViewHandle = WriteShardsResponseOwnedView;
+impl ::buffa::HasMessageView for super::super::CheckpointResponse {
+    type View<'a> = CheckpointResponseView<'a>;
+    type ViewHandle = CheckpointResponseOwnedView;
 }
-impl ::serde::Serialize for WriteShardsResponseOwnedView {
+impl ::serde::Serialize for CheckpointResponseOwnedView {
     fn serialize<__S: ::serde::Serializer>(
         &self,
         __s: __S,

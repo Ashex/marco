@@ -11,7 +11,7 @@ use connectrpc::ErrorCode;
 use marco_proto::connect::marco::v1::{AdminClient, GraphClient};
 use marco_proto::v1::__buffa::oneof::{write_op, write_result};
 use marco_proto::v1::*;
-use marco_server::app::{App, Config};
+use marco_server::app::{App, Config, Op};
 use marco_server::auth::{AuthConfig, Cidr};
 use marco_server::synth::{did, tid, uri, BLOCK, FOLLOW};
 
@@ -35,16 +35,7 @@ async fn start(read_only: bool, proxy: bool) -> Srv {
         proxy_from: if proxy { vec!["127.0.0.1/32".parse::<Cidr>().unwrap()] } else { vec![] },
         operators: if proxy { vec!["alice@example.com".into()] } else { vec![] },
     };
-    let cfg = Config {
-        snapshot: snap,
-        read_only,
-        merge_ratio: 0.125,
-        compact_min: 64,
-        api_listen: "127.0.0.1:0".into(),
-        admin_listen: "127.0.0.1:0".into(),
-        auth,
-        flags: vec![],
-    };
+    let cfg = Config { read_only, auth, ..Config::new(snap) };
     let app = App::open(cfg).unwrap();
     let ui = Arc::new(marco_server::ui::Ui::load(None).unwrap());
     let (api, admin) = marco_server::serve(app.clone(), ui).await.unwrap();
@@ -295,7 +286,7 @@ async fn graph_writes() {
     let gone = uri(&a3, FOLLOW, &tid(8_000_001, 5));
     let r = g
         .write_batch(WriteBatchRequest {
-            ops: vec![add(&u, &a4), add(&u, &a4), del(&u), del(&u), del(&gone), add(&gone, &a4)],
+            ops: vec![add(&u, &a4), add(&u, &a4), del(&u), del(&u), del(&gone), add(&gone, &did(5))],
             cursor: "c1".into(),
             ..Default::default()
         })
@@ -311,7 +302,8 @@ async fn graph_writes() {
             format!("removed {a4}"),
             "not_found".into(),
             "not_found".into(),
-            "deleted".into()
+            // the same source deleting then creating, in order: a re-create
+            "added".into()
         ]
     );
     assert_eq!(r.cursor, "c1");
@@ -392,7 +384,7 @@ async fn read_only_refuses_writes() {
         .unwrap_err();
     assert_eq!(e.code, ErrorCode::FailedPrecondition);
     let a = admin(s.admin, Some(TOKEN));
-    assert_eq!(a.write_shards(WriteShardsRequest::default()).await.unwrap_err().code, ErrorCode::FailedPrecondition);
+    assert_eq!(a.checkpoint(CheckpointRequest::default()).await.unwrap_err().code, ErrorCode::FailedPrecondition);
     let st = SetActorStatusRequest { did: did(3), status: "takendown".into(), ..Default::default() };
     assert_eq!(a.set_actor_status(st).await.unwrap_err().code, ErrorCode::FailedPrecondition);
     assert!(a.get_overview(GetOverviewRequest::default()).await.unwrap().into_owned().read_only);
@@ -501,7 +493,8 @@ async fn admin_rpcs() {
         .await
         .unwrap();
     let tomb = uri(&a5, FOLLOW, &tid(9_500_001, 2));
-    g.write_batch(WriteBatchRequest { ops: vec![del(&tomb)], ..Default::default() }).await.unwrap();
+    // a tombstone from a live source: a later API add of the record stays deleted
+    s.app.apply_from("live", "1", &[Op::Delete { uri: tomb.clone() }]).await.unwrap();
     let o = a.get_overview(GetOverviewRequest::default()).await.unwrap().into_owned();
     assert_eq!(o.delta_entries, 2, "out add + in add");
     assert_eq!(o.tombstones, 1);
@@ -536,8 +529,10 @@ async fn admin_rpcs() {
         ErrorCode::InvalidArgument
     );
 
-    assert_eq!(a.get_wal(GetWalRequest::default()).await.unwrap_err().code, ErrorCode::Unimplemented);
-    assert_eq!(a.list_sources(ListSourcesRequest::default()).await.unwrap_err().code, ErrorCode::Unimplemented);
+    let src = a.list_sources(ListSourcesRequest::default()).await.unwrap().into_owned();
+    let live = src.sources.iter().find(|x| x.name == "live").unwrap();
+    assert_eq!((live.cursor.as_str(), live.durable_cursor.as_str(), live.ops), ("1", "1", 1));
+    assert!(src.sources.iter().any(|x| x.name == "api"));
 
     let rl = a.list_relations(ListRelationsRequest::default()).await.unwrap().into_owned();
     assert_eq!(rl.relations[1].collection, BLOCK);
@@ -713,18 +708,16 @@ async fn admin_rpcs() {
 
     let u7 = uri(&did(7), FOLLOW, &tid(9_600_000, 2));
     g.write_batch(WriteBatchRequest { ops: vec![add(&u7, &did(8))], ..Default::default() }).await.unwrap();
-    let r = a.write_shards(WriteShardsRequest::default()).await.unwrap().into_owned();
-    assert!(r.job.running || r.job.kind == "write");
-    assert_eq!(
-        a.write_shards(WriteShardsRequest { shards: "some".into(), ..Default::default() }).await.unwrap_err().code,
-        ErrorCode::InvalidArgument
-    );
+    let r = a.checkpoint(CheckpointRequest::default()).await.unwrap().into_owned();
+    assert_eq!(r.job.kind, "checkpoint");
     let j = wait().await;
-    assert_eq!((j.kind.as_str(), j.error.as_str()), ("write", ""));
+    assert_eq!((j.kind.as_str(), j.error.as_str()), ("checkpoint", ""));
     let o = a.get_overview(GetOverviewRequest::default()).await.unwrap().into_owned();
     assert_eq!(o.delta_entries, 0);
-    assert_eq!(o.tombstones, 1, "carried onto the new snapshot");
-    assert_eq!(o.dirty_shards, 1, "the tombstone's shard");
+    assert_eq!(o.tombstones, 1, "in the new shard files");
+    assert_eq!(o.dirty_shards, 0);
+    let d = o.durability.into_option().unwrap();
+    assert_eq!((d.checkpoint, d.segments), (1, 0));
     assert!(!has(&did(7), &did(8)).await.is_empty());
     let late = g
         .write_batch(WriteBatchRequest { ops: vec![add(&tomb, &a6)], ..Default::default() })
@@ -732,5 +725,5 @@ async fn admin_rpcs() {
         .unwrap()
         .into_owned();
     assert_eq!(outcome(&late.results[0]), "deleted");
-    assert_eq!(s.app.graph().snapshot().unwrap().meta.n_ids, N);
+    assert_eq!(s.app.graph().snapshot().unwrap().dir.meta.n_ids, N);
 }

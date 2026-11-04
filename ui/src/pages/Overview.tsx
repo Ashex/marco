@@ -9,7 +9,6 @@ import {
   Legend,
   Loaded,
   Meter,
-  NeedsVersion,
   PageHead,
   Panel,
   PanelBody,
@@ -25,40 +24,38 @@ import {
 import { Link } from '../lib/router'
 import { bytes, bytesParts, clock, dur, fmtCount, lat, latParts, n, pct, rate, si } from '../lib/fmt'
 import { useLiveState } from '../lib/live'
-import { last, mean, READ_OPS, sum, unsupported, useOverview, useRecent, useSeries, useShards, useSources, weighted, WRITE_OPS } from '../lib/queries'
+import { last, mean, READ_OPS, sum, useOverview, useRecent, useSeries, useShards, useSources, weighted, WRITE_OPS } from '../lib/queries'
 import { OUTCOMES, outcomeColor } from '../lib/tone'
 import { setAttention } from '../components/Palette'
 import { openPanel } from '../components/nav'
-import { shardName, useWindow, windowLabel } from './common'
-import type { GetOverviewResponse, GetSeriesResponse, ListShardsResponse, RecentWrite } from '../gen/marco/v1/admin_pb'
+import { cursorText, lagText, shardName, sourceNamed, useWindow, windowLabel } from './common'
+import type { Source, GetOverviewResponse, GetSeriesResponse, ListShardsResponse, RecentWrite } from '../gen/marco/v1/admin_pb'
 import { togglePaused } from '../lib/live'
 
 // ---------------------------------------------------------------- shared with other pages
 
 /** The banners every page that shows them derives the same way. */
-export function banners(o?: GetOverviewResponse, sh?: ListShardsResponse): BannerSpec[] {
+export function banners(o?: GetOverviewResponse, _sh?: ListShardsResponse): BannerSpec[] {
   const b: BannerSpec[] = []
   const job = o?.job
   if (job?.running)
     b.push({
       id: 'job',
       tone: 'info',
-      title: job.kind === 'write' ? 'Writing the snapshot' : 'Verifying checksums',
+      title: job.kind === 'checkpoint' ? 'Checkpointing' : 'Verifying checksums',
       desc: `${job.done} / ${job.total} files · started ${clock(n(job.startedMs))}`,
       right: <Link to="/admin/storage">Storage ›</Link>,
     })
   else if (job?.error)
-    b.push({ id: 'jobfail', tone: 'err', title: job.kind === 'write' ? 'Snapshot write failed' : 'Checksums failed', desc: job.error, right: <Link to="/admin/storage">Storage ›</Link> })
-  for (const s of (sh?.shards ?? []).filter((x) => x.state === 'over').slice(0, 3)) {
-    const r = n(s.deltaEntries) / Math.max(1, n(s.baseEntries))
+    b.push({ id: 'jobfail', tone: 'err', title: job.kind === 'checkpoint' ? 'Checkpoint failed' : 'Checksums failed', desc: job.error, right: <Link to="/admin/storage">Storage ›</Link> })
+  if (o && !o.ready)
     b.push({
-      id: `over-${s.shard}`,
-      tone: 'info',
-      title: `${shardName(s.shard)} over threshold`,
-      desc: `delta ${pct(r)} of base · threshold ${pct(sh?.mergeRatio ?? 0.125)}`,
-      right: <Link to="/admin/storage">Storage ›</Link>,
+      id: 'notready',
+      tone: 'warn',
+      title: 'Catching up',
+      desc: `${o.readyReason || 'not ready'} · ${fmtCount(o.readsBeforeReady)} reads before ready`,
+      right: <Link to="/admin/ingest">Ingest ›</Link>,
     })
-  }
   if (o?.readOnly) b.push({ id: 'ro', tone: 'idle', title: 'Read-only', desc: '--read-only · writes refused' })
   return b
 }
@@ -71,7 +68,7 @@ export function useAttention(o?: GetOverviewResponse, sh?: ListShardsResponse) {
       glyph: <Glyph k={x.tone} />,
       label: x.title,
       kind: typeof x.desc === 'string' ? x.desc : undefined,
-      run: () => (x.id.startsWith('over-') ? openPanel('shard', x.id.slice(5)) : void (location.href = '/admin/storage')),
+      run: () => void (location.href = x.id === 'notready' ? '/admin/ingest' : '/admin/storage'),
     })),
   )
   return items
@@ -92,7 +89,7 @@ export function ShardMap({ sh, small }: { sh: ListShardsResponse; small?: boolea
       {sh.shards.map((s) => {
         const d = n(s.deltaEntries) / Math.max(1, n(s.baseEntries))
         const st = s.verify === 'mismatch' ? 'mismatch' : s.state === 'clean' ? '' : s.state
-        const g = { over: '▲', writing: '●', dirty: '◆', mismatch: '■', '': '' }[st] ?? ''
+        const g = { writing: '●', dirty: '◆', mismatch: '■', '': '' }[st] ?? ''
         const title = `${shardName(s.shard)} · delta ${pct(d)} of base · ${s.state}${s.verify !== 'unverified' ? ` · xxh3 ${s.verify}` : ''}`
         return small ? (
           <span key={s.shard} className={`cx-cell ${st}`} style={{ height: 16, padding: '0 2px', fontSize: 9, lineHeight: '16px', justifyContent: 'center', cursor: 'pointer' }} title={title} onClick={() => openPanel('shard', String(s.shard))}>
@@ -113,7 +110,7 @@ export function ShardMap({ sh, small }: { sh: ListShardsResponse; small?: boolea
 }
 
 export function shardCounts(sh: ListShardsResponse) {
-  const c = { clean: 0, dirty: 0, over: 0, writing: 0, mismatch: 0 }
+  const c = { clean: 0, dirty: 0, writing: 0, mismatch: 0 }
   for (const s of sh.shards) {
     c[s.state as keyof typeof c] = (c[s.state as keyof typeof c] ?? 0) + 1
     if (s.verify === 'mismatch') c.mismatch++
@@ -228,17 +225,23 @@ export function Overview() {
           const cnt = sh.data ? shardCounts(sh.data) : undefined
           const dr = n(o.deltaEntries) / Math.max(1, n(o.baseEntries))
           const tr = o.traceRatio
+          const jet = sourceNamed(src.data?.sources, 'jetstream')
+          const fire = sourceNamed(src.data?.sources, 'firehose')
+          const lagCell = (label: string, x?: Source): HealthCell =>
+            x
+              ? { label, tone: x.caughtUp ? 'ok' : 'warn', value: lagText(x.lagSeconds), sub: `${rate(x.opsPerSecond)} ops/s`, to: '/admin/ingest', title: 'lag: now − cursor time_us' }
+              : { label, tone: 'idle', value: '—', sub: 'not configured', to: '/admin/ingest' }
           const health: HealthCell[] = [
             { label: 'Reads', tone: 'ok', value: rate(last(reads)), unit: 'rpc/s', sub: `p99 ${lat(last(weighted(s, 'op_p99', {})))}`, to: '/admin/requests', title: 'all read ops' },
             { label: 'Writes', tone: 'ok', value: rate(last(writes)), unit: 'ops/s', sub: `added ${rate(last(added))} · removed ${rate(last(removed))}`, to: '/admin/ingest' },
-            { label: 'Jetstream', tone: 'idle', value: '—', sub: 'needs a newer marco', to: '/admin/ingest', title: 'lag: now − cursor time_us' },
-            { label: 'Firehose', tone: 'idle', value: '—', sub: 'needs a newer marco', to: '/admin/ingest' },
-            { label: 'WAL', tone: 'idle', value: '—', sub: 'needs a newer marco', to: '/admin/storage' },
+            lagCell('Jetstream', jet),
+            lagCell('Firehose', fire),
+            { label: 'Durability', tone: 'ok', value: o.durability?.segmentMs ? dur(Date.now() - n(o.durability.segmentMs)) : '—', sub: `${fmtCount(o.durability?.segments)} segs · ckpt ${dur(Date.now() - n(o.durability?.checkpointMs))}`, title: `${fmtCount(o.durability?.segments)} segments since the checkpoint ${dur(Date.now() - n(o.durability?.checkpointMs))} ago; last segment age`, to: "/admin/storage" },
             {
               label: 'Snapshot',
-              tone: cnt && (cnt.over || cnt.dirty) ? 'info' : 'ok',
+              tone: cnt && cnt.dirty ? 'info' : 'ok',
               value: dur(Date.now() - n(o.snapshot?.writtenMs)),
-              sub: `${n(o.dirtyShards) + n(o.overShards)} / ${o.snapshot?.shards ?? 0} dirty`,
+              sub: `${n(o.dirtyShards)} / ${o.snapshot?.shards ?? 0} dirty`,
               to: '/admin/storage',
             },
             { label: 'Deltas', tone: dr > o.mergeRatio ? 'warn' : 'ok', value: (dr * 100).toFixed(dr < 0.1 ? 2 : 1), unit: '%', sub: `${si(o.deltaEntries)} entries`, to: '/admin/storage', title: 'delta entries ÷ base entries, all lists' },
@@ -313,7 +316,22 @@ export function Overview() {
           )
           const ingest = (
             <Panel title="Ingest" to="/admin/ingest">
-              {src.data && unsupported(src.data) ? <NeedsVersion what="Sources" rpc="ListSources" /> : <PanelBody>—</PanelBody>}
+              <Loaded load={src}>
+                {(d) => (
+                  <DataTable
+                    compact
+                    rows={d.sources}
+                    rowKey={(x) => x.name}
+                    cols={[
+                      { id: 'name', label: 'Source', fill: true, render: (x) => <span className="mono">{x.name}</span> },
+                      { id: 'cur', label: 'Cursor', className: 'hide-phone', render: (x) => <span className="mono t2">{cursorText(x.cursor, x.cursorKind)}</span> },
+                      { id: 'lag', label: 'Lag', r: true, render: (x) => (x.cursorKind === 'time_us' ? lagText(x.lagSeconds) : '—') },
+                      { id: 'ops', label: 'ops/s', r: true, render: (x) => rate(x.opsPerSecond) },
+                      { id: 'up', label: 'Caught up', render: (x) => <Glyph k={x.caughtUp ? 'ok' : 'warn'} /> },
+                    ]}
+                  />
+                )}
+              </Loaded>
             </Panel>
           )
           const snap = (
@@ -325,7 +343,6 @@ export function Overview() {
                     <Legend
                       items={[
                         [<Glyph k="info" />, `dirty ${cnt?.dirty ?? 0}`],
-                        [<Glyph k="warn" />, `over threshold ${cnt?.over ?? 0}`],
                         [<Glyph k="acc" />, `writing ${cnt?.writing ?? 0}`],
                         [<span className="muted">○ </span>, <span className="muted">clean {cnt?.clean ?? 0}</span>],
                       ]}
@@ -336,7 +353,7 @@ export function Overview() {
                   rows={[
                     ['Written', <>{dur(Date.now() - n(o.snapshot?.writtenMs))} ago <span className="muted mono">{o.snapshot?.build.slice(0, 8)}</span></>],
                     ['Size', <><span className="mono">{bytes(o.snapshot?.sizeBytes)}</span> <span className="muted">{o.snapshot?.shards} shards</span></>],
-                    ['WAL', <span className="muted">needs a newer marco</span>],
+                    ['Segments', <><span className="mono">{fmtCount(o.durability?.segments)}</span> <span className="muted">{bytes(o.durability?.segmentBytes)} · {si(o.durability?.segmentOps)} ops</span></>],
                   ]}
                 />
               </PanelBody>

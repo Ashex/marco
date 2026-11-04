@@ -78,7 +78,7 @@ pub fn verify(a: &VerifyArgs) -> Result<Value> {
                 bad.fetch_add(1, Relaxed);
             }
         });
-        let st = &store.meta.stats[rel as usize];
+        let st = &store.stats()[rel as usize];
         let ok = recs.load(Relaxed) == st.out_records && pairs.load(Relaxed) == st.in_pairs && bad.load(Relaxed) == 0;
         let mut r = json!({
             "decode_secs": t.elapsed().as_secs_f64(),

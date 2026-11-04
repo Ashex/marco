@@ -8,8 +8,9 @@ use axum::extract::Request;
 use axum::middleware::Next;
 use axum::response::Response;
 use prometheus::{
-    exponential_buckets, register_histogram_vec, register_int_counter_vec, register_int_gauge, register_int_gauge_vec,
-    HistogramVec, IntCounterVec, IntGauge, IntGaugeVec,
+    exponential_buckets, register_histogram, register_histogram_vec, register_int_counter, register_int_counter_vec,
+    register_int_gauge, register_int_gauge_vec, Histogram, HistogramVec, IntCounter, IntCounterVec, IntGauge,
+    IntGaugeVec,
 };
 
 pub static RPC_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
@@ -41,12 +42,51 @@ pub static CACHED: LazyLock<IntGauge> = LazyLock::new(|| {
         .unwrap()
 });
 
+pub static READY: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!("marco_ready", "1 once every expected source has caught up since start").unwrap()
+});
+
+pub static READS_BEFORE_READY: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!("marco_reads_before_ready_total", "Graph reads that came before marco was ready").unwrap()
+});
+
+pub static SEGMENT_SECONDS: LazyLock<Histogram> = LazyLock::new(|| {
+    register_histogram!(
+        "marco_segment_write_seconds",
+        "Writing one change segment: encode, write, fsync, rename",
+        exponential_buckets(1e-5, 2.0, 22).unwrap()
+    )
+    .unwrap()
+});
+
+pub static SEGMENT_BYTES: LazyLock<IntCounter> =
+    LazyLock::new(|| register_int_counter!("marco_segment_bytes_total", "Change segment bytes written").unwrap());
+
+pub static SEGMENT_ERRORS: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!("marco_segment_errors_total", "Change segment writes that failed (each is retried)").unwrap()
+});
+
+pub static CHECKPOINT_SECONDS: LazyLock<Histogram> = LazyLock::new(|| {
+    register_histogram!(
+        "marco_checkpoint_seconds",
+        "A checkpoint, cut to new copies serving",
+        exponential_buckets(0.01, 2.0, 18).unwrap()
+    )
+    .unwrap()
+});
+
 pub fn init(version: &str, commit: &str) {
     BUILD.with_label_values(&[version, commit]).set(1);
     let _ = prometheus::register(Box::new(prometheus::process_collector::ProcessCollector::for_self()));
     LazyLock::force(&RPC_SECONDS);
     LazyLock::force(&RPC_ERRORS);
     LazyLock::force(&CACHED);
+    LazyLock::force(&READY);
+    LazyLock::force(&READS_BEFORE_READY);
+    LazyLock::force(&SEGMENT_SECONDS);
+    LazyLock::force(&SEGMENT_BYTES);
+    LazyLock::force(&SEGMENT_ERRORS);
+    LazyLock::force(&CHECKPOINT_SECONDS);
 }
 
 /// `Graph/Has` from `/marco.v1.Graph/Has`.

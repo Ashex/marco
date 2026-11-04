@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use marco_core::did::unpack_plc;
 use marco_core::inset::InList;
-use marco_core::snapshot::{rel_section, BaseDir, DidAt, Index, ShardMeta};
+use marco_core::snapshot::{rel_section, BaseDir, DidAt, Index};
 use marco_core::store::Store;
 use marco_core::varint;
 
@@ -149,8 +149,8 @@ fn did_at(d: &BaseDir, id: u32) -> String {
 
 fn compute(path: &std::path::Path, done: &AtomicUsize, total: &AtomicUsize) -> Result<Stats> {
     let store = Store::open(path)?;
-    let nrel = store.meta.relations.len();
-    let subj = store.meta.subj_index as usize;
+    let nrel = store.dir.meta.relations.len();
+    let subj = store.dir.meta.subj_index as usize;
     total.store(store.shards.len(), Ordering::Relaxed);
     let next = AtomicUsize::new(0);
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get() / 2).clamp(1, 16);
@@ -163,11 +163,9 @@ fn compute(path: &std::path::Path, done: &AtomicUsize, total: &AtomicUsize) -> R
                     let mut acc: Part = (0..nrel).map(|_| Default::default()).collect();
                     loop {
                         let k = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(s) = store.shards.get(k) else { break };
-                        let m: ShardMeta = match serde_json::from_value(s.meta.clone()) {
-                            Ok(m) => m,
-                            Err(_) => break,
-                        };
+                        let Some(f) = store.shards.get(k) else { break };
+                        let Some(f) = f else { continue };
+                        let (s, m) = (&f.snap, &f.meta);
                         let n = (m.hi - m.lo) as usize;
                         let b = s.bytes();
                         for (r, (out, inn, big)) in acc.iter_mut().enumerate() {
@@ -212,7 +210,7 @@ fn compute(path: &std::path::Path, done: &AtomicUsize, total: &AtomicUsize) -> R
             .collect();
         hs.into_iter().map(|h| h.join().expect("list stats thread")).collect()
     });
-    let dir = BaseDir::new(&store.dir);
+    let dir = BaseDir::new(&store.dir.snap);
     let mut rels = Vec::with_capacity(nrel);
     for r in 0..nrel {
         let (mut out, mut inn) = (Dist::default(), Dist::default());
@@ -232,5 +230,5 @@ fn compute(path: &std::path::Path, done: &AtomicUsize, total: &AtomicUsize) -> R
         tops.sort_unstable_by_key(|t| std::cmp::Reverse(t.0));
         rels.push(RelLists { out, inn, big: tops });
     }
-    Ok(Stats { build: store.meta.build, computed_ms: crate::app::now_ms(), threshold: subj as u32, rels })
+    Ok(Stats { build: store.dir.meta.build, computed_ms: crate::app::now_ms(), threshold: subj as u32, rels })
 }

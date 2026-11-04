@@ -13,6 +13,7 @@ pub mod series;
 pub mod synth;
 pub mod sys;
 pub mod ui;
+pub mod writer;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -30,7 +31,7 @@ pub const COMMIT: &str = match option_env!("MARCO_COMMIT") {
 };
 
 fn connect(app: &Arc<App>, admin: bool) -> axum::Router {
-    let mut r = Arc::new(graph_svc::GraphApi(app.clone())).register(connectrpc::Router::new());
+    let mut r = Arc::new(graph_svc::GraphApi(app.clone(), !admin)).register(connectrpc::Router::new());
     if admin {
         r = Arc::new(admin_svc::AdminApi(app.clone())).register(r);
     }
@@ -42,9 +43,18 @@ fn connect(app: &Arc<App>, admin: bool) -> axum::Router {
     router
 }
 
+/// 200 once every expected source has caught up since start, else 503 and why.
+async fn readyz(axum::extract::State(app): axum::extract::State<Arc<App>>) -> (http::StatusCode, String) {
+    match app.readiness() {
+        (true, _) => (http::StatusCode::OK, "ready\n".into()),
+        (false, why) => (http::StatusCode::SERVICE_UNAVAILABLE, format!("{why}\n")),
+    }
+}
+
 pub fn api_router(app: &Arc<App>) -> axum::Router {
     connect(app, false)
         .route("/healthz", axum::routing::get(|| async { "ok\n" }))
+        .route("/readyz", axum::routing::get(readyz).with_state(app.clone()))
         .layer(axum::middleware::from_fn_with_state((app.clone(), Listener::Api), auth::gate))
         .layer(axum::middleware::from_fn(metrics::time_rpcs))
 }
@@ -58,6 +68,7 @@ pub fn admin_router(app: &Arc<App>, ui: Arc<ui::Ui>) -> axum::Router {
         .merge(marco_ops::router(Some(refresh)))
         .merge(ui::routes(ui))
         .route("/healthz", axum::routing::get(|| async { "ok\n" }))
+        .route("/readyz", axum::routing::get(readyz).with_state(app.clone()))
         .layer(axum::middleware::from_fn_with_state((app.clone(), Listener::Admin), auth::gate))
         .layer(axum::middleware::from_fn(metrics::time_rpcs))
 }

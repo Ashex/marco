@@ -3,8 +3,7 @@ import { Admin } from '../gen/marco/v1/admin_pb'
 import { Dir, Graph } from '../gen/marco/v1/graph_pb'
 
 // `npm run dev:mock` and the shots: a whole-network-sized marco with fake DIDs, answering
-// every Admin and Graph RPC the way the server does (GetWal and ListSources included, which
-// answer Unimplemented). A real build never loads this file.
+// every Admin and Graph RPC the way the server does. A real build never loads this file.
 
 const B32 = '234567abcdefghijklmnopqrstuvwxyz'
 function hash(s: string): number {
@@ -44,7 +43,7 @@ const tidUs = (t: string) => {
 
 const NOW = Date.now()
 const START = NOW - (6 * 86400 + 4 * 3600) * 1000
-const SNAP_AT = NOW - (3 * 3600 + 12 * 60) * 1000
+const SNAP_AT = NOW - (6 * 3600 + 5 * 60) * 1000
 const SHARDS = 64
 const W = 709_577
 const FOLLOW = 'app.bsky.graph.follow'
@@ -66,6 +65,9 @@ const state = {
   dirty: { ...DIRTY } as Record<number, number>,
   verify: new Map<number, string>(),
   written: SNAP_AT,
+  ckpt: 212,
+  segBase: 40,
+  segAt: NOW,
   seq: 48_203_117,
   writes: [] as { seq: bigint; atMs: bigint; rel: string; add: boolean; actor: string; subject: string; outcome: string; uri: string }[],
 }
@@ -102,26 +104,27 @@ function jobTick() {
   const j = state.job
   if (!j.running) return
   const el = Date.now() - Number(j.startedMs)
-  const dur = j.kind === 'write' ? 6000 : 3000
+  const dur = j.kind === 'checkpoint' ? 6000 : 3000
   j.done = Math.min(j.total, Math.floor((el / dur) * j.total))
   if (j.kind === 'verify') for (let k = 0; k < Math.max(0, j.done - 1); k++) state.verify.set(k, 'ok')
   if (el >= dur) {
     j.running = false
     j.finishedMs = BigInt(Date.now())
     j.done = j.total
-    if (j.kind === 'write') {
+    if (j.kind === 'checkpoint') {
       state.dirty = {}
       state.written = Date.now()
+      state.ckpt++
+      state.segBase = 0
+      state.segAt = Date.now()
       state.verify.clear()
     } else for (let k = 0; k < SHARDS; k++) state.verify.set(k, 'ok')
   }
 }
 
 function shardState(k: number) {
-  if (state.job.running && state.job.kind === 'write') return 'writing'
-  const d = state.dirty[k]
-  if (d === undefined) return 'clean'
-  return d > 0.125 ? 'over' : 'dirty'
+  if (state.job.running && state.job.kind === 'checkpoint') return 'writing'
+  return state.dirty[k] === undefined ? 'clean' : 'dirty'
 }
 
 // ---------------------------------------------------------------- series
@@ -293,15 +296,46 @@ const snapBytes = SECTIONS.reduce((a, s) => a + s[2], 0)
 const FO = [2.1e6, 3.0e6, 3.8e6, 4.4e6, 4.6e6, 4.3e6, 3.7e6, 2.9e6, 2.0e6, 1.2e6, 0.6e6, 0.21e6, 52e3, 11e3, 2.1e3, 410, 80, 14, 3, 1]
 const FI = [6.0e6, 6.5e6, 6.6e6, 6.2e6, 5.4e6, 4.3e6, 3.1e6, 2.0e6, 1.2e6, 0.7e6, 0.4e6, 0.21e6, 98e3, 41e3, 15e3, 5.2e3, 1.6e3, 420, 90, 12]
 
-const unimplemented = (what: string) => {
-  throw new ConnectError(what, Code.Unimplemented)
+function durability() {
+  const now = Date.now()
+  const segs = state.segBase + Math.floor((now - state.segAt) / 5000)
+  const segMs = Math.floor(now / 5000) * 5000
+  return {
+    segmentIntervalSeconds: 5,
+    segment: BigInt(Math.floor(segMs / 5000) % 100_000),
+    segmentMs: BigInt(segMs),
+    segmentWriteSeconds: 0.004,
+    segments: segs,
+    segmentBytes: BigInt(segs * 1800),
+    segmentOps: BigInt(segs * 150),
+    pendingOps: BigInt(Math.floor(((now - segMs) / 1000) * 30)),
+    checkpoint: BigInt(state.ckpt),
+    checkpointMs: BigInt(state.written),
+    checkpointOps: 3_000_000n,
+    checkpointAgeSeconds: 86_400,
+    checkpointSeconds: 40,
+    checkpointBytes: 38_000_000_000n,
+    checkpointShards: SHARDS,
+    replayedSegments: 12,
+    replayedOps: 1_800n,
+    replaySeconds: 0.06,
+  }
+}
+
+function sources() {
+  const now = Date.now()
+  const cur = (ago: number) => String((now - ago) * 1000)
+  return [
+    { name: 'jetstream', url: 'wss://jetstream.example/subscribe', state: 'connected', cursor: cur(300), cursorKind: 'time_us', lagSeconds: 0.3, opsPerSecond: 30.4, errors: 0n, reconnects: 2n, durableCursor: cur(5300), expected: true, caughtUp: true, lastMs: BigInt(now - 300), ops: 17_204_118n },
+    { name: 'api', url: '', state: 'serving', cursor: String(state.seq), cursorKind: 'seq', lagSeconds: 0, opsPerSecond: 0.2, errors: 0n, reconnects: 0n, durableCursor: String(state.seq - 3), expected: false, caughtUp: true, lastMs: BigInt(now - 4000), ops: 1_204n },
+    { name: 'admin', url: '', state: 'idle', cursor: '', cursorKind: 'seq', lagSeconds: 0, opsPerSecond: 0, errors: 0n, reconnects: 0n, durableCursor: '', expected: false, caughtUp: true, lastMs: 0n, ops: 3n },
+  ]
 }
 
 function overview() {
   jobTick()
   tickWrites()
   const dirty = Object.keys(state.dirty).length
-  const over = Object.values(state.dirty).filter((d) => d > 0.125).length
   return {
     version: '0.1.0',
     commit: '3f9c2a1',
@@ -328,8 +362,12 @@ function overview() {
     traceRatio: state.trace,
     job: { ...state.job },
     mergeRatio: 0.125,
-    dirtyShards: state.job.running && state.job.kind === 'write' ? 0 : dirty - over,
-    overShards: state.job.running && state.job.kind === 'write' ? 0 : over,
+    dirtyShards: state.job.running && state.job.kind === 'checkpoint' ? 0 : dirty,
+    overShards: 0,
+    durability: durability(),
+    ready: true,
+    readyReason: '',
+    readsBeforeReady: 0n,
     deltaEntries: BigInt(deltaTotal()),
     baseEntries: BigInt(base),
     tombstones: 1204n,
@@ -391,6 +429,8 @@ export function mockTransport() {
               mergedLists: st === 'clean' ? 0 : 30,
               mergedBytes: BigInt(st === 'clean' ? 0 : 2_900_000),
               tombstones: st === 'clean' ? 0 : 19,
+              file: `shard-${String(k).padStart(3, '0')}.shd`,
+              checkpoint: BigInt(state.ckpt - (state.dirty[k] === undefined && k !== 12 ? 3 : 0)),
               state: st,
               verify: v,
             }
@@ -411,8 +451,7 @@ export function mockTransport() {
         else rows.sort((p, q) => Number(q.adds + q.dels) / Number(q.base) - Number(p.adds + p.dels) / Number(p.base))
         return { sections: SECTIONS.map(([name, rel, b]) => ({ name, rel, sizeBytes: BigInt(Math.round(b)), files: rel === 'directory' ? 1 : SHARDS })), deltas: rows, deltaLists: 61_220 }
       },
-      getWal: () => unimplemented('this marco has no WAL yet'),
-      listSources: () => unimplemented('this marco has no ingest of its own yet'),
+      listSources: () => ({ sources: sources() }),
       listRelations: () => ({
         config: rels.map((r) => `[[relation]]\nname = "${r.name}"\ncollection = "${r.collection}"\nsubject = "subject"`).join('\n\n'),
         relations: rels.map((r) => ({ name: r.name, collection: r.collection, subject: 'subject', records: BigInt(r.records), pairs: BigInt(r.pairs), duplicates: BigInt(r.records - r.pairs), nonTid: BigInt(r.nonTid) })),
@@ -455,9 +494,9 @@ export function mockTransport() {
       listEdges: (r) => edgesOf(r.actor, r.rel, r.dir, r.cursor, r.limit || 50),
       resolveUri: (r) => resolve(r.uri),
       getSettings: () => ({ flags: FLAGS.map(([name, value, source]) => ({ name, value, source })), build: { version: '0.1.0', commit: '3f9c2a1', format: 2, features: ['metrics', 'jemalloc', 'cpu-profile'] } }),
-      writeShards: () => {
+      checkpoint: () => {
         if (state.job.running) throw new ConnectError('a job is running', Code.FailedPrecondition)
-        state.job = { kind: 'write', running: true, startedMs: BigInt(Date.now()), finishedMs: 0n, error: '', done: 0, total: SHARDS + 1 }
+        state.job = { kind: 'checkpoint', running: true, startedMs: BigInt(Date.now()), finishedMs: 0n, error: '', done: 0, total: SHARDS + 1 }
         return { job: { ...state.job } }
       },
       verifyShards: () => {

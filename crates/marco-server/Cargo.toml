@@ -10,6 +10,10 @@ publish = false
 name = "marco"
 path = "src/main.rs"
 
+[[bin]]
+name = "marco-live-bench"
+path = "src/live_bench.rs"
+
 [features]
 default = ["jemalloc"]
 # jemalloc as the allocator, with the heap sampler /debug/pprof/heap reads
@@ -20,6 +24,7 @@ marco-core = { workspace = true, features = ["metrics"] }
 marco-ops = { workspace = true }
 marco-proto = { workspace = true }
 anyhow = { workspace = true }
+arc-swap = { workspace = true }
 axum = { workspace = true, features = ["http1", "http2", "tokio", "query"] }
 buffa = { workspace = true }
 clap = { workspace = true, features = ["env"] }

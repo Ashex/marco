@@ -5,9 +5,9 @@
 export type Tone = 'ok' | 'warn' | 'err' | 'info' | 'idle'
 export const GLYPH: Record<Tone | 'acc' | 'out' | 'in' | 'sig', string> = { ok: '●', warn: '▲', err: '■', info: '◆', idle: '○', acc: '●', out: '→', in: '←', sig: '●' }
 
-const SHARD: Record<string, Tone | 'acc'> = { clean: 'idle', dirty: 'info', over: 'warn', writing: 'acc' }
+const SHARD: Record<string, Tone | 'acc'> = { clean: 'idle', dirty: 'info', writing: 'acc' }
 export const shardTone = (s: string) => SHARD[s] ?? 'idle'
-export const SHARD_WORD: Record<string, string> = { clean: 'clean', dirty: 'dirty', over: 'over threshold', writing: 'writing' }
+export const SHARD_WORD: Record<string, string> = { clean: 'clean', dirty: 'dirty', writing: 'writing' }
 
 const VERIFY: Record<string, Tone> = { ok: 'ok', mismatch: 'err', verifying: 'info', unverified: 'idle' }
 export const verifyTone = (s: string): Tone => VERIFY[s] ?? 'idle'

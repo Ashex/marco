@@ -1,7 +1,7 @@
 //! marco: the graph server.
 //!
 //! ```text
-//! marco serve --snapshot DIR [--admin-token-file F]   serve a snapshot
+//! marco serve --snapshot DIR [--admin-token-file F]   serve a snapshot (and write to it)
 //! marco synth --out DIR [--actors N]                   write a synthetic snapshot (fake DIDs)
 //! ```
 
@@ -78,6 +78,18 @@ struct Serve {
     /// A built console (ui/dist). Default: this source tree's, if built.
     #[arg(long, env = "MARCO_UI_DIR")]
     ui_dir: Option<PathBuf>,
+    /// Seconds between change segments: the writes a kill -9 can lose, for a source to replay.
+    #[arg(long, env = "MARCO_SEGMENT_INTERVAL", default_value_t = 5.0)]
+    segment_interval: f64,
+    /// Checkpoint once the segments since the last hold this many ops (what a restart replays)…
+    #[arg(long, env = "MARCO_CHECKPOINT_OPS", default_value_t = 3_000_000)]
+    checkpoint_ops: u64,
+    /// …or the last is this many seconds old.
+    #[arg(long, env = "MARCO_CHECKPOINT_AGE", default_value_t = 86_400.0)]
+    checkpoint_age: f64,
+    /// Answer Graph reads before every expected source has caught up (they're counted either way).
+    #[arg(long, env = "MARCO_SERVE_BEFORE_READY")]
+    serve_before_ready: bool,
 }
 
 fn flags(m: &ArgMatches, s: &Serve) -> Vec<FlagInfo> {
@@ -97,6 +109,10 @@ fn flags(m: &ArgMatches, s: &Serve) -> Vec<FlagInfo> {
         ("otlp", s.otlp.clone().unwrap_or_else(|| "—".into())),
         ("read_only", s.read_only.to_string()),
         ("ui_dir", opt(&s.ui_dir)),
+        ("segment_interval", s.segment_interval.to_string()),
+        ("checkpoint_ops", s.checkpoint_ops.to_string()),
+        ("checkpoint_age", s.checkpoint_age.to_string()),
+        ("serve_before_ready", s.serve_before_ready.to_string()),
     ];
     rows.into_iter()
         .map(|(id, value)| {
@@ -137,6 +153,14 @@ fn auth(s: &Serve) -> Result<AuthConfig> {
     Ok(AuthConfig { token, proxy_header, proxy_from, operators: s.admin_operators.clone() })
 }
 
+async fn shutdown_signal() {
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("SIGTERM handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = term.recv() => {}
+    }
+}
+
 fn main() -> Result<()> {
     let matches = Cli::command().get_matches();
     let cli = Cli::from_arg_matches(&matches)?;
@@ -156,8 +180,10 @@ fn main() -> Result<()> {
                 None => None,
             };
             marco_ops::set_trace_ratio(s.trace_ratio);
+            if s.segment_interval <= 0.0 || s.checkpoint_age <= 0.0 {
+                bail!("--segment-interval and --checkpoint-age must be above 0");
+            }
             let cfg = Config {
-                snapshot: s.snapshot.clone(),
                 read_only: s.read_only,
                 merge_ratio: s.merge_ratio,
                 compact_min: s.compact_min,
@@ -165,6 +191,11 @@ fn main() -> Result<()> {
                 admin_listen: s.admin_listen.clone(),
                 auth: auth(&s)?,
                 flags: flags(m, &s),
+                segment_interval: std::time::Duration::from_secs_f64(s.segment_interval),
+                checkpoint_ops: s.checkpoint_ops,
+                checkpoint_age: std::time::Duration::from_secs_f64(s.checkpoint_age),
+                serve_before_ready: s.serve_before_ready,
+                ..Config::new(s.snapshot.clone())
             };
             let ui = Arc::new(marco_server::ui::Ui::load(s.ui_dir.as_deref())?);
             let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
@@ -179,7 +210,11 @@ fn main() -> Result<()> {
                     app.open_seconds * 1e3,
                     if s.read_only { ", read-only" } else { "" },
                 );
-                tokio::signal::ctrl_c().await?;
+                shutdown_signal().await;
+                if !s.read_only {
+                    // the writes since the last segment, so a clean stop loses none
+                    app.shutdown().await?;
+                }
                 Ok(())
             })
         }

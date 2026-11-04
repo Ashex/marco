@@ -398,18 +398,6 @@ export function ErrorState({ error, retry }: { error: unknown; retry?: () => voi
   )
 }
 
-/** In place of a panel whose RPC this marco doesn't serve yet. */
-export function NeedsVersion({ what, rpc }: { what: ReactNode; rpc: string }) {
-  return (
-    <div className="cx-needs cx-hatch" title={`marco.v1.Admin/${rpc} answers Unimplemented`}>
-      <Glyph k="idle" />
-      <span>
-        <b>{what}</b> needs a newer marco <span className="mono muted">({rpc})</span>
-      </span>
-    </div>
-  )
-}
-
 export function Loaded<T>({ load, children }: { load: { data?: T; error?: unknown; loading: boolean; reload?: () => void }; children: (d: T) => ReactNode }) {
   if (load.data !== undefined) return <>{children(load.data)}</>
   if (load.error) return <ErrorState error={load.error} retry={load.reload} />

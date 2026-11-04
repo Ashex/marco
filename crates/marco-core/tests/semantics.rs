@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use marco_core::rkey::key_of;
-use marco_core::{Added, Dir, Graph, ListRef, Relations, Removed};
+use marco_core::{Added, Dir, Graph, ListRef, Relations, Removed, Status};
 use vlatproto::tid::Tid;
 
 const FOLLOW: u8 = 0;
@@ -130,23 +130,56 @@ impl CloneViaSnapshot for Graph {
 }
 
 #[test]
-fn delete_before_create_stays_deleted() {
+fn a_delete_before_the_create_holds_only_against_other_sources() {
     let (a, b) = (did(1), did(2));
     for base in [false, true] {
         let mut g = graph();
         g.add(&follow(&did(9), &tid(1)), &b).unwrap();
+        assert_eq!(g.delete_from("live", &follow(&a, &tid(7))).unwrap(), Removed::NotFound);
+        assert_eq!(g.tombstones(FOLLOW), 1);
         if base {
             g = reopen(&g);
+            assert_eq!(g.tombstones(FOLLOW), 1, "tombstones persist");
         }
-        assert_eq!(g.delete(&follow(&a, &tid(7))).unwrap(), Removed::NotFound);
-        assert_eq!(g.tombstones(FOLLOW), 1);
-        assert_eq!(g.add(&follow(&a, &tid(7)), &b).unwrap(), Added::Deleted);
+        // a backfill landing after the live tail deleted the record
+        assert_eq!(g.add_from("backfill", &follow(&a, &tid(7)), &b).unwrap(), Added::Deleted);
         assert_eq!(g.has(FOLLOW, &a, &b), None);
         assert_eq!(g.counts(FOLLOW, &b), (0, 1));
         // another rkey for the same pair is a different record
-        assert_eq!(g.add(&follow(&a, &tid(8)), &b).unwrap(), Added::Added);
+        assert_eq!(g.add_from("backfill", &follow(&a, &tid(8)), &b).unwrap(), Added::Added);
         assert_eq!(g.has(FOLLOW, &a, &b), Some(follow(&a, &tid(8))));
+        // the same stream re-creating the rkey later is a re-create
+        assert_eq!(g.add_from("live", &follow(&a, &tid(7)), &b).unwrap(), Added::Added);
+        assert_eq!(g.tombstones(FOLLOW), 0);
+        assert_eq!(g.counts(FOLLOW, &a), (2, 0));
+        if base {
+            let g2 = reopen(&g);
+            assert_eq!(g2.tombstones(FOLLOW), 0, "the cleared tombstone stays cleared");
+            assert_eq!(g2.counts(FOLLOW, &a), (2, 0));
+        }
     }
+}
+
+#[test]
+fn statuses_persist_and_hide() {
+    let (a, b, c) = (did(1), did(2), did(3));
+    let mut g = graph();
+    g.add(&follow(&a, &tid(1)), &b).unwrap();
+    g.add(&follow(&c, &tid(1)), &a).unwrap();
+    assert_eq!(g.set_status_from("live", &a, Some(Status::Deleted)).unwrap(), 1);
+    g.set_status_from("live", &c, Some(Status::Takendown)).unwrap();
+    g.set_status_from("live", "did:web:never.example", Some(Status::Takendown)).unwrap();
+    let mut g = reopen(&g);
+    assert_eq!(g.status_of(&a), Some(Status::Deleted));
+    assert_eq!(g.status_of(&c), Some(Status::Takendown));
+    assert_eq!(g.status_of("did:web:never.example"), Some(Status::Takendown));
+    assert_eq!(g.status_of(&b), None);
+    assert_eq!(g.counts(FOLLOW, &a).0, 0, "deleted drops its records");
+    assert_eq!(g.counts(FOLLOW, &c).0, 1, "takendown keeps them");
+    g.set_status_from("live", &c, None).unwrap();
+    let g = reopen(&g);
+    assert_eq!(g.status_of(&c), None);
+    assert_eq!(g.statuses().len(), 2);
 }
 
 #[test]
@@ -294,7 +327,8 @@ fn ids_survive_snapshots_with_live_dids() {
 #[derive(Default)]
 struct Model {
     records: BTreeMap<(u8, u32, String), u32>,
-    tomb: HashSet<(u8, u32, String)>,
+    /// Tombstones with the source that left them.
+    tomb: BTreeMap<(u8, u32, String), usize>,
 }
 
 impl Model {
@@ -339,8 +373,15 @@ fn run_model(subj_index: usize) {
     g.set_subj_index(subj_index);
     g.compact_min = 4;
     let mut m = Model::default();
-    let actors = 40u64;
+    let mut actors = 20u64;
+    let dir = tempfile::tempdir().unwrap();
+    let snap = dir.path().join("g");
+    let mut ckpt = 0;
     for step in 0..6000 {
+        // new DIDs keep arriving, so checkpoints write live DIDs and new shards
+        if step % 100 == 0 {
+            actors += 1;
+        }
         let (coll, rel) = rels[(rnd(5) == 0) as usize];
         let a = rnd(actors) as u32;
         let rkey = match rnd(20) {
@@ -348,21 +389,31 @@ fn run_model(subj_index: usize) {
             _ => tid(rnd(120)),
         };
         let uri = format!("at://{}/{coll}/{rkey}", did(a));
+        let src = (rnd(4) == 0) as usize;
+        let source = ["live", "backfill"][src];
         if rnd(3) == 0 {
-            let got = g.delete(&uri).unwrap();
+            let got = g.delete_from(source, &uri).unwrap();
             let key = (rel, a, rkey.clone());
             match m.records.remove(&key) {
                 Some(s) => assert_eq!(got, removed(&did(s)), "step {step}"),
                 None => {
                     assert_eq!(got, Removed::NotFound, "step {step}");
-                    m.tomb.insert(key);
+                    m.tomb.insert(key, src);
                 }
             }
         } else {
             let b = rnd(actors) as u32;
-            let got = g.add(&uri, &did(b)).unwrap();
+            let got = g.add_from(source, &uri, &did(b)).unwrap();
             let key = (rel, a, rkey.clone());
-            let want = if m.tomb.contains(&key) {
+            let blocked = match m.tomb.get(&key) {
+                Some(&t) if t != src => true,
+                Some(_) => {
+                    m.tomb.remove(&key);
+                    false
+                }
+                None => false,
+            };
+            let want = if blocked {
                 Added::Deleted
             } else if let std::collections::btree_map::Entry::Vacant(e) = m.records.entry(key) {
                 e.insert(b);
@@ -372,11 +423,21 @@ fn run_model(subj_index: usize) {
             };
             assert_eq!(got, want, "step {step} {uri}");
         }
-        if step % 1500 == 1499 {
-            // tombstones are in-memory state; a snapshot drops them, so the model does too
-            g = reopen(&g);
+        if step % 750 == 749 {
+            // a full write, then checkpoints over it that copy unchanged lists
+            g = if g.snapshot().is_none() || step % 3000 == 2999 {
+                g.write_snapshot(&snap).unwrap();
+                Graph::open(&snap).unwrap()
+            } else {
+                ckpt += 1;
+                let m = g.write_checkpoint(&snap, ckpt, 0, Default::default()).unwrap();
+                marco_core::store::remove_unlisted(&snap, &m).unwrap();
+                let g2 = Graph::open(&snap).unwrap();
+                g2.snapshot().unwrap().verify_checksums().unwrap();
+                g2
+            };
+            g.shards = 3;
             g.compact_min = 4;
-            m.tomb.clear();
         }
         if step % 97 == 0 {
             for (_, rel) in rels {
@@ -424,12 +485,12 @@ fn checksums_catch_a_flipped_byte() {
     let p = dir.path().join("g.marco");
     g.write_snapshot(&p).unwrap();
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "no temp dir left");
-    assert_eq!(std::fs::read_dir(&p).unwrap().count(), 4, "directory + 3 shards");
+    assert_eq!(std::fs::read_dir(&p).unwrap().count(), 5, "directory + 3 shards + manifest");
     let id = Graph::open(&p).unwrap().id_of(&did(1)).unwrap();
     let store = marco_core::store::Store::open(&p).unwrap();
-    let k = (id / store.meta.shard_width) as usize;
-    let f = p.join(marco_core::store::shard_file(k));
-    let sec = store.shards[k].sections.iter().find(|s| s.name == "r0.out.dat").unwrap().clone();
+    let k = (id / store.dir.meta.shard_width) as usize;
+    let f = p.join(marco_core::store::shard_file(k, 0));
+    let sec = store.shards[k].as_ref().unwrap().snap.sections.iter().find(|s| s.name == "r0.out.dat").unwrap().clone();
     drop(store);
     let mut b = std::fs::read(&f).unwrap();
     b[sec.off as usize] ^= 1;
@@ -446,6 +507,6 @@ fn shards_must_belong_to_the_snapshot() {
     let (a, b) = (dir.path().join("a"), dir.path().join("b"));
     g.write_snapshot(&a).unwrap();
     g.write_snapshot(&b).unwrap();
-    std::fs::copy(b.join(marco_core::store::shard_file(1)), a.join(marco_core::store::shard_file(1))).unwrap();
+    std::fs::copy(b.join(marco_core::store::shard_file(1, 0)), a.join(marco_core::store::shard_file(1, 0))).unwrap();
     assert!(Graph::open(&a).is_err());
 }

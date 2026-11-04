@@ -122,12 +122,12 @@ for (const [w, theme, tag] of [[1440, 'light', 'desktop-light'], [1440, 'dark', 
   await shot(pg, 'confirm-trace', '.cx-dlg')
   await pg.keyboard.press('Escape')
   await pg.goto(`${base}/admin/storage`)
-  const write = pg.getByRole('button', { name: 'Write dirty shards…' })
+  const write = pg.getByRole('button', { name: 'Checkpoint now…' })
   // a --read-only server disables it
   if (await write.isEnabled()) {
     await write.click()
     await pg.locator('.cx-dlg').waitFor()
-    await shot(pg, 'confirm-write-shards', '.cx-dlg')
+    await shot(pg, 'confirm-checkpoint', '.cx-dlg')
     await pg.keyboard.press('Escape')
   }
   await pg.keyboard.press('Meta+k')

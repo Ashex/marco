@@ -68,6 +68,7 @@ pub mod __buffa {
         reg.register_json_any(super::__GET_SESSION_RESPONSE_JSON_ANY);
         reg.register_json_any(super::__GET_OVERVIEW_REQUEST_JSON_ANY);
         reg.register_json_any(super::__GET_OVERVIEW_RESPONSE_JSON_ANY);
+        reg.register_json_any(super::__DURABILITY_JSON_ANY);
         reg.register_json_any(super::__SNAPSHOT_INFO_JSON_ANY);
         reg.register_json_any(super::__DIRECTORY_INFO_JSON_ANY);
         reg.register_json_any(super::__RELATION_TOTALS_JSON_ANY);
@@ -86,8 +87,6 @@ pub mod __buffa {
         reg.register_json_any(super::__GET_STORAGE_RESPONSE_JSON_ANY);
         reg.register_json_any(super::__SECTION_JSON_ANY);
         reg.register_json_any(super::__DELTA_LIST_JSON_ANY);
-        reg.register_json_any(super::__GET_WAL_REQUEST_JSON_ANY);
-        reg.register_json_any(super::__GET_WAL_RESPONSE_JSON_ANY);
         reg.register_json_any(super::__LIST_RELATIONS_REQUEST_JSON_ANY);
         reg.register_json_any(super::__LIST_RELATIONS_RESPONSE_JSON_ANY);
         reg.register_json_any(super::__RELATION_INFO_JSON_ANY);
@@ -110,8 +109,8 @@ pub mod __buffa {
         reg.register_json_any(super::__GET_SETTINGS_RESPONSE_JSON_ANY);
         reg.register_json_any(super::__FLAG_JSON_ANY);
         reg.register_json_any(super::__BUILD_INFO_JSON_ANY);
-        reg.register_json_any(super::__WRITE_SHARDS_REQUEST_JSON_ANY);
-        reg.register_json_any(super::__WRITE_SHARDS_RESPONSE_JSON_ANY);
+        reg.register_json_any(super::__CHECKPOINT_REQUEST_JSON_ANY);
+        reg.register_json_any(super::__CHECKPOINT_RESPONSE_JSON_ANY);
         reg.register_json_any(super::__VERIFY_SHARDS_REQUEST_JSON_ANY);
         reg.register_json_any(super::__VERIFY_SHARDS_RESPONSE_JSON_ANY);
         reg.register_json_any(super::__SET_TRACE_RATIO_REQUEST_JSON_ANY);
@@ -257,6 +256,10 @@ pub use self::__buffa::view::GetOverviewResponseView;
 #[doc(inline)]
 pub use self::__buffa::view::GetOverviewResponseOwnedView;
 #[doc(inline)]
+pub use self::__buffa::view::DurabilityView;
+#[doc(inline)]
+pub use self::__buffa::view::DurabilityOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::SnapshotInfoView;
 #[doc(inline)]
 pub use self::__buffa::view::SnapshotInfoOwnedView;
@@ -328,14 +331,6 @@ pub use self::__buffa::view::SectionOwnedView;
 pub use self::__buffa::view::DeltaListView;
 #[doc(inline)]
 pub use self::__buffa::view::DeltaListOwnedView;
-#[doc(inline)]
-pub use self::__buffa::view::GetWalRequestView;
-#[doc(inline)]
-pub use self::__buffa::view::GetWalRequestOwnedView;
-#[doc(inline)]
-pub use self::__buffa::view::GetWalResponseView;
-#[doc(inline)]
-pub use self::__buffa::view::GetWalResponseOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::ListRelationsRequestView;
 #[doc(inline)]
@@ -425,13 +420,13 @@ pub use self::__buffa::view::BuildInfoView;
 #[doc(inline)]
 pub use self::__buffa::view::BuildInfoOwnedView;
 #[doc(inline)]
-pub use self::__buffa::view::WriteShardsRequestView;
+pub use self::__buffa::view::CheckpointRequestView;
 #[doc(inline)]
-pub use self::__buffa::view::WriteShardsRequestOwnedView;
+pub use self::__buffa::view::CheckpointRequestOwnedView;
 #[doc(inline)]
-pub use self::__buffa::view::WriteShardsResponseView;
+pub use self::__buffa::view::CheckpointResponseView;
 #[doc(inline)]
-pub use self::__buffa::view::WriteShardsResponseOwnedView;
+pub use self::__buffa::view::CheckpointResponseOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::VerifyShardsRequestView;
 #[doc(inline)]

@@ -243,16 +243,18 @@ pub fn spawn(app: Arc<App>) {
 }
 
 fn sample(app: &App, cache: bool) {
-    let (delta, tombs) = {
+    app.sample_rates();
+    let (delta, tombs, snap) = {
         let g = app.graph();
         g.refresh_gauges();
-        if cache {
-            let b: u64 = g.snapshot().map_or(0, |s| s.files().map(|f| crate::sys::resident(f.bytes())).sum());
-            app.cached_bytes.store(b, Ordering::Relaxed);
-            crate::metrics::CACHED.set(b as i64);
-        }
-        crate::admin_svc::delta_totals(&g)
+        let (d, t) = crate::admin_svc::delta_totals(&g);
+        (d, t, g.shared_snapshot())
     };
+    if let (true, Some(s)) = (cache, snap) {
+        let b: u64 = s.files().map(|f| crate::sys::resident(f.1.bytes())).sum();
+        app.cached_bytes.store(b, Ordering::Relaxed);
+        crate::metrics::CACHED.set(b as i64);
+    }
     let p = crate::sys::proc_self();
     let extra = [
         (Key { metric: "rss_bytes", ..Default::default() }, p.rss_bytes as f64),

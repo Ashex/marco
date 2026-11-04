@@ -6,7 +6,6 @@ use std::sync::Arc;
 use connectrpc::{ConnectError, RequestContext, Response, ServiceRequest, ServiceResult};
 use marco_core::relation::parse_uri;
 use marco_core::rkey::{is_tid, key_of};
-use marco_core::store::DIR_FILE;
 use marco_core::{Dir, Graph, RelId, Stored};
 use marco_proto::connect::marco::v1 as svc;
 use marco_proto::v1::*;
@@ -51,14 +50,6 @@ fn created_us(key: u64) -> i64 {
     }
 }
 
-fn mtime_ms(p: &std::path::Path) -> i64 {
-    std::fs::metadata(p)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_millis() as i64)
-}
-
 /// Delta entries and tombstones over every list.
 pub fn delta_totals(g: &Graph) -> (u64, u64) {
     let mut d = 0u64;
@@ -83,9 +74,8 @@ struct ShardAcc {
 /// Per shard: delta entries, merged lists and tombstones, by the shard that
 /// holds the list (an id added since the snapshot counts in the last).
 fn shard_accs(g: &Graph) -> Vec<ShardAcc> {
-    let Some(s) = g.snapshot() else { return Vec::new() };
-    let n = s.shards.len();
-    let w = s.meta.shard_width.max(1);
+    let n = g.n_shards().max(1);
+    let w = g.shard_width().max(1);
     let at = |id: u32| ((id / w) as usize).min(n - 1);
     let mut v: Vec<ShardAcc> =
         (0..n).map(|_| ShardAcc { delta: 0, delta_lists: 0, merged: 0, merged_bytes: 0, tombs: 0 }).collect();
@@ -109,16 +99,39 @@ fn shard_accs(g: &Graph) -> Vec<ShardAcc> {
     v
 }
 
-fn shard_state(app: &App, base: u64, a: &ShardAcc, ratio: f64) -> &'static str {
+fn shard_state(app: &App, dirty: bool) -> &'static str {
     let job = app.job();
-    if job.running && job.kind == "write" {
+    if job.running && job.kind == "checkpoint" && dirty {
         "writing"
-    } else if a.delta as f64 > base as f64 * ratio && a.delta > 0 {
-        "over"
-    } else if a.delta > 0 || a.merged > 0 || a.tombs > 0 {
+    } else if dirty {
         "dirty"
     } else {
         "clean"
+    }
+}
+
+fn durability_pb(app: &App) -> Durability {
+    let d = app.durability.lock().unwrap().clone();
+    Durability {
+        segment_interval_seconds: app.cfg.segment_interval.as_secs_f64(),
+        segment: d.segment,
+        segment_ms: d.segment_ms,
+        segment_write_seconds: d.segment_write_seconds,
+        segments: d.segments,
+        segment_bytes: d.segment_bytes,
+        segment_ops: d.segment_ops,
+        pending_ops: d.pending_ops,
+        checkpoint: d.checkpoint,
+        checkpoint_ms: d.checkpoint_ms,
+        checkpoint_ops: app.cfg.checkpoint_ops,
+        checkpoint_age_seconds: app.cfg.checkpoint_age.as_secs_f64(),
+        checkpoint_seconds: d.checkpoint_seconds,
+        checkpoint_bytes: d.checkpoint_bytes,
+        checkpoint_shards: d.checkpoint_shards,
+        replayed_segments: d.replayed_segments,
+        replayed_ops: d.replayed_ops,
+        replay_seconds: d.replay_seconds,
+        ..Default::default()
     }
 }
 
@@ -177,23 +190,15 @@ impl svc::Admin for AdminApi {
         let app = &self.0;
         let g = app.graph();
         let snap = g.snapshot().ok_or_else(|| ConnectError::unavailable("no snapshot"))?;
-        let meta = &snap.meta;
-        let accs = shard_accs(&g);
+        let meta = &snap.dir.meta;
+        let stats = snap.stats();
         let ratio = g.merge_ratio;
-        let (mut dirty, mut over) = (0, 0);
-        for (k, a) in accs.iter().enumerate() {
-            let base = snap.shard_meta[k].stats.iter().map(|s| s.out_records + s.in_pairs).sum();
-            match shard_state(app, base, a, ratio) {
-                "over" => over += 1,
-                "dirty" => dirty += 1,
-                _ => {}
-            }
-        }
+        let dirty = g.dirty_shards().iter().filter(|&&d| d).count() as u32;
         let mut relations = Vec::new();
         let (mut delta_entries, mut base_entries, mut tombstones, mut merged_bytes, mut merged_lists) = (0, 0, 0, 0, 0);
         for (i, rel) in g.relations().list.iter().enumerate() {
             let r = i as RelId;
-            let st = meta.stats.get(i).cloned().unwrap_or_default();
+            let st = stats.get(i).cloned().unwrap_or_default();
             let (mut dout, mut din, mut mb) = (0u64, 0u64, 0u64);
             g.for_each_delta(r, Dir::Out, |_, a, d| dout += (a + d) as u64);
             g.for_each_delta(r, Dir::In, |_, a, d| din += (a + d) as u64);
@@ -203,9 +208,7 @@ impl svc::Admin for AdminApi {
                     merged_lists += 1;
                 });
             }
-            let c = &app.counters[i];
-            let records =
-                (st.out_records + c.added.load(Ordering::Relaxed)).saturating_sub(c.removed.load(Ordering::Relaxed));
+            let records = g.records(r).0;
             let tombs = g.tombstones(r) as u64;
             delta_entries += dout + din;
             base_entries += st.out_records + st.in_pairs;
@@ -229,6 +232,7 @@ impl svc::Admin for AdminApi {
             });
         }
         let p = crate::sys::proc_self();
+        let (ready, ready_reason) = app.readiness();
         let resp = GetOverviewResponse {
             version: crate::VERSION.into(),
             commit: crate::COMMIT.into(),
@@ -238,12 +242,12 @@ impl svc::Admin for AdminApi {
                 path: app.cfg.snapshot.display().to_string(),
                 build: format!("{:016x}", meta.build),
                 format: meta.format,
-                shards: meta.shards,
+                shards: g.n_shards() as u32,
                 size_bytes: snap.bytes(),
-                written_ms: mtime_ms(&app.cfg.snapshot.join(DIR_FILE)),
+                written_ms: snap.manifest.written_ms,
                 open_seconds: app.open_seconds,
                 subj_index: meta.subj_index,
-                files: snap.shards.len() as u32 + 1,
+                files: snap.files().count() as u32,
                 ..Default::default()
             }
             .into(),
@@ -267,16 +271,19 @@ impl svc::Admin for AdminApi {
             job: job_pb(&app.job()).into(),
             merge_ratio: ratio,
             dirty_shards: dirty,
-            over_shards: over,
             delta_entries,
             base_entries,
             tombstones,
             merged_bytes,
             merged_lists,
-            write_cursor: app.cursor.lock().unwrap().clone(),
+            write_cursor: app.latest_cursor(crate::app::API_SOURCE).unwrap_or_default(),
             write_seq: app.write_seq.load(Ordering::Relaxed),
             api_listen: app.cfg.api_listen.clone(),
             admin_listen: app.cfg.admin_listen.clone(),
+            durability: durability_pb(app).into(),
+            ready,
+            ready_reason,
+            reads_before_ready: app.reads_before_ready.load(Ordering::Relaxed),
             ..Default::default()
         };
         Response::ok(resp)
@@ -348,28 +355,40 @@ impl svc::Admin for AdminApi {
         let g = app.graph();
         let snap = g.snapshot().ok_or_else(|| ConnectError::unavailable("no snapshot"))?;
         let accs = shard_accs(&g);
+        let dirty = g.dirty_shards();
         let verify = app.verify.lock().unwrap().clone();
         let vword = |i: usize| verify.get(i).cloned().unwrap_or_default();
+        // verify slots follow the files: the directory, then each shard file in order
+        let mut file_slot = 0;
+        let w = g.shard_width();
         let shards = accs
             .iter()
             .enumerate()
             .map(|(k, a)| {
-                let m = &snap.shard_meta[k];
-                let base: u64 = m.stats.iter().map(|s| s.out_records + s.in_pairs).sum();
-                let v = vword(k + 1);
+                let f = snap.shards.get(k).and_then(|f| f.as_deref());
+                let base: u64 = f.map_or(0, |f| f.meta.stats.iter().map(|s| s.out_records + s.in_pairs).sum());
+                let v = if f.is_some() {
+                    file_slot += 1;
+                    vword(file_slot)
+                } else {
+                    Verify::Unverified
+                };
+                let lo = k as u32 * w;
                 Shard {
                     shard: k as u32,
-                    lo: m.lo,
-                    hi: m.hi,
-                    size_bytes: snap.shards[k].len() as u64,
-                    written_ms: mtime_ms(&app.cfg.snapshot.join(marco_core::store::shard_file(k))),
+                    lo,
+                    hi: f.map_or(lo, |f| f.meta.hi),
+                    size_bytes: f.map_or(0, |f| f.snap.len() as u64),
+                    written_ms: f.map_or(0, |f| f.meta.written_ms),
+                    file: f.map_or_else(String::new, |f| f.name.clone()),
+                    checkpoint: f.map_or(0, |f| f.meta.checkpoint),
                     base_entries: base,
                     delta_entries: a.delta,
                     delta_lists: a.delta_lists,
                     merged_lists: a.merged,
                     merged_bytes: a.merged_bytes,
                     tombstones: a.tombs,
-                    state: shard_state(app, base, a, g.merge_ratio).into(),
+                    state: shard_state(app, dirty.get(k).copied().unwrap_or(true)).into(),
                     verify: v.word().into(),
                     verify_error: match v {
                         Verify::Mismatch(e) => e,
@@ -383,7 +402,7 @@ impl svc::Admin for AdminApi {
             shards,
             merge_ratio: g.merge_ratio,
             job: job_pb(&app.job()).into(),
-            directory_bytes: snap.dir.len() as u64,
+            directory_bytes: snap.dir.snap.len() as u64,
             directory_verify: vword(0).word().into(),
             ..Default::default()
         })
@@ -402,7 +421,7 @@ impl svc::Admin for AdminApi {
         let g = self.0.graph();
         let snap = g.snapshot().ok_or_else(|| ConnectError::unavailable("no snapshot"))?;
         let mut secs: std::collections::BTreeMap<String, (u64, u32)> = Default::default();
-        for f in snap.files() {
+        for (_, f) in snap.files() {
             for s in &f.sections {
                 let e = secs.entry(s.name.clone()).or_default();
                 e.0 += s.len;
@@ -462,17 +481,13 @@ impl svc::Admin for AdminApi {
         Response::ok(GetStorageResponse { sections, deltas, delta_lists, ..Default::default() })
     }
 
-    async fn get_wal(&self, _: RequestContext, _: ServiceRequest<'_, GetWalRequest>) -> ServiceResult<GetWalResponse> {
-        Err(ConnectError::unimplemented("this marco has no WAL yet"))
-    }
-
     async fn list_relations(
         &self,
         _: RequestContext,
         _: ServiceRequest<'_, ListRelationsRequest>,
     ) -> ServiceResult<ListRelationsResponse> {
         let g = self.0.graph();
-        let stats = g.snapshot().map(|s| s.meta.stats.clone()).unwrap_or_default();
+        let stats = g.snapshot().map(|s| s.stats()).unwrap_or_default();
         let relations = g
             .relations()
             .list
@@ -504,7 +519,7 @@ impl svc::Admin for AdminApi {
         let (rel, build) = {
             let g = self.0.graph();
             let rel = rel_id(&g, req.rel)?;
-            (rel, g.snapshot().map_or(0, |s| s.meta.build))
+            (rel, g.snapshot().map_or(0, |s| s.manifest.checkpoint ^ s.dir.meta.build))
         };
         match self.0.list_stats.get(build, self.0.cfg.snapshot.clone()) {
             crate::liststats::Answer::Computing(progress) => {
@@ -541,7 +556,40 @@ impl svc::Admin for AdminApi {
         _: RequestContext,
         _: ServiceRequest<'_, ListSourcesRequest>,
     ) -> ServiceResult<ListSourcesResponse> {
-        Err(ConnectError::unimplemented("this marco has no ingest of its own yet"))
+        let now = crate::app::now_ms();
+        let rates = self.0.source_rates();
+        let sources = self
+            .0
+            .sources
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(name, s)| {
+                let r = s.report.clone().unwrap_or_default();
+                Source {
+                    name: name.clone(),
+                    url: r.url,
+                    state: if r.state.is_empty() {
+                        if now - s.last_ms < 60_000 { "writing" } else { "idle" }.into()
+                    } else {
+                        r.state
+                    },
+                    cursor: s.cursor.clone(),
+                    cursor_kind: r.cursor_kind,
+                    lag_seconds: r.lag_seconds,
+                    ops_per_second: rates.get(name).copied().unwrap_or(0.0),
+                    errors: r.errors,
+                    reconnects: r.reconnects,
+                    durable_cursor: s.durable.clone(),
+                    expected: s.expected,
+                    caught_up: s.caught_up,
+                    last_ms: s.last_ms,
+                    ops: s.ops,
+                    ..Default::default()
+                }
+            })
+            .collect();
+        Response::ok(ListSourcesResponse { sources, ..Default::default() })
     }
 
     async fn get_actor(
@@ -558,7 +606,7 @@ impl svc::Admin for AdminApi {
         let Some(id) = g.id_of(&did) else {
             return Response::ok(GetActorResponse { did, status, ..Default::default() });
         };
-        let w = g.snapshot().map_or(1, |s| s.meta.shard_width.max(1));
+        let w = g.shard_width().max(1);
         let rels = (0..g.relations().len() as RelId)
             .map(|r| {
                 let out = g.out_count(r, id);
@@ -675,7 +723,7 @@ impl svc::Admin for AdminApi {
             created_us: created_us(key),
             ..Default::default()
         };
-        let w = g.snapshot().map_or(1, |s| s.meta.shard_width.max(1));
+        let w = g.shard_width().max(1);
         let Some(a) = g.id_of(did) else { return Response::ok(r) };
         r.actor_id = a;
         r.shard = a / w;
@@ -714,7 +762,7 @@ impl svc::Admin for AdminApi {
                 ..Default::default()
             })
             .collect();
-        let format = self.0.graph().snapshot().map_or(0, |s| s.meta.format);
+        let format = self.0.graph().snapshot().map_or(0, |s| s.dir.meta.format);
         let features = ["metrics", "jemalloc", "cpu-profile"].map(String::from).to_vec();
         Response::ok(GetSettingsResponse {
             flags,
@@ -730,17 +778,14 @@ impl svc::Admin for AdminApi {
         })
     }
 
-    async fn write_shards(
+    async fn checkpoint(
         &self,
         _: RequestContext,
-        req: ServiceRequest<'_, WriteShardsRequest>,
-    ) -> ServiceResult<WriteShardsResponse> {
-        if !matches!(req.shards, "" | "dirty" | "all") {
-            return Err(bad("shards must be dirty or all"));
-        }
+        _: ServiceRequest<'_, CheckpointRequest>,
+    ) -> ServiceResult<CheckpointResponse> {
         self.writable()?;
-        let j = self.0.start_write().map_err(ConnectError::failed_precondition)?;
-        Response::ok(WriteShardsResponse { job: job_pb(&j).into(), ..Default::default() })
+        let j = self.0.start_checkpoint().map_err(ConnectError::failed_precondition)?;
+        Response::ok(CheckpointResponse { job: job_pb(&j).into(), ..Default::default() })
     }
 
     async fn verify_shards(

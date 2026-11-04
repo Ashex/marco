@@ -163,6 +163,7 @@ impl RelReport {
             in_pairs: self.in_pairs,
             in_lists: self.in_lists,
             non_tid: self.non_tid,
+            tombstones: 0,
             out_bytes: self.out_bytes,
         }
     }
@@ -891,6 +892,7 @@ pub fn build(o: &Opts) -> Result<Report> {
     let t = Instant::now();
     let c = Counters::default();
     let build = set.build;
+    let shard_metas: Vec<ShardMeta> = (0..o.shards).map(|k| set.shard_meta(k, Vec::new())).collect();
     let mut shard_bytes = Vec::new();
     writers
         .into_par_iter()
@@ -902,8 +904,13 @@ pub fn build(o: &Opts) -> Result<Report> {
                 r.merge(&ins[k][ri]);
                 stats.push(r.stats());
             }
-            let m = ShardMeta { format: FORMAT, build, shard: k as u32, lo: ranges[k].0, hi: ranges[k].1, stats };
-            SetWriter::finish_shard(w, &m)
+            let mut w = w;
+            w.section("status", &[])?;
+            w.section("live", &[])?;
+            for ri in 0..o.rels.len() {
+                w.section(&rel_section(ri, "tomb"), &[])?;
+            }
+            SetWriter::finish_shard(w, &shard_metas[k].clone().with_stats(stats))
         })
         .collect::<Result<Vec<()>>>()?;
     for (ri, rel) in o.rels.list.iter().enumerate() {
@@ -921,14 +928,12 @@ pub fn build(o: &Opts) -> Result<Report> {
     let meta = Meta {
         format: FORMAT,
         build,
-        shards: o.shards as u32,
         shard_width: set.width,
         n_ids: n,
         n_plc: rep.dids_plc as u32,
         n_other: rep.dids_other as u32,
         subj_index: o.subj_index as u32,
         relations: o.rels.list.clone(),
-        stats: rep.rels.iter().map(RelReport::stats).collect(),
     };
     set.finish(&meta)?;
     c.add(5, t);
@@ -938,8 +943,8 @@ pub fn build(o: &Opts) -> Result<Report> {
     let store = marco_core::store::Store::open(&o.out)?;
     rep.sections = store.section_bytes();
     rep.snapshot_bytes = store.bytes();
-    for s in &store.shards {
-        shard_bytes.push(s.len() as u64);
+    for s in store.shards.iter().flatten() {
+        shard_bytes.push(s.snap.len() as u64);
     }
     rep.shard_bytes_max = shard_bytes.iter().copied().max().unwrap_or(0);
     rep.shard_bytes_min = shard_bytes.iter().copied().min().unwrap_or(0);
@@ -1078,7 +1083,7 @@ mod tests {
         let b = Graph::open(&out).unwrap();
         b.snapshot().unwrap().verify_checksums().unwrap();
         for rel in [0u8, 1] {
-            let st = &b.snapshot().unwrap().meta.stats[rel as usize];
+            let st = &b.snapshot().unwrap().stats()[rel as usize];
             assert_eq!(st.out_records, rep.rels[rel as usize].out_records);
             for i in 0..400 {
                 let d = did(i);

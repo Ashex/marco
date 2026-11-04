@@ -1,13 +1,13 @@
 import { useState } from 'react'
 import { DataTable } from '../components/DataTable'
 import { confirmAction } from '../components/dialogs'
-import { Banners, Chip, Glyph, KV, Legend, Loaded, Meter, NeedsVersion, PageHead, Panel, PanelBody, Seg, Spark, Swatch, Tiles, Updated, Arrow, Dot, oldest } from '../components/kit'
+import { Banners, Chip, Glyph, KV, Legend, Loaded, Meter, PageHead, Panel, PanelBody, Seg, Spark, Swatch, Tiles, Updated, Arrow, Dot, oldest } from '../components/kit'
 import { bytes, bytesParts, dur, fmtCount, n, pct, si, ago, lat, shortDid } from '../lib/fmt'
-import { last, sum, series, useOverview, useSeries, useShards, useStorage, useWal, verifyShards, writeShards, unsupported } from '../lib/queries'
+import { last, sum, series, useOverview, useSeries, useShards, useStorage, verifyShards, checkpoint } from '../lib/queries'
 import { SHARD_WORD, shardTone, verifyTone } from '../lib/tone'
 import { ShardMap, shardCounts, useAttention } from './Overview'
 import { dirOf, shardName, windowLabel } from './common'
-import type { GetOverviewResponse, ListShardsResponse, Section } from '../gen/marco/v1/admin_pb'
+import type { Durability, GetOverviewResponse, ListShardsResponse, Section } from '../gen/marco/v1/admin_pb'
 
 const PART: Record<string, [string, string]> = {
   'out.dat': ['out log', 'out'],
@@ -31,24 +31,22 @@ function sectionRows(secs: Section[], o: GetOverviewResponse) {
   return { rows, dir }
 }
 
-export function writeDialog(sh: ListShardsResponse) {
+export function checkpointDialog(sh: ListShardsResponse, d?: Durability) {
   const c = shardCounts(sh)
-  const total = sh.shards.length
   const dirtyIds = sh.shards.filter((s) => s.state !== 'clean').map((s) => String(s.shard).padStart(3, '0'))
-  const size = sh.shards.reduce((a, s) => a + n(s.sizeBytes), 0) + n(sh.directoryBytes)
   return confirmAction({
     tone: 'info',
-    title: `Write ${total} shards?`,
+    title: 'Checkpoint now?',
     items: [
       dirtyIds.length ? `dirty: shard-${dirtyIds.slice(0, 12).join(' ')}${dirtyIds.length > 12 ? ` +${dirtyIds.length - 12}` : ''}` : 'no dirty shards',
-      `rewrites every shard · ≈ ${bytes(size)} written`,
-      'writes wait · reads keep the old files',
-      `${c.over} over threshold · ${c.dirty} dirty`,
+      `folds ${d?.segments ?? 0} segments · ${fmtCount(d?.segmentOps)} ops`,
+      `rewrites ${c.dirty + c.writing} dirty shards · manifest renamed atomically`,
+      'reads and writes continue',
     ],
-    action: `Write ${total} shards`,
-    call: 'POST /marco.v1.Admin/WriteShards\n{"shards":"dirty"}',
-    run: () => writeShards(),
-    done: 'Snapshot write started',
+    action: 'Checkpoint',
+    call: 'POST /marco.v1.Admin/Checkpoint\n{}',
+    run: () => checkpoint(),
+    done: 'Checkpoint started',
   })
 }
 
@@ -70,7 +68,6 @@ export function Storage() {
   const sh = useShards()
   const [by, setBy] = useState<'ratio' | 'size'>('ratio')
   const st = useStorage(by)
-  const wal = useWal()
   const se = useSeries(3600)
   const [sort, setSort] = useState<'delta' | 'bytes' | 'written'>('delta')
   const [all, setAll] = useState(false)
@@ -101,14 +98,14 @@ export function Storage() {
               <button type="button" className="cx-btn" disabled={sh.data.job?.running} onClick={() => verifyDialog(sh.data!)}>
                 Verify checksums…
               </button>
-              <button type="button" className="cx-btn primary" disabled={sh.data.job?.running || o?.readOnly} title={o?.readOnly ? '--read-only' : undefined} onClick={() => writeDialog(sh.data!)}>
-                Write dirty shards…
+              <button type="button" className="cx-btn primary" disabled={sh.data.job?.running || o?.readOnly} title={o?.readOnly ? '--read-only' : undefined} onClick={() => checkpointDialog(sh.data!, o?.durability)}>
+                Checkpoint now…
               </button>
             </>
           )
         }
       />
-      <Banners items={items.map((b) => (b.id.startsWith('over-') && sh.data && !o?.readOnly ? { ...b, right: <button type="button" className="cx-btn sm" onClick={() => writeDialog(sh.data!)}>Rewrite now…</button> } : b))} />
+      <Banners items={items} />
       <Loaded load={ov}>
         {(o) => {
           const cnt = sh.data ? shardCounts(sh.data) : undefined
@@ -121,11 +118,11 @@ export function Storage() {
               tiles={[
                 { label: 'Snapshot', value: sz, unit: szU, sec: `${o.snapshot?.shards} shards`, right: o.snapshot?.build.slice(0, 8) },
                 { label: 'Directory', value: fmtCount(n(o.directory?.base) + n(o.directory?.live)), unit: 'DIDs', right: n(o.directory?.live) ? `+${fmtCount(o.directory?.live)} live` : undefined, title: `base ${fmtCount(o.directory?.base)} · live ${fmtCount(o.directory?.live)}` },
-                { label: 'Dirty shards', value: String(n(o.dirtyShards) + n(o.overShards)), unit: `/ ${o.snapshot?.shards}`, sec: cnt?.writing ? `${cnt.writing} writing` : cnt?.over ? `${cnt.over} over` : undefined },
+                { label: 'Dirty shards', value: String(n(o.dirtyShards)), unit: `/ ${o.snapshot?.shards}`, sec: cnt?.writing ? `${cnt.writing} writing` : undefined },
                 { label: 'Delta entries', value: si(o.deltaEntries), sec: pct(n(o.deltaEntries) / Math.max(1, n(o.baseEntries)), 2), spark: <Spark data={sum(s, { metric: 'delta_entries' })} color="signal" /> },
                 { label: 'Merged since snapshot', value: mb, unit: mbU, sec: `${fmtCount(o.mergedLists)} lists`, title: 'marco_override_bytes', spark: <Spark data={sum(s, { metric: 'merges' })} /> },
                 { label: 'Tombstones', value: fmtCount(o.tombstones), spark: <Spark data={sum(s, { metric: 'tombstones' })} /> },
-                { label: 'WAL', value: '—', sec: 'needs a newer marco' },
+                { label: 'Segments', value: fmtCount(o.durability?.segments), sec: `${bytes(o.durability?.segmentBytes)} · ${si(o.durability?.segmentOps)} ops`, right: o.durability?.segmentMs ? ago(o.durability.segmentMs) : undefined, title: 'change segments since the checkpoint' },
                 { label: 'Cold open', value: (o.snapshot!.openSeconds * 1000).toFixed(0), unit: 'ms', sec: verifyJob ? `verify ${verifyJob}` : undefined, title: 'mmap + footer checks, no full xxh3' },
               ]}
             />
@@ -171,7 +168,6 @@ export function Storage() {
                         items={[
                           [<Glyph k="idle" />, `clean ${c.clean}`],
                           [<Glyph k="info" />, `dirty ${c.dirty}`],
-                          [<Glyph k="warn" />, `over threshold ${c.over}`],
                           [<Glyph k="acc" />, `writing ${c.writing}`],
                           [<Glyph k="err" />, `checksum mismatch ${c.mismatch}`],
                         ]}
@@ -186,9 +182,11 @@ export function Storage() {
                       cols={[
                         { id: 'k', label: 'Shard', render: (x) => <span className="mono">{shardName(x.shard)}</span> },
                         { id: 'ids', label: 'ids', fill: true, className: 'hide-phone', render: (x) => <span className="mono t2">{si(x.lo)}–{si(x.hi)}</span> },
+                        { id: 'file', label: 'File', className: 'hide-phone', title: 'empty: new ids, no file yet', render: (x) => (x.file ? <span className="mono t2">{x.file}</span> : <span className="muted">—</span>) },
+                        { id: 'ck', label: 'Ckpt', r: true, className: 'hide-phone', render: (x) => <span className="mono">{x.file ? String(x.checkpoint) : '—'}</span> },
                         { id: 'b', label: 'Bytes', r: true, render: (x) => bytes(x.sizeBytes) },
                         { id: 'd', label: 'Delta', r: true, render: (x) => pct(n(x.deltaEntries) / Math.max(1, n(x.baseEntries))) },
-                        { id: 'm', label: '', render: (x) => <Meter v={n(x.deltaEntries) / Math.max(1, n(x.baseEntries))} max={ratio} k={x.state === 'over' ? 'warn' : undefined} /> },
+                        { id: 'm', label: '', render: (x) => <Meter v={n(x.deltaEntries) / Math.max(1, n(x.baseEntries))} max={ratio} /> },
                         { id: 'st', label: 'State', render: (x) => <Chip k={shardTone(x.state)}>{SHARD_WORD[x.state] ?? x.state}</Chip> },
                         { id: 'v', label: 'xxh3', title: 'the last verify', render: (x) => <span title={x.verify}><Glyph k={verifyTone(x.verify)} /> <span className="sm t2">{x.verify === 'unverified' ? '—' : x.verify}</span></span> },
                         { id: 'w', label: 'Written', r: true, render: (x) => (x.state === 'writing' ? 'writing' : dur(Date.now() - n(x.writtenMs))) },
@@ -223,7 +221,7 @@ export function Storage() {
           </Panel>
         </div>
         <div className="cx-stack">
-          <Panel title="WAL">{wal.data && unsupported(wal.data) ? <NeedsVersion what="The WAL" rpc="GetWal" /> : <Loaded load={wal}>{() => null}</Loaded>}</Panel>
+          {o?.durability && <DurabilityPanel d={o.durability} />}
           <Panel title="Merges" right={<span className="mono">last {windowLabel(3600)}</span>}>
             <PanelBody>
               <div style={{ display: 'flex', gap: 16 }}>
@@ -257,7 +255,6 @@ export function Storage() {
                 <KV
                   rows={[
                     ...o.relations.map((r) => [r.name, <span className="mono">{fmtCount(r.tombstones)}</span>, <Meter v={n(r.tombstones)} max={Math.max(1, n(o.tombstones))} k="out" />] as [React.ReactNode, React.ReactNode, React.ReactNode]),
-                    ['Dropped at', <span className="muted">needs a newer marco</span>, <span className="muted sm">the sources' min cursor</span>],
                   ]}
                 />
               </PanelBody>
@@ -306,6 +303,42 @@ function BytesPanel({ secs, o }: { secs: Section[]; o: GetOverviewResponse }) {
           { id: 'm', label: '', render: (r) => <Meter v={r.b} max={tot} /> },
         ]}
       />
+    </Panel>
+  )
+}
+
+export function DurabilityPanel({ d }: { d: Durability }) {
+  const next = (
+    <span className="mono">
+      {si(d.checkpointOps)} ops · {dur(d.checkpointAgeSeconds * 1000)}
+    </span>
+  )
+  return (
+    <Panel title="Durability" right={<span className="mono">segment every {d.segmentIntervalSeconds} s</span>}>
+      <PanelBody>
+        <KV
+          rows={[
+            ['Segment interval', <span className="mono">{d.segmentIntervalSeconds} s</span>],
+            [
+              'Last segment',
+              <>
+                <span className="mono">#{String(d.segment)}</span> {ago(d.segmentMs)} <span className="muted mono">{lat(d.segmentWriteSeconds)}</span>
+              </>,
+            ],
+            ['Since checkpoint', <span className="mono">{fmtCount(d.segments)} segments · {bytes(d.segmentBytes)} · {fmtCount(d.segmentOps)} ops</span>],
+            ['Pending ops', <span className="mono">{fmtCount(d.pendingOps)}</span>, <span className="muted sm">not in a segment yet</span>],
+            [
+              'Checkpoint',
+              <>
+                <span className="mono">#{String(d.checkpoint)}</span> {ago(d.checkpointMs)}
+              </>,
+            ],
+            ['Checkpoint took', <span className="mono">{dur(d.checkpointSeconds * 1000)} · {bytes(d.checkpointBytes)} · {d.checkpointShards} shards</span>],
+            ['Next checkpoint at', next, <span className="muted sm">whichever first</span>],
+            ['Replay at start', <span className="mono">{fmtCount(d.replayedSegments)} segments · {fmtCount(d.replayedOps)} ops · {d.replaySeconds.toFixed(2)} s</span>],
+          ]}
+        />
+      </PanelBody>
     </Panel>
   )
 }

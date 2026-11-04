@@ -11,7 +11,9 @@ use marco_proto::v1::*;
 
 use crate::app::{App, Op, Outcome, MAX_BATCH};
 
-pub struct GraphApi(pub Arc<App>);
+/// The Graph service; `gate` holds reads until marco is ready (the API
+/// listener; the console's copy on the admin listener answers regardless).
+pub struct GraphApi(pub Arc<App>, pub bool);
 
 pub fn bad(m: impl Into<String>) -> ConnectError {
     ConnectError::invalid_argument(m)
@@ -88,16 +90,25 @@ impl GraphApi {
         self.writable()?;
         let ops = ops_of(ops)?;
         App::validate(&self.0.graph(), &ops).map_err(bad)?;
-        Ok(self.0.apply(&ops, cursor).await.into_iter().map(result_pb).collect())
+        let out = self.0.apply(&ops, cursor).await.map_err(|e| ConnectError::unavailable(format!("{e:#}")))?;
+        Ok(out.into_iter().map(result_pb).collect())
+    }
+
+    fn readable(&self) -> Result<(), ConnectError> {
+        if self.1 {
+            self.0.read_gate().map_err(ConnectError::unavailable)?;
+        }
+        Ok(())
     }
 }
 
 #[allow(refining_impl_trait)]
 impl svc::Graph for GraphApi {
     async fn has(&self, _: RequestContext, req: ServiceRequest<'_, HasRequest>) -> ServiceResult<HasResponse> {
+        self.readable()?;
         let g = self.0.graph();
         let rel = rel_id(&g, req.rel)?;
-        let hidden = self.0.hidden(req.from) || self.0.hidden(req.to);
+        let hidden = g.hidden(req.from) || g.hidden(req.to);
         let uri = if hidden { None } else { g.has(rel, req.from, req.to) };
         Response::ok(HasResponse { uri: uri.unwrap_or_default(), ..Default::default() })
     }
@@ -107,6 +118,7 @@ impl svc::Graph for GraphApi {
         _: RequestContext,
         req: ServiceRequest<'_, RelationshipsRequest>,
     ) -> ServiceResult<RelationshipsResponse> {
+        self.readable()?;
         let req = req.to_owned_message();
         if req.others.len() > 100 {
             return Err(bad("at most 100 others"));
@@ -115,13 +127,13 @@ impl svc::Graph for GraphApi {
         let rels = rel_ids(&g, &req.rels)?;
         let others: Vec<&str> = req.others.iter().map(String::as_str).collect();
         let rows = g.relationships(&req.actor, &others, &rels);
-        let actor_hidden = self.0.hidden(&req.actor);
+        let actor_hidden = g.hidden(&req.actor);
         let relationships = req
             .others
             .iter()
             .zip(rows)
             .map(|(o, per)| {
-                let hide = actor_hidden || self.0.hidden(o);
+                let hide = actor_hidden || g.hidden(o);
                 Relationship {
                     other: o.clone(),
                     rels: rels
@@ -146,16 +158,17 @@ impl svc::Graph for GraphApi {
         _: RequestContext,
         req: ServiceRequest<'_, ListOutRequest>,
     ) -> ServiceResult<ListOutResponse> {
+        self.readable()?;
         let g = self.0.graph();
         let rel = rel_id(&g, req.rel)?;
-        if self.0.hidden(req.actor) {
+        if g.hidden(req.actor) {
             return Response::ok(ListOutResponse::default());
         }
         let cursor = (!req.cursor.is_empty()).then_some(req.cursor);
         let (items, next) = g.out_list(rel, req.actor, limit(req.limit, 50, 1000), cursor);
         let edges = items
             .into_iter()
-            .filter(|(_, s)| !self.0.hidden(s))
+            .filter(|(_, s)| !g.hidden(s))
             .map(|(uri, subject)| OutEdge { uri, subject, ..Default::default() })
             .collect();
         Response::ok(ListOutResponse { edges, cursor: next.unwrap_or_default(), ..Default::default() })
@@ -166,18 +179,20 @@ impl svc::Graph for GraphApi {
         _: RequestContext,
         req: ServiceRequest<'_, ListInRequest>,
     ) -> ServiceResult<ListInResponse> {
+        self.readable()?;
         let g = self.0.graph();
         let rel = rel_id(&g, req.rel)?;
-        if self.0.hidden(req.subject) {
+        if g.hidden(req.subject) {
             return Response::ok(ListInResponse::default());
         }
         let cursor = (!req.cursor.is_empty()).then_some(req.cursor);
         let (actors, next) = g.in_list(rel, req.subject, limit(req.limit, 50, 1000), cursor);
-        let actors = actors.into_iter().filter(|a| !self.0.hidden(a)).collect();
+        let actors = actors.into_iter().filter(|a| !g.hidden(a)).collect();
         Response::ok(ListInResponse { actors, cursor: next.unwrap_or_default(), ..Default::default() })
     }
 
     async fn counts(&self, _: RequestContext, req: ServiceRequest<'_, CountsRequest>) -> ServiceResult<CountsResponse> {
+        self.readable()?;
         let req = req.to_owned_message();
         if req.actors.len() > 100 {
             return Err(bad("at most 100 actors"));
@@ -188,7 +203,7 @@ impl svc::Graph for GraphApi {
             .actors
             .iter()
             .map(|a| {
-                let hide = self.0.hidden(a);
+                let hide = g.hidden(a);
                 ActorCounts {
                     actor: a.clone(),
                     rels: rels
@@ -215,12 +230,13 @@ impl svc::Graph for GraphApi {
         _: RequestContext,
         req: ServiceRequest<'_, IntersectRequest>,
     ) -> ServiceResult<IntersectResponse> {
+        self.readable()?;
         let req = req.to_owned_message();
         let g = self.0.graph();
         let side = |s: &ListSide| -> Result<Option<ListRef>, ConnectError> {
             let rel = rel_id(&g, &s.rel)?;
             let dir = dir_of(&s.dir)?;
-            if self.0.hidden(&s.actor) {
+            if g.hidden(&s.actor) {
                 return Ok(None);
             }
             Ok(g.id_of(&s.actor).map(|actor| ListRef { rel, dir, actor }))
@@ -237,7 +253,7 @@ impl svc::Graph for GraphApi {
                 .intersect(x, y, limit(req.limit, 100, 10_000))
                 .into_iter()
                 .filter_map(|id| g.did_of(id))
-                .filter(|d| !self.0.hidden(d))
+                .filter(|d| !g.hidden(d))
                 .collect(),
             _ => Vec::new(),
         };
@@ -245,6 +261,7 @@ impl svc::Graph for GraphApi {
     }
 
     async fn filter(&self, _: RequestContext, req: ServiceRequest<'_, FilterRequest>) -> ServiceResult<FilterResponse> {
+        self.readable()?;
         let req = req.to_owned_message();
         if req.actors.len() > 1000 {
             return Err(bad("at most 1000 actors"));
@@ -261,7 +278,7 @@ impl svc::Graph for GraphApi {
         let mut actors = Vec::new();
         let mut dropped = Vec::new();
         for (a, id) in req.actors.iter().zip(&ids) {
-            if self.0.hidden(a) {
+            if g.hidden(a) {
                 dropped.push(Dropped { actor: a.clone(), rel: "status".into(), ..Default::default() });
                 continue;
             }

@@ -1,6 +1,8 @@
 import { useState } from 'react'
 import { Seg } from '../components/kit'
 import { Dir } from '../gen/marco/v1/graph_pb'
+import type { Source } from '../gen/marco/v1/admin_pb'
+import { dur, utc } from '../lib/fmt'
 
 // What several pages share: the time window, relation labels, shard names.
 
@@ -42,3 +44,11 @@ export const dirOf = (d: Dir) => (d === Dir.IN ? 'in' : 'out') as 'out' | 'in'
 
 /** Spark of a series with its values in display units. */
 export const scale = (v: number[], k: number) => v.map((x) => x * k)
+
+/** A source's cursor for display: time_us as a UTC time, anything else as is. */
+export const cursorText = (c: string, kind: string) => (!c ? '—' : kind === 'time_us' ? utc(Number(c), true).slice(11) + ' UTC' : c)
+
+/** Lag in seconds as 0.3 s, 12 s, 3m 10s. */
+export const lagText = (s: number) => (!isFinite(s) ? '—' : s < 10 ? `${s.toFixed(1)} s` : s < 60 ? `${Math.round(s)} s` : dur(s * 1000))
+
+export const sourceNamed = (xs: Source[] | undefined, name: string) => xs?.find((x) => x.name === name)

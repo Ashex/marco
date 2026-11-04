@@ -18,6 +18,9 @@
 //! r{i}.in.dat    in sets, by subject id (inset.rs)
 //! r{i}.in.idx
 //! r{i}.side      non-TID rkeys: sorted (actor u32, key u64, off u32), then the strings
+//! r{i}.tomb      deletes that found nothing: sorted (actor u32, key u64, source u16)
+//! status         actor statuses from sources: sorted (id u32, status u8)
+//! live           DIDs of the shard's ids past the directory, from live_lo up
 //! ```
 
 use std::collections::HashMap;
@@ -35,7 +38,7 @@ use crate::relation::Relation;
 use crate::varint::{self, u32_at, u64_at};
 
 pub const MAGIC: &[u8; 8] = b"MARCOSN1";
-pub const FORMAT: u32 = 2;
+pub const FORMAT: u32 = 3;
 const ALIGN: u64 = 64;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -45,6 +48,8 @@ pub struct RelStats {
     pub in_pairs: u64,
     pub in_lists: u64,
     pub non_tid: u64,
+    #[serde(default)]
+    pub tombstones: u64,
     pub out_bytes: OutBytes,
 }
 
@@ -55,36 +60,54 @@ impl RelStats {
         self.in_pairs += o.in_pairs;
         self.in_lists += o.in_lists;
         self.non_tid += o.non_tid;
+        self.tombstones += o.tombstones;
         self.out_bytes.add(&o.out_bytes);
     }
 }
 
-/// The directory file's meta: the whole snapshot.
+/// The directory file's meta. The directory is written once, by a build or a
+/// full write; checkpoints add shard files around it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Meta {
     pub format: u32,
-    /// Shared by every file of one snapshot.
+    /// Every shard file names the directory it belongs to.
     pub build: u64,
-    pub shards: u32,
     /// Shard k holds ids k*shard_width .. (k+1)*shard_width.
     pub shard_width: u32,
+    /// DIDs in the directory; ids past it are in shard files' live sections.
     pub n_ids: u32,
     pub n_plc: u32,
     pub n_other: u32,
     /// Out logs this long or longer carry a by-subject index.
     pub subj_index: u32,
     pub relations: Vec<Relation>,
-    pub stats: Vec<RelStats>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ShardMeta {
     pub format: u32,
+    /// The directory's build.
     pub build: u64,
     pub shard: u32,
     pub lo: u32,
+    /// Lists cover ids lo..hi.
     pub hi: u32,
+    /// The live section holds the DIDs of ids live_lo..hi.
+    pub live_lo: u32,
+    /// The checkpoint that wrote it.
+    pub checkpoint: u64,
+    pub written_ms: i64,
+    /// Tombstones' sources, by the index they carry.
+    pub sources: Vec<String>,
+    pub statuses: u64,
     pub stats: Vec<RelStats>,
+}
+
+impl ShardMeta {
+    pub fn with_stats(mut self, stats: Vec<RelStats>) -> ShardMeta {
+        self.stats = stats;
+        self
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -611,4 +634,77 @@ impl<'a> Side<'a> {
 
 pub fn rel_section(rel: usize, part: &str) -> String {
     format!("r{rel}.{part}")
+}
+
+pub fn encode_tombs(entries: &[(u32, u64, u16)]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(14 * entries.len());
+    for &(a, k, s) in entries {
+        out.extend_from_slice(&a.to_le_bytes());
+        out.extend_from_slice(&k.to_le_bytes());
+        out.extend_from_slice(&s.to_le_bytes());
+    }
+    out
+}
+
+pub fn decode_tombs(b: &[u8], mut f: impl FnMut(u32, u64, u16)) {
+    for c in b.as_chunks::<14>().0 {
+        f(u32_at(c, 0), u64_at(c, 4), u16::from_le_bytes([c[12], c[13]]));
+    }
+}
+
+pub fn encode_statuses(entries: &[(u32, u8)]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(5 * entries.len());
+    for &(id, s) in entries {
+        out.extend_from_slice(&id.to_le_bytes());
+        out.push(s);
+    }
+    out
+}
+
+pub fn decode_statuses(b: &[u8], mut f: impl FnMut(u32, u8)) {
+    for c in b.as_chunks::<5>().0 {
+        f(u32_at(c, 0), c[4]);
+    }
+}
+
+/// DIDs in id order: a tag (0 did:plc, 15 packed bytes; 1 other, a varint
+/// length and the string).
+pub fn encode_live(dids: &[crate::did::DidKey]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16 * dids.len());
+    for d in dids {
+        match d {
+            crate::did::DidKey::Plc(v) => {
+                out.push(0);
+                out.extend_from_slice(&plc_to_bytes(*v));
+            }
+            crate::did::DidKey::Other(s) => {
+                out.push(1);
+                varint::put(&mut out, s.len() as u64);
+                out.extend_from_slice(s.as_bytes());
+            }
+        }
+    }
+    out
+}
+
+pub fn decode_live(b: &[u8]) -> Result<Vec<crate::did::DidKey>> {
+    let mut v = Vec::new();
+    let mut pos = 0;
+    while pos < b.len() {
+        match b[pos] {
+            0 if pos + 1 + PACKED_LEN <= b.len() => {
+                v.push(crate::did::DidKey::Plc(plc_from_bytes(&b[pos + 1..])));
+                pos += 1 + PACKED_LEN;
+            }
+            1 => {
+                pos += 1;
+                let n = varint::get(b, &mut pos) as usize;
+                let s = b.get(pos..pos + n).and_then(|s| std::str::from_utf8(s).ok()).context("bad live DID")?;
+                v.push(crate::did::DidKey::Other(s.into()));
+                pos += n;
+            }
+            _ => bail!("bad live section"),
+        }
+    }
+    Ok(v)
 }

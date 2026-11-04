@@ -540,6 +540,39 @@ pub struct GetOverviewResponse {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
     )]
     pub admin_listen: ::buffa::alloc::string::String,
+    /// Field 23: `durability`
+    #[serde(
+        rename = "durability",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_unset_message_field"
+    )]
+    pub durability: ::buffa::MessageField<Durability, ::buffa::Inline<Durability>>,
+    /// Every expected source caught up since start; reads before it are flagged.
+    ///
+    /// Field 24: `ready`
+    #[serde(
+        rename = "ready",
+        with = "::buffa::json_helpers::proto_bool",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_false"
+    )]
+    pub ready: bool,
+    /// Why not ready, empty when ready.
+    ///
+    /// Field 25: `ready_reason`
+    #[serde(
+        rename = "readyReason",
+        alias = "ready_reason",
+        with = "::buffa::json_helpers::proto_string",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    )]
+    pub ready_reason: ::buffa::alloc::string::String,
+    /// Field 26: `reads_before_ready`
+    #[serde(
+        rename = "readsBeforeReady",
+        alias = "reads_before_ready",
+        with = "::buffa::json_helpers::uint64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
+    )]
+    pub reads_before_ready: u64,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -569,6 +602,10 @@ impl ::core::fmt::Debug for GetOverviewResponse {
             .field("write_seq", &self.write_seq)
             .field("api_listen", &self.api_listen)
             .field("admin_listen", &self.admin_listen)
+            .field("durability", &self.durability)
+            .field("ready", &self.ready)
+            .field("ready_reason", &self.ready_reason)
+            .field("reads_before_ready", &self.reads_before_ready)
             .finish()
     }
 }
@@ -690,6 +727,25 @@ impl ::buffa::Message for GetOverviewResponse {
         if !self.admin_listen.is_empty() {
             size += 2u64 + ::buffa::types::string_encoded_len(&self.admin_listen) as u64;
         }
+        if self.durability.is_set() {
+            let __slot = __cache.reserve();
+            let inner_size = self.durability.compute_size(__cache);
+            __cache.set(__slot, inner_size);
+            size
+                += 2u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
+                    + inner_size as u64;
+        }
+        if self.ready {
+            size += 2u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
+        }
+        if !self.ready_reason.is_empty() {
+            size += 2u64 + ::buffa::types::string_encoded_len(&self.ready_reason) as u64;
+        }
+        if self.reads_before_ready != 0u64 {
+            size
+                += 2u64
+                    + ::buffa::types::uint64_encoded_len(self.reads_before_ready) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -790,6 +846,23 @@ impl ::buffa::Message for GetOverviewResponse {
         }
         if !self.admin_listen.is_empty() {
             ::buffa::types::put_string_field(22u32, &self.admin_listen, buf);
+        }
+        if self.durability.is_set() {
+            ::buffa::types::put_len_delimited_header(
+                23u32,
+                u64::from(__cache.consume_next()),
+                buf,
+            );
+            self.durability.write_to(__cache, buf);
+        }
+        if self.ready {
+            ::buffa::types::put_bool_field(24u32, self.ready, buf);
+        }
+        if !self.ready_reason.is_empty() {
+            ::buffa::types::put_string_field(25u32, &self.ready_reason, buf);
+        }
+        if self.reads_before_ready != 0u64 {
+            ::buffa::types::put_uint64_field(26u32, self.reads_before_ready, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -979,6 +1052,38 @@ impl ::buffa::Message for GetOverviewResponse {
                 )?;
                 ::buffa::types::merge_string(&mut self.admin_listen, buf)?;
             }
+            23u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::Message::merge_length_delimited(
+                    self.durability.get_or_insert_default(),
+                    buf,
+                    ctx,
+                )?;
+            }
+            24u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.ready = ::buffa::types::decode_bool(buf)?;
+            }
+            25u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.ready_reason, buf)?;
+            }
+            26u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.reads_before_ready = ::buffa::types::decode_uint64(buf)?;
+            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -1009,6 +1114,10 @@ impl ::buffa::Message for GetOverviewResponse {
         self.write_seq = 0u64;
         self.api_listen.clear();
         self.admin_listen.clear();
+        self.durability = ::buffa::MessageField::none();
+        self.ready = false;
+        self.ready_reason.clear();
+        self.reads_before_ready = 0u64;
         self.__buffa_unknown_fields.clear();
     }
 }
@@ -1039,6 +1148,544 @@ pub const __GET_OVERVIEW_RESPONSE_JSON_ANY: ::buffa::type_registry::JsonAnyEntry
     type_url: "type.googleapis.com/marco.v1.GetOverviewResponse",
     to_json: ::buffa::type_registry::any_to_json::<GetOverviewResponse>,
     from_json: ::buffa::type_registry::any_from_json::<GetOverviewResponse>,
+    is_wkt: false,
+};
+/// Writes are applied in memory, then written every few seconds as a change
+/// segment (the ops and every source's cursor at that cut). A checkpoint
+/// folds the segments into new shard files when replaying them would take
+/// too long, or daily.
+#[derive(Clone, PartialEq, Default)]
+#[derive(::serde::Serialize, ::serde::Deserialize)]
+#[serde(default)]
+pub struct Durability {
+    /// Field 1: `segment_interval_seconds`
+    #[serde(
+        rename = "segmentIntervalSeconds",
+        alias = "segment_interval_seconds",
+        with = "::buffa::json_helpers::double",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_f64"
+    )]
+    pub segment_interval_seconds: f64,
+    /// The newest segment written, its time, and how long its write took.
+    ///
+    /// Field 2: `segment`
+    #[serde(
+        rename = "segment",
+        with = "::buffa::json_helpers::uint64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
+    )]
+    pub segment: u64,
+    /// Field 3: `segment_ms`
+    #[serde(
+        rename = "segmentMs",
+        alias = "segment_ms",
+        with = "::buffa::json_helpers::int64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_i64"
+    )]
+    pub segment_ms: i64,
+    /// Field 4: `segment_write_seconds`
+    #[serde(
+        rename = "segmentWriteSeconds",
+        alias = "segment_write_seconds",
+        with = "::buffa::json_helpers::double",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_f64"
+    )]
+    pub segment_write_seconds: f64,
+    /// Segments (and their bytes and ops) since the checkpoint: what a restart replays.
+    ///
+    /// Field 5: `segments`
+    #[serde(
+        rename = "segments",
+        with = "::buffa::json_helpers::uint32",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u32"
+    )]
+    pub segments: u32,
+    /// Field 6: `segment_bytes`
+    #[serde(
+        rename = "segmentBytes",
+        alias = "segment_bytes",
+        with = "::buffa::json_helpers::uint64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
+    )]
+    pub segment_bytes: u64,
+    /// Field 7: `segment_ops`
+    #[serde(
+        rename = "segmentOps",
+        alias = "segment_ops",
+        with = "::buffa::json_helpers::uint64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
+    )]
+    pub segment_ops: u64,
+    /// Ops applied but not in a segment yet.
+    ///
+    /// Field 8: `pending_ops`
+    #[serde(
+        rename = "pendingOps",
+        alias = "pending_ops",
+        with = "::buffa::json_helpers::uint64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
+    )]
+    pub pending_ops: u64,
+    /// Field 9: `checkpoint`
+    #[serde(
+        rename = "checkpoint",
+        with = "::buffa::json_helpers::uint64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
+    )]
+    pub checkpoint: u64,
+    /// Field 10: `checkpoint_ms`
+    #[serde(
+        rename = "checkpointMs",
+        alias = "checkpoint_ms",
+        with = "::buffa::json_helpers::int64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_i64"
+    )]
+    pub checkpoint_ms: i64,
+    /// A checkpoint starts once segment_ops passes this, or the checkpoint is this old.
+    ///
+    /// Field 11: `checkpoint_ops`
+    #[serde(
+        rename = "checkpointOps",
+        alias = "checkpoint_ops",
+        with = "::buffa::json_helpers::uint64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
+    )]
+    pub checkpoint_ops: u64,
+    /// Field 12: `checkpoint_age_seconds`
+    #[serde(
+        rename = "checkpointAgeSeconds",
+        alias = "checkpoint_age_seconds",
+        with = "::buffa::json_helpers::double",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_f64"
+    )]
+    pub checkpoint_age_seconds: f64,
+    /// The last checkpoint's wall time and bytes written.
+    ///
+    /// Field 13: `checkpoint_seconds`
+    #[serde(
+        rename = "checkpointSeconds",
+        alias = "checkpoint_seconds",
+        with = "::buffa::json_helpers::double",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_f64"
+    )]
+    pub checkpoint_seconds: f64,
+    /// Field 14: `checkpoint_bytes`
+    #[serde(
+        rename = "checkpointBytes",
+        alias = "checkpoint_bytes",
+        with = "::buffa::json_helpers::uint64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
+    )]
+    pub checkpoint_bytes: u64,
+    /// Field 15: `checkpoint_shards`
+    #[serde(
+        rename = "checkpointShards",
+        alias = "checkpoint_shards",
+        with = "::buffa::json_helpers::uint32",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u32"
+    )]
+    pub checkpoint_shards: u32,
+    /// The replay at start: segments, ops and seconds.
+    ///
+    /// Field 16: `replayed_segments`
+    #[serde(
+        rename = "replayedSegments",
+        alias = "replayed_segments",
+        with = "::buffa::json_helpers::uint32",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u32"
+    )]
+    pub replayed_segments: u32,
+    /// Field 17: `replayed_ops`
+    #[serde(
+        rename = "replayedOps",
+        alias = "replayed_ops",
+        with = "::buffa::json_helpers::uint64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
+    )]
+    pub replayed_ops: u64,
+    /// Field 18: `replay_seconds`
+    #[serde(
+        rename = "replaySeconds",
+        alias = "replay_seconds",
+        with = "::buffa::json_helpers::double",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_f64"
+    )]
+    pub replay_seconds: f64,
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub __buffa_unknown_fields: ::buffa::UnknownFields,
+}
+impl ::core::fmt::Debug for Durability {
+    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+        f.debug_struct("Durability")
+            .field("segment_interval_seconds", &self.segment_interval_seconds)
+            .field("segment", &self.segment)
+            .field("segment_ms", &self.segment_ms)
+            .field("segment_write_seconds", &self.segment_write_seconds)
+            .field("segments", &self.segments)
+            .field("segment_bytes", &self.segment_bytes)
+            .field("segment_ops", &self.segment_ops)
+            .field("pending_ops", &self.pending_ops)
+            .field("checkpoint", &self.checkpoint)
+            .field("checkpoint_ms", &self.checkpoint_ms)
+            .field("checkpoint_ops", &self.checkpoint_ops)
+            .field("checkpoint_age_seconds", &self.checkpoint_age_seconds)
+            .field("checkpoint_seconds", &self.checkpoint_seconds)
+            .field("checkpoint_bytes", &self.checkpoint_bytes)
+            .field("checkpoint_shards", &self.checkpoint_shards)
+            .field("replayed_segments", &self.replayed_segments)
+            .field("replayed_ops", &self.replayed_ops)
+            .field("replay_seconds", &self.replay_seconds)
+            .finish()
+    }
+}
+impl Durability {
+    /// Protobuf type URL for this message, for use with `Any::pack` and
+    /// `Any::unpack_if`.
+    ///
+    /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
+    pub const TYPE_URL: &'static str = "type.googleapis.com/marco.v1.Durability";
+}
+::buffa::impl_default_instance!(Durability);
+impl ::buffa::MessageName for Durability {
+    const PACKAGE: &'static str = "marco.v1";
+    const NAME: &'static str = "Durability";
+    const FULL_NAME: &'static str = "marco.v1.Durability";
+    const TYPE_URL: &'static str = "type.googleapis.com/marco.v1.Durability";
+}
+impl ::buffa::Message for Durability {
+    /// Returns the total encoded size in bytes.
+    ///
+    /// Accumulates in `u64` (which cannot overflow for in-memory
+    /// data) and saturates to `u32` at return, so a message whose
+    /// encoded size exceeds the 2 GiB protobuf limit yields a value
+    /// above [`::buffa::MAX_MESSAGE_BYTES`] that the encode entry
+    /// points reject, never a silently wrapped size.
+    #[allow(clippy::let_and_return)]
+    fn compute_size(&self, _cache: &mut ::buffa::SizeCache) -> u32 {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        let mut size = 0u64;
+        if self.segment_interval_seconds.to_bits() != 0u64 {
+            size += 1u64 + ::buffa::types::FIXED64_ENCODED_LEN as u64;
+        }
+        if self.segment != 0u64 {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(self.segment) as u64;
+        }
+        if self.segment_ms != 0i64 {
+            size += 1u64 + ::buffa::types::int64_encoded_len(self.segment_ms) as u64;
+        }
+        if self.segment_write_seconds.to_bits() != 0u64 {
+            size += 1u64 + ::buffa::types::FIXED64_ENCODED_LEN as u64;
+        }
+        if self.segments != 0u32 {
+            size += 1u64 + ::buffa::types::uint32_encoded_len(self.segments) as u64;
+        }
+        if self.segment_bytes != 0u64 {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(self.segment_bytes) as u64;
+        }
+        if self.segment_ops != 0u64 {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(self.segment_ops) as u64;
+        }
+        if self.pending_ops != 0u64 {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(self.pending_ops) as u64;
+        }
+        if self.checkpoint != 0u64 {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(self.checkpoint) as u64;
+        }
+        if self.checkpoint_ms != 0i64 {
+            size += 1u64 + ::buffa::types::int64_encoded_len(self.checkpoint_ms) as u64;
+        }
+        if self.checkpoint_ops != 0u64 {
+            size
+                += 1u64 + ::buffa::types::uint64_encoded_len(self.checkpoint_ops) as u64;
+        }
+        if self.checkpoint_age_seconds.to_bits() != 0u64 {
+            size += 1u64 + ::buffa::types::FIXED64_ENCODED_LEN as u64;
+        }
+        if self.checkpoint_seconds.to_bits() != 0u64 {
+            size += 1u64 + ::buffa::types::FIXED64_ENCODED_LEN as u64;
+        }
+        if self.checkpoint_bytes != 0u64 {
+            size
+                += 1u64
+                    + ::buffa::types::uint64_encoded_len(self.checkpoint_bytes) as u64;
+        }
+        if self.checkpoint_shards != 0u32 {
+            size
+                += 1u64
+                    + ::buffa::types::uint32_encoded_len(self.checkpoint_shards) as u64;
+        }
+        if self.replayed_segments != 0u32 {
+            size
+                += 2u64
+                    + ::buffa::types::uint32_encoded_len(self.replayed_segments) as u64;
+        }
+        if self.replayed_ops != 0u64 {
+            size += 2u64 + ::buffa::types::uint64_encoded_len(self.replayed_ops) as u64;
+        }
+        if self.replay_seconds.to_bits() != 0u64 {
+            size += 2u64 + ::buffa::types::FIXED64_ENCODED_LEN as u64;
+        }
+        size += self.__buffa_unknown_fields.encoded_len() as u64;
+        ::buffa::saturate_size(size)
+    }
+    fn write_to(
+        &self,
+        _cache: &mut ::buffa::SizeCache,
+        buf: &mut impl ::buffa::EncodeSink,
+    ) {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        if self.segment_interval_seconds.to_bits() != 0u64 {
+            ::buffa::types::put_double_field(1u32, self.segment_interval_seconds, buf);
+        }
+        if self.segment != 0u64 {
+            ::buffa::types::put_uint64_field(2u32, self.segment, buf);
+        }
+        if self.segment_ms != 0i64 {
+            ::buffa::types::put_int64_field(3u32, self.segment_ms, buf);
+        }
+        if self.segment_write_seconds.to_bits() != 0u64 {
+            ::buffa::types::put_double_field(4u32, self.segment_write_seconds, buf);
+        }
+        if self.segments != 0u32 {
+            ::buffa::types::put_uint32_field(5u32, self.segments, buf);
+        }
+        if self.segment_bytes != 0u64 {
+            ::buffa::types::put_uint64_field(6u32, self.segment_bytes, buf);
+        }
+        if self.segment_ops != 0u64 {
+            ::buffa::types::put_uint64_field(7u32, self.segment_ops, buf);
+        }
+        if self.pending_ops != 0u64 {
+            ::buffa::types::put_uint64_field(8u32, self.pending_ops, buf);
+        }
+        if self.checkpoint != 0u64 {
+            ::buffa::types::put_uint64_field(9u32, self.checkpoint, buf);
+        }
+        if self.checkpoint_ms != 0i64 {
+            ::buffa::types::put_int64_field(10u32, self.checkpoint_ms, buf);
+        }
+        if self.checkpoint_ops != 0u64 {
+            ::buffa::types::put_uint64_field(11u32, self.checkpoint_ops, buf);
+        }
+        if self.checkpoint_age_seconds.to_bits() != 0u64 {
+            ::buffa::types::put_double_field(12u32, self.checkpoint_age_seconds, buf);
+        }
+        if self.checkpoint_seconds.to_bits() != 0u64 {
+            ::buffa::types::put_double_field(13u32, self.checkpoint_seconds, buf);
+        }
+        if self.checkpoint_bytes != 0u64 {
+            ::buffa::types::put_uint64_field(14u32, self.checkpoint_bytes, buf);
+        }
+        if self.checkpoint_shards != 0u32 {
+            ::buffa::types::put_uint32_field(15u32, self.checkpoint_shards, buf);
+        }
+        if self.replayed_segments != 0u32 {
+            ::buffa::types::put_uint32_field(16u32, self.replayed_segments, buf);
+        }
+        if self.replayed_ops != 0u64 {
+            ::buffa::types::put_uint64_field(17u32, self.replayed_ops, buf);
+        }
+        if self.replay_seconds.to_bits() != 0u64 {
+            ::buffa::types::put_double_field(18u32, self.replay_seconds, buf);
+        }
+        self.__buffa_unknown_fields.write_to(buf);
+    }
+    fn merge_field(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        buf: &mut impl ::buffa::bytes::Buf,
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<(), ::buffa::DecodeError> {
+        #[allow(unused_imports)]
+        use ::buffa::bytes::Buf as _;
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        match tag.field_number() {
+            1u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Fixed64,
+                )?;
+                self.segment_interval_seconds = ::buffa::types::decode_double(buf)?;
+            }
+            2u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.segment = ::buffa::types::decode_uint64(buf)?;
+            }
+            3u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.segment_ms = ::buffa::types::decode_int64(buf)?;
+            }
+            4u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Fixed64,
+                )?;
+                self.segment_write_seconds = ::buffa::types::decode_double(buf)?;
+            }
+            5u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.segments = ::buffa::types::decode_uint32(buf)?;
+            }
+            6u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.segment_bytes = ::buffa::types::decode_uint64(buf)?;
+            }
+            7u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.segment_ops = ::buffa::types::decode_uint64(buf)?;
+            }
+            8u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.pending_ops = ::buffa::types::decode_uint64(buf)?;
+            }
+            9u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.checkpoint = ::buffa::types::decode_uint64(buf)?;
+            }
+            10u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.checkpoint_ms = ::buffa::types::decode_int64(buf)?;
+            }
+            11u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.checkpoint_ops = ::buffa::types::decode_uint64(buf)?;
+            }
+            12u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Fixed64,
+                )?;
+                self.checkpoint_age_seconds = ::buffa::types::decode_double(buf)?;
+            }
+            13u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Fixed64,
+                )?;
+                self.checkpoint_seconds = ::buffa::types::decode_double(buf)?;
+            }
+            14u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.checkpoint_bytes = ::buffa::types::decode_uint64(buf)?;
+            }
+            15u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.checkpoint_shards = ::buffa::types::decode_uint32(buf)?;
+            }
+            16u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.replayed_segments = ::buffa::types::decode_uint32(buf)?;
+            }
+            17u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.replayed_ops = ::buffa::types::decode_uint64(buf)?;
+            }
+            18u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Fixed64,
+                )?;
+                self.replay_seconds = ::buffa::types::decode_double(buf)?;
+            }
+            _ => {
+                self.__buffa_unknown_fields
+                    .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
+            }
+        }
+        ::core::result::Result::Ok(())
+    }
+    fn clear(&mut self) {
+        self.segment_interval_seconds = 0f64;
+        self.segment = 0u64;
+        self.segment_ms = 0i64;
+        self.segment_write_seconds = 0f64;
+        self.segments = 0u32;
+        self.segment_bytes = 0u64;
+        self.segment_ops = 0u64;
+        self.pending_ops = 0u64;
+        self.checkpoint = 0u64;
+        self.checkpoint_ms = 0i64;
+        self.checkpoint_ops = 0u64;
+        self.checkpoint_age_seconds = 0f64;
+        self.checkpoint_seconds = 0f64;
+        self.checkpoint_bytes = 0u64;
+        self.checkpoint_shards = 0u32;
+        self.replayed_segments = 0u32;
+        self.replayed_ops = 0u64;
+        self.replay_seconds = 0f64;
+        self.__buffa_unknown_fields.clear();
+    }
+}
+impl ::buffa::ExtensionSet for Durability {
+    const PROTO_FQN: &'static str = "marco.v1.Durability";
+    fn unknown_fields(&self) -> &::buffa::UnknownFields {
+        &self.__buffa_unknown_fields
+    }
+    fn unknown_fields_mut(&mut self) -> &mut ::buffa::UnknownFields {
+        &mut self.__buffa_unknown_fields
+    }
+}
+impl ::buffa::json_helpers::ProtoElemJson for Durability {
+    fn serialize_proto_json<S: ::serde::Serializer>(
+        v: &Self,
+        s: S,
+    ) -> ::core::result::Result<S::Ok, S::Error> {
+        ::serde::Serialize::serialize(v, s)
+    }
+    fn deserialize_proto_json<'de, D: ::serde::Deserializer<'de>>(
+        d: D,
+    ) -> ::core::result::Result<Self, D::Error> {
+        <Self as ::serde::Deserialize>::deserialize(d)
+    }
+}
+#[doc(hidden)]
+pub const __DURABILITY_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
+    type_url: "type.googleapis.com/marco.v1.Durability",
+    to_json: ::buffa::type_registry::any_to_json::<Durability>,
+    from_json: ::buffa::type_registry::any_from_json::<Durability>,
     is_wkt: false,
 };
 #[derive(Clone, PartialEq, Default)]
@@ -2137,7 +2784,7 @@ pub const __PROCESS_INFO_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buff
 #[derive(::serde::Serialize, ::serde::Deserialize)]
 #[serde(default)]
 pub struct Job {
-    /// "write" or "verify"; empty when none has run.
+    /// "checkpoint" or "verify"; empty when none has run.
     ///
     /// Field 1: `kind`
     #[serde(
@@ -4109,7 +4756,7 @@ pub struct Shard {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u32"
     )]
     pub tombstones: u32,
-    /// clean, dirty, over or writing.
+    /// clean, dirty or writing (a checkpoint is rewriting it).
     ///
     /// Field 12: `state`
     #[serde(
@@ -4135,6 +4782,23 @@ pub struct Shard {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
     )]
     pub verify_error: ::buffa::alloc::string::String,
+    /// Its file and the checkpoint that wrote it; empty for a shard of new ids
+    /// with no file yet.
+    ///
+    /// Field 15: `file`
+    #[serde(
+        rename = "file",
+        with = "::buffa::json_helpers::proto_string",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    )]
+    pub file: ::buffa::alloc::string::String,
+    /// Field 16: `checkpoint`
+    #[serde(
+        rename = "checkpoint",
+        with = "::buffa::json_helpers::uint64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
+    )]
+    pub checkpoint: u64,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -4156,6 +4820,8 @@ impl ::core::fmt::Debug for Shard {
             .field("state", &self.state)
             .field("verify", &self.verify)
             .field("verify_error", &self.verify_error)
+            .field("file", &self.file)
+            .field("checkpoint", &self.checkpoint)
             .finish()
     }
 }
@@ -4228,6 +4894,12 @@ impl ::buffa::Message for Shard {
         if !self.verify_error.is_empty() {
             size += 1u64 + ::buffa::types::string_encoded_len(&self.verify_error) as u64;
         }
+        if !self.file.is_empty() {
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.file) as u64;
+        }
+        if self.checkpoint != 0u64 {
+            size += 2u64 + ::buffa::types::uint64_encoded_len(self.checkpoint) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -4279,6 +4951,12 @@ impl ::buffa::Message for Shard {
         }
         if !self.verify_error.is_empty() {
             ::buffa::types::put_string_field(14u32, &self.verify_error, buf);
+        }
+        if !self.file.is_empty() {
+            ::buffa::types::put_string_field(15u32, &self.file, buf);
+        }
+        if self.checkpoint != 0u64 {
+            ::buffa::types::put_uint64_field(16u32, self.checkpoint, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -4391,6 +5069,20 @@ impl ::buffa::Message for Shard {
                 )?;
                 ::buffa::types::merge_string(&mut self.verify_error, buf)?;
             }
+            15u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.file, buf)?;
+            }
+            16u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.checkpoint = ::buffa::types::decode_uint64(buf)?;
+            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -4413,6 +5105,8 @@ impl ::buffa::Message for Shard {
         self.state.clear();
         self.verify.clear();
         self.verify_error.clear();
+        self.file.clear();
+        self.checkpoint = 0u64;
         self.__buffa_unknown_fields.clear();
     }
 }
@@ -5211,425 +5905,6 @@ pub const __DELTA_LIST_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa:
     type_url: "type.googleapis.com/marco.v1.DeltaList",
     to_json: ::buffa::type_registry::any_to_json::<DeltaList>,
     from_json: ::buffa::type_registry::any_from_json::<DeltaList>,
-    is_wkt: false,
-};
-#[derive(Clone, PartialEq, Default)]
-#[derive(::serde::Serialize, ::serde::Deserialize)]
-#[serde(default)]
-pub struct GetWalRequest {
-    #[serde(skip)]
-    #[doc(hidden)]
-    pub __buffa_unknown_fields: ::buffa::UnknownFields,
-}
-impl ::core::fmt::Debug for GetWalRequest {
-    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
-        f.debug_struct("GetWalRequest").finish()
-    }
-}
-impl GetWalRequest {
-    /// Protobuf type URL for this message, for use with `Any::pack` and
-    /// `Any::unpack_if`.
-    ///
-    /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
-    pub const TYPE_URL: &'static str = "type.googleapis.com/marco.v1.GetWalRequest";
-}
-::buffa::impl_default_instance!(GetWalRequest);
-impl ::buffa::MessageName for GetWalRequest {
-    const PACKAGE: &'static str = "marco.v1";
-    const NAME: &'static str = "GetWalRequest";
-    const FULL_NAME: &'static str = "marco.v1.GetWalRequest";
-    const TYPE_URL: &'static str = "type.googleapis.com/marco.v1.GetWalRequest";
-}
-impl ::buffa::Message for GetWalRequest {
-    /// Returns the total encoded size in bytes.
-    ///
-    /// Accumulates in `u64` (which cannot overflow for in-memory
-    /// data) and saturates to `u32` at return, so a message whose
-    /// encoded size exceeds the 2 GiB protobuf limit yields a value
-    /// above [`::buffa::MAX_MESSAGE_BYTES`] that the encode entry
-    /// points reject, never a silently wrapped size.
-    #[allow(clippy::let_and_return)]
-    fn compute_size(&self, _cache: &mut ::buffa::SizeCache) -> u32 {
-        #[allow(unused_imports)]
-        use ::buffa::Enumeration as _;
-        let mut size = 0u64;
-        size += self.__buffa_unknown_fields.encoded_len() as u64;
-        ::buffa::saturate_size(size)
-    }
-    fn write_to(
-        &self,
-        _cache: &mut ::buffa::SizeCache,
-        buf: &mut impl ::buffa::EncodeSink,
-    ) {
-        #[allow(unused_imports)]
-        use ::buffa::Enumeration as _;
-        self.__buffa_unknown_fields.write_to(buf);
-    }
-    fn merge_field(
-        &mut self,
-        tag: ::buffa::encoding::Tag,
-        buf: &mut impl ::buffa::bytes::Buf,
-        ctx: ::buffa::DecodeContext<'_>,
-    ) -> ::core::result::Result<(), ::buffa::DecodeError> {
-        #[allow(unused_imports)]
-        use ::buffa::bytes::Buf as _;
-        #[allow(unused_imports)]
-        use ::buffa::Enumeration as _;
-        match tag.field_number() {
-            _ => {
-                self.__buffa_unknown_fields
-                    .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
-            }
-        }
-        ::core::result::Result::Ok(())
-    }
-    fn clear(&mut self) {
-        self.__buffa_unknown_fields.clear();
-    }
-}
-impl ::buffa::ExtensionSet for GetWalRequest {
-    const PROTO_FQN: &'static str = "marco.v1.GetWalRequest";
-    fn unknown_fields(&self) -> &::buffa::UnknownFields {
-        &self.__buffa_unknown_fields
-    }
-    fn unknown_fields_mut(&mut self) -> &mut ::buffa::UnknownFields {
-        &mut self.__buffa_unknown_fields
-    }
-}
-impl ::buffa::json_helpers::ProtoElemJson for GetWalRequest {
-    fn serialize_proto_json<S: ::serde::Serializer>(
-        v: &Self,
-        s: S,
-    ) -> ::core::result::Result<S::Ok, S::Error> {
-        ::serde::Serialize::serialize(v, s)
-    }
-    fn deserialize_proto_json<'de, D: ::serde::Deserializer<'de>>(
-        d: D,
-    ) -> ::core::result::Result<Self, D::Error> {
-        <Self as ::serde::Deserialize>::deserialize(d)
-    }
-}
-#[doc(hidden)]
-pub const __GET_WAL_REQUEST_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
-    type_url: "type.googleapis.com/marco.v1.GetWalRequest",
-    to_json: ::buffa::type_registry::any_to_json::<GetWalRequest>,
-    from_json: ::buffa::type_registry::any_from_json::<GetWalRequest>,
-    is_wkt: false,
-};
-#[derive(Clone, PartialEq, Default)]
-#[derive(::serde::Serialize, ::serde::Deserialize)]
-#[serde(default)]
-pub struct GetWalResponse {
-    /// Field 1: `head_seq`
-    #[serde(
-        rename = "headSeq",
-        alias = "head_seq",
-        with = "::buffa::json_helpers::uint64",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
-    )]
-    pub head_seq: u64,
-    /// Field 2: `trim_seq`
-    #[serde(
-        rename = "trimSeq",
-        alias = "trim_seq",
-        with = "::buffa::json_helpers::uint64",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
-    )]
-    pub trim_seq: u64,
-    /// Field 3: `held_ops`
-    #[serde(
-        rename = "heldOps",
-        alias = "held_ops",
-        with = "::buffa::json_helpers::uint64",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
-    )]
-    pub held_ops: u64,
-    /// Field 4: `held_bytes`
-    #[serde(
-        rename = "heldBytes",
-        alias = "held_bytes",
-        with = "::buffa::json_helpers::uint64",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
-    )]
-    pub held_bytes: u64,
-    /// Field 5: `files`
-    #[serde(
-        rename = "files",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_vec",
-        deserialize_with = "::buffa::json_helpers::null_as_default"
-    )]
-    pub files: ::buffa::alloc::vec::Vec<::buffa::alloc::string::String>,
-    /// Field 6: `fsync_p99_seconds`
-    #[serde(
-        rename = "fsyncP99Seconds",
-        alias = "fsync_p99_seconds",
-        with = "::buffa::json_helpers::double",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_f64"
-    )]
-    pub fsync_p99_seconds: f64,
-    /// The seq each shard is persisted to.
-    ///
-    /// Field 7: `shard_seqs`
-    #[serde(
-        rename = "shardSeqs",
-        alias = "shard_seqs",
-        with = "::buffa::json_helpers::proto_seq",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_vec"
-    )]
-    pub shard_seqs: ::buffa::alloc::vec::Vec<u64>,
-    #[serde(skip)]
-    #[doc(hidden)]
-    pub __buffa_unknown_fields: ::buffa::UnknownFields,
-}
-impl ::core::fmt::Debug for GetWalResponse {
-    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
-        f.debug_struct("GetWalResponse")
-            .field("head_seq", &self.head_seq)
-            .field("trim_seq", &self.trim_seq)
-            .field("held_ops", &self.held_ops)
-            .field("held_bytes", &self.held_bytes)
-            .field("files", &self.files)
-            .field("fsync_p99_seconds", &self.fsync_p99_seconds)
-            .field("shard_seqs", &self.shard_seqs)
-            .finish()
-    }
-}
-impl GetWalResponse {
-    /// Protobuf type URL for this message, for use with `Any::pack` and
-    /// `Any::unpack_if`.
-    ///
-    /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
-    pub const TYPE_URL: &'static str = "type.googleapis.com/marco.v1.GetWalResponse";
-}
-::buffa::impl_default_instance!(GetWalResponse);
-impl ::buffa::MessageName for GetWalResponse {
-    const PACKAGE: &'static str = "marco.v1";
-    const NAME: &'static str = "GetWalResponse";
-    const FULL_NAME: &'static str = "marco.v1.GetWalResponse";
-    const TYPE_URL: &'static str = "type.googleapis.com/marco.v1.GetWalResponse";
-}
-impl ::buffa::Message for GetWalResponse {
-    /// Returns the total encoded size in bytes.
-    ///
-    /// Accumulates in `u64` (which cannot overflow for in-memory
-    /// data) and saturates to `u32` at return, so a message whose
-    /// encoded size exceeds the 2 GiB protobuf limit yields a value
-    /// above [`::buffa::MAX_MESSAGE_BYTES`] that the encode entry
-    /// points reject, never a silently wrapped size.
-    #[allow(clippy::let_and_return)]
-    fn compute_size(&self, _cache: &mut ::buffa::SizeCache) -> u32 {
-        #[allow(unused_imports)]
-        use ::buffa::Enumeration as _;
-        let mut size = 0u64;
-        if self.head_seq != 0u64 {
-            size += 1u64 + ::buffa::types::uint64_encoded_len(self.head_seq) as u64;
-        }
-        if self.trim_seq != 0u64 {
-            size += 1u64 + ::buffa::types::uint64_encoded_len(self.trim_seq) as u64;
-        }
-        if self.held_ops != 0u64 {
-            size += 1u64 + ::buffa::types::uint64_encoded_len(self.held_ops) as u64;
-        }
-        if self.held_bytes != 0u64 {
-            size += 1u64 + ::buffa::types::uint64_encoded_len(self.held_bytes) as u64;
-        }
-        for v in &self.files {
-            size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
-        }
-        if self.fsync_p99_seconds.to_bits() != 0u64 {
-            size += 1u64 + ::buffa::types::FIXED64_ENCODED_LEN as u64;
-        }
-        if !self.shard_seqs.is_empty() {
-            let payload: u64 = self
-                .shard_seqs
-                .iter()
-                .map(|&v| ::buffa::types::uint64_encoded_len(v) as u64)
-                .sum::<u64>();
-            size += 1u64 + ::buffa::encoding::varint_len(payload) as u64 + payload;
-        }
-        size += self.__buffa_unknown_fields.encoded_len() as u64;
-        ::buffa::saturate_size(size)
-    }
-    fn write_to(
-        &self,
-        _cache: &mut ::buffa::SizeCache,
-        buf: &mut impl ::buffa::EncodeSink,
-    ) {
-        #[allow(unused_imports)]
-        use ::buffa::Enumeration as _;
-        if self.head_seq != 0u64 {
-            ::buffa::types::put_uint64_field(1u32, self.head_seq, buf);
-        }
-        if self.trim_seq != 0u64 {
-            ::buffa::types::put_uint64_field(2u32, self.trim_seq, buf);
-        }
-        if self.held_ops != 0u64 {
-            ::buffa::types::put_uint64_field(3u32, self.held_ops, buf);
-        }
-        if self.held_bytes != 0u64 {
-            ::buffa::types::put_uint64_field(4u32, self.held_bytes, buf);
-        }
-        for v in &self.files {
-            ::buffa::types::put_string_field(5u32, v, buf);
-        }
-        if self.fsync_p99_seconds.to_bits() != 0u64 {
-            ::buffa::types::put_double_field(6u32, self.fsync_p99_seconds, buf);
-        }
-        if !self.shard_seqs.is_empty() {
-            let payload: u64 = self
-                .shard_seqs
-                .iter()
-                .map(|&v| ::buffa::types::uint64_encoded_len(v) as u64)
-                .sum::<u64>();
-            ::buffa::types::put_len_delimited_header(7u32, payload, buf);
-            for &v in &self.shard_seqs {
-                ::buffa::types::encode_uint64(v, buf);
-            }
-        }
-        self.__buffa_unknown_fields.write_to(buf);
-    }
-    fn merge_field(
-        &mut self,
-        tag: ::buffa::encoding::Tag,
-        buf: &mut impl ::buffa::bytes::Buf,
-        ctx: ::buffa::DecodeContext<'_>,
-    ) -> ::core::result::Result<(), ::buffa::DecodeError> {
-        #[allow(unused_imports)]
-        use ::buffa::bytes::Buf as _;
-        #[allow(unused_imports)]
-        use ::buffa::Enumeration as _;
-        match tag.field_number() {
-            1u32 => {
-                ::buffa::encoding::check_wire_type(
-                    tag,
-                    ::buffa::encoding::WireType::Varint,
-                )?;
-                self.head_seq = ::buffa::types::decode_uint64(buf)?;
-            }
-            2u32 => {
-                ::buffa::encoding::check_wire_type(
-                    tag,
-                    ::buffa::encoding::WireType::Varint,
-                )?;
-                self.trim_seq = ::buffa::types::decode_uint64(buf)?;
-            }
-            3u32 => {
-                ::buffa::encoding::check_wire_type(
-                    tag,
-                    ::buffa::encoding::WireType::Varint,
-                )?;
-                self.held_ops = ::buffa::types::decode_uint64(buf)?;
-            }
-            4u32 => {
-                ::buffa::encoding::check_wire_type(
-                    tag,
-                    ::buffa::encoding::WireType::Varint,
-                )?;
-                self.held_bytes = ::buffa::types::decode_uint64(buf)?;
-            }
-            5u32 => {
-                ::buffa::encoding::check_wire_type(
-                    tag,
-                    ::buffa::encoding::WireType::LengthDelimited,
-                )?;
-                let __elem = ::buffa::types::decode_string(buf)?;
-                ctx.register_element_memory(
-                    ::buffa::__private::element_footprint(&__elem),
-                )?;
-                self.files.push(__elem);
-            }
-            6u32 => {
-                ::buffa::encoding::check_wire_type(
-                    tag,
-                    ::buffa::encoding::WireType::Fixed64,
-                )?;
-                self.fsync_p99_seconds = ::buffa::types::decode_double(buf)?;
-            }
-            7u32 => {
-                if tag.wire_type() == ::buffa::encoding::WireType::LengthDelimited {
-                    let len = ::buffa::encoding::decode_varint(buf)?;
-                    let len = usize::try_from(len)
-                        .map_err(|_| ::buffa::DecodeError::MessageTooLarge)?;
-                    if buf.remaining() < len {
-                        return ::core::result::Result::Err(
-                            ::buffa::DecodeError::UnexpectedEof,
-                        );
-                    }
-                    if buf.chunk().len() >= len {
-                        ::buffa::types::extend_packed_uint64(
-                            &buf.chunk()[..len],
-                            &mut self.shard_seqs,
-                            len,
-                        )?;
-                        buf.advance(len);
-                    } else {
-                        self.shard_seqs.reserve(len);
-                        let mut limited = buf.take(len);
-                        while limited.has_remaining() {
-                            self.shard_seqs
-                                .push(::buffa::types::decode_uint64_packed(&mut limited)?);
-                        }
-                        let leftover = limited.remaining();
-                        if leftover > 0 {
-                            limited.advance(leftover);
-                        }
-                    }
-                } else if tag.wire_type() == ::buffa::encoding::WireType::Varint {
-                    self.shard_seqs.push(::buffa::types::decode_uint64(buf)?);
-                } else {
-                    return ::core::result::Result::Err(
-                        ::buffa::encoding::wire_type_mismatch(
-                            tag,
-                            ::buffa::encoding::WireType::LengthDelimited,
-                        ),
-                    );
-                }
-            }
-            _ => {
-                self.__buffa_unknown_fields
-                    .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
-            }
-        }
-        ::core::result::Result::Ok(())
-    }
-    fn clear(&mut self) {
-        self.head_seq = 0u64;
-        self.trim_seq = 0u64;
-        self.held_ops = 0u64;
-        self.held_bytes = 0u64;
-        self.files.clear();
-        self.fsync_p99_seconds = 0f64;
-        self.shard_seqs.clear();
-        self.__buffa_unknown_fields.clear();
-    }
-}
-impl ::buffa::ExtensionSet for GetWalResponse {
-    const PROTO_FQN: &'static str = "marco.v1.GetWalResponse";
-    fn unknown_fields(&self) -> &::buffa::UnknownFields {
-        &self.__buffa_unknown_fields
-    }
-    fn unknown_fields_mut(&mut self) -> &mut ::buffa::UnknownFields {
-        &mut self.__buffa_unknown_fields
-    }
-}
-impl ::buffa::json_helpers::ProtoElemJson for GetWalResponse {
-    fn serialize_proto_json<S: ::serde::Serializer>(
-        v: &Self,
-        s: S,
-    ) -> ::core::result::Result<S::Ok, S::Error> {
-        ::serde::Serialize::serialize(v, s)
-    }
-    fn deserialize_proto_json<'de, D: ::serde::Deserializer<'de>>(
-        d: D,
-    ) -> ::core::result::Result<Self, D::Error> {
-        <Self as ::serde::Deserialize>::deserialize(d)
-    }
-}
-#[doc(hidden)]
-pub const __GET_WAL_RESPONSE_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
-    type_url: "type.googleapis.com/marco.v1.GetWalResponse",
-    to_json: ::buffa::type_registry::any_to_json::<GetWalResponse>,
-    from_json: ::buffa::type_registry::any_from_json::<GetWalResponse>,
     is_wkt: false,
 };
 #[derive(Clone, PartialEq, Default)]
@@ -7351,6 +7626,8 @@ pub struct Source {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
     )]
     pub name: ::buffa::alloc::string::String,
+    /// url, state, cursor_kind, lag, errors and reconnects are the source's own report.
+    ///
     /// Field 2: `url`
     #[serde(
         rename = "url",
@@ -7365,6 +7642,8 @@ pub struct Source {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
     )]
     pub state: ::buffa::alloc::string::String,
+    /// The cursor of the last write applied.
+    ///
     /// Field 4: `cursor`
     #[serde(
         rename = "cursor",
@@ -7410,6 +7689,48 @@ pub struct Source {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
     )]
     pub reconnects: u64,
+    /// The cursor in the newest change segment: a restart resumes after it.
+    ///
+    /// Field 10: `durable_cursor`
+    #[serde(
+        rename = "durableCursor",
+        alias = "durable_cursor",
+        with = "::buffa::json_helpers::proto_string",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    )]
+    pub durable_cursor: ::buffa::alloc::string::String,
+    /// Configured: readiness waits for it to catch up.
+    ///
+    /// Field 11: `expected`
+    #[serde(
+        rename = "expected",
+        with = "::buffa::json_helpers::proto_bool",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_false"
+    )]
+    pub expected: bool,
+    /// Field 12: `caught_up`
+    #[serde(
+        rename = "caughtUp",
+        alias = "caught_up",
+        with = "::buffa::json_helpers::proto_bool",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_false"
+    )]
+    pub caught_up: bool,
+    /// Field 13: `last_ms`
+    #[serde(
+        rename = "lastMs",
+        alias = "last_ms",
+        with = "::buffa::json_helpers::int64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_i64"
+    )]
+    pub last_ms: i64,
+    /// Field 14: `ops`
+    #[serde(
+        rename = "ops",
+        with = "::buffa::json_helpers::uint64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
+    )]
+    pub ops: u64,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -7426,6 +7747,11 @@ impl ::core::fmt::Debug for Source {
             .field("ops_per_second", &self.ops_per_second)
             .field("errors", &self.errors)
             .field("reconnects", &self.reconnects)
+            .field("durable_cursor", &self.durable_cursor)
+            .field("expected", &self.expected)
+            .field("caught_up", &self.caught_up)
+            .field("last_ms", &self.last_ms)
+            .field("ops", &self.ops)
             .finish()
     }
 }
@@ -7483,6 +7809,23 @@ impl ::buffa::Message for Source {
         if self.reconnects != 0u64 {
             size += 1u64 + ::buffa::types::uint64_encoded_len(self.reconnects) as u64;
         }
+        if !self.durable_cursor.is_empty() {
+            size
+                += 1u64
+                    + ::buffa::types::string_encoded_len(&self.durable_cursor) as u64;
+        }
+        if self.expected {
+            size += 1u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
+        }
+        if self.caught_up {
+            size += 1u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
+        }
+        if self.last_ms != 0i64 {
+            size += 1u64 + ::buffa::types::int64_encoded_len(self.last_ms) as u64;
+        }
+        if self.ops != 0u64 {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(self.ops) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -7519,6 +7862,21 @@ impl ::buffa::Message for Source {
         }
         if self.reconnects != 0u64 {
             ::buffa::types::put_uint64_field(9u32, self.reconnects, buf);
+        }
+        if !self.durable_cursor.is_empty() {
+            ::buffa::types::put_string_field(10u32, &self.durable_cursor, buf);
+        }
+        if self.expected {
+            ::buffa::types::put_bool_field(11u32, self.expected, buf);
+        }
+        if self.caught_up {
+            ::buffa::types::put_bool_field(12u32, self.caught_up, buf);
+        }
+        if self.last_ms != 0i64 {
+            ::buffa::types::put_int64_field(13u32, self.last_ms, buf);
+        }
+        if self.ops != 0u64 {
+            ::buffa::types::put_uint64_field(14u32, self.ops, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -7596,6 +7954,41 @@ impl ::buffa::Message for Source {
                 )?;
                 self.reconnects = ::buffa::types::decode_uint64(buf)?;
             }
+            10u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.durable_cursor, buf)?;
+            }
+            11u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.expected = ::buffa::types::decode_bool(buf)?;
+            }
+            12u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.caught_up = ::buffa::types::decode_bool(buf)?;
+            }
+            13u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.last_ms = ::buffa::types::decode_int64(buf)?;
+            }
+            14u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.ops = ::buffa::types::decode_uint64(buf)?;
+            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -7613,6 +8006,11 @@ impl ::buffa::Message for Source {
         self.ops_per_second = 0f64;
         self.errors = 0u64;
         self.reconnects = 0u64;
+        self.durable_cursor.clear();
+        self.expected = false;
+        self.caught_up = false;
+        self.last_ms = 0i64;
+        self.ops = 0u64;
         self.__buffa_unknown_fields.clear();
     }
 }
@@ -10262,40 +10660,31 @@ pub const __BUILD_INFO_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa:
 #[derive(Clone, PartialEq, Default)]
 #[derive(::serde::Serialize, ::serde::Deserialize)]
 #[serde(default)]
-pub struct WriteShardsRequest {
-    /// "dirty" (default) or "all". This build rewrites every shard either way.
-    ///
-    /// Field 1: `shards`
-    #[serde(
-        rename = "shards",
-        with = "::buffa::json_helpers::proto_string",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
-    )]
-    pub shards: ::buffa::alloc::string::String,
+pub struct CheckpointRequest {
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
 }
-impl ::core::fmt::Debug for WriteShardsRequest {
+impl ::core::fmt::Debug for CheckpointRequest {
     fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
-        f.debug_struct("WriteShardsRequest").field("shards", &self.shards).finish()
+        f.debug_struct("CheckpointRequest").finish()
     }
 }
-impl WriteShardsRequest {
+impl CheckpointRequest {
     /// Protobuf type URL for this message, for use with `Any::pack` and
     /// `Any::unpack_if`.
     ///
     /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
-    pub const TYPE_URL: &'static str = "type.googleapis.com/marco.v1.WriteShardsRequest";
+    pub const TYPE_URL: &'static str = "type.googleapis.com/marco.v1.CheckpointRequest";
 }
-::buffa::impl_default_instance!(WriteShardsRequest);
-impl ::buffa::MessageName for WriteShardsRequest {
+::buffa::impl_default_instance!(CheckpointRequest);
+impl ::buffa::MessageName for CheckpointRequest {
     const PACKAGE: &'static str = "marco.v1";
-    const NAME: &'static str = "WriteShardsRequest";
-    const FULL_NAME: &'static str = "marco.v1.WriteShardsRequest";
-    const TYPE_URL: &'static str = "type.googleapis.com/marco.v1.WriteShardsRequest";
+    const NAME: &'static str = "CheckpointRequest";
+    const FULL_NAME: &'static str = "marco.v1.CheckpointRequest";
+    const TYPE_URL: &'static str = "type.googleapis.com/marco.v1.CheckpointRequest";
 }
-impl ::buffa::Message for WriteShardsRequest {
+impl ::buffa::Message for CheckpointRequest {
     /// Returns the total encoded size in bytes.
     ///
     /// Accumulates in `u64` (which cannot overflow for in-memory
@@ -10308,9 +10697,6 @@ impl ::buffa::Message for WriteShardsRequest {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
         let mut size = 0u64;
-        if !self.shards.is_empty() {
-            size += 1u64 + ::buffa::types::string_encoded_len(&self.shards) as u64;
-        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -10321,9 +10707,6 @@ impl ::buffa::Message for WriteShardsRequest {
     ) {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
-        if !self.shards.is_empty() {
-            ::buffa::types::put_string_field(1u32, &self.shards, buf);
-        }
         self.__buffa_unknown_fields.write_to(buf);
     }
     fn merge_field(
@@ -10337,13 +10720,6 @@ impl ::buffa::Message for WriteShardsRequest {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
         match tag.field_number() {
-            1u32 => {
-                ::buffa::encoding::check_wire_type(
-                    tag,
-                    ::buffa::encoding::WireType::LengthDelimited,
-                )?;
-                ::buffa::types::merge_string(&mut self.shards, buf)?;
-            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -10352,12 +10728,11 @@ impl ::buffa::Message for WriteShardsRequest {
         ::core::result::Result::Ok(())
     }
     fn clear(&mut self) {
-        self.shards.clear();
         self.__buffa_unknown_fields.clear();
     }
 }
-impl ::buffa::ExtensionSet for WriteShardsRequest {
-    const PROTO_FQN: &'static str = "marco.v1.WriteShardsRequest";
+impl ::buffa::ExtensionSet for CheckpointRequest {
+    const PROTO_FQN: &'static str = "marco.v1.CheckpointRequest";
     fn unknown_fields(&self) -> &::buffa::UnknownFields {
         &self.__buffa_unknown_fields
     }
@@ -10365,7 +10740,7 @@ impl ::buffa::ExtensionSet for WriteShardsRequest {
         &mut self.__buffa_unknown_fields
     }
 }
-impl ::buffa::json_helpers::ProtoElemJson for WriteShardsRequest {
+impl ::buffa::json_helpers::ProtoElemJson for CheckpointRequest {
     fn serialize_proto_json<S: ::serde::Serializer>(
         v: &Self,
         s: S,
@@ -10379,16 +10754,16 @@ impl ::buffa::json_helpers::ProtoElemJson for WriteShardsRequest {
     }
 }
 #[doc(hidden)]
-pub const __WRITE_SHARDS_REQUEST_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
-    type_url: "type.googleapis.com/marco.v1.WriteShardsRequest",
-    to_json: ::buffa::type_registry::any_to_json::<WriteShardsRequest>,
-    from_json: ::buffa::type_registry::any_from_json::<WriteShardsRequest>,
+pub const __CHECKPOINT_REQUEST_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
+    type_url: "type.googleapis.com/marco.v1.CheckpointRequest",
+    to_json: ::buffa::type_registry::any_to_json::<CheckpointRequest>,
+    from_json: ::buffa::type_registry::any_from_json::<CheckpointRequest>,
     is_wkt: false,
 };
 #[derive(Clone, PartialEq, Default)]
 #[derive(::serde::Serialize, ::serde::Deserialize)]
 #[serde(default)]
-pub struct WriteShardsResponse {
+pub struct CheckpointResponse {
     /// Field 1: `job`
     #[serde(
         rename = "job",
@@ -10399,26 +10774,26 @@ pub struct WriteShardsResponse {
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
 }
-impl ::core::fmt::Debug for WriteShardsResponse {
+impl ::core::fmt::Debug for CheckpointResponse {
     fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
-        f.debug_struct("WriteShardsResponse").field("job", &self.job).finish()
+        f.debug_struct("CheckpointResponse").field("job", &self.job).finish()
     }
 }
-impl WriteShardsResponse {
+impl CheckpointResponse {
     /// Protobuf type URL for this message, for use with `Any::pack` and
     /// `Any::unpack_if`.
     ///
     /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
-    pub const TYPE_URL: &'static str = "type.googleapis.com/marco.v1.WriteShardsResponse";
+    pub const TYPE_URL: &'static str = "type.googleapis.com/marco.v1.CheckpointResponse";
 }
-::buffa::impl_default_instance!(WriteShardsResponse);
-impl ::buffa::MessageName for WriteShardsResponse {
+::buffa::impl_default_instance!(CheckpointResponse);
+impl ::buffa::MessageName for CheckpointResponse {
     const PACKAGE: &'static str = "marco.v1";
-    const NAME: &'static str = "WriteShardsResponse";
-    const FULL_NAME: &'static str = "marco.v1.WriteShardsResponse";
-    const TYPE_URL: &'static str = "type.googleapis.com/marco.v1.WriteShardsResponse";
+    const NAME: &'static str = "CheckpointResponse";
+    const FULL_NAME: &'static str = "marco.v1.CheckpointResponse";
+    const TYPE_URL: &'static str = "type.googleapis.com/marco.v1.CheckpointResponse";
 }
-impl ::buffa::Message for WriteShardsResponse {
+impl ::buffa::Message for CheckpointResponse {
     /// Returns the total encoded size in bytes.
     ///
     /// Accumulates in `u64` (which cannot overflow for in-memory
@@ -10493,8 +10868,8 @@ impl ::buffa::Message for WriteShardsResponse {
         self.__buffa_unknown_fields.clear();
     }
 }
-impl ::buffa::ExtensionSet for WriteShardsResponse {
-    const PROTO_FQN: &'static str = "marco.v1.WriteShardsResponse";
+impl ::buffa::ExtensionSet for CheckpointResponse {
+    const PROTO_FQN: &'static str = "marco.v1.CheckpointResponse";
     fn unknown_fields(&self) -> &::buffa::UnknownFields {
         &self.__buffa_unknown_fields
     }
@@ -10502,7 +10877,7 @@ impl ::buffa::ExtensionSet for WriteShardsResponse {
         &mut self.__buffa_unknown_fields
     }
 }
-impl ::buffa::json_helpers::ProtoElemJson for WriteShardsResponse {
+impl ::buffa::json_helpers::ProtoElemJson for CheckpointResponse {
     fn serialize_proto_json<S: ::serde::Serializer>(
         v: &Self,
         s: S,
@@ -10516,10 +10891,10 @@ impl ::buffa::json_helpers::ProtoElemJson for WriteShardsResponse {
     }
 }
 #[doc(hidden)]
-pub const __WRITE_SHARDS_RESPONSE_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
-    type_url: "type.googleapis.com/marco.v1.WriteShardsResponse",
-    to_json: ::buffa::type_registry::any_to_json::<WriteShardsResponse>,
-    from_json: ::buffa::type_registry::any_from_json::<WriteShardsResponse>,
+pub const __CHECKPOINT_RESPONSE_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
+    type_url: "type.googleapis.com/marco.v1.CheckpointResponse",
+    to_json: ::buffa::type_registry::any_to_json::<CheckpointResponse>,
+    from_json: ::buffa::type_registry::any_from_json::<CheckpointResponse>,
     is_wkt: false,
 };
 #[derive(Clone, PartialEq, Default)]

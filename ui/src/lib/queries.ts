@@ -1,4 +1,4 @@
-import { admin, graph, isUnimplemented } from './api'
+import { admin, graph } from './api'
 import { invalidate, useLive } from './query'
 import type { GetSeriesResponse, Series } from '../gen/marco/v1/admin_pb'
 import { Dir } from '../gen/marco/v1/graph_pb'
@@ -17,7 +17,6 @@ export const keys = {
   listStats: (rel: string) => ['liststats', rel],
   settings: ['settings'],
   sources: ['sources'],
-  wal: ['wal'],
   actor: (did: string) => ['actor', did],
   edges: (did: string, rel: string, dir: Dir, cursor: string) => ['edges', did, rel, dir, cursor],
   uri: (u: string) => ['uri', u],
@@ -37,18 +36,7 @@ export const useEdges = (did: string, rel: string, dir: Dir, cursor: string, lim
   useLive(keys.edges(did, rel, dir, cursor), () => admin().listEdges({ actor: did, rel, dir, cursor, limit }), { enabled: !!did && !!rel })
 export const useResolve = (u: string) => useLive(keys.uri(u), () => admin().resolveUri({ uri: u }), { enabled: !!u })
 
-/** A call this marco doesn't serve yet answers `{ unsupported: true }` instead of an error. */
-async function orUnsupported<T>(f: () => Promise<T>): Promise<T | { unsupported: true }> {
-  try {
-    return await f()
-  } catch (e) {
-    if (isUnimplemented(e)) return { unsupported: true }
-    throw e
-  }
-}
-export const useSources = () => useLive(keys.sources, () => orUnsupported(() => admin().listSources({})), { poll: (d) => (d && 'unsupported' in d ? false : 2000) })
-export const useWal = () => useLive(keys.wal, () => orUnsupported(() => admin().getWal({})), { poll: (d) => (d && 'unsupported' in d ? false : 2000) })
-export const unsupported = (d: unknown): d is { unsupported: true } => !!d && typeof d === 'object' && 'unsupported' in d
+export const useSources = () => useLive(keys.sources, () => admin().listSources({}), { poll: 2000 })
 
 // ---------------------------------------------------------------- series
 
@@ -93,8 +81,8 @@ export const WRITE_OPS = ['add', 'delete']
 
 // ---------------------------------------------------------------- writes
 
-export async function writeShards() {
-  const r = await admin().writeShards({ shards: 'dirty' })
+export async function checkpoint() {
+  const r = await admin().checkpoint({})
   await invalidate(keys.shards, keys.overview)
   return r
 }

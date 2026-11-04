@@ -8,9 +8,6 @@ import "marco/v1/graph.proto";
 // Graph, /metrics and /debug/*. Every call needs the admin token
 // (`Authorization: Bearer <token>`) or a login from the trusted proxy
 // header, except GetSession, which says which of the two a caller has.
-//
-// GetWal and ListSources answer Unimplemented until marco has a WAL and its
-// own ingest (P1).
 service Admin {
   rpc GetSession(GetSessionRequest) returns (GetSessionResponse) {
     option idempotency_level = NO_SIDE_EFFECTS;
@@ -32,9 +29,6 @@ service Admin {
   }
   // Bytes by section, and the lists whose deltas are biggest against their base.
   rpc GetStorage(GetStorageRequest) returns (GetStorageResponse) {
-    option idempotency_level = NO_SIDE_EFFECTS;
-  }
-  rpc GetWal(GetWalRequest) returns (GetWalResponse) {
     option idempotency_level = NO_SIDE_EFFECTS;
   }
   rpc ListRelations(ListRelationsRequest) returns (ListRelationsResponse) {
@@ -62,14 +56,16 @@ service Admin {
   rpc GetSettings(GetSettingsRequest) returns (GetSettingsResponse) {
     option idempotency_level = NO_SIDE_EFFECTS;
   }
-  // Writes the snapshot (base + deltas) in place and serves it. Starts a job
-  // and answers at once; GetOverview and ListShards show its progress.
-  rpc WriteShards(WriteShardsRequest) returns (WriteShardsResponse);
+  // Folds the change segments into new shard files now: one cut of the whole
+  // graph, the dirty shards rewritten, the manifest renamed. Starts a job and
+  // answers at once; GetOverview and ListShards show its progress.
+  rpc Checkpoint(CheckpointRequest) returns (CheckpointResponse);
   // Checks every file's section checksums against the bytes on disk, as a job.
   rpc VerifyShards(VerifyShardsRequest) returns (VerifyShardsResponse);
   rpc SetTraceRatio(SetTraceRatioRequest) returns (SetTraceRatioResponse);
   // deleted drops the actor's records and hides it as a subject; takendown
-  // hides both; active undoes either.
+  // hides both; active undoes either. Durable when it answers: it writes a
+  // change segment at once.
   rpc SetActorStatus(SetActorStatusRequest) returns (SetActorStatusResponse);
 }
 
@@ -114,6 +110,43 @@ message GetOverviewResponse {
   uint64 write_seq = 20;
   string api_listen = 21;
   string admin_listen = 22;
+  Durability durability = 23;
+  // Every expected source caught up since start; reads before it are flagged.
+  bool ready = 24;
+  // Why not ready, empty when ready.
+  string ready_reason = 25;
+  uint64 reads_before_ready = 26;
+}
+
+// Writes are applied in memory, then written every few seconds as a change
+// segment (the ops and every source's cursor at that cut). A checkpoint
+// folds the segments into new shard files when replaying them would take
+// too long, or daily.
+message Durability {
+  double segment_interval_seconds = 1;
+  // The newest segment written, its time, and how long its write took.
+  uint64 segment = 2;
+  int64 segment_ms = 3;
+  double segment_write_seconds = 4;
+  // Segments (and their bytes and ops) since the checkpoint: what a restart replays.
+  uint32 segments = 5;
+  uint64 segment_bytes = 6;
+  uint64 segment_ops = 7;
+  // Ops applied but not in a segment yet.
+  uint64 pending_ops = 8;
+  uint64 checkpoint = 9;
+  int64 checkpoint_ms = 10;
+  // A checkpoint starts once segment_ops passes this, or the checkpoint is this old.
+  uint64 checkpoint_ops = 11;
+  double checkpoint_age_seconds = 12;
+  // The last checkpoint's wall time and bytes written.
+  double checkpoint_seconds = 13;
+  uint64 checkpoint_bytes = 14;
+  uint32 checkpoint_shards = 15;
+  // The replay at start: segments, ops and seconds.
+  uint32 replayed_segments = 16;
+  uint64 replayed_ops = 17;
+  double replay_seconds = 18;
 }
 
 message SnapshotInfo {
@@ -165,7 +198,7 @@ message ProcessInfo {
 }
 
 message Job {
-  // "write" or "verify"; empty when none has run.
+  // "checkpoint" or "verify"; empty when none has run.
   string kind = 1;
   bool running = 2;
   int64 started_ms = 3;
@@ -252,11 +285,15 @@ message Shard {
   uint32 merged_lists = 9;
   uint64 merged_bytes = 10;
   uint32 tombstones = 11;
-  // clean, dirty, over or writing.
+  // clean, dirty or writing (a checkpoint is rewriting it).
   string state = 12;
   // unverified, verifying, ok or mismatch.
   string verify = 13;
   string verify_error = 14;
+  // Its file and the checkpoint that wrote it; empty for a shard of new ids
+  // with no file yet.
+  string file = 15;
+  uint64 checkpoint = 16;
 }
 
 message GetStorageRequest {
@@ -287,19 +324,6 @@ message DeltaList {
   uint64 base = 4;
   uint64 adds = 5;
   uint64 dels = 6;
-}
-
-message GetWalRequest {}
-
-message GetWalResponse {
-  uint64 head_seq = 1;
-  uint64 trim_seq = 2;
-  uint64 held_ops = 3;
-  uint64 held_bytes = 4;
-  repeated string files = 5;
-  double fsync_p99_seconds = 6;
-  // The seq each shard is persisted to.
-  repeated uint64 shard_seqs = 7;
 }
 
 message ListRelationsRequest {}
@@ -364,14 +388,23 @@ message ListSourcesResponse {
 
 message Source {
   string name = 1;
+  // url, state, cursor_kind, lag, errors and reconnects are the source's own report.
   string url = 2;
   string state = 3;
+  // The cursor of the last write applied.
   string cursor = 4;
   string cursor_kind = 5;
   double lag_seconds = 6;
   double ops_per_second = 7;
   uint64 errors = 8;
   uint64 reconnects = 9;
+  // The cursor in the newest change segment: a restart resumes after it.
+  string durable_cursor = 10;
+  // Configured: readiness waits for it to catch up.
+  bool expected = 11;
+  bool caught_up = 12;
+  int64 last_ms = 13;
+  uint64 ops = 14;
 }
 
 message GetActorRequest {
@@ -482,12 +515,9 @@ message BuildInfo {
   repeated string features = 4;
 }
 
-message WriteShardsRequest {
-  // "dirty" (default) or "all". This build rewrites every shard either way.
-  string shards = 1;
-}
+message CheckpointRequest {}
 
-message WriteShardsResponse {
+message CheckpointResponse {
   Job job = 1;
 }
 

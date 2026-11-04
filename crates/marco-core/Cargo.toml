@@ -21,6 +21,7 @@ sha2 = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
 xxhash-rust = { workspace = true }
+rustc-hash = { workspace = true }
 prometheus = { workspace = true, optional = true }
 
 [dev-dependencies]
