@@ -13,3 +13,8 @@ plugins:
     out: ../crates/marco-proto/src/gen/connect
     strategy: all
     opt: [filter=services]
+  # TypeScript (the console): protobuf-es v2 messages and service
+  # descriptors, which is all connect-es v2 needs.
+  - local: protoc-gen-es
+    out: ../ui/src/gen
+    opt: [target=ts]

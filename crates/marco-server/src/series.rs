@@ -172,7 +172,12 @@ impl Ring {
                 vals.push((Key { metric: "rpc_errors", rpc, ..Default::default() }, r));
             }
         }
+        let first = self.prev.is_none();
         self.prev = Some((now, hists, ctrs));
+        // the first sample has nothing to take differences from
+        if first {
+            return;
+        }
         let mut row = vec![f32::NAN; self.keys.len()];
         for (k, v) in vals {
             let i = self.slot(k);
@@ -286,10 +291,10 @@ mod tests {
         h.with_label_values(&["Graph/Has"]).observe(0.007);
         r.sample(&[fam(&h)], &[]);
         let (_, ts, series) = r.window(60);
-        assert_eq!(ts.len(), 2);
+        assert_eq!(ts.len(), 1, "the first sample only sets the baseline");
         let get = |m: &str| series.iter().find(|(k, _)| k.metric == m && k.rpc == "Graph/Has").unwrap().1.clone();
-        assert!(get("rpc_rate")[1] > 0.0);
-        let p99 = get("rpc_p99")[1];
+        assert!(get("rpc_rate")[0] > 0.0);
+        let p99 = get("rpc_p99")[0];
         assert!((0.001..=0.00201).contains(&p99), "the 99th of 100 is in the 1-2 ms bucket: {p99}");
     }
 }

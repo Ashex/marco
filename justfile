@@ -11,7 +11,8 @@ connect_rust_version := "0.9.0"
 tools_rev := "r1"
 tools_dir := env("MARCO_TOOLS", home_directory() / ".cache/marco-tools" / tools_rev)
 
-export PATH := tools_dir / "bin" + ":" + home_directory() / ".cargo/bin" + ":" + env("PATH")
+# protoc-gen-es comes from the console's node_modules (ui/package.json pins it).
+export PATH := tools_dir / "bin" + ":" + justfile_directory() / "ui/node_modules/.bin" + ":" + home_directory() / ".cargo/bin" + ":" + env("PATH")
 
 import? 'internal/justfile'
 
@@ -22,6 +23,21 @@ check: check-private check-gen
     cargo check --all-targets
     cargo clippy --all-targets -- -D warnings
     cargo fmt --check
+    cd ui && npm run typecheck
+
+# The console: build into ui/dist (the server reads it at start), dev servers, screenshots
+ui:
+    cd ui && npm ci && npm run build
+
+ui-dev url="http://127.0.0.1:7301":
+    cd ui && MARCO_URL={{url}} npm run dev
+
+ui-mock:
+    cd ui && npm run dev:mock
+
+# Screenshots of every section against the mock: desktop, 390 px, light and dark; fails on console errors
+shots *args:
+    cd ui && npm run shots -- {{args}}
 
 test *args:
     cargo test {{args}}
@@ -54,8 +70,11 @@ tools:
             protoc-gen-buffa-packaging@{{buffa_version}} \
             connectrpc-codegen@{{connect_rust_version}}
     fi
+    if [ ! -d ui/node_modules ]; then
+        (cd ui && npm ci)
+    fi
 
-gen_dirs := "crates/marco-proto/src/gen"
+gen_dirs := "crates/marco-proto/src/gen ui/src/gen"
 
 # Regenerate the API code from proto/
 gen: tools
