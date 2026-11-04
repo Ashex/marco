@@ -1,0 +1,778 @@
+//! marco.v1.Admin: what the console shows and the operator's actions.
+
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+
+use connectrpc::{ConnectError, RequestContext, Response, ServiceRequest, ServiceResult};
+use marco_core::relation::parse_uri;
+use marco_core::rkey::{is_tid, key_of};
+use marco_core::store::DIR_FILE;
+use marco_core::{Dir, Graph, RelId, Stored};
+use marco_proto::connect::marco::v1 as svc;
+use marco_proto::v1::*;
+
+use crate::app::{App, JobState, Status, Verify};
+use crate::auth::Caller;
+use crate::graph_svc::{bad, dir_of, dir_pb, rel_id};
+
+pub struct AdminApi(pub Arc<App>);
+
+/// How far a list is scanned for answers that need its whole length
+/// (an actor's first record, a record's position).
+const SCAN_CAP: u64 = 100_000;
+
+fn stored(s: Stored) -> String {
+    match s {
+        Stored::Base => "base",
+        Stored::Delta => "delta",
+        Stored::Merged => "merged",
+    }
+    .into()
+}
+
+fn job_pb(j: &JobState) -> Job {
+    Job {
+        kind: j.kind.into(),
+        running: j.running,
+        started_ms: j.started_ms,
+        finished_ms: j.finished_ms,
+        error: j.error.clone(),
+        done: j.done,
+        total: j.total,
+        ..Default::default()
+    }
+}
+
+fn created_us(key: u64) -> i64 {
+    if is_tid(key) {
+        (key >> 10) as i64
+    } else {
+        0
+    }
+}
+
+fn mtime_ms(p: &std::path::Path) -> i64 {
+    std::fs::metadata(p)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_millis() as i64)
+}
+
+/// Delta entries and tombstones over every list.
+pub fn delta_totals(g: &Graph) -> (u64, u64) {
+    let mut d = 0u64;
+    let mut t = 0u64;
+    for r in 0..g.relations().len() as RelId {
+        for dir in [Dir::Out, Dir::In] {
+            g.for_each_delta(r, dir, |_, a, x| d += (a + x) as u64);
+        }
+        t += g.tombstones(r) as u64;
+    }
+    (d, t)
+}
+
+struct ShardAcc {
+    delta: u64,
+    delta_lists: u32,
+    merged: u32,
+    merged_bytes: u64,
+    tombs: u32,
+}
+
+/// Per shard: delta entries, merged lists and tombstones, by the shard that
+/// holds the list (an id added since the snapshot counts in the last).
+fn shard_accs(g: &Graph) -> Vec<ShardAcc> {
+    let Some(s) = g.snapshot() else { return Vec::new() };
+    let n = s.shards.len();
+    let w = s.meta.shard_width.max(1);
+    let at = |id: u32| ((id / w) as usize).min(n - 1);
+    let mut v: Vec<ShardAcc> =
+        (0..n).map(|_| ShardAcc { delta: 0, delta_lists: 0, merged: 0, merged_bytes: 0, tombs: 0 }).collect();
+    for r in 0..g.relations().len() as RelId {
+        for dir in [Dir::Out, Dir::In] {
+            g.for_each_delta(r, dir, |id, a, d| {
+                let x = &mut v[at(id)];
+                x.delta += (a + d) as u64;
+                x.delta_lists += 1;
+            });
+            g.for_each_merged(r, dir, |id, b| {
+                let x = &mut v[at(id)];
+                x.merged += 1;
+                x.merged_bytes += b as u64;
+            });
+        }
+        for (a, _) in g.tombstone_keys(r) {
+            v[at(a)].tombs += 1;
+        }
+    }
+    v
+}
+
+fn shard_state(app: &App, base: u64, a: &ShardAcc, ratio: f64) -> &'static str {
+    let job = app.job();
+    if job.running && job.kind == "write" {
+        "writing"
+    } else if a.delta as f64 > base as f64 * ratio && a.delta > 0 {
+        "over"
+    } else if a.delta > 0 || a.merged > 0 || a.tombs > 0 {
+        "dirty"
+    } else {
+        "clean"
+    }
+}
+
+fn status_pb(s: &str) -> Result<Option<Status>, ConnectError> {
+    match s {
+        "active" => Ok(None),
+        "deleted" => Ok(Some(Status::Deleted)),
+        "takendown" => Ok(Some(Status::Takendown)),
+        _ => Err(bad("status must be active, deleted or takendown")),
+    }
+}
+
+fn dist_pb(d: &crate::liststats::Dist, threshold: u64) -> ListDist {
+    ListDist {
+        log2_counts: d.log2(),
+        lists: d.lists(),
+        p50: d.quantile(0.5),
+        p90: d.quantile(0.9),
+        p99: d.quantile(0.99),
+        p999: d.quantile(0.999),
+        max: d.max(),
+        over_threshold: d.at_least(threshold),
+        ..Default::default()
+    }
+}
+
+impl AdminApi {
+    fn writable(&self) -> Result<(), ConnectError> {
+        if self.0.cfg.read_only {
+            return Err(ConnectError::failed_precondition("this marco is --read-only"));
+        }
+        Ok(())
+    }
+}
+
+#[allow(refining_impl_trait)]
+impl svc::Admin for AdminApi {
+    async fn get_session(
+        &self,
+        ctx: RequestContext,
+        _: ServiceRequest<'_, GetSessionRequest>,
+    ) -> ServiceResult<GetSessionResponse> {
+        let (auth, operator) = match ctx.extensions().get::<Caller>() {
+            Some(Caller::Token) => ("token", String::new()),
+            Some(Caller::Proxy(l)) => ("proxy", l.clone()),
+            None => ("", String::new()),
+        };
+        Response::ok(GetSessionResponse { auth: auth.into(), operator, ..Default::default() })
+    }
+
+    async fn get_overview(
+        &self,
+        _: RequestContext,
+        _: ServiceRequest<'_, GetOverviewRequest>,
+    ) -> ServiceResult<GetOverviewResponse> {
+        let app = &self.0;
+        let g = app.graph();
+        let snap = g.snapshot().ok_or_else(|| ConnectError::unavailable("no snapshot"))?;
+        let meta = &snap.meta;
+        let accs = shard_accs(&g);
+        let ratio = g.merge_ratio;
+        let (mut dirty, mut over) = (0, 0);
+        for (k, a) in accs.iter().enumerate() {
+            let base = snap.shard_meta[k].stats.iter().map(|s| s.out_records + s.in_pairs).sum();
+            match shard_state(app, base, a, ratio) {
+                "over" => over += 1,
+                "dirty" => dirty += 1,
+                _ => {}
+            }
+        }
+        let mut relations = Vec::new();
+        let (mut delta_entries, mut base_entries, mut tombstones, mut merged_bytes, mut merged_lists) = (0, 0, 0, 0, 0);
+        for (i, rel) in g.relations().list.iter().enumerate() {
+            let r = i as RelId;
+            let st = meta.stats.get(i).cloned().unwrap_or_default();
+            let (mut dout, mut din, mut mb) = (0u64, 0u64, 0u64);
+            g.for_each_delta(r, Dir::Out, |_, a, d| dout += (a + d) as u64);
+            g.for_each_delta(r, Dir::In, |_, a, d| din += (a + d) as u64);
+            for dir in [Dir::Out, Dir::In] {
+                g.for_each_merged(r, dir, |_, b| {
+                    mb += b as u64;
+                    merged_lists += 1;
+                });
+            }
+            let c = &app.counters[i];
+            let records =
+                (st.out_records + c.added.load(Ordering::Relaxed)).saturating_sub(c.removed.load(Ordering::Relaxed));
+            let tombs = g.tombstones(r) as u64;
+            delta_entries += dout + din;
+            base_entries += st.out_records + st.in_pairs;
+            tombstones += tombs;
+            merged_bytes += mb;
+            relations.push(RelationTotals {
+                name: rel.name.clone(),
+                collection: rel.collection.clone(),
+                subject: rel.subject.clone(),
+                records,
+                snapshot_records: st.out_records,
+                snapshot_pairs: st.in_pairs,
+                out_lists: st.out_lists,
+                in_lists: st.in_lists,
+                non_tid: st.non_tid,
+                delta_out: dout,
+                delta_in: din,
+                tombstones: tombs,
+                merged_bytes: mb,
+                ..Default::default()
+            });
+        }
+        let p = crate::sys::proc_self();
+        let resp = GetOverviewResponse {
+            version: crate::VERSION.into(),
+            commit: crate::COMMIT.into(),
+            started_ms: app.started_ms,
+            read_only: app.cfg.read_only,
+            snapshot: SnapshotInfo {
+                path: app.cfg.snapshot.display().to_string(),
+                build: format!("{:016x}", meta.build),
+                format: meta.format,
+                shards: meta.shards,
+                size_bytes: snap.bytes(),
+                written_ms: mtime_ms(&app.cfg.snapshot.join(DIR_FILE)),
+                open_seconds: app.open_seconds,
+                subj_index: meta.subj_index,
+                files: snap.shards.len() as u32 + 1,
+                ..Default::default()
+            }
+            .into(),
+            directory: DirectoryInfo {
+                base: meta.n_ids as u64,
+                live: (g.n_ids() - meta.n_ids) as u64,
+                ..Default::default()
+            }
+            .into(),
+            relations,
+            process: ProcessInfo {
+                rss_bytes: p.rss_bytes,
+                mem_total_bytes: crate::sys::mem_total(),
+                cpu_seconds: p.cpu_seconds,
+                threads: p.threads,
+                snapshot_cached_bytes: app.cached_bytes.load(Ordering::Relaxed),
+                ..Default::default()
+            }
+            .into(),
+            trace_ratio: marco_core::obs::trace_ratio(),
+            job: job_pb(&app.job()).into(),
+            merge_ratio: ratio,
+            dirty_shards: dirty,
+            over_shards: over,
+            delta_entries,
+            base_entries,
+            tombstones,
+            merged_bytes,
+            merged_lists,
+            write_cursor: app.cursor.lock().unwrap().clone(),
+            write_seq: app.write_seq.load(Ordering::Relaxed),
+            api_listen: app.cfg.api_listen.clone(),
+            admin_listen: app.cfg.admin_listen.clone(),
+            ..Default::default()
+        };
+        Response::ok(resp)
+    }
+
+    async fn get_series(
+        &self,
+        _: RequestContext,
+        req: ServiceRequest<'_, GetSeriesRequest>,
+    ) -> ServiceResult<GetSeriesResponse> {
+        let w = match req.window_seconds {
+            0 => 3600,
+            x => x.min(86_400),
+        };
+        let (step_ms, t_ms, series) = self.0.series.lock().unwrap().window(w as u64);
+        let series = series
+            .into_iter()
+            .map(|(k, values)| Series {
+                metric: k.metric.into(),
+                op: k.op,
+                rel: k.rel,
+                outcome: k.outcome,
+                dir: k.dir,
+                rpc: k.rpc,
+                values,
+                ..Default::default()
+            })
+            .collect();
+        Response::ok(GetSeriesResponse { step_ms, t_ms, series, ..Default::default() })
+    }
+
+    async fn list_recent_writes(
+        &self,
+        _: RequestContext,
+        req: ServiceRequest<'_, ListRecentWritesRequest>,
+    ) -> ServiceResult<ListRecentWritesResponse> {
+        let lim = if req.limit == 0 { 50 } else { req.limit.min(256) } as usize;
+        let ring = self.0.recent.lock().unwrap();
+        let writes = ring
+            .iter()
+            .rev()
+            .filter(|w| w.seq > req.after)
+            .take(lim)
+            .map(|w| RecentWrite {
+                seq: w.seq,
+                at_ms: w.at_ms,
+                rel: w.rel.clone(),
+                add: w.add,
+                actor: w.actor.clone(),
+                subject: w.subject.clone(),
+                outcome: w.outcome.into(),
+                uri: w.uri.clone(),
+                ..Default::default()
+            })
+            .collect();
+        Response::ok(ListRecentWritesResponse {
+            writes,
+            last_seq: self.0.write_seq.load(Ordering::Relaxed),
+            ..Default::default()
+        })
+    }
+
+    async fn list_shards(
+        &self,
+        _: RequestContext,
+        _: ServiceRequest<'_, ListShardsRequest>,
+    ) -> ServiceResult<ListShardsResponse> {
+        let app = &self.0;
+        let g = app.graph();
+        let snap = g.snapshot().ok_or_else(|| ConnectError::unavailable("no snapshot"))?;
+        let accs = shard_accs(&g);
+        let verify = app.verify.lock().unwrap().clone();
+        let vword = |i: usize| verify.get(i).cloned().unwrap_or_default();
+        let shards = accs
+            .iter()
+            .enumerate()
+            .map(|(k, a)| {
+                let m = &snap.shard_meta[k];
+                let base: u64 = m.stats.iter().map(|s| s.out_records + s.in_pairs).sum();
+                let v = vword(k + 1);
+                Shard {
+                    shard: k as u32,
+                    lo: m.lo,
+                    hi: m.hi,
+                    size_bytes: snap.shards[k].len() as u64,
+                    written_ms: mtime_ms(&app.cfg.snapshot.join(marco_core::store::shard_file(k))),
+                    base_entries: base,
+                    delta_entries: a.delta,
+                    delta_lists: a.delta_lists,
+                    merged_lists: a.merged,
+                    merged_bytes: a.merged_bytes,
+                    tombstones: a.tombs,
+                    state: shard_state(app, base, a, g.merge_ratio).into(),
+                    verify: v.word().into(),
+                    verify_error: match v {
+                        Verify::Mismatch(e) => e,
+                        _ => String::new(),
+                    },
+                    ..Default::default()
+                }
+            })
+            .collect();
+        Response::ok(ListShardsResponse {
+            shards,
+            merge_ratio: g.merge_ratio,
+            job: job_pb(&app.job()).into(),
+            directory_bytes: snap.dir.len() as u64,
+            directory_verify: vword(0).word().into(),
+            ..Default::default()
+        })
+    }
+
+    async fn get_storage(
+        &self,
+        _: RequestContext,
+        req: ServiceRequest<'_, GetStorageRequest>,
+    ) -> ServiceResult<GetStorageResponse> {
+        let by_size = match req.by {
+            "" | "ratio" => false,
+            "size" => true,
+            _ => return Err(bad("by must be ratio or size")),
+        };
+        let g = self.0.graph();
+        let snap = g.snapshot().ok_or_else(|| ConnectError::unavailable("no snapshot"))?;
+        let mut secs: std::collections::BTreeMap<String, (u64, u32)> = Default::default();
+        for f in snap.files() {
+            for s in &f.sections {
+                let e = secs.entry(s.name.clone()).or_default();
+                e.0 += s.len;
+                e.1 += 1;
+            }
+        }
+        let rel_of = |name: &str| -> String {
+            name.strip_prefix('r')
+                .and_then(|r| r.split('.').next())
+                .and_then(|n| n.parse::<usize>().ok())
+                .and_then(|i| g.relations().list.get(i))
+                .map_or_else(|| "directory".to_string(), |r| r.name.clone())
+        };
+        let sections = secs
+            .into_iter()
+            .map(|(name, (b, files))| Section { rel: rel_of(&name), name, size_bytes: b, files, ..Default::default() })
+            .collect();
+        let mut lists: Vec<(f64, u64, RelId, Dir, u32, u64, u64)> = Vec::new();
+        for r in 0..g.relations().len() as RelId {
+            for dir in [Dir::Out, Dir::In] {
+                g.for_each_delta(r, dir, |id, a, d| {
+                    let now = match dir {
+                        Dir::Out => g.out_count(r, id),
+                        Dir::In => g.in_count(r, id),
+                    };
+                    let base = (now + d as u64).saturating_sub(a as u64);
+                    let n = (a + d) as u64;
+                    lists.push((n as f64 / base.max(1) as f64, n, r, dir, id, a as u64, d as u64));
+                });
+            }
+        }
+        let delta_lists = lists.len() as u32;
+        if by_size {
+            lists.sort_unstable_by_key(|x| std::cmp::Reverse(x.1));
+        } else {
+            lists.sort_unstable_by(|x, y| y.0.total_cmp(&x.0).then(y.1.cmp(&x.1)));
+        }
+        let deltas = lists
+            .iter()
+            .take(20)
+            .map(|&(_, _, r, dir, id, a, d)| {
+                let now = match dir {
+                    Dir::Out => g.out_count(r, id),
+                    Dir::In => g.in_count(r, id),
+                };
+                DeltaList {
+                    did: g.did_of(id).unwrap_or_default(),
+                    rel: g.relations().get(r).name.clone(),
+                    dir: dir_pb(dir),
+                    base: (now + d).saturating_sub(a),
+                    adds: a,
+                    dels: d,
+                    ..Default::default()
+                }
+            })
+            .collect();
+        Response::ok(GetStorageResponse { sections, deltas, delta_lists, ..Default::default() })
+    }
+
+    async fn get_wal(&self, _: RequestContext, _: ServiceRequest<'_, GetWalRequest>) -> ServiceResult<GetWalResponse> {
+        Err(ConnectError::unimplemented("this marco has no WAL yet"))
+    }
+
+    async fn list_relations(
+        &self,
+        _: RequestContext,
+        _: ServiceRequest<'_, ListRelationsRequest>,
+    ) -> ServiceResult<ListRelationsResponse> {
+        let g = self.0.graph();
+        let stats = g.snapshot().map(|s| s.meta.stats.clone()).unwrap_or_default();
+        let relations = g
+            .relations()
+            .list
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let st = stats.get(i).cloned().unwrap_or_default();
+                RelationInfo {
+                    name: r.name.clone(),
+                    collection: r.collection.clone(),
+                    subject: r.subject.clone(),
+                    records: st.out_records,
+                    pairs: st.in_pairs,
+                    duplicates: st.out_records.saturating_sub(st.in_pairs),
+                    non_tid: st.non_tid,
+                    ..Default::default()
+                }
+            })
+            .collect();
+        let config = toml::to_string(g.relations()).unwrap_or_default();
+        Response::ok(ListRelationsResponse { relations, config, ..Default::default() })
+    }
+
+    async fn get_list_stats(
+        &self,
+        _: RequestContext,
+        req: ServiceRequest<'_, GetListStatsRequest>,
+    ) -> ServiceResult<GetListStatsResponse> {
+        let (rel, build) = {
+            let g = self.0.graph();
+            let rel = rel_id(&g, req.rel)?;
+            (rel, g.snapshot().map_or(0, |s| s.meta.build))
+        };
+        match self.0.list_stats.get(build, self.0.cfg.snapshot.clone()) {
+            crate::liststats::Answer::Computing(progress) => {
+                Response::ok(GetListStatsResponse { ready: false, progress, ..Default::default() })
+            }
+            crate::liststats::Answer::Ready(st) => {
+                let r = &st.rels[rel as usize];
+                let t = st.threshold as u64;
+                Response::ok(GetListStatsResponse {
+                    ready: true,
+                    progress: 1.0,
+                    computed_ms: st.computed_ms,
+                    out: dist_pb(&r.out, t).into(),
+                    r#in: dist_pb(&r.inn, t).into(),
+                    big: r
+                        .big
+                        .iter()
+                        .map(|(len, did, out)| BigList {
+                            did: did.clone(),
+                            dir: dir_pb(if *out { Dir::Out } else { Dir::In }),
+                            length: *len,
+                            ..Default::default()
+                        })
+                        .collect(),
+                    threshold: st.threshold,
+                    ..Default::default()
+                })
+            }
+        }
+    }
+
+    async fn list_sources(
+        &self,
+        _: RequestContext,
+        _: ServiceRequest<'_, ListSourcesRequest>,
+    ) -> ServiceResult<ListSourcesResponse> {
+        Err(ConnectError::unimplemented("this marco has no ingest of its own yet"))
+    }
+
+    async fn get_actor(
+        &self,
+        _: RequestContext,
+        req: ServiceRequest<'_, GetActorRequest>,
+    ) -> ServiceResult<GetActorResponse> {
+        let did = req.actor.trim().to_string();
+        if marco_core::did::classify(&did).is_none() {
+            return Err(bad(format!("{did:?} isn't a DID")));
+        }
+        let g = self.0.graph();
+        let status = Status::name(self.0.status_of(&did)).to_string();
+        let Some(id) = g.id_of(&did) else {
+            return Response::ok(GetActorResponse { did, status, ..Default::default() });
+        };
+        let w = g.snapshot().map_or(1, |s| s.meta.shard_width.max(1));
+        let rels = (0..g.relations().len() as RelId)
+            .map(|r| {
+                let out = g.out_count(r, id);
+                let inn = g.in_count(r, id);
+                let mutual = if out.min(inn) == 0 || out.min(inn) > 1_000_000 {
+                    0
+                } else {
+                    g.intersect(
+                        marco_core::ListRef { rel: r, dir: Dir::Out, actor: id },
+                        marco_core::ListRef { rel: r, dir: Dir::In, actor: id },
+                        usize::MAX,
+                    )
+                    .len() as u64
+                };
+                let first_us = if out > 0 && out <= SCAN_CAP {
+                    g.out_page(r, id, out as usize, None).last().map_or(0, |&(k, _)| created_us(k))
+                } else {
+                    0
+                };
+                ActorRelation {
+                    rel: g.relations().get(r).name.clone(),
+                    out,
+                    r#in: inn,
+                    mutual,
+                    first_us,
+                    out_stored: stored(g.list_stored(r, Dir::Out, id)),
+                    in_stored: stored(g.list_stored(r, Dir::In, id)),
+                    ..Default::default()
+                }
+            })
+            .collect();
+        Response::ok(GetActorResponse { did, known: true, id, shard: id / w, status, rels, ..Default::default() })
+    }
+
+    async fn list_edges(
+        &self,
+        _: RequestContext,
+        req: ServiceRequest<'_, ListEdgesRequest>,
+    ) -> ServiceResult<ListEdgesResponse> {
+        let g = self.0.graph();
+        let rel = rel_id(&g, req.rel)?;
+        let dir = dir_of(&req.dir)?;
+        let lim = if req.limit == 0 { 50 } else { req.limit.min(500) } as usize;
+        let Some(id) = g.id_of(req.actor) else { return Response::ok(ListEdgesResponse::default()) };
+        let mut edges = Vec::new();
+        let mut cursor = String::new();
+        let total = match dir {
+            Dir::Out => {
+                let before = (!req.cursor.is_empty()).then(|| key_of(req.cursor).0);
+                let page = g.out_page(rel, id, lim, before);
+                if page.len() == lim {
+                    cursor = page.last().and_then(|&(k, _)| g.rkey_string(rel, id, k)).unwrap_or_default();
+                }
+                for (k, s) in page {
+                    edges.push(Edge {
+                        did: g.did_of(s).unwrap_or_default(),
+                        id: s,
+                        rkey: g.rkey_string(rel, id, k).unwrap_or_default(),
+                        uri: g.uri(rel, id, k).unwrap_or_default(),
+                        created_us: created_us(k),
+                        stored: stored(g.out_stored(rel, id, k)),
+                        ..Default::default()
+                    });
+                }
+                g.out_count(rel, id)
+            }
+            Dir::In => {
+                let after = if req.cursor.is_empty() {
+                    None
+                } else {
+                    match g.id_of(req.cursor) {
+                        Some(x) => Some(x),
+                        None => return Err(bad("cursor isn't a DID in this graph")),
+                    }
+                };
+                let page = g.in_page(rel, id, lim, after);
+                if page.len() == lim {
+                    cursor = page.last().and_then(|&x| g.did_of(x)).unwrap_or_default();
+                }
+                for x in page {
+                    let k = g.out_find_subject(rel, x, id);
+                    edges.push(Edge {
+                        did: g.did_of(x).unwrap_or_default(),
+                        id: x,
+                        rkey: k.and_then(|k| g.rkey_string(rel, x, k)).unwrap_or_default(),
+                        uri: k.and_then(|k| g.uri(rel, x, k)).unwrap_or_default(),
+                        created_us: k.map_or(0, created_us),
+                        stored: k.map_or_else(String::new, |k| stored(g.out_stored(rel, x, k))),
+                        ..Default::default()
+                    });
+                }
+                g.in_count(rel, id)
+            }
+        };
+        Response::ok(ListEdgesResponse { edges, cursor, total, ..Default::default() })
+    }
+
+    async fn resolve_uri(
+        &self,
+        _: RequestContext,
+        req: ServiceRequest<'_, ResolveUriRequest>,
+    ) -> ServiceResult<ResolveUriResponse> {
+        let uri = req.uri.trim();
+        let Some((did, coll, rkey)) = parse_uri(uri) else { return Err(bad(format!("{uri:?} isn't a record URI"))) };
+        let g = self.0.graph();
+        let Some(rel) = g.relations().by_collection(coll) else { return Err(bad(format!("no relation for {coll}"))) };
+        let (key, side) = key_of(rkey);
+        let mut r = ResolveUriResponse {
+            rel: g.relations().get(rel).name.clone(),
+            collection: coll.into(),
+            actor: did.into(),
+            rkey: rkey.into(),
+            tid: !side,
+            created_us: created_us(key),
+            ..Default::default()
+        };
+        let w = g.snapshot().map_or(1, |s| s.meta.shard_width.max(1));
+        let Some(a) = g.id_of(did) else { return Response::ok(r) };
+        r.actor_id = a;
+        r.shard = a / w;
+        r.out_count = g.out_count(rel, a);
+        r.tombstoned = g.is_tombstoned(rel, a, key);
+        let Some(s) = g.out_get(rel, a, key) else { return Response::ok(r) };
+        r.subject = g.did_of(s).unwrap_or_default();
+        r.subject_id = s;
+        r.subject_shard = s / w;
+        r.stored = stored(g.out_stored(rel, a, key));
+        if r.out_count <= SCAN_CAP {
+            let page = g.out_page(rel, a, r.out_count as usize, None);
+            r.position = page.iter().position(|e| e.0 == key).map_or(0, |p| p as u64 + 1);
+        }
+        r.pair_records = g.records_naming(rel, a, s) as u64;
+        r.in_contains = g.in_contains(rel, s, a);
+        r.subject_in_count = g.in_count(rel, s);
+        r.subject_in_stored = stored(g.list_stored(rel, Dir::In, s));
+        Response::ok(r)
+    }
+
+    async fn get_settings(
+        &self,
+        _: RequestContext,
+        _: ServiceRequest<'_, GetSettingsRequest>,
+    ) -> ServiceResult<GetSettingsResponse> {
+        let flags = self
+            .0
+            .cfg
+            .flags
+            .iter()
+            .map(|f| Flag {
+                name: f.name.clone(),
+                value: f.value.clone(),
+                source: f.source.clone(),
+                ..Default::default()
+            })
+            .collect();
+        let format = self.0.graph().snapshot().map_or(0, |s| s.meta.format);
+        let features = ["metrics", "jemalloc", "cpu-profile"].map(String::from).to_vec();
+        Response::ok(GetSettingsResponse {
+            flags,
+            build: BuildInfo {
+                version: crate::VERSION.into(),
+                commit: crate::COMMIT.into(),
+                format,
+                features,
+                ..Default::default()
+            }
+            .into(),
+            ..Default::default()
+        })
+    }
+
+    async fn write_shards(
+        &self,
+        _: RequestContext,
+        req: ServiceRequest<'_, WriteShardsRequest>,
+    ) -> ServiceResult<WriteShardsResponse> {
+        if !matches!(req.shards, "" | "dirty" | "all") {
+            return Err(bad("shards must be dirty or all"));
+        }
+        self.writable()?;
+        let j = self.0.start_write().map_err(ConnectError::failed_precondition)?;
+        Response::ok(WriteShardsResponse { job: job_pb(&j).into(), ..Default::default() })
+    }
+
+    async fn verify_shards(
+        &self,
+        _: RequestContext,
+        _: ServiceRequest<'_, VerifyShardsRequest>,
+    ) -> ServiceResult<VerifyShardsResponse> {
+        let j = self.0.start_verify().map_err(ConnectError::failed_precondition)?;
+        Response::ok(VerifyShardsResponse { job: job_pb(&j).into(), ..Default::default() })
+    }
+
+    async fn set_trace_ratio(
+        &self,
+        _: RequestContext,
+        req: ServiceRequest<'_, SetTraceRatioRequest>,
+    ) -> ServiceResult<SetTraceRatioResponse> {
+        if !(0.0..=1.0).contains(&req.ratio) {
+            return Err(bad("ratio must be 0 to 1"));
+        }
+        marco_core::obs::set_trace_ratio(req.ratio);
+        Response::ok(SetTraceRatioResponse { ratio: marco_core::obs::trace_ratio(), ..Default::default() })
+    }
+
+    async fn set_actor_status(
+        &self,
+        _: RequestContext,
+        req: ServiceRequest<'_, SetActorStatusRequest>,
+    ) -> ServiceResult<SetActorStatusResponse> {
+        let st = status_pb(req.status)?;
+        self.writable()?;
+        let did = req.did.trim().to_string();
+        let removed = self.0.set_status(&did, st).await.map_err(bad)?;
+        Response::ok(SetActorStatusResponse { did, status: Status::name(st).into(), removed, ..Default::default() })
+    }
+}

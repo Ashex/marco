@@ -1,0 +1,40 @@
+[package]
+name = "marco-server"
+version = "0.1.0"
+edition = "2021"
+description = "marco's server: marco.v1.Graph on the API listener; Graph, marco.v1.Admin, /metrics, /debug/* and the console at /admin on the admin listener"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "marco"
+path = "src/main.rs"
+
+[features]
+default = ["jemalloc"]
+# jemalloc as the allocator, with the heap sampler /debug/pprof/heap reads
+jemalloc = ["marco-ops/jemalloc"]
+
+[dependencies]
+marco-core = { workspace = true, features = ["metrics"] }
+marco-ops = { workspace = true }
+marco-proto = { workspace = true }
+anyhow = { workspace = true }
+axum = { workspace = true, features = ["http1", "http2", "tokio", "query"] }
+buffa = { workspace = true }
+clap = { workspace = true, features = ["env"] }
+connectrpc = { workspace = true, features = ["axum", "json", "gzip", "zstd"] }
+futures = { workspace = true }
+http = { workspace = true }
+libc = { workspace = true }
+prometheus = { workspace = true, features = ["process"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
+toml = { workspace = true }
+tracing = { workspace = true }
+vlatproto = { workspace = true }
+
+[dev-dependencies]
+marco-proto = { workspace = true, features = ["client"] }
+tempfile = { workspace = true }

@@ -49,6 +49,15 @@ pub enum Removed {
     NotFound,
 }
 
+/// Where a record or list lives: the snapshot, a delta over it, or a list
+/// merged since the snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stored {
+    Base,
+    Delta,
+    Merged,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Dir {
     Out,
@@ -150,8 +159,9 @@ pub struct Graph {
     live_dids: Vec<DidKey>,
     state: Vec<RelState>,
     /// A list's delta merges into an override once it's this big and over
-    /// an eighth of the base.
+    /// `merge_ratio` of the base.
     pub compact_min: usize,
+    pub merge_ratio: f64,
     obs: obs::Metrics,
 }
 
@@ -172,6 +182,7 @@ impl Graph {
             live_dids: Vec::new(),
             state,
             compact_min: 64,
+            merge_ratio: 0.125,
             obs: obs::Metrics::new(&names),
         }
     }
@@ -916,12 +927,72 @@ impl Graph {
         self.state[rel as usize].tomb.len()
     }
 
+    // ------------------------------------------------------------ accessors for the admin API
+
+    /// Each list with a delta: (list id, adds, deletes).
+    pub fn for_each_delta(&self, rel: RelId, dir: Dir, mut f: impl FnMut(u32, usize, usize)) {
+        let st = &self.state[rel as usize];
+        match dir {
+            Dir::Out => st.out.iter().for_each(|(&id, d)| f(id, d.adds.len(), d.dels.len())),
+            Dir::In => st.inn.iter().for_each(|(&id, d)| f(id, d.adds.len(), d.dels.len())),
+        }
+    }
+
+    /// Each list merged since the snapshot: (list id, bytes).
+    pub fn for_each_merged(&self, rel: RelId, dir: Dir, mut f: impl FnMut(u32, usize)) {
+        let st = &self.state[rel as usize];
+        let m = if dir == Dir::Out { &st.out_over } else { &st.in_over };
+        m.iter().for_each(|(&id, b)| f(id, b.len()));
+    }
+
+    /// The deletes waiting for their create, as (actor, key).
+    pub fn tombstone_keys(&self, rel: RelId) -> Vec<(u32, u64)> {
+        self.state[rel as usize].tomb.iter().copied().collect()
+    }
+
+    pub fn is_tombstoned(&self, rel: RelId, actor: u32, key: u64) -> bool {
+        self.state[rel as usize].tomb.contains(&(actor, key))
+    }
+
+    /// Live records of `actor` naming `subject`.
+    pub fn records_naming(&self, rel: RelId, actor: u32, subject: u32) -> usize {
+        self.out_count_subject(rel, actor, subject)
+    }
+
+    /// Where `actor`'s record `key` is.
+    pub fn out_stored(&self, rel: RelId, actor: u32, key: u64) -> Stored {
+        let st = &self.state[rel as usize];
+        if st.out.get(&actor).is_some_and(|d| d.adds.contains_key(&key)) {
+            Stored::Delta
+        } else if st.out_over.contains_key(&actor) {
+            Stored::Merged
+        } else {
+            Stored::Base
+        }
+    }
+
+    /// Where a list is: a delta over the base wins over a merge.
+    pub fn list_stored(&self, rel: RelId, dir: Dir, id: u32) -> Stored {
+        let st = &self.state[rel as usize];
+        let (delta, merged) = match dir {
+            Dir::Out => (st.out.contains_key(&id), st.out_over.contains_key(&id)),
+            Dir::In => (st.inn.contains_key(&id), st.in_over.contains_key(&id)),
+        };
+        if delta {
+            Stored::Delta
+        } else if merged {
+            Stored::Merged
+        } else {
+            Stored::Base
+        }
+    }
+
     fn maybe_compact(&mut self, rel: RelId, actor: u32, subject: u32) {
         let min = self.compact_min;
         let r = rel as usize;
         let out_due = self.state[r].out.get(&actor).is_some_and(|d| {
             let n = d.adds.len() + d.dels.len();
-            n >= min && n * 8 > self.base_out(rel, actor).map_or(0, |l| l.len())
+            n >= min && n as f64 > self.base_out(rel, actor).map_or(0, |l| l.len()) as f64 * self.merge_ratio
         });
         if out_due {
             let t = self.obs.merge_start();
@@ -939,7 +1010,7 @@ impl Graph {
         }
         let in_due = self.state[r].inn.get(&subject).is_some_and(|d| {
             let n = d.adds.len() + d.dels.len();
-            n >= min && n * 8 > self.base_in(rel, subject).map_or(0, |l| l.len())
+            n >= min && n as f64 > self.base_in(rel, subject).map_or(0, |l| l.len()) as f64 * self.merge_ratio
         });
         if in_due {
             let t = self.obs.merge_start();

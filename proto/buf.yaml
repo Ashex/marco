@@ -1,0 +1,13 @@
+version: v2
+modules:
+  - path: .
+lint:
+  use:
+    - STANDARD
+  except:
+    # The services are marco.v1.Graph and marco.v1.Admin, the names the API docs and curl use.
+    - SERVICE_SUFFIX
+breaking:
+  use:
+    # The API is curl-able as JSON, so JSON names are part of the contract too.
+    - WIRE_JSON

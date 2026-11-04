@@ -1,0 +1,247 @@
+syntax = "proto3";
+
+package marco.v1;
+
+// The graph API: actor-to-actor edges. Reads are open. Writes need the admin
+// token (`Authorization: Bearer <token>`).
+//
+// Relations are named in config ("follow", "block"). A rel field takes a
+// name; an empty rels list means every relation.
+service Graph {
+  // The newest record of `from` naming `to`, as its URI, or empty.
+  rpc Has(HasRequest) returns (HasResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  // Per other and relation: the actor's record naming the other, and the
+  // other's naming the actor (getRelationships). At most 100 others.
+  rpc Relationships(RelationshipsRequest) returns (RelationshipsResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  // An actor's records, newest first. The cursor is an rkey: pass the last
+  // response's to get the records older than it.
+  rpc ListOut(ListOutRequest) returns (ListOutResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  // The actors naming a subject, in id order. The cursor is a DID.
+  rpc ListIn(ListInRequest) returns (ListInResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  // Out records and in actors per actor and relation. At most 100 actors.
+  rpc Counts(CountsRequest) returns (CountsResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  // The actors in both lists (mutuals, "followed by people you follow").
+  rpc Intersect(IntersectRequest) returns (IntersectResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  // `actors` without those a drop rule hits for `viewer`.
+  rpc Filter(FilterRequest) returns (FilterResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  // Ops from a pipeline, many messages on one stream, answered once at the end.
+  rpc Write(stream WriteRequest) returns (WriteResponse);
+  // Ops in one request. The relation comes from each URI's collection.
+  rpc WriteBatch(WriteBatchRequest) returns (WriteBatchResponse);
+}
+
+enum Dir {
+  DIR_UNSPECIFIED = 0;
+  // The actor's records.
+  DIR_OUT = 1;
+  // The actors naming the subject.
+  DIR_IN = 2;
+}
+
+message HasRequest {
+  string rel = 1;
+  string from = 2;
+  string to = 3;
+}
+
+message HasResponse {
+  string uri = 1;
+}
+
+message RelationshipsRequest {
+  string actor = 1;
+  repeated string others = 2;
+  repeated string rels = 3;
+}
+
+message RelationshipsResponse {
+  // One per other, in the request's order.
+  repeated Relationship relationships = 1;
+}
+
+message Relationship {
+  string other = 1;
+  repeated RelationshipEdge rels = 2;
+}
+
+message RelationshipEdge {
+  string rel = 1;
+  // The actor's record naming the other, newest if several.
+  string out_uri = 2;
+  // The other's record naming the actor.
+  string in_uri = 3;
+}
+
+message ListOutRequest {
+  string rel = 1;
+  string actor = 2;
+  // Default 50, at most 1000.
+  uint32 limit = 3;
+  string cursor = 4;
+}
+
+message ListOutResponse {
+  repeated OutEdge edges = 1;
+  // Empty on the last page.
+  string cursor = 2;
+}
+
+message OutEdge {
+  string uri = 1;
+  string subject = 2;
+}
+
+message ListInRequest {
+  string rel = 1;
+  string subject = 2;
+  // Default 50, at most 1000.
+  uint32 limit = 3;
+  string cursor = 4;
+}
+
+message ListInResponse {
+  repeated string actors = 1;
+  string cursor = 2;
+}
+
+message CountsRequest {
+  repeated string actors = 1;
+  repeated string rels = 2;
+}
+
+message CountsResponse {
+  repeated ActorCounts counts = 1;
+}
+
+message ActorCounts {
+  string actor = 1;
+  repeated RelCounts rels = 2;
+}
+
+message RelCounts {
+  string rel = 1;
+  // The actor's records.
+  uint64 out_records = 2;
+  // The actors with a record naming this actor.
+  uint64 in_actors = 3;
+}
+
+message ListSide {
+  string rel = 1;
+  Dir dir = 2;
+  string actor = 3;
+}
+
+message IntersectRequest {
+  ListSide a = 1;
+  ListSide b = 2;
+  // Default 100, at most 10000.
+  uint32 limit = 3;
+}
+
+message IntersectResponse {
+  // In id order.
+  repeated string actors = 1;
+  // The two sides' lengths.
+  uint64 a_len = 2;
+  uint64 b_len = 3;
+}
+
+message FilterDrop {
+  string rel = 1;
+  // DIR_OUT drops the viewer's subjects (the viewer blocks them), DIR_IN
+  // those naming the viewer (they block the viewer).
+  Dir dir = 2;
+}
+
+message FilterRequest {
+  string viewer = 1;
+  // At most 1000.
+  repeated string actors = 2;
+  repeated FilterDrop drop = 3;
+}
+
+message FilterResponse {
+  // The actors kept, in the request's order.
+  repeated string actors = 1;
+  repeated Dropped dropped = 2;
+}
+
+message Dropped {
+  string actor = 1;
+  // The first rule that dropped it, or "status" for an actor taken down or deleted.
+  string rel = 2;
+  Dir dir = 3;
+}
+
+message WriteOp {
+  oneof op {
+    AddOp add = 1;
+    DeleteOp delete = 2;
+  }
+}
+
+message AddOp {
+  string uri = 1;
+  string subject = 2;
+}
+
+message DeleteOp {
+  string uri = 1;
+}
+
+message WriteResult {
+  oneof outcome {
+    // A new record.
+    bool added = 1;
+    // A repeat create.
+    bool exists = 2;
+    // A delete for this record came first, so it stays deleted.
+    bool deleted = 3;
+    // The record is gone; this is the subject it named.
+    string removed = 4;
+    // No such record. The delete is kept, in case its create comes later.
+    bool not_found = 5;
+    // The op didn't apply.
+    string error = 6;
+  }
+}
+
+message WriteRequest {
+  // At most 1000 per message.
+  repeated WriteOp ops = 1;
+  // The pipeline's position after these ops, kept and handed back.
+  string cursor = 2;
+}
+
+message WriteResponse {
+  // One per op, in order.
+  repeated WriteResult results = 1;
+  // The last cursor applied.
+  string cursor = 2;
+}
+
+message WriteBatchRequest {
+  // At most 1000.
+  repeated WriteOp ops = 1;
+  string cursor = 2;
+}
+
+message WriteBatchResponse {
+  repeated WriteResult results = 1;
+  string cursor = 2;
+}
