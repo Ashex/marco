@@ -90,7 +90,7 @@ svg .bar3 { fill: var(--muted); opacity: .55; }
 <body>
 <main>
 <h1>marco</h1>
-<p class="sub">The successor to polo. A small, fast graph database for atproto actor-to-actor edges: follows, blocks, and any record whose subject is a DID.</p>
+<p class="sub">A small, fast graph database for atproto actor-to-actor edges: follows, blocks, and any record whose subject is a DID.</p>
 <span class="status">Scoping draft · 2026-11-04 · nothing built</span>
 
 <p>vlDB indexes all of app.bsky, so it's too big for anyone else to run. marco is the piece most appviews actually need on day one: who follows, blocks or otherwise points at whom. It should be a single binary that holds the whole network's graph on one ordinary box, with an add call, a delete-by-URI call, and the read calls an appview hydrates with.</p>
@@ -108,7 +108,8 @@ svg .bar3 { fill: var(--muted); opacity: .55; }
 <tr><td>Any relation whose record names a subject DID (config, not code)</td><td><span class="tag yes">in</span></td><td>follow, block and verification today; other apps' graph records with no new code.</td></tr>
 <tr><td>Add edges, delete by AT URI alone</td><td><span class="tag yes">in</span></td><td>Firehose and Jetstream deletes carry only the path, so marco has to find the subject itself.</td></tr>
 <tr><td>Membership, counts, batch relationships with record URIs</td><td><span class="tag yes">in</span></td><td>Profile viewer state needs the follow's URI to unfollow, not just a bool.</td></tr>
-<tr><td>Lists newest-first with rkey cursors, both directions</td><td><span class="tag yes">in</span></td><td>getFollows / getFollowers order.</td></tr>
+<tr><td>Out lists newest-first with rkey cursors</td><td><span class="tag yes">in</span></td><td>getFollows order, free from the out log.</td></tr>
+<tr><td>In lists (followers) in time order</td><td><span class="tag no">out</span></td><td>Followers come back in id order with an id cursor. A time log per subject would add ~21 GB.</td></tr>
 <tr><td>Intersections: mutuals, "followed by people you know", block filters</td><td><span class="tag yes">in</span></td><td>The hot read for social proof and moderation.</td></tr>
 <tr><td>Built-in Jetstream / firehose consumer with a durable cursor</td><td><span class="tag yes">in</span></td><td>Shipping it means it fills itself. The API path stays for people with their own pipeline.</td></tr>
 <tr><td>Record-to-record edges (likes on posts, list items to lists)</td><td><span class="tag no">out</span></td><td>Post-keyed sets are 5x the size (12.2B likes). That's vlDB.</td></tr>
@@ -139,8 +140,8 @@ svg .bar3 { fill: var(--muted); opacity: .55; }
   <text x="24" y="192" font-size="13" class="m">did:plc packs to 15 bytes</text>
   <rect class="box" x="340" y="130" width="250" height="80" rx="8"/>
   <text x="354" y="154" font-weight="600">Relations (config)</text>
-  <text x="354" y="174" font-size="13" class="m">name, collection, subject path,</text>
-  <text x="354" y="192" font-size="13" class="m">in-side order: time | id</text>
+  <text x="354" y="174" font-size="13" class="m">name, collection,</text>
+  <text x="354" y="192" font-size="13" class="m">subject path</text>
   <rect class="box" x="650" y="130" width="240" height="80" rx="8"/>
   <text x="664" y="154" font-weight="600">rkey</text>
   <text x="664" y="174" font-size="13" class="m">TID → u64 (99.97%)</text>
@@ -153,13 +154,11 @@ svg .bar3 { fill: var(--muted); opacity: .55; }
 name = "follow"
 collection = "app.bsky.graph.follow"
 subject = "subject"
-in_order = "time"
 
 [[relation]]
 name = "block"
 collection = "app.bsky.graph.block"
-subject = "subject"
-in_order = "id"</pre>
+subject = "subject"</pre>
 
 <h2>Storage layout</h2>
 <div class="fig">
@@ -176,10 +175,8 @@ in_order = "id"</pre>
   <text x="480" y="20" font-weight="600">In set, per (subject, relation)</text>
   <rect class="acc" x="480" y="32" width="410" height="34" rx="6"/>
   <text x="490" y="54" class="mono" font-size="12">actor ids, sorted (Elias-Fano when frozen)</text>
-  <rect class="box" x="480" y="70" width="410" height="34" rx="6" stroke-dasharray="4 3"/>
-  <text x="490" y="92" class="mono" font-size="12">optional: (rkey Δ, actor) time log</text>
-  <text x="480" y="128" class="m" font-size="13">answers: has(a, b) · counts · intersections ·</text>
-  <text x="480" y="146" class="m" font-size="13">followers newest-first when in_order = time</text>
+  <text x="480" y="90" class="m" font-size="13">answers: has(a, b) · counts · intersections ·</text>
+  <text x="480" y="108" class="m" font-size="13">followers in id order</text>
 
   <text x="10" y="210" font-weight="600">Each list is a frozen base plus a small mutable delta</text>
   <rect class="box" x="10" y="222" width="300" height="56" rx="6"/>
@@ -258,7 +255,7 @@ in_order = "id"</pre>
 <tr><td><code>POST /v1/edges/delete</code></td><td><code>{uris: [...], cursor?}</code></td><td>per URI: the subject it removed, or not-found</td></tr>
 <tr><td><code>GET /v1/has</code></td><td><code>rel, from, to</code></td><td>the edge's URI or null</td></tr>
 <tr><td><code>POST /v1/relationships</code></td><td><code>{actor, others: [≤100], rels: [follow, block]}</code></td><td>per other and relation: out URI, in URI (getRelationships)</td></tr>
-<tr><td><code>GET /v1/out</code>, <code>/v1/in</code></td><td><code>rel, actor, limit, cursor</code></td><td>DIDs + URIs, newest first; the cursor is an rkey</td></tr>
+<tr><td><code>GET /v1/out</code>, <code>/v1/in</code></td><td><code>rel, actor, limit, cursor</code></td><td>DIDs + URIs. Out: newest first, cursor an rkey. In: id order, cursor a DID</td></tr>
 <tr><td><code>POST /v1/counts</code></td><td><code>{actors: [...], rels}</code></td><td>out and in counts</td></tr>
 <tr><td><code>POST /v1/intersect</code></td><td><code>{a: {rel, dir, actor}, b: {...}, limit}</code></td><td>mutuals, "followed by people you follow"</td></tr>
 <tr><td><code>POST /v1/filter</code></td><td><code>{viewer, actors: [...], drop: [block.out, block.in]}</code></td><td>the actors left (feed and thread block filtering)</td></tr>
@@ -289,14 +286,13 @@ in_order = "id"</pre>
 
 <h2>Size at network scale</h2>
 <div class="fig">
-<svg viewBox="0 0 900 230" role="img" aria-label="Estimated memory by component">
+<svg viewBox="0 0 900 190" role="img" aria-label="Estimated memory by component">
   <g font-size="13">
   <text x="10" y="34">In sets, follows (EF 2.9 B)</text><rect class="bar" x="300" y="20" width="137" height="20"/><text x="445" y="35">6.8 GB</text>
   <text x="10" y="64">Out logs, follows (rkey Δ + u32)</text><rect class="bar" x="300" y="50" width="418" height="20"/><text x="726" y="65">20.9 GB</text>
   <text x="10" y="94">Blocks, both</text><rect class="bar" x="300" y="80" width="44" height="20"/><text x="352" y="95">2.2 GB</text>
   <text x="10" y="124">Directory (41M DIDs)</text><rect class="bar" x="300" y="110" width="26" height="20"/><text x="334" y="125">1.3 GB</text>
-  <text x="10" y="154">Optional: follower time logs</text><rect class="bar3" x="300" y="140" width="418" height="20"/><text x="726" y="155">~21 GB</text>
-  <text x="10" y="200" class="m">Base ≈ 31 GB, or ≈ 52 GB with followers in time order. Out logs can stay on disk (mmapped); hot RAM is then ~10 GB.</text>
+  <text x="10" y="170" class="m">≈ 31 GB in all. Out logs can stay on disk (mmapped); hot RAM is then ~10 GB.</text>
   </g>
 </svg>
 </div>
@@ -328,7 +324,7 @@ in_order = "id"</pre>
   <rect class="box" x="610" y="20" width="280" height="80" rx="8"/>
   <text x="624" y="44" font-weight="600">P2 · ship it</text>
   <text x="624" y="64" class="m" font-size="12">public repo, image, README, Rust + TS</text>
-  <text x="624" y="82" class="m" font-size="12">clients, a hosted instance for Jaz's apps</text>
+  <text x="624" y="82" class="m" font-size="12">clients, a hosted instance</text>
   </g>
 </svg>
 </div>
@@ -339,13 +335,13 @@ in_order = "id"</pre>
 <tr><td>P2</td><td>A stranger's path works from the README alone: pull the image, point it at Jetstream, query.</td></tr>
 </table></div>
 
-<h2>Open questions</h2>
+<h2>Decided</h2>
 <div class="tw"><table>
-<tr><th>Question</th><th>Proposal</th></tr>
-<tr><td>Language and reuse</td><td>Rust on vlatproto for TIDs, DIDs, CARs and firehose frames. No vlsync, no SlateDB: local disk only, to stay small to ship.</td></tr>
-<tr><td>Followers newest-first by default?</td><td>On for follows (~21 GB), off for blocks. It's per relation.</td></tr>
-<tr><td>Public from the start?</td><td>Yes, exported like vlpds, so no private names in the package.</td></tr>
-<tr><td>Does vlDB adopt it for its graph families later?</td><td>Not in scope. The formats are close enough that it could.</td></tr>
+<tr><th>Question</th><th>Answer (2026-11-04)</th></tr>
+<tr><td>Language and reuse</td><td>Rust on vlatproto for TIDs, DIDs, CARs and firehose frames. No vlsync, no SlateDB: local disk only.</td></tr>
+<tr><td>Followers in time order</td><td>Not needed. In lists stay id-sorted sets.</td></tr>
+<tr><td>Public?</td><td>Yes, once it's built. No private names in the package from the start, so the export is a copy.</td></tr>
+<tr><td>vlDB integration</td><td>Ignored for now.</td></tr>
 </table></div>
 </main>
 </body>
