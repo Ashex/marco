@@ -818,6 +818,9 @@ fn in_shard(w: &mut Writer, k: usize, lo: u32, hi: u32, spills: &[Spill], c: &Co
 pub fn build(o: &Opts) -> Result<Report> {
     let wall = Instant::now();
     let mut rep = Report { threads: rayon::current_num_threads(), shards: o.shards, ..Default::default() };
+    if let Some(r) = o.rels.list.iter().find(|r| r.list.is_some()) {
+        bail!("relation {}: the bulk build doesn't take list relations yet", r.name);
+    }
     let per_rel: Vec<Vec<PathBuf>> = o.rels.list.iter().map(|r| files_of(&o.input, &r.name)).collect::<Result<_>>()?;
     let all: Vec<PathBuf> = per_rel.iter().flatten().cloned().collect();
     eprintln!("{} files, {} threads, {} shards", all.len(), rep.threads, o.shards);
@@ -1016,7 +1019,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let input = tmp.path().join("in");
         let mut rng = crate::stats::Rng::new(7);
-        let mut g = Graph::new(Relations::bsky_default());
+        let rels = Relations::new(Relations::bsky_default().list[..2].to_vec()).unwrap();
+        let mut g = Graph::new(rels.clone());
         for (rel, coll, n) in [("follow", "app.bsky.graph.follow", 20_000), ("block", "app.bsky.graph.block", 2_000)] {
             // ops in time order: creates, re-creates and deletes, some deletes of keys never created
             let mut ops: Vec<Op> = Vec::new();
@@ -1059,7 +1063,7 @@ mod tests {
             input: input.clone(),
             out: out.clone(),
             tmp: tmp.path().join("spill"),
-            rels: Relations::bsky_default(),
+            rels,
             subj_index: 8,
             shards: 5,
             sub_buckets: 3,

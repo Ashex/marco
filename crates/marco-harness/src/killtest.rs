@@ -56,8 +56,10 @@ fn touched(cap: &Capture) -> (BTreeSet<String>, BTreeSet<String>) {
             Some(Change::Ops(ops)) => {
                 for op in ops {
                     let uri = match op {
-                        Op::Add { uri, subject, .. } => {
+                        Op::Add { uri, subject, list, .. } => {
                             dids.insert(subject);
+                            // a list node reads like an actor
+                            dids.extend(list);
                             uri
                         }
                         Op::Delete { uri, .. } => uri,

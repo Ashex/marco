@@ -17,6 +17,6 @@ pub mod snapshot;
 pub mod store;
 pub mod varint;
 
-pub use graph::{Added, Dir, Graph, ListRef, Relationship, Removed, Stored};
+pub use graph::{Added, Dir, Graph, ListRef, Relationship, Removed, SetOp, Stored};
 pub use relation::{RelId, Relation, Relations};
 pub use segment::{Op, Rec, Status};

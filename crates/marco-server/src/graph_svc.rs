@@ -26,9 +26,10 @@ pub fn rel_id(g: &Graph, name: &str) -> Result<RelId, ConnectError> {
     g.relations().by_name(name).ok_or_else(|| bad(format!("no relation {name:?}")))
 }
 
+/// The named relations; none names every one a caller configured.
 pub fn rel_ids(g: &Graph, names: &[String]) -> Result<Vec<RelId>, ConnectError> {
     if names.is_empty() {
-        return Ok((0..g.relations().len() as RelId).collect());
+        return Ok(g.relations().user());
     }
     names.iter().map(|n| rel_id(g, n)).collect()
 }
@@ -60,7 +61,7 @@ fn ops_of(ops: &[WriteOp]) -> Result<Vec<Op>, ConnectError> {
         .enumerate()
         .map(|(i, o)| match &o.op {
             Some(write_op::Op::Add(a)) => {
-                Ok(Op::Add { uri: a.uri.clone(), subject: a.subject.clone(), time_us: a.time_us })
+                Ok(Op::Add { uri: a.uri.clone(), subject: a.subject.clone(), list: None, time_us: a.time_us })
             }
             Some(write_op::Op::Delete(d)) => Ok(Op::Delete { uri: d.uri.clone(), time_us: d.time_us }),
             None => Err(bad(format!("op {i} is neither add nor delete"))),
@@ -126,7 +127,7 @@ impl svc::Graph for GraphApi {
             return Err(bad("at most 100 others"));
         }
         let g = self.0.graph();
-        let rels = rel_ids(&g, &req.rels)?;
+        let rels = if req.rels.is_empty() { g.relations().actor_rels() } else { rel_ids(&g, &req.rels)? };
         let others: Vec<&str> = req.others.iter().map(String::as_str).collect();
         let rows = g.relationships(&req.actor, &others, &rels);
         let actor_hidden = g.hidden(&req.actor);

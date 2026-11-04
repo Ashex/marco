@@ -351,6 +351,66 @@ struct Model {
     records: BTreeMap<(u8, u32, String), u32>,
     /// Tombstones with the time of the delete that left them.
     tomb: BTreeMap<(u8, u32, String), i64>,
+    /// Each key's last change: (time, kept through a checkpoint).
+    stamp: BTreeMap<(u8, u32, String), (i64, u8, bool)>,
+}
+
+/// The rules a key follows, for any value (a subject, or a list and member).
+fn model_add<K: Ord + Clone, V: PartialEq + Copy>(
+    records: &mut BTreeMap<K, V>,
+    tomb: &mut BTreeMap<K, i64>,
+    stamp: &mut BTreeMap<K, (i64, u8, bool)>,
+    key: K,
+    v: V,
+    t: i64,
+    src: u8,
+) -> Added {
+    let stale = |stamp: &BTreeMap<K, (i64, u8, bool)>| t != 0 && stamp.get(&key).is_some_and(|s| s.1 != src && t < s.0);
+    let mut recreated = false;
+    if let Some(&d) = tomb.get(&key) {
+        if t < d {
+            return Added::Deleted;
+        }
+        if stale(stamp) {
+            return Added::Exists;
+        }
+        tomb.remove(&key);
+        recreated = true;
+    }
+    if stale(stamp) {
+        return Added::Exists;
+    }
+    let held = records.get(&key).copied();
+    if held == Some(v) {
+        return Added::Exists;
+    }
+    records.insert(key.clone(), v);
+    let e = stamp.entry(key).or_insert((i64::MIN, src, false));
+    e.0 = e.0.max(t);
+    e.1 = src;
+    e.2 |= recreated || held.is_some();
+    Added::Added
+}
+
+fn model_delete<K: Ord + Clone, V: Copy>(
+    records: &mut BTreeMap<K, V>,
+    tomb: &mut BTreeMap<K, i64>,
+    stamp: &BTreeMap<K, (i64, u8, bool)>,
+    key: K,
+    t: i64,
+    src: u8,
+) -> Option<V> {
+    if t != 0 && stamp.get(&key).is_some_and(|s| s.1 != src && s.0 > t) && records.contains_key(&key) {
+        return None;
+    }
+    let e = tomb.entry(key.clone()).or_insert(t);
+    *e = (*e).max(t);
+    records.remove(&key)
+}
+
+/// A checkpoint keeps only the stamps of keys replaced or re-created.
+fn model_checkpoint<K: Ord>(stamp: &mut BTreeMap<K, (i64, u8, bool)>) {
+    stamp.retain(|_, v| v.2);
 }
 
 impl Model {
@@ -412,39 +472,25 @@ fn run_model(subj_index: usize) {
         };
         let uri = format!("at://{}/{coll}/{rkey}", did(a));
         // mostly in order, a quarter from a backfill that saw things up to 300 steps ago
-        let t = step as i64 * 10 - if rnd(4) == 0 { rnd(3000) as i64 } else { 0 };
+        // the backfill source sees things up to 300 steps late
+        let src = (rnd(4) == 0) as u8;
+        let t = step as i64 * 10 - if src == 1 { rnd(3000) as i64 } else { 0 };
+        g.set_source(["live", "backfill"][src as usize]);
+        let key = (rel, a, rkey.clone());
         if rnd(3) == 0 {
             let got = g.delete_at(&uri, t).unwrap();
-            let key = (rel, a, rkey.clone());
-            match m.records.remove(&key) {
+            match model_delete(&mut m.records, &mut m.tomb, &m.stamp, key, t, src) {
                 Some(s) => assert_eq!(got, removed(&did(s)), "step {step}"),
                 None => assert_eq!(got, Removed::NotFound, "step {step}"),
             }
-            let e = m.tomb.entry(key).or_insert(t);
-            *e = (*e).max(t);
         } else {
             let b = rnd(actors) as u32;
             let got = g.add_at(&uri, &did(b), t).unwrap();
-            let key = (rel, a, rkey.clone());
-            let blocked = match m.tomb.get(&key) {
-                Some(&d) if t < d => true,
-                Some(_) => {
-                    m.tomb.remove(&key);
-                    false
-                }
-                None => false,
-            };
-            let want = if blocked {
-                Added::Deleted
-            } else if let std::collections::btree_map::Entry::Vacant(e) = m.records.entry(key) {
-                e.insert(b);
-                Added::Added
-            } else {
-                Added::Exists
-            };
+            let want = model_add(&mut m.records, &mut m.tomb, &mut m.stamp, key, b, t, src);
             assert_eq!(got, want, "step {step} {uri}");
         }
         if step % 750 == 749 {
+            model_checkpoint(&mut m.stamp);
             // a full write, then checkpoints over it that copy unchanged lists
             g = if g.snapshot().is_none() || step % 3000 == 2999 {
                 g.write_snapshot(&snap).unwrap();
@@ -551,4 +597,423 @@ fn a_checkpoint_id_is_never_written_twice() {
     let after: Vec<Vec<u8>> = m.shards.values().map(|n| std::fs::read(p.join(n)).unwrap()).collect();
     assert!(before == after, "the committed files are untouched");
     g.write_checkpoint(&p, 2, 0, Default::default()).unwrap();
+}
+
+const LIST: u8 = 2;
+const LIST_OWNER: u8 = 3;
+
+fn listitem(a: &str, rkey: &str) -> String {
+    format!("at://{a}/app.bsky.graph.listitem/{rkey}")
+}
+
+fn list_uri(a: &str, l: u32) -> String {
+    format!("at://{a}/app.bsky.graph.list/l{l}")
+}
+
+#[test]
+fn lists_are_sets_of_members() {
+    let (o, x, y, z) = (did(1), did(2), did(3), did(4));
+    let (l1, l2) = (list_uri(&o, 1), list_uri(&o, 2));
+    for snapshot_between in [false, true] {
+        let mut g = graph();
+        let add = |g: &mut Graph, rk: u64, l: &str, s: &str| g.add_rec(&listitem(&o, &tid(rk)), s, Some(l), 0).unwrap();
+        assert_eq!(add(&mut g, 1, &l1, &x), Added::Added);
+        assert_eq!(add(&mut g, 2, &l1, &y), Added::Added);
+        assert_eq!(add(&mut g, 3, &l1, &x), Added::Added, "a repeat member is a second record");
+        assert_eq!(add(&mut g, 4, &l2, &y), Added::Added);
+        assert_eq!(add(&mut g, 5, &l2, &z), Added::Added);
+        assert!(g.add_rec(&listitem(&o, &tid(9)), &x, None, 0).is_err(), "a listitem names its list");
+        assert!(g.add_rec(&listitem(&x, &tid(9)), &y, Some(&l1), 0).is_err(), "the list is in the owner's repo");
+        if snapshot_between {
+            g = reopen(&g);
+        }
+        let id = |g: &Graph, s: &str| g.id_of(s).unwrap();
+        assert_eq!(g.counts(LIST, &l1), (3, 0));
+        assert_eq!(g.out_distinct(LIST, id(&g, &l1)), 2);
+        assert_eq!(g.counts(LIST, &x), (0, 1), "x is on one list");
+        assert_eq!(g.counts(LIST, &y), (0, 2));
+        assert_eq!(g.counts(LIST_OWNER, &o), (5, 0));
+        let (members, _) = g.out_list(LIST, &l1, 10, None);
+        let want: Vec<(String, String)> =
+            [(3, &x), (2, &y), (1, &x)].into_iter().map(|(k, s)| (listitem(&o, &tid(k)), s.to_string())).collect();
+        assert_eq!(members, want, "newest first, URIs in the owner's repo");
+        let (members, _) = g.out_list_opts(LIST, &l1, 10, None, true);
+        assert_eq!(members, want[1..].to_vec(), "one record per member, its oldest");
+        let (lists, _) = g.in_list(LIST, &y, 10, None);
+        assert_eq!(lists.iter().collect::<BTreeSet<_>>(), [&l1, &l2].into_iter().collect());
+        assert_eq!(g.has(LIST, &l1, &x), Some(listitem(&o, &tid(1))), "the oldest, as the distinct page keeps");
+        assert_eq!(g.has(LIST, &l2, &x), None);
+
+        let side = |g: &Graph, rel, dir, s: &str| ListRef { rel, dir, actor: id(g, s) };
+        let names = |g: &Graph, v: Vec<u32>| v.into_iter().map(|i| g.did_of(i).unwrap()).collect::<BTreeSet<_>>();
+        let (s1, s2) = (side(&g, LIST, Dir::Out, &l1), side(&g, LIST, Dir::Out, &l2));
+        assert_eq!(names(&g, g.combine(s1, s2, marco_core::SetOp::And, 10, None)), [y.clone()].into());
+        assert_eq!(names(&g, g.combine(s1, s2, marco_core::SetOp::AndNot, 10, None)), [x.clone()].into());
+        assert_eq!(names(&g, g.combine(s2, s1, marco_core::SetOp::AndNot, 10, None)), [z.clone()].into());
+        let both = g.combine(s1, s2, marco_core::SetOp::And, 10, None)[0];
+        assert!(g.combine(s1, s2, marco_core::SetOp::And, 10, Some(both)).is_empty(), "the cursor");
+        let ids: Vec<u32> = [&x, &y, &z].iter().map(|d| id(&g, d)).collect();
+        assert_eq!(names(&g, g.filter_sets(id(&g, &o), &ids, &[], &[s1])), [z.clone()].into());
+
+        assert_eq!(g.delete(&listitem(&o, &tid(2))).unwrap(), removed(&y), "delete by URI finds the list");
+        assert_eq!(g.counts(LIST, &y), (0, 1));
+        assert_eq!(g.out_distinct(LIST, id(&g, &l1)), 1);
+        assert_eq!(g.delete(&listitem(&o, &tid(2))).unwrap(), Removed::NotFound);
+        assert_eq!(g.add_rec(&listitem(&o, &tid(6)), &z, Some(&l1), -5).unwrap(), Added::Added);
+        g.delete_at(&listitem(&o, &tid(7)), 100).unwrap();
+        assert_eq!(g.add_rec(&listitem(&o, &tid(7)), &z, Some(&l1), 50).unwrap(), Added::Deleted, "tombstone");
+
+        g.set_status(&o, Some(Status::Takendown), 0).unwrap();
+        assert!(g.hidden(&l1), "a list hides with its owner");
+        g.set_status(&o, None, 0).unwrap();
+        let g = reopen(&g);
+        let mut g = g;
+        assert_eq!(g.set_status(&o, Some(Status::Deleted), 200).unwrap(), 5);
+        assert_eq!(g.counts(LIST, &l1), (0, 0));
+        assert_eq!(g.counts(LIST, &y), (0, 0));
+        assert_eq!(g.counts(LIST_OWNER, &o), (0, 0));
+    }
+}
+
+#[test]
+fn lists_match_a_model() {
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut rnd = |n: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % n
+    };
+    let mut g = graph();
+    g.set_subj_index(8);
+    g.compact_min = 4;
+    // (owner, rkey) -> (list, member), and tombstones by (owner, rkey)
+    let mut recs: BTreeMap<(u32, String), (u32, u32)> = BTreeMap::new();
+    let mut tomb: BTreeMap<(u32, String), i64> = BTreeMap::new();
+    let mut stamp: BTreeMap<(u32, String), (i64, u8, bool)> = BTreeMap::new();
+    let dir = tempfile::tempdir().unwrap();
+    let snap = dir.path().join("g");
+    let mut ckpt = 0;
+    let owners = 6u64;
+    for step in 0..5000 {
+        let o = rnd(owners) as u32;
+        let rkey = if rnd(25) == 0 { format!("x{}", rnd(20)) } else { tid(rnd(150)) };
+        let uri = listitem(&did(o), &rkey);
+        let src = (rnd(4) == 0) as u8;
+        let t = step as i64 * 10 - if src == 1 { rnd(2000) as i64 } else { 0 };
+        g.set_source(["live", "backfill"][src as usize]);
+        let key = (o, rkey.clone());
+        if rnd(3) == 0 {
+            let got = g.delete_at(&uri, t).unwrap();
+            match model_delete(&mut recs, &mut tomb, &stamp, key, t, src) {
+                Some((_, m)) => assert_eq!(got, removed(&did(m)), "step {step}"),
+                None => assert_eq!(got, Removed::NotFound, "step {step}"),
+            }
+        } else {
+            let (l, m) = (rnd(3) as u32, 10 + rnd(15) as u32);
+            let got = g.add_rec(&uri, &did(m), Some(&list_uri(&did(o), l)), t).unwrap();
+            let want = model_add(&mut recs, &mut tomb, &mut stamp, key, (l, m), t, src);
+            assert_eq!(got, want, "step {step} {uri}");
+        }
+        if step % 700 == 699 {
+            model_checkpoint(&mut stamp);
+            g = if g.snapshot().is_none() || step % 2800 == 2799 {
+                g.write_snapshot(&snap).unwrap();
+                Graph::open(&snap).unwrap()
+            } else {
+                ckpt += 1;
+                let m = g.write_checkpoint(&snap, ckpt, 0, Default::default()).unwrap();
+                marco_core::store::remove_unlisted(&snap, &m, true).unwrap();
+                Graph::open(&snap).unwrap()
+            };
+            g.shards = 3;
+            g.compact_min = 4;
+        }
+        if step % 83 == 0 {
+            for o in 0..owners as u32 {
+                let n_owner = recs.keys().filter(|k| k.0 == o).count() as u64;
+                assert_eq!(g.counts(LIST_OWNER, &did(o)).0, n_owner, "owner {o} step {step}");
+                for l in 0..3 {
+                    let lu = list_uri(&did(o), l);
+                    let items: Vec<(&String, u32)> =
+                        recs.iter().filter(|(k, v)| k.0 == o && v.0 == l).map(|(k, v)| (&k.1, v.1)).collect();
+                    let members: BTreeSet<u32> = items.iter().map(|i| i.1).collect();
+                    assert_eq!(g.counts(LIST, &lu).0, items.len() as u64, "list {o}/{l} step {step}");
+                    let lid = g.id_of(&lu);
+                    assert_eq!(lid.map_or(0, |i| g.out_distinct(LIST, i)), members.len() as u64, "step {step}");
+                    let (page, _) = g.out_list_opts(LIST, &lu, 1000, None, true);
+                    assert_eq!(page.iter().map(|p| p.1.clone()).collect::<BTreeSet<_>>().len(), page.len());
+                    assert_eq!(page.len(), members.len());
+                    for m in 10..25u32 {
+                        assert_eq!(g.has(LIST, &lu, &did(m)).is_some(), members.contains(&m), "step {step}");
+                        if let (Some(li), Some(mi)) = (lid, g.id_of(&did(m))) {
+                            let s = ListRef { rel: LIST, dir: Dir::Out, actor: li };
+                            assert_eq!(g.side_contains(s, mi), members.contains(&m));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A list merged down to nothing is the one byte n = 0, read back as empty.
+#[test]
+fn a_list_compacted_to_empty_reads_as_empty() {
+    let a = did(1);
+    let mut g = graph();
+    for k in 0..4 {
+        g.add(&follow(&a, &tid(k)), &did(10 + k as u32)).unwrap();
+    }
+    let mut g = reopen(&g);
+    g.compact_min = 4;
+    for k in 0..4 {
+        g.delete(&follow(&a, &tid(k))).unwrap();
+    }
+    assert_eq!(g.counts(FOLLOW, &a), (0, 0));
+    assert_eq!(reopen(&g).counts(FOLLOW, &a), (0, 0));
+}
+
+#[test]
+fn an_update_replaces_the_record() {
+    let (a, b, c) = (did(1), did(2), did(3));
+    let mut g = graph();
+    let u = follow(&a, &tid(1));
+    assert_eq!(g.add_at(&u, &b, 1).unwrap(), Added::Added);
+    let mut g = reopen(&g);
+    assert_eq!(g.add_at(&u, &c, 2).unwrap(), Added::Added, "a new subject under the same rkey");
+    assert_eq!(g.add_at(&u, &c, 3).unwrap(), Added::Exists);
+    assert_eq!((g.has(FOLLOW, &a, &b), g.has(FOLLOW, &a, &c)), (None, Some(u.clone())));
+    assert_eq!((g.counts(FOLLOW, &a), g.counts(FOLLOW, &b), g.counts(FOLLOW, &c)), ((1, 0), (0, 0), (0, 1)));
+    g.delete_at(&u, 10).unwrap();
+    assert_eq!(g.add_at(&u, &b, 5).unwrap(), Added::Deleted, "an older update stays deleted");
+}
+
+#[test]
+fn an_update_moves_a_listitem() {
+    let (o, x) = (did(1), did(2));
+    let (l1, l2) = (list_uri(&o, 1), list_uri(&o, 2));
+    let u = listitem(&o, &tid(1));
+    for snapshot_between in [false, true] {
+        let mut g = graph();
+        assert_eq!(g.add_rec(&u, &x, Some(&l1), 1).unwrap(), Added::Added);
+        if snapshot_between {
+            g = reopen(&g);
+        }
+        assert_eq!(g.add_rec(&u, &x, Some(&l2), 2).unwrap(), Added::Added);
+        assert_eq!((g.has(LIST, &l1, &x), g.has(LIST, &l2, &x)), (None, Some(u.clone())));
+        assert_eq!((g.counts(LIST, &l1).0, g.counts(LIST, &l2).0, g.counts(LIST, &x).1), (0, 1, 1));
+        assert_eq!(g.counts(LIST_OWNER, &o).0, 1);
+        assert_eq!(g.delete(&u).unwrap(), removed(&x), "the delete finds the new list");
+        assert_eq!(g.counts(LIST, &l2).0, 0);
+    }
+}
+
+#[test]
+fn a_graph_with_fewer_ids_than_shards_reopens() {
+    let mut g = Graph::new(Relations::bsky_default());
+    g.add(&follow(&did(1), &tid(1)), &did(2)).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("g");
+    g.write_snapshot(&p).unwrap();
+    assert_eq!(Graph::open(&p).unwrap().counts(FOLLOW, &did(1)), (1, 0));
+}
+
+/// Two sources: the live tail saw create x at 10 and update y at 20; a
+/// backfill hands over the create at 10 afterwards, through a checkpoint too.
+#[test]
+fn a_late_older_add_leaves_a_newer_update() {
+    let (a, x, y) = (did(1), did(2), did(3));
+    let u = follow(&a, &tid(1));
+    for snapshot_between in [false, true] {
+        let mut g = graph();
+        g.add_at(&u, &x, 10).unwrap();
+        assert_eq!(g.add_at(&u, &y, 20).unwrap(), Added::Added);
+        if snapshot_between {
+            g = reopen(&g);
+        }
+        g.set_source("backfill");
+        assert_eq!(g.add_at(&u, &x, 10).unwrap(), Added::Exists, "older than the update");
+        assert_eq!(g.has(FOLLOW, &a, &y), Some(u.clone()));
+        assert_eq!(g.add_at(&u, &x, 30).unwrap(), Added::Added, "a newer one still lands");
+    }
+}
+
+/// A delete at 10, a re-create z at 15, then an update y at 12 from a slower
+/// source: z holds.
+#[test]
+fn an_update_older_than_a_re_create_leaves_it() {
+    let (a, x, y, z) = (did(1), did(2), did(3), did(4));
+    let u = follow(&a, &tid(1));
+    for snapshot_between in [false, true] {
+        let mut g = graph();
+        g.add_at(&u, &x, 1).unwrap();
+        g.delete_at(&u, 10).unwrap();
+        assert_eq!(g.add_at(&u, &y, 5).unwrap(), Added::Deleted);
+        assert_eq!(g.add_at(&u, &z, 15).unwrap(), Added::Added);
+        if snapshot_between {
+            g = reopen(&g);
+        }
+        g.set_source("slower");
+        assert_eq!(g.add_at(&u, &y, 12).unwrap(), Added::Exists);
+        assert_eq!((g.has(FOLLOW, &a, &z), g.counts(FOLLOW, &a)), (Some(u.clone()), (1, 0)));
+    }
+}
+
+/// The live tail saw a good record at 20; a backfill hands over an earlier
+/// malformed create at 10, which ingest maps to a delete. A replaced or
+/// re-created key keeps its stamp through a checkpoint; a plain create's
+/// lives until the next one.
+#[test]
+fn a_late_older_delete_leaves_a_newer_record() {
+    let (a, x, y) = (did(1), did(2), did(3));
+    let u = follow(&a, &tid(1));
+    let mut g = graph();
+    g.set_source("live");
+    g.add_at(&u, &y, 20).unwrap();
+    g.set_source("backfill");
+    assert_eq!(g.delete_at(&u, 10).unwrap(), Removed::NotFound);
+    assert_eq!(g.has(FOLLOW, &a, &y), Some(u.clone()));
+    let v = follow(&a, &tid(2));
+    g.set_source("live");
+    g.add_at(&v, &x, 5).unwrap();
+    g.add_at(&v, &y, 20).unwrap();
+    let mut g = reopen(&g);
+    g.set_source("backfill");
+    assert_eq!(g.delete_at(&v, 10).unwrap(), Removed::NotFound, "a replaced key's stamp survives the snapshot");
+    assert_eq!(g.delete_at(&v, 20).unwrap(), removed(&y), "a delete wins a tie");
+}
+
+#[test]
+fn replace_keeps_counts_and_distinct_members_right() {
+    let (o, x, y, z) = (did(1), did(2), did(3), did(4));
+    let l = list_uri(&o, 1);
+    for snapshot_between in [false, true] {
+        let mut g = graph();
+        g.add_rec(&listitem(&o, &tid(1)), &x, Some(&l), 1).unwrap();
+        g.add_rec(&listitem(&o, &tid(2)), &y, Some(&l), 1).unwrap();
+        if snapshot_between {
+            g = reopen(&g);
+        }
+        let distinct = |g: &Graph| g.out_distinct(LIST, g.id_of(&l).unwrap());
+        g.add_rec(&listitem(&o, &tid(2)), &x, Some(&l), 2).unwrap();
+        assert_eq!((g.counts(LIST, &l), distinct(&g), g.counts(LIST, &x).1, g.counts(LIST, &y).1), ((2, 0), 1, 1, 0));
+        assert_eq!(distinct(&reopen(&g)), 1);
+        g.add_rec(&listitem(&o, &tid(2)), &z, Some(&l), 3).unwrap();
+        assert_eq!((g.counts(LIST, &l), distinct(&g), g.counts(LIST, &z).1), ((2, 0), 2, 1));
+        let (first, _) = g.out_list_opts(LIST, &l, 1, None, true);
+        let (rest, _) = g.out_list_opts(LIST, &l, 1, Some(&tid(2)), true);
+        assert_eq!(first.len() + rest.len(), 2);
+        assert_eq!(g.delete(&listitem(&o, &tid(2))).unwrap(), removed(&z));
+        assert_eq!((distinct(&g), g.records(LIST).0, g.records(LIST_OWNER).0), (1, 1, 1));
+        let g3 = reopen(&g);
+        assert_eq!((distinct(&g3), g3.records(LIST).0, g3.records(LIST_OWNER).0), (1, 1, 1));
+    }
+}
+
+/// The archive's worst list is 640k records for 119 members: a distinct page
+/// and Has stay well under a second on it.
+#[test]
+fn a_distinct_page_of_a_list_of_repeats_is_quick() {
+    let o = did(1);
+    let l = list_uri(&o, 1);
+    let mut g = graph();
+    let (n, members) = (640_000u64, 119u32);
+    for k in 0..n {
+        let m = did(10 + (k as u32).wrapping_mul(7919) % members);
+        g.add_rec(&listitem(&o, &tid(k)), &m, Some(&l), 0).unwrap();
+    }
+    let g = reopen(&g);
+    let t = std::time::Instant::now();
+    let (page, next) = g.out_list_opts(LIST, &l, 50, None, true);
+    let (rest, _) = g.out_list_opts(LIST, &l, 100, next.as_deref(), true);
+    assert_eq!(page.len() + rest.len(), members as usize);
+    assert!(g.has(LIST, &l, &did(10)).is_some());
+    assert!(t.elapsed() < std::time::Duration::from_millis(500), "{:?}", t.elapsed());
+}
+
+/// One source, in order: a create stamped 100, then its delete stamped 99 (the
+/// source's clock stepped back). The source's own delete applies.
+#[test]
+fn a_sources_own_delete_applies_behind_its_create_by_clock_skew() {
+    let (a, y) = (did(1), did(3));
+    let u = follow(&a, &tid(1));
+    let mut g = graph();
+    g.add_at(&u, &y, 100).unwrap();
+    assert_eq!(g.delete_at(&u, 99).unwrap(), removed(&y));
+    let v = follow(&a, &tid(2));
+    g.add_at(&v, &y, 100).unwrap();
+    g.add_at(&v, &did(4), 110).unwrap();
+    assert_eq!(g.add_at(&v, &did(5), 105).unwrap(), Added::Added, "its own update, whatever its clock");
+}
+
+/// An account's deletion takes every record, even ones stamped after it.
+#[test]
+fn an_account_deletion_takes_records_stamped_after_it() {
+    let (a, y) = (did(1), did(3));
+    let mut g = graph();
+    g.add_at(&follow(&a, &tid(1)), &y, 100).unwrap();
+    g.add_at(&follow(&a, &tid(2)), &y, 50).unwrap();
+    g.set_source("relay");
+    g.set_status(&a, Some(Status::Deleted), 99).unwrap();
+    assert_eq!((g.counts(FOLLOW, &a), g.counts(FOLLOW, &y)), ((0, 0), (0, 0)));
+}
+
+#[test]
+fn the_stamp_section_is_checksummed() {
+    let (a, x, y) = (did(1), did(2), did(3));
+    let u = follow(&a, &tid(1));
+    let mut g = graph();
+    g.add_at(&u, &x, 10).unwrap();
+    g.add_at(&u, &y, 20).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("s");
+    g.write_snapshot(&p).unwrap();
+    let g = Graph::open(&p).unwrap();
+    let st = g.snapshot().unwrap();
+    let (name, r) = st
+        .shards
+        .iter()
+        .flatten()
+        .find_map(|f| {
+            let r = f.rels[FOLLOW as usize].stamp.clone();
+            (!r.is_empty()).then(|| (f.name.clone(), r))
+        })
+        .expect("a stamp section with the replace");
+    st.verify_checksums().unwrap();
+    drop(g);
+    let fp = p.join(&name);
+    let mut b = std::fs::read(&fp).unwrap();
+    b[r.start] ^= 1;
+    std::fs::write(&fp, &b).unwrap();
+    assert!(Graph::open(&p).unwrap().snapshot().unwrap().verify_checksums().is_err());
+}
+
+/// Stamps past the TTL go at a snapshot or checkpoint; newer ones stay. A
+/// plain create's stamp isn't written.
+#[test]
+fn stamps_follow_the_tombstone_ttl_and_checkpoints() {
+    let now = marco_core::store::now_ms() * 1000;
+    let (a, x, y) = (did(1), did(2), did(3));
+    let (old, new, plain) = (follow(&a, &tid(1)), follow(&a, &tid(2)), follow(&a, &tid(3)));
+    let mut g = graph();
+    g.tombstone_ttl_us = 3_600_000_000;
+    g.add_at(&old, &x, now - 7_200_000_000).unwrap();
+    g.add_at(&old, &y, now - 7_100_000_000).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("s");
+    g.write_snapshot(&p).unwrap();
+    let mut g = Graph::open(&p).unwrap();
+    g.tombstone_ttl_us = 3_600_000_000;
+    let id = g.id_of(&a).unwrap();
+    let key = |u: &str| key_of(u.rsplit('/').next().unwrap()).0;
+    assert_eq!(g.stamp(FOLLOW, id, key(&old)), None, "past the TTL");
+    g.add_at(&new, &x, now - 60_000_000).unwrap();
+    g.add_at(&new, &y, now - 50_000_000).unwrap();
+    g.add_at(&plain, &x, now - 40_000_000).unwrap();
+    g.write_checkpoint(&p, 1, 1, BTreeMap::new()).unwrap();
+    let g = Graph::open(&p).unwrap();
+    g.snapshot().unwrap().verify_checksums().unwrap();
+    assert_eq!(g.stamp(FOLLOW, id, key(&new)), Some(now - 50_000_000));
+    assert_eq!(g.stamp(FOLLOW, id, key(&plain)), None);
 }

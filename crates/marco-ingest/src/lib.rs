@@ -102,6 +102,24 @@ pub(crate) fn valid_subject(s: &str) -> bool {
     marco_core::did::classify(s).is_some()
 }
 
+/// A list relation's record: its list, which must be in the record's own
+/// repo (the appview refuses the rest too). Ok(None) for other relations.
+pub(crate) fn list_of(
+    rels: &marco_core::Relations,
+    rel: marco_core::RelId,
+    uri: &str,
+    list: Option<&str>,
+) -> Result<Option<String>, ()> {
+    if !rels.is_list(rel) {
+        return Ok(None);
+    }
+    let owner = marco_core::relation::parse_uri(uri).map(|x| x.0);
+    match list.and_then(|l| marco_core::relation::parse_uri(l).map(|x| (l, x.0))) {
+        Some((l, o)) if Some(o) == owner => Ok(Some(l.to_string())),
+        _ => Err(()),
+    }
+}
+
 pub(crate) fn account_change(did: &str, active: bool, status: Option<&str>) -> Change {
     let did = did.to_string();
     if active {

@@ -17,7 +17,7 @@ use marco_core::Relations;
 use vlatproto::cbor::ValueRef;
 use vlatproto::cid::Cid;
 
-use crate::{account_change, edge_uri, valid_subject, Change, Event, Kind, Op};
+use crate::{account_change, edge_uri, list_of, valid_subject, Change, Event, Kind, Op};
 
 /// The subscribe URL: `base` (`wss://host`, or the full XRPC path) with a
 /// cursor when given.
@@ -128,11 +128,17 @@ pub fn decode(frame: &[u8], rels: &Relations) -> Result<Frame, &'static str> {
                             ev.skipped.push("bad_record");
                             continue;
                         };
-                        match subject_of(&rec, &rels.get(rel).subject) {
-                            Some(s) if valid_subject(s) => {
-                                out.push(Op::Add { uri, subject: s.to_string(), time_us: ev.time_us })
+                        let r = rels.get(rel);
+                        let list = r.list.as_deref().and_then(|p| subject_of(&rec, p));
+                        match (subject_of(&rec, &r.subject), list_of(rels, rel, &uri, list)) {
+                            (Some(s), Ok(list)) if valid_subject(s) => {
+                                out.push(Op::Add { uri, subject: s.to_string(), list, time_us: ev.time_us })
                             }
-                            _ => ev.skipped.push("bad_subject"),
+                            (_, list) => {
+                                // a record that isn't an edge leaves its key empty
+                                ev.skipped.push(if list.is_err() { "bad_list" } else { "bad_subject" });
+                                out.push(Op::Delete { uri, time_us: ev.time_us });
+                            }
                         }
                     }
                     "delete" => out.push(Op::Delete { uri, time_us: ev.time_us }),
@@ -272,6 +278,7 @@ mod tests {
                 Op::Add {
                     uri: "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.graph.follow/3kaaaaaaaaa22".into(),
                     subject: "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                    list: None,
                     time_us: 1_767_225_600_000_000,
                 },
                 Op::Delete {

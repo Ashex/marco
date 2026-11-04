@@ -5,7 +5,19 @@
 //! name = "follow"
 //! collection = "app.bsky.graph.follow"
 //! subject = "subject"
+//!
+//! [[relation]]
+//! name = "listitem"
+//! collection = "app.bsky.graph.listitem"
+//! subject = "subject"
+//! list = "list"
 //! ```
+//!
+//! A relation with `list` keeps edges from that record (a list, in the
+//! actor's own repo) to the subject: the list is a node in the directory,
+//! keyed by its AT URI. A delete names only the actor and rkey, so each such
+//! relation gets a companion, `<name>.owner`, holding the records as actor
+//! -> list. Companions are added here, never configured.
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -18,12 +30,27 @@ pub struct Relation {
     pub collection: String,
     /// Dotted path to the subject DID in the record.
     pub subject: String,
+    /// Dotted path to an AT URI in the record, of a record in the same repo:
+    /// edges go from that node rather than from the actor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub list: Option<String>,
+    /// Set on a companion: the list relation whose records it holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_of: Option<String>,
 }
 
 impl Relation {
     pub fn subject_of<'a>(&self, record: &'a serde_json::Value) -> Option<&'a str> {
-        self.subject.split('.').try_fold(record, |v, k| v.get(k))?.as_str()
+        path_of(&self.subject, record)
     }
+
+    pub fn list_of<'a>(&self, record: &'a serde_json::Value) -> Option<&'a str> {
+        path_of(self.list.as_deref()?, record)
+    }
+}
+
+fn path_of<'a>(path: &str, record: &'a serde_json::Value) -> Option<&'a str> {
+    path.split('.').try_fold(record, |v, k| v.get(k))?.as_str()
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -33,44 +60,105 @@ pub struct Relations {
 }
 
 impl Relations {
+    /// The configured relations, each list relation followed by its
+    /// companion. Companions in `list` (a snapshot's) are made again.
     pub fn new(list: Vec<Relation>) -> Result<Relations> {
-        let r = Relations { list };
+        let user: Vec<Relation> = list.into_iter().filter(|r| r.owner_of.is_none()).collect();
+        let r = Relations { list: user };
         r.validate()?;
+        let mut all = Vec::with_capacity(r.list.len() + 1);
+        for x in r.list {
+            let owner = x.list.as_ref().map(|path| Relation {
+                name: format!("{}.owner", x.name),
+                collection: x.collection.clone(),
+                subject: path.clone(),
+                list: None,
+                owner_of: Some(x.name.clone()),
+            });
+            all.push(x);
+            all.extend(owner);
+        }
+        if all.len() > RelId::MAX as usize {
+            bail!("at most {} relations, companions included", RelId::MAX);
+        }
+        let r = Relations { list: all };
+        if r.list.iter().enumerate().any(|(i, x)| r.list[..i].iter().any(|o| o.name == x.name)) {
+            bail!("relation names must be unique, companions' `<name>.owner` included");
+        }
         Ok(r)
     }
 
     pub fn parse_toml(s: &str) -> Result<Relations> {
         let r: Relations = toml::from_str(s).context("relations config")?;
-        r.validate()?;
-        Ok(r)
+        Relations::new(r.list)
     }
 
-    /// follow and block, the relations an appview needs first.
+    /// follow, block and listitem, the relations an appview needs first.
     pub fn bsky_default() -> Relations {
-        let rel = |name: &str, collection: &str| Relation {
+        let rel = |name: &str, collection: &str, list: Option<&str>| Relation {
             name: name.into(),
             collection: collection.into(),
             subject: "subject".into(),
+            list: list.map(Into::into),
+            owner_of: None,
         };
-        Relations { list: vec![rel("follow", "app.bsky.graph.follow"), rel("block", "app.bsky.graph.block")] }
+        Relations::new(vec![
+            rel("follow", "app.bsky.graph.follow", None),
+            rel("block", "app.bsky.graph.block", None),
+            rel("listitem", "app.bsky.graph.listitem", Some("list")),
+        ])
+        .expect("default relations")
     }
 
     fn validate(&self) -> Result<()> {
-        if self.list.len() > RelId::MAX as usize {
-            bail!("at most {} relations", RelId::MAX);
-        }
         for (i, r) in self.list.iter().enumerate() {
             if !vlatproto::syntax::valid_nsid(&r.collection) {
                 bail!("relation {}: {:?} isn't an NSID", r.name, r.collection);
             }
-            if r.subject.is_empty() || r.name.is_empty() {
-                bail!("relation {i}: name and subject are required");
+            if r.subject.is_empty() || r.name.is_empty() || r.list.as_ref().is_some_and(|l| l.is_empty()) {
+                bail!("relation {i}: name and subject are required, and list can't be empty");
+            }
+            if r.name.contains('.') {
+                bail!("relation {}: names can't hold a '.'", r.name);
             }
             if self.list[..i].iter().any(|o| o.name == r.name || o.collection == r.collection) {
                 bail!("relation {}: name and collection must be unique", r.name);
             }
         }
         Ok(())
+    }
+
+    /// The relations a caller names: every one but the companions.
+    pub fn user(&self) -> Vec<RelId> {
+        (0..self.list.len() as RelId).filter(|&r| self.list[r as usize].owner_of.is_none()).collect()
+    }
+
+    /// The relations between actors: neither list relations nor companions.
+    pub fn actor_rels(&self) -> Vec<RelId> {
+        (0..self.list.len() as RelId).filter(|&r| !self.is_list(r) && !self.is_owner(r)).collect()
+    }
+
+    pub fn is_list(&self, rel: RelId) -> bool {
+        self.list[rel as usize].list.is_some()
+    }
+
+    pub fn is_owner(&self, rel: RelId) -> bool {
+        self.list[rel as usize].owner_of.is_some()
+    }
+
+    /// A list relation's companion, which holds its records by actor.
+    pub fn owner_rel(&self, rel: RelId) -> Option<RelId> {
+        if !self.is_list(rel) {
+            return None;
+        }
+        let name = &self.list[rel as usize].name;
+        self.list.iter().position(|r| r.owner_of.as_ref() == Some(name)).map(|i| i as RelId)
+    }
+
+    /// A companion's list relation.
+    pub fn list_rel(&self, owner: RelId) -> Option<RelId> {
+        let name = self.list[owner as usize].owner_of.as_ref()?;
+        self.by_name(name)
     }
 
     pub fn len(&self) -> usize {
@@ -86,7 +174,7 @@ impl Relations {
     }
 
     pub fn by_collection(&self, collection: &str) -> Option<RelId> {
-        self.list.iter().position(|r| r.collection == collection).map(|i| i as RelId)
+        self.list.iter().position(|r| r.collection == collection && r.owner_of.is_none()).map(|i| i as RelId)
     }
 
     pub fn by_name(&self, name: &str) -> Option<RelId> {
@@ -133,6 +221,22 @@ subject = "target.did"
         assert_eq!(r.get(2).subject_of(&rec), Some("did:plc:x"));
         assert_eq!(r.get(0).subject_of(&rec), None);
         assert!(Relations::parse_toml("[[relation]]\nname='a'\ncollection='nope'\nsubject='s'").is_err());
+    }
+
+    #[test]
+    fn list_companions() {
+        let r = Relations::bsky_default();
+        let names: Vec<&str> = r.list.iter().map(|x| x.name.as_str()).collect();
+        assert_eq!(names, ["follow", "block", "listitem", "listitem.owner"]);
+        assert_eq!(r.by_collection("app.bsky.graph.listitem"), Some(2));
+        assert_eq!(r.owner_rel(2), Some(3));
+        assert_eq!(r.list_rel(3), Some(2));
+        assert_eq!(r.owner_rel(0), None);
+        assert_eq!(r.user(), vec![0, 1, 2]);
+        let again = Relations::new(r.list.clone()).unwrap();
+        assert_eq!(again.list, r.list);
+        let rec = serde_json::json!({"list": "at://did:plc:x/app.bsky.graph.list/l", "subject": "did:plc:y"});
+        assert_eq!(r.get(2).list_of(&rec), Some("at://did:plc:x/app.bsky.graph.list/l"));
     }
 
     #[test]

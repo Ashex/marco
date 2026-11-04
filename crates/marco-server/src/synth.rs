@@ -1,6 +1,7 @@
 //! A synthetic graph with fake DIDs, for tests, demos and the console's
 //! checks: follows with a long-tailed degree, a few blocks, some repeat
-//! records and some non-TID rkeys, written as a snapshot.
+//! records and some non-TID rkeys, lists with repeat members, written as a
+//! snapshot.
 
 use std::path::Path;
 
@@ -10,6 +11,12 @@ use vlatproto::tid::Tid;
 
 pub const FOLLOW: &str = "app.bsky.graph.follow";
 pub const BLOCK: &str = "app.bsky.graph.block";
+pub const LISTITEM: &str = "app.bsky.graph.listitem";
+
+/// `actor`'s list `l`.
+pub fn list_uri(actor: &str, l: u32) -> String {
+    format!("at://{actor}/app.bsky.graph.list/l{l}")
+}
 
 /// The i-th fake DID: did:plc: and 24 base32 characters.
 pub fn did(i: u32) -> String {
@@ -49,7 +56,8 @@ impl Rng {
 }
 
 /// `actors` actors; actor 0 follows everyone and actor 1 is followed by
-/// everyone, so tests have a long list each way.
+/// everyone, so tests have a long list each way. Actor 2's list 0 holds
+/// everyone; every 8th actor keeps a few short lists.
 pub fn graph(actors: u32, shards: usize) -> Result<Graph> {
     let mut g = Graph::new(Relations::bsky_default());
     g.shards = shards;
@@ -87,6 +95,17 @@ pub fn graph(actors: u32, shards: usize) -> Result<Graph> {
             if s != a {
                 t += 1;
                 g.add(&uri(&ad, BLOCK, &tid(t, 1)), &did(s))?;
+            }
+        }
+        if a % 8 == 2 {
+            for l in 0..1 + rng.below(3) as u32 {
+                let lu = list_uri(&ad, l);
+                let members = if a == 2 && l == 0 { n as u64 } else { 1 + rng.below(40) };
+                for j in 0..members {
+                    let s = if a == 2 && l == 0 { j as u32 } else { rng.below(n as u64) as u32 };
+                    t += 1;
+                    g.add_rec(&uri(&ad, LISTITEM, &tid(t, 5)), &did(s), Some(&lu), 0)?;
+                }
             }
         }
     }

@@ -9,13 +9,14 @@ use std::time::Duration;
 use marco_core::store::{Manifest, MANIFEST};
 use marco_core::{segment, Graph};
 use marco_server::app::{App, Config, Op, SourceReport, Status};
-use marco_server::synth::{did, tid, uri, BLOCK, FOLLOW};
+use marco_server::synth::{did, list_uri, tid, uri, BLOCK, FOLLOW, LISTITEM};
 
 const N: u32 = 300;
 const SRC: &str = "jetstream";
 
 /// The i-th write of a deterministic stream: adds, deletes of earlier adds
-/// (some recreated under the same rkey), unknown deletes, new DIDs, statuses.
+/// (some recreated under the same rkey), unknown deletes, new DIDs, statuses,
+/// and listitems, whose deletes name only the owner and rkey.
 enum W {
     Ops(Vec<Op>),
     Status(String, Option<Status>, i64),
@@ -30,7 +31,7 @@ fn stream(n: usize) -> Vec<W> {
         seed ^= seed << 17;
         seed % m.max(1)
     };
-    let mut made: Vec<String> = Vec::new();
+    let mut made: Vec<(String, Option<String>)> = Vec::new();
     // event times from a day ago, inside the tombstone TTL
     let t0 = marco_server::app::now_ms() * 1000 - 86_400_000_000;
     for i in 0..n {
@@ -43,21 +44,29 @@ fn stream(n: usize) -> Vec<W> {
         let mut ops = Vec::new();
         for _ in 0..1 + rnd(4) {
             let a = if rnd(10) == 0 { format!("did:web:n{}.example", rnd(30)) } else { did(rnd(N as u64) as u32) };
-            let coll = if rnd(6) == 0 { BLOCK } else { FOLLOW };
+            let r = rnd(12);
+            let coll = if r < 2 {
+                BLOCK
+            } else if r < 4 {
+                LISTITEM
+            } else {
+                FOLLOW
+            };
+            let list = (coll == LISTITEM).then(|| list_uri(&a, rnd(3) as u32));
             match rnd(10) {
                 0..=2 if !made.is_empty() => {
-                    let u = made[rnd(made.len() as u64) as usize].clone();
+                    let (u, _) = made[rnd(made.len() as u64) as usize].clone();
                     ops.push(Op::Delete { uri: u, time_us: t });
                 }
                 3 => ops.push(Op::Delete { uri: uri(&a, coll, &tid(50_000_000 + rnd(500), 1)), time_us: t }),
                 _ => {
-                    let u = if rnd(12) == 0 && !made.is_empty() {
+                    let (u, list) = if rnd(12) == 0 && !made.is_empty() {
                         made[rnd(made.len() as u64) as usize].clone()
                     } else {
-                        uri(&a, coll, &tid(40_000_000 + i as u64 * 10 + rnd(10), 1))
+                        (uri(&a, coll, &tid(40_000_000 + i as u64 * 10 + rnd(10), 1)), list)
                     };
-                    made.push(u.clone());
-                    ops.push(Op::Add { uri: u, subject: did(rnd(N as u64 + 10) as u32), time_us: t });
+                    made.push((u.clone(), list.clone()));
+                    ops.push(Op::Add { uri: u, subject: did(rnd(N as u64 + 10) as u32), list, time_us: t });
                 }
             }
         }
@@ -102,9 +111,18 @@ fn dump(g: &Graph) -> Vec<String> {
     let mut dids: Vec<String> = (0..N + 20).map(did).collect();
     dids.extend((0..30).map(|i| format!("did:web:n{i}.example")));
     let mut out = Vec::new();
+    let lists: Vec<String> = dids.iter().flat_map(|d| (0..3).map(move |l| list_uri(d, l))).collect();
+    for l in &lists {
+        let (page, _) = g.out_list(2, l, 100_000, None);
+        out.push(format!(
+            "{l} members {page:?} counts {:?} distinct {:?}",
+            g.counts(2, l),
+            g.id_of(l).map(|i| g.out_distinct(2, i))
+        ));
+    }
     for d in &dids {
         out.push(format!("{d} status {:?}", g.status_of(d)));
-        for rel in [0u8, 1] {
+        for rel in [0u8, 1, 2, 3] {
             let (page, _) = g.out_list(rel, d, 100_000, None);
             out.push(format!("{d} {rel} out {page:?}"));
             out.push(format!("{d} {rel} counts {:?}", g.counts(rel, d)));
@@ -112,7 +130,7 @@ fn dump(g: &Graph) -> Vec<String> {
             out.push(format!("{d} {rel} in {inn:?}"));
         }
     }
-    for rel in [0u8, 1] {
+    for rel in [0u8, 1, 2, 3] {
         out.push(format!("{rel} records {:?} tombstones {}", g.records(rel), g.tombstones(rel)));
     }
     out
@@ -268,7 +286,9 @@ async fn a_new_sources_first_cursor_is_durable_on_return() {
     let app = App::open(cfg(&snap)).unwrap();
     // a first call with ops: its segment is written before they apply
     let u = uri(&did(1), FOLLOW, &tid(70_000_000, 1));
-    app.apply_from("relay", "start", &[Op::Add { uri: u.clone(), subject: did(2), time_us: 0 }]).await.unwrap();
+    app.apply_from("relay", "start", &[Op::Add { uri: u.clone(), subject: did(2), list: None, time_us: 0 }])
+        .await
+        .unwrap();
     assert_eq!(app.source_cursor("relay").as_deref(), Some("start"));
     app.apply_from("relay", "next", &[]).await.unwrap();
     assert_eq!(app.latest_cursor("relay").as_deref(), Some("next"));
@@ -292,7 +312,7 @@ async fn a_corrupt_or_missing_segment_refuses_to_start() {
         app.apply_from(
             SRC,
             &i.to_string(),
-            &[Op::Add { uri: uri(&did(1), FOLLOW, &tid(60_000_000 + i, 1)), subject: did(2), time_us: 0 }],
+            &[Op::Add { uri: uri(&did(1), FOLLOW, &tid(60_000_000 + i, 1)), subject: did(2), list: None, time_us: 0 }],
         )
         .await
         .unwrap();
@@ -342,7 +362,9 @@ async fn a_replayed_account_deletion_keeps_its_own_time() {
     for _ in 0..2 {
         app.status_from(SRC, "1", a, Some(Status::Deleted), t).await.unwrap();
         app.status_from(SRC, "2", a, None, t + 1_000).await.unwrap();
-        app.apply_from(SRC, "3", &[Op::Add { uri: later.clone(), subject: did(2), time_us: t + 2_000 }]).await.unwrap();
+        app.apply_from(SRC, "3", &[Op::Add { uri: later.clone(), subject: did(2), list: None, time_us: t + 2_000 }])
+            .await
+            .unwrap();
         assert!(app.graph().has(0, a, &did(2)).is_some(), "the create after the deletion stays");
     }
 }
@@ -416,7 +438,7 @@ async fn a_failing_segment_write_shows_and_lands_once_it_can() {
     app.apply_from(SRC, "1", &[]).await.unwrap();
     std::fs::set_permissions(&snap, std::fs::Permissions::from_mode(0o555)).unwrap();
     let u = uri(&did(1), FOLLOW, &tid(72_000_000, 1));
-    app.apply_from(SRC, "2", &[Op::Add { uri: u, subject: did(2), time_us: 0 }]).await.unwrap();
+    app.apply_from(SRC, "2", &[Op::Add { uri: u, subject: did(2), list: None, time_us: 0 }]).await.unwrap();
     let flush = {
         let app = app.clone();
         tokio::spawn(async move { app.flush().await })
@@ -434,4 +456,105 @@ async fn a_failing_segment_write_shows_and_lands_once_it_can() {
     flush.await.unwrap().unwrap();
     assert!(app.durability.lock().unwrap().segment_error.is_empty());
     assert_eq!(app.source_cursor(SRC).as_deref(), Some("2"));
+}
+
+/// A listitem stream: three owners' lists filled, emptied and refilled, so
+/// deletes, re-creates and repeat members cross segments and checkpoints.
+fn list_stream(n: usize) -> Vec<W> {
+    let t0 = marco_server::app::now_ms() * 1000 - 86_400_000_000;
+    let mut v = Vec::new();
+    for i in 0..n {
+        let o = did((i % 3) as u32);
+        let t = t0 + i as i64 * 1000;
+        let rk = tid(70_000_000 + (i as u64 % 97), 1);
+        let u = uri(&o, LISTITEM, &rk);
+        v.push(W::Ops(vec![if i % 4 == 3 {
+            Op::Delete { uri: u, time_us: t }
+        } else {
+            Op::Add {
+                uri: u,
+                subject: did(10 + (i % 7) as u32),
+                list: Some(list_uri(&o, (i % 5) as u32 % 3)),
+                time_us: t,
+            }
+        }]));
+        if i == n / 2 {
+            v.push(W::Status(did(1), Some(Status::Deleted), t));
+        }
+    }
+    v
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn listitems_survive_kills_on_both_sides_of_a_checkpoint() {
+    let s = list_stream(900);
+    let want = uninterrupted(&s).await;
+    let (_d, snap) = snapshot();
+    let app = App::open(cfg(&snap)).unwrap();
+    feed(&app, &s, 0, 200).await;
+    app.flush().await.unwrap();
+    feed(&app, &s, 200, 450).await;
+    app.checkpoint().await.unwrap();
+    feed(&app, &s, 450, 600).await;
+    app.flush().await.unwrap();
+    feed(&app, &s, 600, 650).await;
+    drop(app);
+    let app = App::open(cfg(&snap)).unwrap();
+    assert_eq!(resume(&app), 600);
+    feed(&app, &s, resume(&app), s.len()).await;
+    let got = dump(&app.graph());
+    for (a, b) in got.iter().zip(&want) {
+        assert_eq!(a, b);
+    }
+    assert_eq!(got.len(), want.len());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_listitem_delete_before_its_create_holds_through_a_restart() {
+    let (_d, snap) = snapshot();
+    let app = App::open(cfg(&snap)).unwrap();
+    let o = did(4);
+    let u = uri(&o, LISTITEM, &tid(80_000_000, 1));
+    let t = marco_server::app::now_ms() * 1000 - 3_600_000_000;
+    app.apply_from(SRC, "1", &[Op::Delete { uri: u.clone(), time_us: t }]).await.unwrap();
+    app.checkpoint().await.unwrap();
+    drop(app);
+    let app = App::open(cfg(&snap)).unwrap();
+    let add = |time_us| Op::Add { uri: u.clone(), subject: did(9), list: Some(list_uri(&o, 0)), time_us };
+    let out = app.apply_from("backfill", "1", &[add(t - 1)]).await.unwrap();
+    assert!(matches!(&out[..], [marco_server::app::Outcome::Deleted]), "the owner's tombstone holds");
+    let out = app.apply_from(SRC, "2", &[add(t + 1)]).await.unwrap();
+    assert!(matches!(&out[..], [marco_server::app::Outcome::Added]), "a later re-create lands");
+    app.shutdown().await.unwrap();
+    let app = App::open(cfg(&snap)).unwrap();
+    assert!(app.graph().has(2, &list_uri(&o, 0), &did(9)).is_some());
+}
+
+/// A replace's stamp, and its source, survive a kill with or without a
+/// checkpoint: another source's older ops still change nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replaces_stamp_survives_a_kill() {
+    for checkpoint in [false, true] {
+        let (_d, snap) = snapshot();
+        let app = App::open(cfg(&snap)).unwrap();
+        let a = did(3);
+        let u = uri(&a, FOLLOW, &tid(90_000_000, 1));
+        let t = marco_server::app::now_ms() * 1000 - 3_600_000_000;
+        let add = |s: u32, time_us| Op::Add { uri: u.clone(), subject: did(s), list: None, time_us };
+        app.apply_from(SRC, "1", &[add(7, t)]).await.unwrap();
+        app.apply_from(SRC, "2", &[add(8, t + 10)]).await.unwrap();
+        if checkpoint {
+            app.checkpoint().await.unwrap();
+        } else {
+            app.flush().await.unwrap();
+        }
+        drop(app);
+        let app = App::open(cfg(&snap)).unwrap();
+        let out = app.apply_from("backfill", "1", &[Op::Delete { uri: u.clone(), time_us: t + 5 }]).await.unwrap();
+        assert!(matches!(&out[..], [marco_server::app::Outcome::NotFound]), "checkpoint {checkpoint}: {out:?}");
+        let out = app.apply_from("backfill", "2", &[add(7, t + 5)]).await.unwrap();
+        assert!(matches!(&out[..], [marco_server::app::Outcome::Exists]), "checkpoint {checkpoint}: {out:?}");
+        assert!(app.graph().has(0, &a, &did(8)).is_some());
+        app.shutdown().await.unwrap();
+    }
 }

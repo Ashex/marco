@@ -10,7 +10,17 @@
 //! re-create under the rkey a delete freed (the archive has 1,841). An add
 //! seen before it stays deleted: a backfill landing after the live tail
 //! deleted the record. Checkpoints drop tombstones older than
-//! `tombstone_ttl_us`, past what any source still replays.
+//! `tombstone_ttl_us`, past what any source still replays. An add of a key
+//! that names another subject replaces the record: that's an update.
+//!
+//! Each key also keeps the time and source of its last change, a stamp, so
+//! a second source's older op can't undo a newer one: from another source,
+//! an add older than the stamp changes nothing, and so does a delete of a
+//! record changed after it. The source that set the stamp always applies,
+//! in arrival order, whatever its clock says. A
+//! plain create's stamp lives in memory until the next checkpoint; a key
+//! that was replaced or re-created after a delete keeps it in the snapshot,
+//! with the tombstones' TTL.
 //!
 //! Writes take `&mut self` and reads `&self`. The graph is `Clone`, and
 //! everything a snapshot holds is shared, so the server keeps two copies and
@@ -32,8 +42,9 @@ use crate::relation::{parse_uri, RelId, Relations};
 use crate::rkey::{self, is_tid, key_of};
 use crate::segment::Status;
 use crate::snapshot::{
-    decode_live, decode_statuses, decode_tombs, encode_index, encode_live, encode_side, encode_statuses, encode_tombs,
-    rel_section, write_directory, BaseDir, DidAt, DirParts, Index, Meta, RelStats, ShardMeta, Side, Writer, FORMAT,
+    decode_live, decode_stamps, decode_statuses, decode_tombs, encode_index, encode_live, encode_side, encode_stamps,
+    encode_statuses, encode_tombs, rel_section, write_directory, BaseDir, DidAt, DirParts, Index, Meta, RelStats,
+    ShardMeta, Side, Writer, FORMAT,
 };
 use crate::store::{now_ms, shard_file, Manifest, SetWriter, ShardFile, Store, DEFAULT_SHARDS};
 use crate::varint::u32_at;
@@ -83,6 +94,17 @@ pub struct ListRef {
     pub actor: u32,
 }
 
+/// How `combine` joins two sides.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SetOp {
+    And,
+    AndNot,
+}
+
+/// Probing a big out side member by member through the in sets beats
+/// decoding it once it's this many times the other side.
+const PROBE_RATIO: u64 = 32;
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Relationship {
     /// The actor's record naming the other, newest if several.
@@ -100,6 +122,8 @@ struct OutDelta {
     /// range, not a scan of a delta that can hold every record of a mass unfollow.
     adds_s: BTreeSet<(u32, u64)>,
     dels_s: BTreeSet<(u32, u64)>,
+    /// Distinct subjects gained less those lost since the base.
+    pairs: i64,
 }
 
 impl OutDelta {
@@ -147,6 +171,8 @@ struct RelState {
     untomb: FxHashSet<(u32, u64)>,
     /// Non-TID rkeys added since the snapshot.
     side: FxHashMap<(u32, u64), Box<str>>,
+    /// Stamps set since the snapshot: (time, source, kept in the next checkpoint).
+    stamp: FxHashMap<(u32, u64), (i64, u32, bool)>,
 }
 
 /// What a snapshot holds that the graph reads as its base, shared by every
@@ -160,6 +186,8 @@ struct Base {
     any_status: bool,
     /// Per relation, the shard files' tombstones: a lookup on every add.
     tombs: Vec<FxHashMap<(u32, u64), i64>>,
+    /// Per relation, the shard files' stamps: (time, source).
+    stamps: Vec<FxHashMap<(u32, u64), (i64, u32)>>,
 }
 
 #[derive(Clone)]
@@ -200,6 +228,8 @@ pub struct Graph {
     obs: Arc<obs::Metrics>,
     /// Applies without metrics: the second copy of a write.
     pub quiet: bool,
+    /// The source of the ops being applied (`set_source`).
+    source: u32,
 }
 
 impl Graph {
@@ -225,6 +255,7 @@ impl Graph {
             merge_ratio: 0.125,
             obs: Arc::new(obs::Metrics::new(&names)),
             quiet: false,
+            source: source_id(""),
         }
     }
 
@@ -250,6 +281,7 @@ impl Graph {
         let mut live: Vec<(u32, Vec<DidKey>)> = Vec::new();
         let mut bits: Vec<(u32, bool)> = Vec::new();
         let mut tombs: Vec<FxHashMap<(u32, u64), i64>> = vec![FxHashMap::default(); g.rels.len()];
+        let mut stamps: Vec<FxHashMap<(u32, u64), (i64, u32)>> = vec![FxHashMap::default(); g.rels.len()];
         for f in &store.shards {
             let Some(f) = f else { continue };
             for (i, st) in f.meta.stats.iter().enumerate().take(g.rels.len()) {
@@ -269,6 +301,11 @@ impl Graph {
                     m.insert((a, k), t);
                 });
             }
+            for (i, m) in stamps.iter_mut().enumerate() {
+                decode_stamps(&f.bytes()[f.rels[i].stamp.clone()], |a, k, t, src| {
+                    m.insert((a, k), (t, src));
+                });
+            }
         }
         live.sort_unstable_by_key(|l| l.0);
         for (lo, v) in live {
@@ -286,7 +323,7 @@ impl Graph {
             }
         }
         let any_status = status_bits.iter().any(|&w| w != 0);
-        g.base = Some(Arc::new(Base { store, status_bits, any_status, tombs }));
+        g.base = Some(Arc::new(Base { store, status_bits, any_status, tombs, stamps }));
         Ok(g)
     }
 
@@ -356,8 +393,9 @@ impl Graph {
         Some((f, &f.rels[rel as usize], id - f.meta.lo, (f.meta.hi - f.meta.lo) as usize))
     }
 
+    /// A DID's id, or a node's (a list) by its AT URI.
     pub fn id_of(&self, did: &str) -> Option<u32> {
-        let r = classify(did)?;
+        let r = node_ref(did)?;
         self.id_of_ref(r)
     }
 
@@ -395,6 +433,29 @@ impl Graph {
         Ok(self.push_did(r.to_key()))
     }
 
+    /// A list node: interned by its AT URI, after the DIDs it shares ids with.
+    fn intern_node(&mut self, uri: &str) -> Result<u32> {
+        let Some(r) = node_ref(uri).filter(|_| uri.starts_with("at://")) else { bail!("{uri:?} isn't a record URI") };
+        if let Some(id) = self.id_of_ref(r) {
+            return Ok(id);
+        }
+        if self.n_ids() == u32::MAX {
+            bail!("directory full");
+        }
+        Ok(self.push_did(r.to_key()))
+    }
+
+    /// The DID whose repo holds `rel`'s records keyed by `actor`: the
+    /// actor, or a list node's owner.
+    pub fn record_did(&self, rel: RelId, actor: u32) -> Option<String> {
+        let d = self.did_of(actor)?;
+        if self.rels.is_list(rel) {
+            return parse_uri(&d).map(|x| x.0.to_string());
+        }
+        Some(d)
+    }
+
+    /// A DID, or a list node's AT URI.
     pub fn did_of(&self, id: u32) -> Option<String> {
         if id < self.base_n {
             return Some(match self.base_dir()?.get(id)? {
@@ -447,8 +508,14 @@ impl Graph {
         !self.status.is_empty() || self.base.as_ref().is_some_and(|b| b.any_status)
     }
 
-    /// Hidden from reads: deleted or taken down.
+    /// Hidden from reads: deleted or taken down, or a list whose owner is.
     pub fn hidden(&self, did: &str) -> bool {
+        if !self.any_status() {
+            return false;
+        }
+        if did.starts_with("at://") {
+            return parse_uri(did).is_some_and(|(owner, _, _)| self.status_of(owner).is_some());
+        }
         self.status_of(did).is_some()
     }
 
@@ -463,8 +530,18 @@ impl Graph {
         let mut removed = 0;
         if status == Some(Status::Deleted) {
             for rel in 0..self.rels.len() as RelId {
+                // a list relation's logs are by list: its records go through its companion
+                if self.rels.is_list(rel) {
+                    continue;
+                }
+                let list_rel = self.rels.list_rel(rel);
                 for (k, _) in self.out_all(rel, a) {
-                    if self.delete_id(rel, a, k, time_us).is_some() {
+                    // an account's deletion takes every record, whenever it was stamped
+                    let gone = match list_rel {
+                        Some(p) => self.delete_key_(p, a, k, time_us, true),
+                        None => self.delete_id_(rel, a, k, time_us, true),
+                    };
+                    if gone.is_some() {
                         removed += 1;
                     }
                 }
@@ -536,6 +613,42 @@ impl Graph {
         }
     }
 
+    /// When `actor`'s record `key` last changed, if that's known: since the
+    /// snapshot for any change, from it for a replace or a re-create.
+    pub fn stamp(&self, rel: RelId, actor: u32, key: u64) -> Option<i64> {
+        self.stamp_src(rel, actor, key).map(|s| s.0)
+    }
+
+    fn stamp_src(&self, rel: RelId, actor: u32, key: u64) -> Option<(i64, u32)> {
+        let st = &self.state[rel as usize];
+        if !st.stamp.is_empty() {
+            if let Some(&(t, src, _)) = st.stamp.get(&(actor, key)) {
+                return Some((t, src));
+            }
+        }
+        self.base.as_ref()?.stamps[rel as usize].get(&(actor, key)).copied()
+    }
+
+    /// The source the next ops come from: a stamp only holds against others.
+    pub fn set_source(&mut self, name: &str) {
+        self.source = source_id(name);
+    }
+
+    /// An op at `time_us` from another source than the key's last change, and
+    /// older than it. An op with no time (0) can't be ordered, so it never is.
+    fn stale(&self, rel: RelId, actor: u32, key: u64, time_us: i64) -> bool {
+        time_us != 0 && self.stamp_src(rel, actor, key).is_some_and(|(s, src)| src != self.source && time_us < s)
+    }
+
+    fn set_stamp(&mut self, rel: RelId, actor: u32, key: u64, time_us: i64, keep: bool) {
+        let base = self.base.as_ref().and_then(|b| b.stamps[rel as usize].get(&(actor, key)).copied());
+        let src = self.source;
+        let e = self.state[rel as usize].stamp.entry((actor, key)).or_insert((i64::MIN, src, base.is_some()));
+        e.0 = e.0.max(time_us).max(base.map_or(i64::MIN, |b| b.0));
+        e.1 = src;
+        e.2 |= keep;
+    }
+
     /// Tombstones per relation: the snapshot's, plus those set since, less
     /// those cleared since.
     pub fn tombstones(&self, rel: RelId) -> usize {
@@ -599,7 +712,7 @@ impl Graph {
     pub fn uri(&self, rel: RelId, actor: u32, key: u64) -> Option<String> {
         Some(format!(
             "at://{}/{}/{}",
-            self.did_of(actor)?,
+            self.record_did(rel, actor)?,
             self.rels.get(rel).collection,
             self.rkey_string(rel, actor, key)?
         ))
@@ -675,6 +788,37 @@ impl Graph {
             });
         }
         best
+    }
+
+    /// Distinct subjects of `actor`'s live records: a list's members.
+    pub fn out_distinct(&self, rel: RelId, actor: u32) -> u64 {
+        let base = self.base_out(rel, actor).map_or(0, |l| l.distinct()) as i64;
+        let d = self.state[rel as usize].out.get(&actor).map_or(0, |d| d.pairs);
+        (base + d).max(0) as u64
+    }
+
+    /// The oldest live record of `actor` naming `subject`: the one a list
+    /// keeps for a member, as the appview does.
+    pub fn out_first_subject(&self, rel: RelId, actor: u32, subject: u32) -> Option<u64> {
+        let d = self.state[rel as usize].out.get(&actor);
+        let added = d.and_then(|d| d.adds_naming(subject).next());
+        let mut base = None;
+        if let Some(l) = self.base_out(rel, actor) {
+            let dels = d.filter(|d| d.dels_name(subject)).map(|d| &d.dels);
+            // positions are rkey order, so the first live one is the oldest
+            l.for_subject_asc(subject, |p| {
+                let k = l.key_at(p);
+                if dels.is_some_and(|m| m.contains_key(&k)) {
+                    return true;
+                }
+                base = Some(k);
+                false
+            });
+        }
+        match (added, base) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     pub fn out_count(&self, rel: RelId, actor: u32) -> u64 {
@@ -809,12 +953,21 @@ impl Graph {
 
     // ------------------------------------------------------------ reads
 
-    /// The newest record of `from` naming `to`, as (actor, key).
+    /// The newest record of `from` naming `to`; for a list relation the
+    /// member's oldest, the one its distinct page keeps.
     pub fn has_id(&self, rel: RelId, from: u32, to: u32) -> Option<u64> {
         if !self.in_contains(rel, to, from) {
             return None;
         }
-        self.out_find_subject(rel, from, to)
+        self.pair_key(rel, from, to)
+    }
+
+    fn pair_key(&self, rel: RelId, from: u32, to: u32) -> Option<u64> {
+        if self.rels.is_list(rel) {
+            self.out_first_subject(rel, from, to)
+        } else {
+            self.out_find_subject(rel, from, to)
+        }
     }
 
     pub fn has(&self, rel: RelId, from: &str, to: &str) -> Option<String> {
@@ -842,10 +995,11 @@ impl Graph {
         for (ri, &rel) in rels.iter().enumerate() {
             per.iter_mut().for_each(|p| *p = (None, None));
             for o in self.in_intersect(rel, actor, &probes, usize::MAX) {
-                per[at(o)].1 = self.out_find_subject(rel, o, actor);
+                per[at(o)].1 = self.pair_key(rel, o, actor);
             }
-            let scan =
-                self.out_count(rel, actor) <= RELATIONSHIPS_SCAN && !self.state[rel as usize].out.contains_key(&actor);
+            let scan = self.out_count(rel, actor) <= RELATIONSHIPS_SCAN
+                && !self.state[rel as usize].out.contains_key(&actor)
+                && !self.rels.is_list(rel);
             match self.base_out(rel, actor) {
                 Some(l) if scan => l.for_each_desc(None, |k, s| {
                     if let Ok(i) = probes.binary_search(&s) {
@@ -891,16 +1045,53 @@ impl Graph {
         out
     }
 
+    /// Like `out_page`, keeping only each subject's oldest record, so a
+    /// member stays put under a cursor when a newer repeat arrives.
+    pub fn out_page_distinct(&self, rel: RelId, actor: u32, limit: usize, before: Option<u64>) -> Vec<(u64, u32)> {
+        let n = self.out_count(rel, actor);
+        // short lists, and lists mostly of repeats (640k records for 119
+        // members), in one pass: every member's oldest record
+        if n <= 4096 || self.out_distinct(rel, actor) * 2 < n {
+            let mut seen = FxHashSet::default();
+            let mut firsts: Vec<(u64, u32)> =
+                self.out_all(rel, actor).into_iter().filter(|&(_, s)| seen.insert(s)).collect();
+            firsts.retain(|&(k, _)| before.is_none_or(|b| k < b));
+            firsts.sort_unstable_by_key(|f| std::cmp::Reverse(f.0));
+            firsts.truncate(limit);
+            return firsts;
+        }
+        let mut out = Vec::with_capacity(limit.min(1024));
+        let mut before = before;
+        let chunk = limit.clamp(64, 4096);
+        loop {
+            let page = self.out_page(rel, actor, chunk, before);
+            for &(k, s) in &page {
+                if self.out_first_subject(rel, actor, s) == Some(k) {
+                    out.push((k, s));
+                    if out.len() == limit {
+                        return out;
+                    }
+                }
+            }
+            if page.len() < chunk {
+                return out;
+            }
+            before = page.last().map(|p| p.0);
+        }
+    }
+
     fn out_list_(
         &self,
         rel: RelId,
         actor: &str,
         limit: usize,
         cursor: Option<&str>,
+        distinct: bool,
     ) -> (Vec<(String, String)>, Option<String>) {
         let Some(a) = self.id_of(actor) else { return (Vec::new(), None) };
         let before = cursor.map(|c| key_of(c).0);
-        let page = self.out_page(rel, a, limit, before);
+        let page =
+            if distinct { self.out_page_distinct(rel, a, limit, before) } else { self.out_page(rel, a, limit, before) };
         let next = (page.len() == limit).then(|| page.last().and_then(|&(k, _)| self.rkey_string(rel, a, k))).flatten();
         let items = page.into_iter().filter_map(|(k, s)| Some((self.uri(rel, a, k)?, self.did_of(s)?))).collect();
         (items, next)
@@ -924,9 +1115,11 @@ impl Graph {
         self.id_of(actor).map_or((0, 0), |a| (self.out_count(rel, a), self.in_count(rel, a)))
     }
 
+    /// A side's members: an out side counts subjects, not records (one list
+    /// holds 640k records for 119 members).
     fn side_len(&self, s: ListRef) -> u64 {
         match s.dir {
-            Dir::Out => self.out_count(s.rel, s.actor),
+            Dir::Out => self.out_distinct(s.rel, s.actor),
             Dir::In => self.in_count(s.rel, s.actor),
         }
     }
@@ -938,21 +1131,82 @@ impl Graph {
         }
     }
 
-    fn intersect_(&self, a: ListRef, b: ListRef, limit: usize) -> Vec<u32> {
-        let (small, big) = if self.side_len(a) <= self.side_len(b) { (a, b) } else { (b, a) };
-        let probes = self.side_set(small);
-        match big.dir {
-            Dir::In => self.in_intersect(big.rel, big.actor, &probes, limit),
+    /// Whether `x` is in a side. An out side asks x's in set, so it never
+    /// decodes the side's list.
+    pub fn side_contains(&self, s: ListRef, x: u32) -> bool {
+        match s.dir {
+            Dir::Out => self.in_contains(s.rel, x, s.actor),
+            Dir::In => self.in_contains(s.rel, s.actor, x),
+        }
+    }
+
+    /// The members of sorted `probes` in side `s`, up to `limit`.
+    fn side_intersect(&self, s: ListRef, probes: &[u32], limit: usize) -> Vec<u32> {
+        match s.dir {
+            Dir::In => self.in_intersect(s.rel, s.actor, probes, limit),
+            Dir::Out if self.side_len(s) > probes.len() as u64 * PROBE_RATIO => {
+                probes.iter().copied().filter(|&x| self.side_contains(s, x)).take(limit).collect()
+            }
             Dir::Out => {
-                let other = self.side_set(big);
+                let other = self.side_set(s);
                 let mut out = Vec::new();
-                inset::merge_intersect(&probes, &other, limit, &mut out);
+                inset::merge_intersect(probes, &other, limit, &mut out);
                 out
             }
         }
     }
 
-    fn filter_id_(&self, viewer: u32, actors: &[u32], drop: &[(RelId, Dir)]) -> Vec<u32> {
+    fn intersect_(&self, a: ListRef, b: ListRef, limit: usize) -> Vec<u32> {
+        self.combine_(a, b, SetOp::And, limit, None)
+    }
+
+    fn combine_(&self, a: ListRef, b: ListRef, op: SetOp, limit: usize, after: Option<u32>) -> Vec<u32> {
+        let after_of = |mut v: Vec<u32>| {
+            if let Some(x) = after {
+                v.drain(..v.partition_point(|&y| y <= x));
+            }
+            v
+        };
+        match op {
+            SetOp::And => {
+                let (small, big) = if self.side_len(a) <= self.side_len(b) { (a, b) } else { (b, a) };
+                let probes = after_of(self.side_set(small));
+                self.side_intersect(big, &probes, limit)
+            }
+            SetOp::AndNot => {
+                let left = after_of(self.side_set(a));
+                let mut out = Vec::with_capacity(limit.min(left.len()));
+                // b decoded at most once; an in set or a much bigger out side is probed instead
+                let probe = b.dir == Dir::In || self.side_len(b) > left.len() as u64 * PROBE_RATIO;
+                let whole = if probe { Vec::new() } else { self.side_set(b) };
+                // in chunks, so a short page off a long left side stops early
+                for part in left.chunks(limit.max(256)) {
+                    let hit = if probe {
+                        self.side_intersect(b, part, usize::MAX)
+                    } else {
+                        let mut v = Vec::new();
+                        inset::merge_intersect(part, &whole, usize::MAX, &mut v);
+                        v
+                    };
+                    let mut j = 0;
+                    for &x in part {
+                        while j < hit.len() && hit[j] < x {
+                            j += 1;
+                        }
+                        if hit.get(j) != Some(&x) {
+                            out.push(x);
+                            if out.len() == limit {
+                                return out;
+                            }
+                        }
+                    }
+                }
+                out
+            }
+        }
+    }
+
+    fn filter_id_(&self, viewer: u32, actors: &[u32], drop: &[(RelId, Dir)], sets: &[ListRef]) -> Vec<u32> {
         let outs: Vec<Vec<u32>> =
             drop.iter().map(|&(r, d)| if d == Dir::Out { self.out_set(r, viewer) } else { Vec::new() }).collect();
         actors
@@ -962,7 +1216,7 @@ impl Graph {
                 !drop.iter().zip(&outs).any(|(&(r, d), set)| match d {
                     Dir::Out => set.binary_search(&x).is_ok(),
                     Dir::In => self.in_contains(r, viewer, x),
-                })
+                }) && !sets.iter().any(|&s| self.side_contains(s, x))
             })
             .collect()
     }
@@ -978,8 +1232,21 @@ impl Graph {
         limit: usize,
         cursor: Option<&str>,
     ) -> (Vec<(String, String)>, Option<String>) {
+        self.out_list_opts(rel, actor, limit, cursor, false)
+    }
+
+    /// `out_list`; `distinct` keeps each subject's newest record only (a
+    /// list's members, where 7.5% of records repeat one).
+    pub fn out_list_opts(
+        &self,
+        rel: RelId,
+        actor: &str,
+        limit: usize,
+        cursor: Option<&str>,
+        distinct: bool,
+    ) -> (Vec<(String, String)>, Option<String>) {
         let g = self.obs.op(Op::OutList, rel as usize, limit);
-        let r = self.out_list_(rel, actor, limit, cursor);
+        let r = self.out_list_(rel, actor, limit, cursor, distinct);
         self.obs.done(g, r.0.len());
         r
     }
@@ -1017,11 +1284,25 @@ impl Graph {
         r
     }
 
+    /// `a` and `b` (or `a` without `b`), ids above `after`, ascending.
+    pub fn combine(&self, a: ListRef, b: ListRef, op: SetOp, limit: usize, after: Option<u32>) -> Vec<u32> {
+        let rel = if a.rel == b.rel { a.rel as usize } else { self.obs.multi() };
+        let g = self.obs.op(Op::Intersect, rel, limit);
+        let r = self.combine_(a, b, op, limit, after);
+        self.obs.done(g, r.len());
+        r
+    }
+
     /// `actors` without those any of `drop` hits: (rel, Out) drops the
     /// viewer's subjects, (rel, In) drops those naming the viewer.
     pub fn filter_id(&self, viewer: u32, actors: &[u32], drop: &[(RelId, Dir)]) -> Vec<u32> {
+        self.filter_sets(viewer, actors, drop, &[])
+    }
+
+    /// `filter_id`, also dropping the members of any of `sets`.
+    pub fn filter_sets(&self, viewer: u32, actors: &[u32], drop: &[(RelId, Dir)], sets: &[ListRef]) -> Vec<u32> {
         let g = self.obs.op(Op::Filter, self.obs.multi(), actors.len());
-        let r = self.filter_id_(viewer, actors, drop);
+        let r = self.filter_id_(viewer, actors, drop, sets);
         self.obs.done(g, r.len());
         r
     }
@@ -1038,8 +1319,15 @@ impl Graph {
 
     /// Adds a record its source saw at `time_us`.
     pub fn add_at(&mut self, uri: &str, subject: &str, time_us: i64) -> Result<Added> {
+        self.add_rec(uri, subject, None, time_us)
+    }
+
+    /// Adds a record; `list` is the record's list, which a list relation
+    /// needs. A create or update of a key holding another subject (or list)
+    /// replaces it, so a source's ops applied in order end where its repo does.
+    pub fn add_rec(&mut self, uri: &str, subject: &str, list: Option<&str>, time_us: i64) -> Result<Added> {
         let g = (!self.quiet).then(|| self.obs.op(Op::Add, self.obs.multi(), 1));
-        let r = self.add_(uri, subject, time_us);
+        let r = self.add_(uri, subject, list, time_us);
         if let Some(g) = g {
             if let Ok((rel, a)) = &r {
                 let o = match a {
@@ -1106,40 +1394,105 @@ impl Graph {
 
     // ------------------------------------------------------------ writes
 
-    fn add_(&mut self, uri: &str, subject: &str, time_us: i64) -> Result<(RelId, Added)> {
+    fn add_(&mut self, uri: &str, subject: &str, list: Option<&str>, time_us: i64) -> Result<(RelId, Added)> {
         let Some((did, coll, rkey_s)) = parse_uri(uri) else { bail!("{uri:?} isn't a record URI") };
         let Some(rel) = self.rels.by_collection(coll) else { bail!("no relation for {coll}") };
+        let owner = self.rels.owner_rel(rel);
+        let list = match (owner, list) {
+            (None, _) => None,
+            (Some(_), None) => bail!("{coll} records name their list"),
+            (Some(_), Some(l)) => match parse_uri(l) {
+                Some((o, _, _)) if o == did => Some(l),
+                Some(_) => bail!("{l} isn't in {did}'s repo"),
+                None => bail!("{l:?} isn't a record URI"),
+            },
+        };
         let a = self.intern(did)?;
         let s = self.intern(subject)?;
+        let l = list.map(|l| self.intern_node(l)).transpose()?;
         let (key, side) = key_of(rkey_s);
+        let rec = owner.unwrap_or(rel);
         if side {
-            if let Some(have) = self.rkey_string(rel, a, key) {
+            if let Some(have) = self.rkey_string(rec, a, key) {
                 if have != rkey_s {
                     bail!("rkeys {have:?} and {rkey_s:?} of {did} hash alike");
                 }
             }
         }
-        let r = self.add_id(rel, a, key, s, time_us);
+        // older than the key's last change: a second source replaying the past
+        if self.tombstone(rec, a, key).is_none_or(|t| time_us >= t) && self.stale(rec, a, key, time_us) {
+            return Ok((rel, Added::Exists));
+        }
+        let mut replaced = false;
+        // a create or update of a record holding something else replaces it
+        if self.tombstone(rec, a, key).is_none_or(|t| time_us >= t) {
+            let held = self.out_get(rec, a, key);
+            let member = match (l, held) {
+                (Some(_), Some(hl)) => self.out_get(rel, hl, key),
+                _ => held,
+            };
+            let same = match l {
+                None => held == Some(s),
+                Some(l) => held == Some(l) && member == Some(s),
+            };
+            if held.is_some() && !same {
+                self.remove_id(rec, a, key);
+                if let (Some(_), Some(hl)) = (l, held) {
+                    self.remove_id(rel, hl, key);
+                }
+                replaced = true;
+            }
+        }
+        let r = match l {
+            None => self.add_id(rel, a, key, s, time_us),
+            Some(l) => {
+                let r = self.add_id(rec, a, key, l, time_us);
+                if r == Added::Added && self.out_get(rel, l, key).is_none() {
+                    self.put_id(rel, l, key, s);
+                }
+                r
+            }
+        };
+        if replaced {
+            self.set_stamp(rec, a, key, time_us, true);
+        }
         if side && r == Added::Added {
-            self.state[rel as usize].side.insert((a, key), rkey_s.into());
+            self.state[rec as usize].side.insert((a, key), rkey_s.into());
+            if let Some(l) = l {
+                self.state[rel as usize].side.insert((l, key), rkey_s.into());
+            }
         }
         Ok((rel, r))
     }
 
     pub fn add_id(&mut self, rel: RelId, actor: u32, key: u64, subject: u32, time_us: i64) -> Added {
+        let mut recreated = false;
         if let Some(t) = self.tombstone(rel, actor, key) {
             if time_us < t {
                 return Added::Deleted;
             }
             self.clear_tomb(rel, actor, key);
+            recreated = true;
+        }
+        if self.stale(rel, actor, key, time_us) {
+            return Added::Exists;
         }
         if self.out_get(rel, actor, key).is_some() {
             return Added::Exists;
         }
+        self.set_stamp(rel, actor, key, time_us, recreated);
+        self.put_id(rel, actor, key, subject)
+    }
+
+    /// The edge alone, no tombstone or stamp: a list relation's, whose
+    /// record is its companion's.
+    fn put_id(&mut self, rel: RelId, actor: u32, key: u64, subject: u32) -> Added {
         let pair = self.in_contains(rel, subject, actor);
         let st = &mut self.state[rel as usize];
-        st.out.entry(actor).or_default().add(key, subject);
+        let od = st.out.entry(actor).or_default();
+        od.add(key, subject);
         if !pair {
+            od.pairs += 1;
             let d = st.inn.entry(subject).or_default();
             if !d.dels.remove(&actor) {
                 d.adds.insert(actor);
@@ -1158,17 +1511,47 @@ impl Graph {
         let (key, _) = key_of(rkey_s);
         Ok((
             rel,
-            match self.delete_id(rel, a, key, time_us) {
+            match self.delete_key(rel, a, key, time_us) {
                 Some(s) => Removed::Subject(self.did_of(s).unwrap_or_default()),
                 None => Removed::NotFound,
             },
         ))
     }
 
+    /// Removes `actor`'s record `key` in `rel` as a configured relation
+    /// sees it: a list relation's record by its owner, through the companion.
+    /// Returns the subject.
+    pub fn delete_key(&mut self, rel: RelId, actor: u32, key: u64, time_us: i64) -> Option<u32> {
+        self.delete_key_(rel, actor, key, time_us, false)
+    }
+
+    fn delete_key_(&mut self, rel: RelId, actor: u32, key: u64, time_us: i64, force: bool) -> Option<u32> {
+        match self.rels.owner_rel(rel) {
+            None => self.delete_id_(rel, actor, key, time_us, force),
+            Some(o) => {
+                let l = self.delete_id_(o, actor, key, time_us, force)?;
+                self.remove_id(rel, l, key)
+            }
+        }
+    }
+
     /// Removes `actor`'s record `key`, returning its subject, and leaves a
     /// tombstone at `time_us` either way.
     pub fn delete_id(&mut self, rel: RelId, actor: u32, key: u64, time_us: i64) -> Option<u32> {
+        self.delete_id_(rel, actor, key, time_us, false)
+    }
+
+    fn delete_id_(&mut self, rel: RelId, actor: u32, key: u64, time_us: i64, force: bool) -> Option<u32> {
+        // a record another source changed after the delete is a newer one:
+        // a second source's late delete, or a record that wasn't an edge, leaves it
+        if !force && self.stale(rel, actor, key, time_us) && self.out_get(rel, actor, key).is_some() {
+            return None;
+        }
         self.set_tomb(rel, actor, key, time_us);
+        self.remove_id(rel, actor, key)
+    }
+
+    fn remove_id(&mut self, rel: RelId, actor: u32, key: u64) -> Option<u32> {
         let in_adds = self.state[rel as usize].out.get(&actor).and_then(|d| d.adds.get(&key).copied());
         let (subject, others) = match in_adds {
             Some(s) => {
@@ -1199,6 +1582,7 @@ impl Graph {
         };
         self.records[rel as usize] -= 1;
         if !others {
+            self.state[rel as usize].out.entry(actor).or_default().pairs -= 1;
             let d = self.state[rel as usize].inn.entry(subject).or_default();
             if !d.adds.remove(&actor) {
                 d.dels.insert(actor);
@@ -1395,6 +1779,7 @@ impl Graph {
                 .chain(st.in_over.keys())
                 .for_each(|&id| mark(id));
             st.tomb.keys().chain(st.untomb.iter()).for_each(|&(a, _)| mark(a));
+            st.stamp.iter().filter(|(_, v)| v.2).for_each(|(&(a, _), _)| mark(a));
         }
         self.status.keys().for_each(|&id| mark(id));
         if let Some(s) = self.snapshot() {
@@ -1673,6 +2058,32 @@ impl Graph {
         tombs.sort_unstable();
         stats.tombstones = tombs.len() as u64;
         w.section(&rel_section(r, "tomb"), &encode_tombs(&tombs))?;
+
+        let mut stamps: Vec<(u32, u64, i64, u32)> = Vec::new();
+        let base_stamps = |f: &ShardFile, stamps: &mut Vec<(u32, u64, i64, u32)>| {
+            decode_stamps(&f.bytes()[f.rels[r].stamp.clone()], |a, key, t, src| {
+                if (lo..hi).contains(&a) && !st.stamp.contains_key(&(a, key)) {
+                    stamps.push((a, key, t, src));
+                }
+            });
+        };
+        match (old, self.snapshot()) {
+            (Some(f), _) => base_stamps(f, &mut stamps),
+            (None, Some(s)) => s.shards.iter().flatten().for_each(|f| base_stamps(f, &mut stamps)),
+            (None, None) => {}
+        }
+        stamps.extend(
+            st.stamp
+                .iter()
+                .filter(|((a, _), v)| v.2 && (lo..hi).contains(a))
+                .map(|(&(a, k), &(t, src, _))| (a, k, t, src)),
+        );
+        if self.tombstone_ttl_us > 0 {
+            let cutoff = now_ms() * 1000 - self.tombstone_ttl_us;
+            stamps.retain(|t| t.2 >= cutoff);
+        }
+        stamps.sort_unstable();
+        w.section(&rel_section(r, "stamp"), &encode_stamps(&stamps))?;
         Ok(stats)
     }
 
@@ -1687,6 +2098,19 @@ impl Graph {
 struct ShardBody {
     stats: Vec<RelStats>,
     statuses: u64,
+}
+
+/// A source's name as a stamp holds it.
+fn source_id(name: &str) -> u32 {
+    xxhash_rust::xxh3::xxh3_64(name.as_bytes()) as u32
+}
+
+/// A DID, or an AT URI as a node.
+fn node_ref(s: &str) -> Option<DidRef<'_>> {
+    if s.starts_with("at://") {
+        return parse_uri(s).map(|_| DidRef::Other(s));
+    }
+    classify(s)
 }
 
 /// Merges two lists already in `first`-order, up to `limit`.

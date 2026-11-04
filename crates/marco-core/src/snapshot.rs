@@ -38,7 +38,7 @@ use crate::relation::Relation;
 use crate::varint::{self, u32_at, u64_at};
 
 pub const MAGIC: &[u8; 8] = b"MARCOSN1";
-pub const FORMAT: u32 = 3;
+pub const FORMAT: u32 = 4;
 const ALIGN: u64 = 64;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -656,6 +656,24 @@ pub fn encode_tombs(entries: &[(u32, u64, i64)]) -> Vec<u8> {
 pub fn decode_tombs(b: &[u8], mut f: impl FnMut(u32, u64, i64)) {
     for c in b.as_chunks::<20>().0 {
         f(u32_at(c, 0), u64_at(c, 4), u64_at(c, 12) as i64);
+    }
+}
+
+/// Stamps: (actor, key, time, source), 24 bytes each.
+pub fn encode_stamps(entries: &[(u32, u64, i64, u32)]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(24 * entries.len());
+    for &(a, k, t, src) in entries {
+        out.extend_from_slice(&a.to_le_bytes());
+        out.extend_from_slice(&k.to_le_bytes());
+        out.extend_from_slice(&t.to_le_bytes());
+        out.extend_from_slice(&src.to_le_bytes());
+    }
+    out
+}
+
+pub fn decode_stamps(b: &[u8], mut f: impl FnMut(u32, u64, i64, u32)) {
+    for c in b.as_chunks::<24>().0 {
+        f(u32_at(c, 0), u64_at(c, 4), u64_at(c, 12) as i64, u32_at(c, 20));
     }
 }
 

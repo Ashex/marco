@@ -282,7 +282,7 @@ impl Gen {
                         .to_string();
                     let uri = format!("at://{a}/app.bsky.graph.follow/{rkey}");
                     self.made.push(uri.clone());
-                    Op::Add { uri, subject: b.clone(), time_us: 0 }
+                    Op::Add { uri, subject: b.clone(), list: None, time_us: 0 }
                 }
             })
             .collect()

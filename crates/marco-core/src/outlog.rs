@@ -2,6 +2,7 @@
 //!
 //! ```text
 //! varint n
+//! varint dups        n less the distinct subjects (records repeating a subject)
 //! nb > 1:            skip     nb x u64   first rkey of each block of 128
 //!                    offsets  nb x u32   block start, from the first block
 //! n >= subj_index:   bysubj   n x u32    positions sorted by (subject, position)
@@ -47,6 +48,7 @@ pub fn encode(edges: &[(u64, u32)], subj_index: usize, out: &mut Vec<u8>, bytes:
     debug_assert!(n > 0 && edges.windows(2).all(|w| w[0].0 < w[1].0));
     let at = out.len();
     varint::put(out, n as u64);
+    varint::put(out, (n - distinct(edges)) as u64);
     bytes.header += (out.len() - at) as u64;
     let nb = n.div_ceil(BLOCK);
     let offs_at = if nb > 1 {
@@ -89,10 +91,24 @@ pub fn encode(edges: &[(u64, u32)], subj_index: usize, out: &mut Vec<u8>, bytes:
     }
 }
 
+fn distinct(edges: &[(u64, u32)]) -> usize {
+    if edges.len() < 2 {
+        return edges.len();
+    }
+    let mut s: Vec<u32> = edges.iter().map(|e| e.1).collect();
+    s.sort_unstable();
+    s.dedup();
+    s.len()
+}
+
 /// An encoded list's record count and bytes by part, from its header.
 pub fn bytes_of(b: &[u8], subj_index: usize) -> (usize, OutBytes) {
     let mut pos = 0;
     let n = varint::get(b, &mut pos) as usize;
+    if n == 0 {
+        return (0, OutBytes { header: pos as u64, ..Default::default() });
+    }
+    let _dups = varint::get(b, &mut pos);
     let nb = n.div_ceil(BLOCK);
     let mut o = OutBytes { header: pos as u64, subjects: 4 * n as u64, ..Default::default() };
     if nb > 1 {
@@ -108,6 +124,7 @@ pub fn bytes_of(b: &[u8], subj_index: usize) -> (usize, OutBytes) {
 #[derive(Clone, Copy)]
 pub struct OutList<'a> {
     n: usize,
+    dups: usize,
     nb: usize,
     skip: &'a [u8],
     offs: &'a [u8],
@@ -119,6 +136,8 @@ impl<'a> OutList<'a> {
     pub fn parse(bytes: &'a [u8], subj_index: usize) -> OutList<'a> {
         let mut pos = 0;
         let n = varint::get(bytes, &mut pos) as usize;
+        // a list merged empty is the one byte n = 0
+        let dups = if n == 0 { 0 } else { (varint::get(bytes, &mut pos) as usize).min(n) };
         let nb = n.div_ceil(BLOCK);
         let (skip, offs) = if nb > 1 {
             let s = &bytes[pos..pos + 8 * nb];
@@ -133,11 +152,16 @@ impl<'a> OutList<'a> {
             pos += 4 * n;
             s
         });
-        OutList { n, nb, skip, offs, bysubj, blocks: &bytes[pos..] }
+        OutList { n, dups, nb, skip, offs, bysubj, blocks: &bytes[pos..] }
     }
 
     pub fn len(&self) -> usize {
         self.n
+    }
+
+    /// Distinct subjects.
+    pub fn distinct(&self) -> usize {
+        self.n - self.dups
     }
 
     pub fn is_empty(&self) -> bool {
@@ -249,6 +273,40 @@ impl<'a> OutList<'a> {
         }
     }
 
+    /// Positions of records naming `subject`, oldest first, until `f`
+    /// returns false: the subject's run in `bysubj` read forward, or the
+    /// blocks scanned from the first.
+    pub fn for_subject_asc(&self, subject: u32, mut f: impl FnMut(usize) -> bool) {
+        if let Some(idx) = self.bysubj {
+            let at = |i: usize| u32_at(idx, 4 * i) as usize;
+            let (mut lo, mut hi) = (0, self.n);
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                if self.subject(at(mid)) < subject {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            let mut i = lo;
+            while i < self.n && self.subject(at(i)) == subject {
+                if !f(at(i)) {
+                    return;
+                }
+                i += 1;
+            }
+            return;
+        }
+        for b in 0..self.nb {
+            let subj = self.block_subjects(b);
+            for i in 0..subj.len() / 4 {
+                if u32_at(subj, 4 * i) == subject && !f(b * BLOCK + i) {
+                    return;
+                }
+            }
+        }
+    }
+
     /// Records with rkey below `before` (all if None), newest first, until
     /// `f` returns false.
     pub fn for_each_desc(&self, before: Option<u64>, mut f: impl FnMut(u64, u32) -> bool) {
@@ -285,7 +343,16 @@ impl<'a> OutList<'a> {
 
     /// Distinct subjects, sorted.
     pub fn subjects_sorted(&self, out: &mut Vec<u32>) {
-        out.reserve(self.n);
+        out.reserve(self.n - self.dups);
+        if let Some(by) = self.bysubj {
+            for c in by.as_chunks::<4>().0 {
+                let s = self.subject(u32::from_le_bytes(*c) as usize);
+                if out.last() != Some(&s) {
+                    out.push(s);
+                }
+            }
+            return;
+        }
         for b in 0..self.nb {
             for c in self.block_subjects(b).as_chunks::<4>().0 {
                 out.push(u32::from_le_bytes(*c));
@@ -308,6 +375,13 @@ mod tests {
         assert_eq!(bytes_of(&enc, subj_index), (edges.len(), bytes));
         let l = OutList::parse(&enc, subj_index);
         assert_eq!(l.to_vec(), edges);
+        let mut want: Vec<u32> = edges.iter().map(|e| e.1).collect();
+        want.sort_unstable();
+        want.dedup();
+        assert_eq!(l.distinct(), want.len());
+        let mut got = Vec::new();
+        l.subjects_sorted(&mut got);
+        assert_eq!(got, want);
         for (i, &(k, s)) in edges.iter().enumerate() {
             assert_eq!(l.find_key(k), Some(i));
             assert_eq!(l.key_at(i), k);
@@ -320,6 +394,12 @@ mod tests {
             });
             let want: Vec<usize> = (0..edges.len()).rev().filter(|&p| edges[p].1 == s).collect();
             assert_eq!(got, want);
+            let mut asc = Vec::new();
+            l.for_subject_asc(s, |p| {
+                asc.push(p);
+                true
+            });
+            assert_eq!(asc, want.iter().rev().copied().collect::<Vec<_>>());
         }
         let cut = edges[edges.len() / 2].0;
         let mut desc = Vec::new();

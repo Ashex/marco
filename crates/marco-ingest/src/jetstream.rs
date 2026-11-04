@@ -9,7 +9,7 @@
 use marco_core::Relations;
 use serde::Deserialize;
 
-use crate::{account_change, edge_uri, valid_subject, Change, Event, Kind, Op};
+use crate::{account_change, edge_uri, list_of, valid_subject, Change, Event, Kind, Op};
 
 /// Jetstream's `time_us` is per instance and may repeat across events, so a
 /// resume starts this far back and replays the overlap.
@@ -46,7 +46,7 @@ pub fn subscribe_url(base: &str, rels: &Relations, cursor: Option<u64>) -> Strin
         u.push_str("/subscribe");
     }
     let mut sep = if u.contains('?') { '&' } else { '?' };
-    for r in &rels.list {
+    for r in rels.list.iter().filter(|r| r.owner_of.is_none()) {
         u.push(sep);
         u.push_str("wantedCollections=");
         u.push_str(&r.collection);
@@ -79,16 +79,21 @@ pub fn decode(line: &[u8], rels: &Relations) -> Result<Event, &'static str> {
                 return Ok(ev);
             };
             match c.operation.as_str() {
-                // An update is an add: it changes nothing for a record marco
-                // has (Exists), and a delete + add would turn an update of a
-                // record marco never saw into a tombstone.
+                // An update is an add, which replaces what the key held. A record
+                // that isn't an edge (a bad subject or list) leaves the key empty,
+                // as a delete, so the live graph ends where a rebuild does.
                 "create" | "update" => {
                     let subject = c.record.as_ref().and_then(|r| rels.get(rel).subject_of(r));
-                    match subject {
-                        Some(s) if valid_subject(s) => {
-                            ev.change = Change::Ops(vec![Op::Add { uri, subject: s.to_string(), time_us: ev.time_us }]);
+                    let list = c.record.as_ref().and_then(|r| rels.get(rel).list_of(r));
+                    match (subject, list_of(rels, rel, &uri, list)) {
+                        (Some(s), Ok(list)) if valid_subject(s) => {
+                            ev.change =
+                                Change::Ops(vec![Op::Add { uri, subject: s.to_string(), list, time_us: ev.time_us }]);
                         }
-                        _ => ev.skipped.push("bad_subject"),
+                        (_, list) => {
+                            ev.skipped.push(if list.is_err() { "bad_list" } else { "bad_subject" });
+                            ev.change = Change::Ops(vec![Op::Delete { uri, time_us: ev.time_us }]);
+                        }
                     }
                 }
                 "delete" => ev.change = Change::Ops(vec![Op::Delete { uri, time_us: ev.time_us }]),
@@ -120,11 +125,11 @@ mod tests {
         let r = Relations::bsky_default();
         assert_eq!(
             subscribe_url("wss://js.example", &r, Some(5)),
-            "wss://js.example/subscribe?wantedCollections=app.bsky.graph.follow&wantedCollections=app.bsky.graph.block&cursor=5"
+            "wss://js.example/subscribe?wantedCollections=app.bsky.graph.follow&wantedCollections=app.bsky.graph.block&wantedCollections=app.bsky.graph.listitem&cursor=5"
         );
         assert_eq!(
             subscribe_url("ws://127.0.0.1:9/subscribe?x=1", &r, None),
-            "ws://127.0.0.1:9/subscribe?x=1&wantedCollections=app.bsky.graph.follow&wantedCollections=app.bsky.graph.block"
+            "ws://127.0.0.1:9/subscribe?x=1&wantedCollections=app.bsky.graph.follow&wantedCollections=app.bsky.graph.block&wantedCollections=app.bsky.graph.listitem"
         );
     }
 
@@ -180,7 +185,11 @@ mod tests {
             &rels,
         )
         .unwrap();
-        assert_eq!((ev.change, ev.skipped), (Change::None, vec!["bad_subject"]));
+        let gone = Change::Ops(vec![Op::Delete {
+            uri: "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.graph.follow/3k".into(),
+            time_us: 7,
+        }]);
+        assert_eq!((ev.change, ev.skipped), (gone, vec!["bad_subject"]), "a record that isn't an edge empties its key");
         let ev = decode(
             br#"{"did":"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa","time_us":8,"kind":"commit","commit":{"operation":"create","collection":"app.bsky.feed.like","rkey":"3k","record":{}}}"#,
             &rels,

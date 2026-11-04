@@ -9,6 +9,7 @@
 //! record: 1 apply   source, cursor (varint-length strings), varint n, n ops
 //!         2 status  source, cursor, did, u8 status (0 active, 1 deleted, 2 takendown), varint time_us
 //! op:     1 add uri subject varint time_us | 2 delete uri varint time_us
+//!         | 3 add uri subject list varint time_us (a list relation's record)
 //! ```
 
 use std::collections::BTreeMap;
@@ -61,8 +62,17 @@ impl Status {
 /// firehose commit's time); 0 means when marco applies it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Op {
-    Add { uri: String, subject: String, time_us: i64 },
-    Delete { uri: String, time_us: i64 },
+    /// `list`: the record's list, for a list relation (listitem).
+    Add {
+        uri: String,
+        subject: String,
+        list: Option<String>,
+        time_us: i64,
+    },
+    Delete {
+        uri: String,
+        time_us: i64,
+    },
 }
 
 impl Op {
@@ -169,10 +179,13 @@ pub fn encode(h: &Header, records: &[Rec]) -> Result<Vec<u8>> {
                 varint::put(&mut out, ops.len() as u64);
                 for op in ops {
                     match op {
-                        Op::Add { uri, subject, time_us } => {
-                            out.push(1);
+                        Op::Add { uri, subject, list, time_us } => {
+                            out.push(if list.is_some() { 3 } else { 1 });
                             put_str(&mut out, uri);
                             put_str(&mut out, subject);
+                            if let Some(l) = list {
+                                put_str(&mut out, l);
+                            }
                             varint::put(&mut out, *time_us as u64);
                         }
                         Op::Delete { uri, time_us } => {
@@ -225,9 +238,10 @@ pub fn decode(b: &[u8]) -> Result<Segment> {
                     pos += 1;
                     let uri = get_str(body, &mut pos)?;
                     ops.push(match t {
-                        1 => {
+                        1 | 3 => {
                             let subject = get_str(body, &mut pos)?;
-                            Op::Add { uri, subject, time_us: get_varint(body, &mut pos)? as i64 }
+                            let list = if t == 3 { Some(get_str(body, &mut pos)?) } else { None };
+                            Op::Add { uri, subject, list, time_us: get_varint(body, &mut pos)? as i64 }
                         }
                         2 => Op::Delete { uri, time_us: get_varint(body, &mut pos)? as i64 },
                         _ => bail!("bad op tag {t}"),
@@ -275,7 +289,14 @@ mod tests {
                     Op::Add {
                         uri: "at://did:plc:a/app.bsky.graph.follow/3lab2xyz7qk2c".into(),
                         subject: "did:plc:b".into(),
+                        list: None,
                         time_us: 1_730_000_000_000_000,
+                    },
+                    Op::Add {
+                        uri: "at://did:plc:a/app.bsky.graph.listitem/3lab2xyz7qk2d".into(),
+                        subject: "did:plc:b".into(),
+                        list: Some("at://did:plc:a/app.bsky.graph.list/3lab2xyz7qk2e".into()),
+                        time_us: 5,
                     },
                     Op::Delete { uri: "at://did:plc:a/app.bsky.graph.block/x".into(), time_us: 7 },
                 ],
@@ -289,7 +310,7 @@ mod tests {
                 time_us: 9,
             },
         ];
-        let h = Header { segment: 7, build: 9, records: 3, ops: 3, ..Default::default() };
+        let h = Header { segment: 7, build: 9, records: 3, ops: 4, ..Default::default() };
         let mut b = encode(&h, &recs).unwrap();
         let s = decode(&b).unwrap();
         assert_eq!(s.header, h);

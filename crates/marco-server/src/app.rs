@@ -121,7 +121,7 @@ impl Outcome {
 /// Applies one op.
 pub fn apply_op(g: &mut Graph, op: &Op) -> Outcome {
     match op {
-        Op::Add { uri, subject, time_us } => match g.add_at(uri, subject, *time_us) {
+        Op::Add { uri, subject, list, time_us } => match g.add_rec(uri, subject, list.as_deref(), *time_us) {
             Ok(Added::Added) => Outcome::Added,
             Ok(Added::Exists) => Outcome::Exists,
             Ok(Added::Deleted) => Outcome::Deleted,
@@ -144,7 +144,11 @@ pub enum Applied {
 /// a checkpoint's replay all go through here, so they agree.
 pub fn apply_rec(g: &mut Graph, rec: &Rec) -> Applied {
     match rec {
-        Rec::Apply { ops, .. } => Applied::Ops(ops.iter().map(|op| apply_op(g, op)).collect()),
+        Rec::Apply { source, ops, .. } => {
+            // a stamp holds only against other sources: the record's own source applies in order
+            g.set_source(source);
+            Applied::Ops(ops.iter().map(|op| apply_op(g, op)).collect())
+        }
         Rec::Status { did, status, time_us, .. } => {
             Applied::Status(g.set_status(did, *status, *time_us).map_err(|e| e.to_string()))
         }
@@ -429,12 +433,19 @@ impl App {
                 Op::Add { uri, .. } | Op::Delete { uri, .. } => uri,
             };
             let Some((_, coll, _)) = parse_uri(uri) else { return Err(format!("op {i}: {uri:?} isn't a record URI")) };
-            if g.relations().by_collection(coll).is_none() {
+            let Some(rel) = g.relations().by_collection(coll) else {
                 return Err(format!("op {i}: no relation for {coll}"));
-            }
-            if let Op::Add { subject, .. } = op {
+            };
+            if let Op::Add { subject, list, .. } = op {
                 if classify(subject).is_none() {
                     return Err(format!("op {i}: subject {subject:?} isn't a DID"));
+                }
+                if g.relations().is_list(rel) {
+                    let owner = parse_uri(uri).map(|x| x.0);
+                    match list.as_deref().and_then(parse_uri) {
+                        Some((o, _, _)) if Some(o) == owner => {}
+                        _ => return Err(format!("op {i}: {coll} needs a list in the record's own repo")),
+                    }
                 }
             }
         }

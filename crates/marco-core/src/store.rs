@@ -99,6 +99,8 @@ pub struct RelRanges {
     pub in_idx: Range<usize>,
     pub side: Range<usize>,
     pub tomb: Range<usize>,
+    /// Records replaced or re-created after a delete: (actor, key, time).
+    pub stamp: Range<usize>,
 }
 
 pub struct DirFile {
@@ -138,7 +140,11 @@ impl ShardFile {
         let meta: ShardMeta =
             serde_json::from_value(snap.meta.clone()).with_context(|| format!("{} meta", p.display()))?;
         let k = meta.shard as u64;
-        if snap.kind != "shard" || meta.build != d.build || meta.lo as u64 != k * d.shard_width as u64 {
+        // a fresh write clamps empty shards' ranges to the directory's ids;
+        // checkpoints write shards for live ids past them
+        let lo = k * d.shard_width as u64;
+        let lo_ok = meta.lo as u64 == lo || meta.lo as u64 == lo.min(d.n_ids as u64);
+        if snap.kind != "shard" || meta.build != d.build || !lo_ok {
             bail!("{} isn't a shard of this snapshot", p.display());
         }
         let rels = (0..d.relations.len())
@@ -151,6 +157,7 @@ impl ShardFile {
                     in_idx: r("in.idx"),
                     side: r("side"),
                     tomb: r("tomb"),
+                    stamp: r("stamp"),
                 }
             })
             .collect();

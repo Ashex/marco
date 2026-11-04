@@ -20,12 +20,23 @@ pub fn write(snapshot: &Path, out: &Path, events: u32, seed: u64, writes_after_d
     let n = g.n_ids();
     anyhow::ensure!(n > 2, "the snapshot has {n} DIDs");
     let mut rng = Rng(seed.max(1));
-    let colls: Vec<String> = g.relations().list.iter().map(|r| r.collection.clone()).collect();
-    let did = |rng: &mut Rng| g.did_of(rng.below(n as u64) as u32).unwrap_or_default();
+    let rels = g.relations();
+    let colls: Vec<String> = rels.actor_rels().iter().map(|&r| rels.get(r).collection.clone()).collect();
+    let list_coll = rels.user().into_iter().find(|&r| rels.is_list(r)).map(|r| rels.get(r).collection.clone());
+    // relations keyed by actor: the records a delete can name
+    let rec_rels: Vec<RelId> =
+        rels.actor_rels().into_iter().chain((0..rels.len() as RelId).filter(|&r| rels.is_owner(r))).collect();
+    // ids past the DIDs can be list nodes
+    let did = |rng: &mut Rng| loop {
+        let d = g.did_of(rng.below(n as u64) as u32).unwrap_or_default();
+        if !d.starts_with("at://") {
+            return d;
+        }
+    };
     let snapshot_uri = |rng: &mut Rng| -> Option<(String, String)> {
         for _ in 0..20 {
             let a = rng.below(n as u64) as u32;
-            let rel = rng.below(colls.len() as u64) as RelId;
+            let rel = rec_rels[rng.below(rec_rels.len() as u64) as usize];
             let c = g.out_count(rel, a) as usize;
             if c == 0 {
                 continue;
@@ -36,7 +47,7 @@ pub fn write(snapshot: &Path, out: &Path, events: u32, seed: u64, writes_after_d
         }
         None
     };
-    let mut created: Vec<(String, String)> = Vec::new();
+    let mut created: Vec<(String, String, Option<String>)> = Vec::new();
     let mut takendown: Vec<String> = Vec::new();
     let mut deleted = std::collections::HashSet::new();
     let mut f = std::io::BufWriter::new(std::fs::File::create(out)?);
@@ -46,10 +57,13 @@ pub fn write(snapshot: &Path, out: &Path, events: u32, seed: u64, writes_after_d
     for _ in 0..events {
         t += 1 + rng.below(2000);
         let roll = rng.below(1000);
-        let commit = |did: &str, op: &str, coll: &str, rkey: &str, subject: Option<&str>| {
+        let commit = |did: &str, op: &str, coll: &str, rkey: &str, subject: Option<&str>, list: Option<&str>| {
             let mut c = json!({"rev": "3l2synthrev22", "operation": op, "collection": coll, "rkey": rkey});
             if let Some(s) = subject {
                 c["record"] = json!({"$type": coll, "subject": s, "createdAt": "2026-11-04T00:00:00.000Z"});
+                if let Some(l) = list {
+                    c["record"]["list"] = json!(l);
+                }
                 c["cid"] = json!("bafyreisynthsynthsynthsynthsynthsynthsynthsynthsynthsynth");
             }
             json!({"did": did, "time_us": t, "kind": "commit", "commit": c})
@@ -64,41 +78,44 @@ pub fn write(snapshot: &Path, out: &Path, events: u32, seed: u64, writes_after_d
             if !writes_after_delete && deleted.contains(&a) {
                 continue;
             }
-            let coll = &colls[if rng.below(10) == 0 { 1 % colls.len() } else { 0 }];
+            let (coll, list) = match &list_coll {
+                Some(lc) if rng.below(8) == 0 => (lc, Some(marco_server::synth::list_uri(&a, rng.below(3) as u32))),
+                _ => (&colls[if rng.below(10) == 0 { 1 % colls.len() } else { 0 }], None),
+            };
             tid_t += 1 + rng.below(50);
             let rkey = marco_server::synth::tid(tid_t, rng.below(1024));
             let uri = format!("at://{a}/{coll}/{rkey}");
-            let v = commit(&a, "create", coll, &rkey, Some(&s));
-            created.push((uri, s));
+            let v = commit(&a, "create", coll, &rkey, Some(&s), list.as_deref());
+            created.push((uri, s, list));
             v
         } else if roll < 700 {
             kinds[1] += 1;
             match snapshot_uri(&mut rng) {
                 Some((uri, _)) => {
                     let (d, c, k) = split(&uri);
-                    commit(&d, "delete", &c, &k, None)
+                    commit(&d, "delete", &c, &k, None, None)
                 }
                 None => continue,
             }
         } else if roll < 800 && !created.is_empty() {
             kinds[2] += 1;
-            let (uri, _) = created.swap_remove(rng.below(created.len() as u64) as usize);
+            let (uri, _, _) = created.swap_remove(rng.below(created.len() as u64) as usize);
             let (d, c, k) = split(&uri);
-            commit(&d, "delete", &c, &k, None)
+            commit(&d, "delete", &c, &k, None, None)
         } else if roll < 830 {
             kinds[3] += 1;
             let a = did(&mut rng);
             tid_t += 1;
             let rkey = marco_server::synth::tid(tid_t, 1);
-            commit(&a, "delete", &colls[0], &rkey, None)
+            commit(&a, "delete", &colls[0], &rkey, None, None)
         } else if roll < 880 && !created.is_empty() {
             kinds[4] += 1;
-            let (uri, s) = created[rng.below(created.len() as u64) as usize].clone();
+            let (uri, s, list) = created[rng.below(created.len() as u64) as usize].clone();
             let (d, c, k) = split(&uri);
             if !writes_after_delete && deleted.contains(&d) {
                 continue;
             }
-            commit(&d, if rng.below(2) == 0 { "create" } else { "update" }, &c, &k, Some(&s))
+            commit(&d, if rng.below(2) == 0 { "create" } else { "update" }, &c, &k, Some(&s), list.as_deref())
         } else if roll < 900 {
             kinds[5] += 1;
             let a = did(&mut rng);
