@@ -1,0 +1,25 @@
+[package]
+name = "marco-ingest"
+version = "0.1.0"
+edition = "2021"
+description = "marco's built-in ingest: Jetstream and firehose (subscribeRepos) consumers that turn records into edge ops and apply them in order with a durable cursor"
+license = "MIT"
+publish = false
+
+[dependencies]
+marco-core = { workspace = true }
+vlatproto = { workspace = true }
+anyhow = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+futures = { workspace = true }
+prometheus = { workspace = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt", "net", "time", "sync", "macros"] }
+tokio-tungstenite = { version = "0.29", features = ["__rustls-tls", "rustls-tls-webpki-roots"] }
+tracing = { workspace = true }
+webpki-roots = "1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread"] }

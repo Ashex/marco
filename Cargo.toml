@@ -1,14 +1,17 @@
 # marco: a graph database for atproto actor-to-actor edges. The engine
-# (marco-core), the server (marco-server) and its API (marco-proto), and the
-# bulk loader (marco-load). Builds on vlatproto by path.
+# (marco-core), the server (marco-server) and its API (marco-proto), the
+# built-in Jetstream and firehose consumers (marco-ingest) and their harness
+# (marco-harness), and the bulk loader (marco-load). Builds on vlatproto by path.
 [workspace]
 resolver = "2"
 members = ["crates/*"]
 
 [workspace.dependencies]
 marco-core = { path = "crates/marco-core", default-features = false }
+marco-ingest = { path = "crates/marco-ingest" }
 marco-ops = { path = "crates/marco-ops" }
 marco-proto = { path = "crates/marco-proto" }
+marco-server = { path = "crates/marco-server" }
 # Keep in step with buffa_version and connect_rust_version in the justfile:
 # the generated code targets these runtimes.
 buffa = { version = "0.9.2", default-features = false, features = ["std"] }

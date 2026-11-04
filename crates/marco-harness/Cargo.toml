@@ -1,0 +1,27 @@
+[package]
+name = "marco-harness"
+version = "0.1.0"
+edition = "2021"
+description = "marco's ingest harness: record a Jetstream or firehose capture, replay it as a fake source, the kill -9 test against a capture, and the live tail-lag and throughput measurements"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "marco-harness"
+path = "src/main.rs"
+
+[dependencies]
+marco-core = { workspace = true }
+marco-ingest = { workspace = true }
+marco-proto = { workspace = true, features = ["client"] }
+marco-server = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+connectrpc = { workspace = true, features = ["client"] }
+futures = { workspace = true }
+http = { workspace = true }
+libc = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "process", "fs", "io-util"] }
+tokio-tungstenite = { version = "0.29", features = ["__rustls-tls", "rustls-tls-webpki-roots"] }
+tracing = { workspace = true }

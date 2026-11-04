@@ -7,6 +7,7 @@ pub mod admin_svc;
 pub mod app;
 pub mod auth;
 pub mod graph_svc;
+pub mod ingest;
 pub mod liststats;
 pub mod metrics;
 pub mod series;

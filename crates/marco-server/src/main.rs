@@ -2,6 +2,7 @@
 //!
 //! ```text
 //! marco serve --snapshot DIR [--admin-token-file F]   serve a snapshot (and write to it)
+//!     [--jetstream URL | --firehose URL]               and fill it from a stream
 //! marco synth --out DIR [--actors N]                   write a synthetic snapshot (fake DIDs)
 //! ```
 
@@ -11,6 +12,7 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use clap::parser::ValueSource;
 use clap::{ArgMatches, Args, CommandFactory, FromArgMatches, Parser, Subcommand};
+use marco_ingest::{Proto, Source};
 use marco_server::app::{App, Config, FlagInfo};
 use marco_server::auth::{AuthConfig, Cidr};
 
@@ -96,6 +98,12 @@ struct Serve {
     /// Don't map the snapshot's pages in after open (they then fault in as reads touch them).
     #[arg(long, env = "MARCO_NO_PREFAULT")]
     no_prefault: bool,
+    /// Follow a Jetstream instance (wss://host or wss://host/subscribe) for the relations' collections.
+    #[arg(long, env = "MARCO_JETSTREAM", conflicts_with = "firehose")]
+    jetstream: Option<String>,
+    /// Follow a relay's com.atproto.sync.subscribeRepos (wss://host).
+    #[arg(long, env = "MARCO_FIREHOSE")]
+    firehose: Option<String>,
 }
 
 fn flags(m: &ArgMatches, s: &Serve) -> Vec<FlagInfo> {
@@ -121,6 +129,8 @@ fn flags(m: &ArgMatches, s: &Serve) -> Vec<FlagInfo> {
         ("serve_before_ready", s.serve_before_ready.to_string()),
         ("tombstone_days", s.tombstone_days.to_string()),
         ("no_prefault", s.no_prefault.to_string()),
+        ("jetstream", s.jetstream.clone().unwrap_or_else(|| "—".into())),
+        ("firehose", s.firehose.clone().unwrap_or_else(|| "—".into())),
     ];
     rows.into_iter()
         .map(|(id, value)| {
@@ -191,6 +201,14 @@ fn main() -> Result<()> {
             if s.segment_interval <= 0.0 || s.checkpoint_age <= 0.0 {
                 bail!("--segment-interval and --checkpoint-age must be above 0");
             }
+            let source = match (&s.jetstream, &s.firehose) {
+                (Some(u), _) => Some(Source::new(Proto::Jetstream, u)?),
+                (_, Some(u)) => Some(Source::new(Proto::Firehose, u)?),
+                _ => None,
+            };
+            if source.is_some() && s.read_only {
+                bail!("--read-only can't follow a source");
+            }
             let cfg = Config {
                 read_only: s.read_only,
                 merge_ratio: s.merge_ratio,
@@ -205,6 +223,7 @@ fn main() -> Result<()> {
                 serve_before_ready: s.serve_before_ready,
                 prefault: !s.no_prefault,
                 tombstone_ttl: std::time::Duration::from_secs_f64(s.tombstone_days.max(0.0) * 86_400.0),
+                expected_sources: source.iter().map(|s| s.name.clone()).collect(),
                 ..Config::new(s.snapshot.clone())
             };
             let ui = Arc::new(marco_server::ui::Ui::load(s.ui_dir.as_deref())?);
@@ -220,7 +239,16 @@ fn main() -> Result<()> {
                     app.open_seconds * 1e3,
                     if s.read_only { ", read-only" } else { "" },
                 );
+                let (stop, stopped) = tokio::sync::watch::channel(false);
+                let ingest = source.map(|src| {
+                    eprintln!("following {} ({})", src.name, src.url);
+                    marco_server::ingest::start(&app, src, stopped)
+                });
                 shutdown_signal().await;
+                let _ = stop.send(true);
+                if let Some(t) = ingest {
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), t).await;
+                }
                 if !s.read_only {
                     // the writes since the last segment, so a clean stop loses none
                     app.shutdown().await?;

@@ -21,6 +21,7 @@ jemalloc = ["marco-ops/jemalloc"]
 
 [dependencies]
 marco-core = { workspace = true, features = ["metrics"] }
+marco-ingest = { workspace = true }
 marco-ops = { workspace = true }
 marco-proto = { workspace = true }
 anyhow = { workspace = true }
