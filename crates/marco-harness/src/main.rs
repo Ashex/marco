@@ -154,6 +154,10 @@ enum Cmd {
         /// Apply to a sink that drops everything instead: the source's and the network's share of the lag.
         #[arg(long)]
         null_sink: bool,
+        /// Write every op's lag as `<event time µs> <lag µs>` lines, to line
+        /// up two runs on the same stream event by event.
+        #[arg(long)]
+        events_out: Option<PathBuf>,
     },
     /// The oldest event a source replays (subscribe with cursor 1).
     Retention {
@@ -219,12 +223,12 @@ fn main() -> Result<()> {
                 Ok(())
             }
             Cmd::Bench { snapshot, capture, work } => bench(&snapshot, &capture, &work).await,
-            Cmd::Lag { snapshot, jetstream, work, seconds, null_sink } => {
+            Cmd::Lag { snapshot, jetstream, work, seconds, null_sink, events_out } => {
                 let d = Duration::from_secs(seconds);
                 if null_sink {
-                    lag(Arc::new(Null::default()), &jetstream, d).await
+                    lag(Arc::new(Null::default()), &jetstream, d, events_out).await
                 } else {
-                    lag(work_app(&snapshot, &work)?, &jetstream, d).await
+                    lag(work_app(&snapshot, &work)?, &jetstream, d, events_out).await
                 }
             }
             Cmd::Retention { src } => {
@@ -388,7 +392,12 @@ impl marco_ingest::Sink for Null {
     }
 }
 
-async fn lag<S: marco_ingest::Sink>(app: Arc<S>, url: &str, d: Duration) -> Result<()> {
+async fn lag<S: marco_ingest::Sink>(app: Arc<S>, url: &str, d: Duration, events_out: Option<PathBuf>) -> Result<()> {
+    use std::io::Write;
+    let mut events = match events_out {
+        Some(p) => Some(std::io::BufWriter::new(std::fs::File::create(p)?)),
+        None => None,
+    };
     let rels = marco_core::Relations::bsky_default();
     let (tap, mut taps) = tokio::sync::mpsc::unbounded_channel();
     let opts = marco_ingest::Options { lag_tap: Some(tap), ..Default::default() };
@@ -402,6 +411,11 @@ async fn lag<S: marco_ingest::Sink>(app: Arc<S>, url: &str, d: Duration) -> Resu
         tokio::select! {
             v = taps.recv() => match v {
                 Some(us) => {
+                    if let Some(w) = events.as_mut() {
+                        // the tap sends now − event time; the event's time is close to now − lag
+                        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_micros() as i64;
+                        writeln!(w, "{} {us}", now - us)?;
+                    }
                     all.push(us as f64 / 1e6);
                     minute.push(us as f64 / 1e6);
                 }
@@ -419,6 +433,9 @@ async fn lag<S: marco_ingest::Sink>(app: Arc<S>, url: &str, d: Duration) -> Resu
                 next += Duration::from_secs(60);
             }
         }
+    }
+    if let Some(mut w) = events {
+        w.flush()?;
     }
     let s = t.elapsed().as_secs_f64();
     let ops = st.ops.load(Ordering::Relaxed);
