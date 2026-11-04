@@ -104,6 +104,15 @@ struct Serve {
     /// Follow a relay's com.atproto.sync.subscribeRepos (wss://host).
     #[arg(long, env = "MARCO_FIREHOSE")]
     firehose: Option<String>,
+    /// How far back the Jetstream instance replays, hours (measure yours with
+    /// marco-harness retention). A bulk-built snapshot older than this is
+    /// refused: following it would miss what changed in between.
+    #[arg(long, env = "MARCO_SOURCE_RETENTION_HOURS", default_value_t = 36.0)]
+    source_retention_hours: f64,
+    /// Follow a bulk-built snapshot past the retention, or from a firehose (which
+    /// starts at the live tail).
+    #[arg(long, env = "MARCO_ALLOW_GAP")]
+    allow_gap: bool,
 }
 
 fn flags(m: &ArgMatches, s: &Serve) -> Vec<FlagInfo> {
@@ -131,6 +140,8 @@ fn flags(m: &ArgMatches, s: &Serve) -> Vec<FlagInfo> {
         ("no_prefault", s.no_prefault.to_string()),
         ("jetstream", s.jetstream.clone().unwrap_or_else(|| "—".into())),
         ("firehose", s.firehose.clone().unwrap_or_else(|| "—".into())),
+        ("source_retention_hours", s.source_retention_hours.to_string()),
+        ("allow_gap", s.allow_gap.to_string()),
     ];
     rows.into_iter()
         .map(|(id, value)| {
@@ -240,10 +251,15 @@ fn main() -> Result<()> {
                     if s.read_only { ", read-only" } else { "" },
                 );
                 let (stop, stopped) = tokio::sync::watch::channel(false);
-                let ingest = source.map(|src| {
-                    eprintln!("following {} ({})", src.name, src.url);
-                    marco_server::ingest::start(&app, src, stopped)
-                });
+                let ingest = match source {
+                    Some(src) => {
+                        let retention = std::time::Duration::from_secs_f64(s.source_retention_hours.max(0.0) * 3600.0);
+                        let start = marco_server::ingest::start_point(&app, &src, retention, s.allow_gap).await?;
+                        eprintln!("following {} ({})", src.name, src.url);
+                        Some(marco_server::ingest::start(&app, src, start, stopped))
+                    }
+                    None => None,
+                };
                 shutdown_signal().await;
                 let _ = stop.send(true);
                 if let Some(t) = ingest {

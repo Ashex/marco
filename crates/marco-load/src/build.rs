@@ -54,7 +54,58 @@ pub struct Opts {
     /// Spill files per shard and relation: each is sorted in memory alone.
     pub sub_buckets: usize,
     pub deletes: Option<DeletesOut>,
+    /// The input's `cursors.json`: stamped into the manifest, so a server
+    /// resumes its sources from the input's cut.
+    pub cursors: BTreeMap<String, String>,
 }
+
+/// The cursor key for the time (µs) an input's records are current to:
+/// marco serve starts a new Jetstream or firehose source from it
+/// (marco_ingest::SNAPSHOT_TIME).
+pub const SNAPSHOT_TIME: &str = "time_us";
+
+/// Time the build leaves for starting the server before the cursor ages
+/// past the source's retention (marco serve checks again when it starts).
+pub const START_MARGIN: std::time::Duration = std::time::Duration::from_secs(2 * 3600);
+
+/// The optional `cursors.json` of an input directory: source -> the cursor
+/// the input's state covers. A time cursor (`time_us`, or a Jetstream one)
+/// that will be older than `retention` by the time a server could start
+/// would leave a gap the source can't replay, so it's refused unless `allow_gap`.
+pub fn read_cursors(input: &Path, retention: std::time::Duration, allow_gap: bool) -> Result<BTreeMap<String, String>> {
+    let p = input.join(CURSORS);
+    let c: BTreeMap<String, String> = match std::fs::read(&p) {
+        Ok(b) => serde_json::from_slice(&b).with_context(|| format!("parse {}", p.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(e) => return Err(e).with_context(|| format!("read {}", p.display())),
+    };
+    let now_us = marco_core::store::now_ms() * 1000;
+    for (k, v) in &c {
+        if k != SNAPSHOT_TIME && k != "jetstream" && !k.starts_with("jetstream:") {
+            continue;
+        }
+        let us: i64 = v.parse().with_context(|| format!("{}: {k} = {v:?} isn't a time_us cursor", p.display()))?;
+        let age = std::time::Duration::from_micros((now_us - us).max(0) as u64);
+        if age + START_MARGIN > retention {
+            let msg = format!(
+                "{}: the {k} cursor is {:.1} h old; with {:.0} h to start the server that's past the source's {:.1} h retention, \
+                 and serving it would miss what changed in between",
+                p.display(),
+                age.as_secs_f64() / 3600.0,
+                START_MARGIN.as_secs_f64() / 3600.0,
+                retention.as_secs_f64() / 3600.0
+            );
+            if !allow_gap {
+                bail!("{msg} (--allow-gap to build anyway)");
+            }
+            eprintln!("warning: {msg}");
+        }
+    }
+    Ok(c)
+}
+
+/// The input directory's cursors file.
+pub const CURSORS: &str = "cursors.json";
 
 #[derive(Serialize, Default, Clone)]
 pub struct Phase {
@@ -189,6 +240,8 @@ pub struct Report {
     pub shard_bytes_min: u64,
     pub wall_secs: f64,
     pub peak_rss_gb: f64,
+    /// Stamped into the manifest from the input's cursors.json.
+    pub cursors: BTreeMap<String, String>,
 }
 
 #[derive(Default)]
@@ -1055,7 +1108,7 @@ pub fn build(o: &Opts) -> Result<Report> {
         subj_index: o.subj_index as u32,
         relations: o.rels.list.clone(),
     };
-    set.finish(&meta)?;
+    set.finish_with(&meta, o.cursors.clone())?;
     c.add(5, t);
     rep.phases.push(c.phase("finish (fsync, rename)", t));
     let _ = std::fs::remove_dir(&o.tmp);
@@ -1068,6 +1121,7 @@ pub fn build(o: &Opts) -> Result<Report> {
     }
     rep.shard_bytes_max = shard_bytes.iter().copied().max().unwrap_or(0);
     rep.shard_bytes_min = shard_bytes.iter().copied().min().unwrap_or(0);
+    rep.cursors = o.cursors.clone();
     rep.wall_secs = wall.elapsed().as_secs_f64();
     rep.peak_rss_gb = rep.phases.iter().map(|p| p.peak_rss_gb).fold(0.0, f64::max);
     metrics::set("wall_seconds", rep.wall_secs);
@@ -1237,6 +1291,7 @@ mod tests {
             shards: 5,
             sub_buckets: 3,
             deletes: Some(DeletesOut { dir: tmp.path().join("deletes"), since_us: 0 }),
+            cursors: [("time_us".to_string(), "1730000000000000".to_string())].into(),
         };
         let rep = build(&o).unwrap();
         let f = &rep.rels[0];
@@ -1255,6 +1310,7 @@ mod tests {
         }
         let b = Graph::open(&out).unwrap();
         b.snapshot().unwrap().verify_checksums().unwrap();
+        assert_eq!(b.manifest().unwrap().cursors, o.cursors);
         for rel in [0u8, 1] {
             let st = &b.snapshot().unwrap().stats()[rel as usize];
             assert_eq!(st.out_records, rep.rels[rel as usize].out_records);
@@ -1316,6 +1372,7 @@ mod tests {
             shards,
             sub_buckets: 1,
             deletes: None,
+            cursors: BTreeMap::new(),
         };
         let rep = build(&o).unwrap();
         (rep, Graph::open(&out).unwrap())
@@ -1385,5 +1442,22 @@ mod tests {
             .collect();
         let (rep, _) = build_lists(tmp.path(), &lops, 5);
         assert_eq!((rep.rels[2].rows, rep.rels[3].rows), (200, 200));
+    }
+
+    #[test]
+    fn cursors_past_retention_are_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let day = std::time::Duration::from_secs(86_400);
+        assert!(read_cursors(tmp.path(), day, false).unwrap().is_empty());
+        let now_us = marco_core::store::now_ms() * 1000;
+        let write = |us: i64| std::fs::write(tmp.path().join(CURSORS), format!(r#"{{"time_us":"{us}"}}"#)).unwrap();
+        write(now_us - 3_600_000_000);
+        assert_eq!(read_cursors(tmp.path(), day, false).unwrap().len(), 1);
+        // inside the retention, but not with time left to start the server
+        write(now_us - 23 * 3_600_000_000);
+        assert!(read_cursors(tmp.path(), day, false).is_err());
+        write(now_us - 2 * 86_400_000_000);
+        assert!(read_cursors(tmp.path(), day, false).is_err());
+        assert_eq!(read_cursors(tmp.path(), day, true).unwrap().len(), 1);
     }
 }

@@ -45,6 +45,8 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["r
 pprof = { version = "0.15", features = ["prost-codec"] }
 tikv-jemallocator = { version = "0.7", features = ["profiling", "unprefixed_malloc_on_supported_platforms"] }
 jemalloc_pprof = "0.9"
+scylla = { version = "1.9.0", default-features = false }
+uuid = "1"
 
 [profile.release]
 opt-level = 3

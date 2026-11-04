@@ -111,6 +111,43 @@ pub fn decode(line: &[u8], rels: &Relations) -> Result<Event, &'static str> {
     Ok(ev)
 }
 
+/// The time of the first event the instance sends from `cursor`. Asked for
+/// a cursor older than it holds, Jetstream starts at its oldest event, so a
+/// first event well past the cursor is a gap no replay fills.
+pub async fn first_event_us(base: &str, rels: &Relations, cursor: u64) -> anyhow::Result<i64> {
+    use anyhow::Context;
+    use futures::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+    let url = subscribe_url(base, rels, Some(cursor));
+    let connector = if url.starts_with("wss://") {
+        tokio_tungstenite::Connector::Rustls(crate::conn::tls())
+    } else {
+        tokio_tungstenite::Connector::Plain
+    };
+    let cfg = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+        .max_message_size(Some(crate::conn::MAX_FRAME_BYTES));
+    let dial = tokio_tungstenite::connect_async_tls_with_config(url.as_str(), Some(cfg), true, Some(connector));
+    let (mut ws, _) = tokio::time::timeout(std::time::Duration::from_secs(15), dial)
+        .await
+        .context("dial timed out")?
+        .with_context(|| format!("dial {url}"))?;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    while let Ok(Some(m)) = tokio::time::timeout_at(deadline, ws.next()).await {
+        let b = match m? {
+            Message::Text(t) => t.as_bytes().to_vec(),
+            Message::Binary(b) => b.to_vec(),
+            _ => continue,
+        };
+        if let Ok(ev) = decode(&b, rels) {
+            if ev.time_us > 0 {
+                let _ = ws.close(None).await;
+                return Ok(ev.time_us);
+            }
+        }
+    }
+    anyhow::bail!("{url}: no event within 30 s")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

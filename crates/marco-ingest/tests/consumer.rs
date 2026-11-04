@@ -237,3 +237,47 @@ async fn accounts() {
     assert_eq!(sink.statuses.lock().unwrap().get(C), Some(&Status::Deleted));
     assert!(!sink.has_status(B));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_jetstream_source_starts_from_the_snapshot_cursor() {
+    let s = 1_000_000u64;
+    let t0 = now_us();
+    let at = |x: u64| t0 + x;
+    let lines = vec![
+        (at(10 * s), follow(at(10 * s), A, "create", "3kaaaaaaaaa21", Some(B))),
+        (at(12 * s), follow(at(12 * s), A, "create", "3kaaaaaaaaa22", Some(C))),
+    ];
+    let (url, seen) = jetstream(lines).await;
+    let sink = Arc::new(Mem::default());
+    let src = Source::new(Proto::Jetstream, &url).unwrap();
+    let (_stop, rx) = tokio::sync::watch::channel(false);
+    let opts = marco_ingest::Options { start: Some(at(11 * s)), ..Default::default() };
+    let _ = marco_ingest::run(src.clone(), Relations::bsky_default(), sink.clone(), opts, rx);
+    for _ in 0..500 {
+        if sink.source_cursor(&src.name).is_some_and(|c| c == at(12 * s).to_string()) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // from the stamp less the overlap, never from now
+    assert!(seen.lock().unwrap()[0].ends_with(&format!("cursor={}", at(10 * s))), "{:?}", seen.lock().unwrap());
+    assert_eq!(sink.source_cursor(&src.name), Some(at(12 * s).to_string()));
+    assert_eq!(sink.edges.lock().unwrap().len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn first_event_from_a_cursor_shows_how_far_back_an_instance_goes() {
+    let s = 1_000_000u64;
+    let t0 = now_us();
+    // the instance's oldest event is at +2 h: asked for t0, it starts there
+    let lines = vec![
+        (t0 + 7200 * s, follow(t0 + 7200 * s, A, "create", "3kaaaaaaaaa21", Some(B))),
+        (t0 + 7201 * s, follow(t0 + 7201 * s, A, "create", "3kaaaaaaaaa22", Some(C))),
+    ];
+    let (url, _) = jetstream(lines).await;
+    let rels = Relations::bsky_default();
+    let first = marco_ingest::jetstream::first_event_us(&url, &rels, t0).await.unwrap();
+    assert_eq!(first as u64, t0 + 7200 * s);
+    let first = marco_ingest::jetstream::first_event_us(&url, &rels, t0 + 7201 * s).await.unwrap();
+    assert_eq!(first as u64, t0 + 7201 * s);
+}

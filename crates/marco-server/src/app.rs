@@ -673,6 +673,10 @@ impl App {
         self.rates.lock().unwrap().iter().map(|(k, v)| (k.clone(), v.2)).collect()
     }
 
+    pub(crate) fn forget_source(&self, source: &str) {
+        self.sources.lock().unwrap().remove(source);
+    }
+
     pub(crate) fn note_durable(&self, cursors: &BTreeMap<String, String>) {
         let mut m = self.sources.lock().unwrap();
         for (k, v) in cursors {

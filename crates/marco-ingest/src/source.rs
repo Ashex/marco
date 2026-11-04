@@ -6,6 +6,11 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use anyhow::{bail, Result};
 
+/// The cursor key a bulk build stamps: the time (µs) its records are
+/// current to. Jetstream cursors are event times, so a time carries to any
+/// instance: a Jetstream source with no cursor of its own starts there.
+pub const SNAPSHOT_TIME: &str = "time_us";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Proto {
     Jetstream,

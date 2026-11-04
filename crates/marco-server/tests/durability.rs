@@ -558,3 +558,37 @@ async fn a_replaces_stamp_survives_a_kill() {
         app.shutdown().await.unwrap();
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bulk_built_snapshots_time_starts_a_new_source_once() {
+    let (_d, snap) = snapshot();
+    let t = marco_server::app::now_ms() * 1000 - 3_600_000_000;
+    let mut m = Manifest::read(&snap).unwrap();
+    m.cursors.insert(marco_ingest::SNAPSHOT_TIME.into(), t.to_string());
+    m.write(&snap).unwrap();
+    let app = App::open(cfg(&snap)).unwrap();
+    let src = marco_ingest::Source::new(marco_ingest::Proto::Jetstream, "ws://127.0.0.1:9/subscribe").unwrap();
+    let day = Duration::from_secs(86_400);
+    let start = marco_server::ingest::start_point(&app, &src, day, false).await.unwrap();
+    assert_eq!(start, Some(t as u64));
+    // past the source's retention: refused, unless the operator accepts the gap
+    let short = Duration::from_secs(1800);
+    assert!(marco_server::ingest::start_point(&app, &src, short, false).await.is_err());
+    assert_eq!(marco_server::ingest::start_point(&app, &src, short, true).await.unwrap(), Some(t as u64));
+    // a firehose resumes only by seq: catching up is Jetstream's job
+    let relay = marco_ingest::Source::new(marco_ingest::Proto::Firehose, "ws://127.0.0.1:9").unwrap();
+    let e = marco_server::ingest::start_point(&app, &relay, day, false).await.unwrap_err();
+    assert!(format!("{e:#}").contains("catch up from Jetstream"), "{e:#}");
+    assert_eq!(marco_server::ingest::start_point(&app, &relay, day, true).await.unwrap(), None);
+    // the source's first cursor replaces the snapshot's time, durably
+    let u = uri(&did(1), FOLLOW, &tid(70_000_000, 1));
+    app.apply_from(&src.name, &(t + 5).to_string(), &[Op::Add { uri: u, subject: did(2), list: None, time_us: t }])
+        .await
+        .unwrap();
+    assert_eq!(app.source_cursor(marco_ingest::SNAPSHOT_TIME), None);
+    drop(app);
+    let app = App::open(cfg(&snap)).unwrap();
+    assert_eq!(app.source_cursor(marco_ingest::SNAPSHOT_TIME), None);
+    assert_eq!(app.source_cursor(&src.name), Some((t + 5).to_string()));
+    assert_eq!(marco_server::ingest::start_point(&app, &src, day, false).await.unwrap(), None);
+}

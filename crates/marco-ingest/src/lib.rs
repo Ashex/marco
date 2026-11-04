@@ -16,7 +16,7 @@ pub mod writer;
 use std::future::Future;
 
 pub use conn::{run, Options};
-pub use source::{sources, Progress, Proto, Source, SourceState};
+pub use source::{sources, Progress, Proto, Source, SourceState, SNAPSHOT_TIME};
 
 pub use marco_core::{Op, Status};
 

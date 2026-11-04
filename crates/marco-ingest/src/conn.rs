@@ -37,6 +37,9 @@ pub struct Options {
     pub healthy_after: Duration,
     pub user_agent: String,
     pub lag_tap: Option<LagTap>,
+    /// Where a source with no cursor of its own starts (time_us or seq),
+    /// rather than the live tail: a bulk-built snapshot's time.
+    pub start: Option<u64>,
 }
 
 impl Default for Options {
@@ -52,6 +55,7 @@ impl Default for Options {
             healthy_after: Duration::from_secs(60),
             user_agent: concat!("marco/", env!("CARGO_PKG_VERSION")).into(),
             lag_tap: None,
+            start: None,
         }
     }
 }
@@ -153,6 +157,12 @@ async fn read<S: Sink>(
 ) {
     let name = src.name.clone();
     let mut cursor = sink.source_cursor(&name).and_then(|c| c.parse::<u64>().ok());
+    if cursor.is_none() {
+        cursor = opts.start;
+        if let Some(c) = cursor {
+            tracing::info!(source = name, cursor = c, "a new source, starting where the snapshot is current to");
+        }
+    }
     if cursor.is_none() && src.proto == Proto::Jetstream {
         // A new source starts from now, saved before the first event: a
         // kill before the sink's first checkpoint then resumes here rather

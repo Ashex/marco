@@ -6,12 +6,12 @@
 //! marco-load bench  --snapshot FILE            read latencies and throughput
 //! marco-load verify --snapshot FILE            checksums, every list decoded, a sampled export checked
 //! marco-load replay --snapshot FILE --deletes DIR   delete-by-URI replay through the mutable path
+//! marco-load diff   --a SNAP --b SNAP              two snapshots compared record by record
+//! marco-load scan-scylla --config TOML --out DIR [--snapshot SNAP]   Scylla tables -> build input (-> snapshot)
+//! marco-load fill-scylla --config TOML --input DIR   build input -> Scylla tables (tests, benchmarks)
 //! ```
 //!
-//! Export files are zstd RowBinary ops (repo, rkey, subject, Int64 time_us,
-//! UInt8 op: 1 create, 2 update, 3 delete), in any order, one directory per
-//! relation, each file one repo-prefix chunk; the files of a relation must
-//! sort in DID order (`p-<prefix>` names, then `z-other`).
+//! The build's input format is in this crate's README.
 
 use std::path::PathBuf;
 
@@ -20,6 +20,9 @@ use clap::{Parser, Subcommand};
 
 mod bench;
 mod build;
+#[cfg(feature = "scylla")]
+mod cql;
+mod diff;
 mod metrics;
 mod rows;
 mod stats;
@@ -67,6 +70,13 @@ enum Cmd {
         /// Only deletes at or after this time_us (default: the archive crawl's start).
         #[arg(long, default_value_t = 1_771_484_880_000_000)]
         deletes_since_us: i64,
+        /// How far back the sources in the input's cursors.json replay: an older
+        /// Jetstream cursor is refused (Jetstream keeps about 36 h).
+        #[arg(long, default_value_t = 36.0)]
+        retention_hours: f64,
+        /// Build even if a cursor is past the retention.
+        #[arg(long)]
+        allow_gap: bool,
     },
     Open {
         #[arg(long)]
@@ -75,6 +85,13 @@ enum Cmd {
     Bench(bench::Args),
     Verify(verify::VerifyArgs),
     Replay(verify::ReplayArgs),
+    Diff(diff::Args),
+    /// Scan Scylla tables into build input (see the README), then optionally build.
+    #[cfg(feature = "scylla")]
+    ScanScylla(Box<cql::scan::Args>),
+    /// Load build input into Scylla tables as current state (tests, benchmarks).
+    #[cfg(feature = "scylla")]
+    FillScylla(cql::fill::Args),
 }
 
 fn main() -> Result<()> {
@@ -84,14 +101,29 @@ fn main() -> Result<()> {
         eprintln!("ops on http://{a}");
     }
     let report: serde_json::Value = match cli.cmd {
-        Cmd::Build { input, out, tmp, relations, subj_index, shards, sub_buckets, deletes_out, deletes_since_us } => {
+        Cmd::Build {
+            input,
+            out,
+            tmp,
+            relations,
+            subj_index,
+            shards,
+            sub_buckets,
+            deletes_out,
+            deletes_since_us,
+            retention_hours,
+            allow_gap,
+        } => {
             let rels = match relations {
                 Some(p) => marco_core::Relations::parse_toml(&std::fs::read_to_string(p)?)?,
                 None => marco_core::Relations::bsky_default(),
             };
             let tmp = tmp.unwrap_or_else(|| out.with_extension("spill"));
             let deletes = deletes_out.map(|dir| build::DeletesOut { dir, since_us: deletes_since_us });
-            let o = build::Opts { input, out, tmp: tmp.clone(), rels, subj_index, shards, sub_buckets, deletes };
+            let retention = std::time::Duration::from_secs_f64(retention_hours.max(0.0) * 3600.0);
+            let cursors = build::read_cursors(&input, retention, allow_gap)?;
+            let o =
+                build::Opts { input, out, tmp: tmp.clone(), rels, subj_index, shards, sub_buckets, deletes, cursors };
             let r = build::build(&o)?;
             let _ = std::fs::remove_dir(&tmp);
             serde_json::to_value(r)?
@@ -100,6 +132,11 @@ fn main() -> Result<()> {
         Cmd::Bench(a) => bench::run(&a)?,
         Cmd::Verify(a) => verify::verify(&a)?,
         Cmd::Replay(a) => verify::replay(&a)?,
+        Cmd::Diff(a) => diff::run(&a)?,
+        #[cfg(feature = "scylla")]
+        Cmd::ScanScylla(a) => cql::scan::run(&a)?,
+        #[cfg(feature = "scylla")]
+        Cmd::FillScylla(a) => cql::fill::run(&a)?,
     };
     let s = serde_json::to_string_pretty(&report)?;
     if let Some(p) = cli.report {

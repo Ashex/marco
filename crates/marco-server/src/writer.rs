@@ -279,6 +279,14 @@ impl Writer {
     fn first(&mut self, a: (Rec, bool, Reply), waiters: &mut Vec<Waiter>) {
         let (source, cursor) = source_cursor(&a.0);
         self.cursors.insert(source.to_string(), cursor.to_string());
+        // A stream source now has its own cursor, in this segment: the bulk
+        // build's time has done its job, and a source added later mustn't
+        // start from it.
+        if (source.starts_with("jetstream:") || source.starts_with("firehose:"))
+            && self.cursors.remove(marco_ingest::SNAPSHOT_TIME).is_some()
+        {
+            self.app.forget_source(marco_ingest::SNAPSHOT_TIME);
+        }
         self.buf_ops += a.0.ops() as u64;
         self.buf.push(a.0.clone());
         let (tx, rx) = tokio::sync::oneshot::channel();

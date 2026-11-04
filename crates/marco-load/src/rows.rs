@@ -75,3 +75,14 @@ impl Rows {
         Ok(i64::from_le_bytes(b))
     }
 }
+
+/// Appends one op row in the input format: three Strings (LEB128 length,
+/// bytes), Int64 time_us, UInt8 op.
+pub fn put_row(out: &mut Vec<u8>, repo: &[u8], rkey: &[u8], subject: &[u8], time_us: i64, op: u8) {
+    for s in [repo, rkey, subject] {
+        marco_core::varint::put(out, s.len() as u64);
+        out.extend_from_slice(s);
+    }
+    out.extend_from_slice(&time_us.to_le_bytes());
+    out.push(op);
+}
