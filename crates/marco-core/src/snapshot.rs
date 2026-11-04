@@ -316,11 +316,31 @@ impl Snapshot {
 
 // ---------------------------------------------------------------- offsets
 
-/// Offsets for ids 0..=n: a u64 base per 128 ids, then a u32 per id from
-/// its base. Half the bytes of plain u64s.
+/// Offsets for ids 0..=n. Dense: a u64 base per 128 ids, then a u32 per id
+/// from its base, half the bytes of plain u64s. Sparse, when it's smaller
+/// (a relation most ids have no list in, like a list relation, whose lists
+/// are 3% of the ids): u32 c, the c ids with a list (u32, ascending), their
+/// c + 1 starts (u64). The lengths tell them apart: a sparse index is only
+/// written when it's shorter than the dense one.
 pub fn encode_index(offsets: &[u64]) -> Result<Vec<u8>> {
     let groups = offsets.len().div_ceil(128);
-    let mut out = Vec::with_capacity(groups * 8 + offsets.len() * 4);
+    let dense = groups * 8 + offsets.len() * 4;
+    let present: Vec<u32> =
+        (0..offsets.len().saturating_sub(1)).filter(|&i| offsets[i + 1] > offsets[i]).map(|i| i as u32).collect();
+    let c = present.len();
+    if 4 + 4 * c + 8 * (c + 1) < dense {
+        let mut out = Vec::with_capacity(4 + 12 * c + 8);
+        out.extend_from_slice(&(c as u32).to_le_bytes());
+        for &i in &present {
+            out.extend_from_slice(&i.to_le_bytes());
+        }
+        for &i in &present {
+            out.extend_from_slice(&offsets[i as usize].to_le_bytes());
+        }
+        out.extend_from_slice(&offsets[offsets.len() - 1].to_le_bytes());
+        return Ok(out);
+    }
+    let mut out = Vec::with_capacity(dense);
     for g in 0..groups {
         out.extend_from_slice(&offsets[g * 128].to_le_bytes());
     }
@@ -335,33 +355,80 @@ pub fn encode_index(offsets: &[u64]) -> Result<Vec<u8>> {
 }
 
 #[derive(Clone, Copy)]
-pub struct Index<'a> {
-    bases: &'a [u8],
-    rels: &'a [u8],
-    n: usize,
+pub enum Index<'a> {
+    Dense { bases: &'a [u8], rels: &'a [u8], n: usize },
+    Sparse { ids: &'a [u8], starts: &'a [u8], c: usize },
 }
 
 impl<'a> Index<'a> {
-    /// An index over ids 0..n.
-    pub fn parse(bytes: &'a [u8], n: usize) -> Index<'a> {
+    /// An index over ids 0..n, None if its length is neither form's.
+    pub fn parse(bytes: &'a [u8], n: usize) -> Option<Index<'a>> {
         let g = (n + 1).div_ceil(128);
-        Index { bases: &bytes[..8 * g], rels: &bytes[8 * g..8 * g + 4 * (n + 1)], n }
-    }
-
-    #[inline]
-    fn at(&self, i: usize) -> usize {
-        (u64_at(self.bases, 8 * (i / 128)) + u32_at(self.rels, 4 * i) as u64) as usize
+        if bytes.len() == 8 * g + 4 * (n + 1) {
+            return Some(Index::Dense { bases: &bytes[..8 * g], rels: &bytes[8 * g..], n });
+        }
+        let c = u32_at(bytes.get(..4)?, 0) as usize;
+        (bytes.len() == 12 + 12 * c).then(|| Index::Sparse {
+            ids: &bytes[4..4 + 4 * c],
+            starts: &bytes[4 + 4 * c..],
+            c,
+        })
     }
 
     /// The byte range of `id`'s list, None if it has none.
     #[inline]
     pub fn range(&self, id: u32) -> Option<Range<usize>> {
-        let i = id as usize;
-        if i >= self.n {
-            return None;
+        match *self {
+            Index::Dense { bases, rels, n } => {
+                let i = id as usize;
+                if i >= n {
+                    return None;
+                }
+                let at = |i: usize| (u64_at(bases, 8 * (i / 128)) + u32_at(rels, 4 * i) as u64) as usize;
+                let (a, b) = (at(i), at(i + 1));
+                (b > a).then_some(a..b)
+            }
+            Index::Sparse { ids, starts, c } => {
+                let (mut lo, mut hi) = (0, c);
+                while lo < hi {
+                    let mid = (lo + hi) / 2;
+                    match u32_at(ids, 4 * mid).cmp(&id) {
+                        std::cmp::Ordering::Equal => {
+                            return Some(u64_at(starts, 8 * mid) as usize..u64_at(starts, 8 * mid + 8) as usize)
+                        }
+                        std::cmp::Ordering::Less => lo = mid + 1,
+                        std::cmp::Ordering::Greater => hi = mid,
+                    }
+                }
+                None
+            }
         }
-        let (a, b) = (self.at(i), self.at(i + 1));
-        (b > a).then_some(a..b)
+    }
+}
+
+#[cfg(test)]
+mod index_tests {
+    use super::*;
+
+    #[test]
+    fn dense_and_sparse_find_the_same_lists() {
+        for every in [1u64, 3, 40, 1000] {
+            let n = 5000usize;
+            let mut offsets = vec![0u64];
+            for i in 0..n as u64 {
+                let len = if i % every == 0 { 1 + i % 7 } else { 0 };
+                offsets.push(offsets.last().unwrap() + len);
+            }
+            let b = encode_index(&offsets).unwrap();
+            let ix = Index::parse(&b, n).unwrap();
+            assert_eq!(matches!(ix, Index::Sparse { .. }), every >= 3, "every {every}");
+            for i in 0..n + 2 {
+                let want = (i < n && offsets[i + 1] > offsets[i]).then(|| offsets[i] as usize..offsets[i + 1] as usize);
+                assert_eq!(ix.range(i as u32), want, "every {every} id {i}");
+            }
+            assert!(Index::parse(&b[..b.len() - 1], n).is_none(), "a short index is refused");
+        }
+        assert!(Index::parse(&[1, 0], 10).is_none());
     }
 }
 

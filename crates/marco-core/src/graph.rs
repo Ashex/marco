@@ -674,7 +674,7 @@ impl Graph {
             return None;
         }
         let b = f.bytes();
-        let range = Index::parse(&b[r.out_idx.clone()], n).range(local)?;
+        let range = Index::parse(&b[r.out_idx.clone()], n)?.range(local)?;
         Some(OutList::parse(&b[r.out_dat.start + range.start..r.out_dat.start + range.end], self.subj_index))
     }
 
@@ -690,7 +690,7 @@ impl Graph {
             return None;
         }
         let b = f.bytes();
-        let range = Index::parse(&b[r.in_idx.clone()], n).range(local)?;
+        let range = Index::parse(&b[r.in_idx.clone()], n)?.range(local)?;
         Some(InList::parse(&b[r.in_dat.start + range.start..r.in_dat.start + range.end]))
     }
 
@@ -1938,7 +1938,7 @@ impl Graph {
             if idx.is_empty() {
                 return None;
             }
-            let x = Index::parse(&f.bytes()[idx.clone()], n).range(id - f.meta.lo)?;
+            let x = Index::parse(&f.bytes()[idx.clone()], n)?.range(id - f.meta.lo)?;
             Some(d.start + x.start..d.start + x.end)
         };
         let ob = old.map_or(&[][..], |f| f.bytes());

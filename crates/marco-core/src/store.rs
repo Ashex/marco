@@ -160,7 +160,15 @@ impl ShardFile {
                     stamp: r("stamp"),
                 }
             })
-            .collect();
+            .collect::<Vec<RelRanges>>();
+        let n = (meta.hi - meta.lo) as usize;
+        for (i, r) in rels.iter().enumerate() {
+            for idx in [&r.out_idx, &r.in_idx] {
+                if !idx.is_empty() && crate::snapshot::Index::parse(&snap.bytes()[idx.clone()], n).is_none() {
+                    bail!("{}: relation {i}'s index isn't {n} ids long", p.display());
+                }
+            }
+        }
         let status = snap.range("status").unwrap_or(0..0);
         let live = snap.range("live").unwrap_or(0..0);
         Ok(ShardFile { name: name.to_string(), snap, meta, rels, status, live })

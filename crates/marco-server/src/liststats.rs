@@ -179,7 +179,7 @@ fn compute(path: &std::path::Path, done: &AtomicUsize, total: &AtomicUsize) -> R
                                 if idx.is_empty() {
                                     continue;
                                 }
-                                let ix = Index::parse(&b[idx], n);
+                                let Some(ix) = Index::parse(&b[idx], n) else { continue };
                                 for local in 0..n as u32 {
                                     let Some(rg) = ix.range(local) else { continue };
                                     let list = &b[dat.start + rg.start..dat.start + rg.end];
