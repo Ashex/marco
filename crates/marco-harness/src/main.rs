@@ -16,6 +16,7 @@ mod capture;
 mod fake;
 mod hist;
 mod killtest;
+mod mixfile;
 mod perf;
 mod synth;
 

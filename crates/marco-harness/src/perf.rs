@@ -34,6 +34,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::hist::Hist;
+use crate::mixfile;
 use crate::Rng;
 
 // ------------------------------------------------------------------ inputs
@@ -58,6 +59,27 @@ pub struct Inputs {
     pub cursors: Vec<(String, String)>,
     /// 50 actors per page, for block filtering.
     pub filter_pages: Vec<Vec<String>>,
+    /// Mix files' pools, drawn after the rest so the draws above stay P0's.
+    /// Viewers: `random` (the first 2,000 actors), `active` (50 to 5,000
+    /// follows), `heavy` (the most-following), each with up to 100 of its follows.
+    #[serde(default)]
+    pub viewers_random: Vec<Viewer>,
+    #[serde(default)]
+    pub viewers_active: Vec<Viewer>,
+    #[serde(default)]
+    pub viewers_heavy: Vec<Viewer>,
+    /// Subjects of random follows: actors drawn about as often as they're followed.
+    #[serde(default)]
+    pub popular: Vec<String>,
+    /// List URIs, drawn about as often as they have members (empty without lists).
+    #[serde(default)]
+    pub lists: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Viewer {
+    pub did: String,
+    pub follows: Vec<String>,
 }
 
 fn top(g: &Graph, k: usize, count: impl Fn(u32) -> u64 + Sync) -> Vec<(u32, u64)> {
@@ -135,6 +157,49 @@ pub fn make_inputs(snapshot: &Path, seed: u64) -> Result<Inputs> {
             (did(x), did(page[rng.below(page.len() as u64) as usize].1))
         })
         .collect();
+    let mut r2 = Rng((seed ^ 0x6d69_785f_706f_6f6c) | 1);
+    let viewer = |rng: &mut Rng, x: u32| {
+        let page = g.out_page(f, x, 1 << 20, None);
+        let follows = (0..page.len().min(100)).map(|_| did(page[rng.below(page.len() as u64) as usize].1)).collect();
+        Viewer { did: did(x), follows }
+    };
+    let viewers_random = actors.iter().take(2000).map(|&x| viewer(&mut r2, x)).collect();
+    let mut viewers_active = Vec::new();
+    // a cap on draws, so a graph with few such actors (a test's) stops early
+    let tries = (n as u64 * 64).min(100_000_000);
+    for _ in 0..tries {
+        if viewers_active.len() == 2000 {
+            break;
+        }
+        let x = r2.below(n as u64) as u32;
+        if (50..=5000).contains(&g.out_count(f, x)) {
+            viewers_active.push(viewer(&mut r2, x));
+        }
+    }
+    let viewers_heavy = hot_out.iter().map(|&(x, _)| viewer(&mut r2, x)).collect();
+    let popular = (0..20_000)
+        .map(|_| {
+            let x = actors[r2.below(actors.len() as u64) as usize];
+            let page = g.out_page(f, x, 1 << 20, None);
+            did(page[r2.below(page.len() as u64) as usize].1)
+        })
+        .collect();
+    let mut lists = Vec::new();
+    if let Some(li) = g.relations().by_name("listitem") {
+        for _ in 0..tries {
+            if lists.len() == 2000 {
+                break;
+            }
+            let x = r2.below(n as u64) as u32;
+            if g.in_count(li, x) == 0 {
+                continue;
+            }
+            let on = g.in_page(li, x, 1 << 20, None);
+            if let Some(l) = g.did_of(on[r2.below(on.len() as u64) as usize]) {
+                lists.push(l);
+            }
+        }
+    }
     let cursors = hot_in
         .iter()
         .map(|&(x, _)| {
@@ -154,6 +219,11 @@ pub fn make_inputs(snapshot: &Path, seed: u64) -> Result<Inputs> {
         hot_hits,
         cursors,
         filter_pages,
+        viewers_random,
+        viewers_active,
+        viewers_heavy,
+        popular,
+        lists,
     })
 }
 
@@ -177,6 +247,8 @@ pub enum Shape {
     MutualsHot,
     FollowedByYouFollow,
     Filter,
+    /// The k-th shape of the loaded mix file.
+    File(u16),
 }
 
 impl Shape {
@@ -218,6 +290,7 @@ impl Shape {
             Shape::MutualsHot => "mutuals_hot",
             Shape::FollowedByYouFollow => "followed_by_you_follow_hot",
             Shape::Filter => "filter_50_blocks",
+            Shape::File(k) => mixfile::name(k),
         }
     }
 
@@ -231,11 +304,12 @@ impl Shape {
 pub struct Mix {
     pub weights: Vec<(Shape, u32)>,
     table: Vec<Shape>,
+    name: Option<String>,
 }
 
 impl Mix {
     pub fn one(s: Shape) -> Mix {
-        Mix { weights: vec![(s, 1)], table: vec![s] }
+        Mix { weights: vec![(s, 1)], table: vec![s], name: None }
     }
 
     /// "has:30,relationships_50x2:20,…"
@@ -245,11 +319,15 @@ impl Mix {
             let (name, w) = part.split_once(':').with_context(|| format!("{part:?} isn't shape:weight"))?;
             weights.push((Shape::parse(name)?, w.parse::<u32>().with_context(|| format!("weight {w:?}"))?));
         }
+        Mix::from_weights(weights, None)
+    }
+
+    pub fn from_weights(weights: Vec<(Shape, u32)>, name: Option<String>) -> Result<Mix> {
         let table: Vec<Shape> = weights.iter().flat_map(|&(s, w)| std::iter::repeat_n(s, w as usize)).collect();
         if table.is_empty() {
             bail!("an empty mix");
         }
-        Ok(Mix { weights, table })
+        Ok(Mix { weights, table, name })
     }
 
     pub fn pick(&self, i: usize) -> Shape {
@@ -261,6 +339,9 @@ impl Mix {
     }
 
     fn label(&self) -> String {
+        if let Some(n) = &self.name {
+            return n.clone();
+        }
         if self.weights.len() == 1 {
             return self.weights[0].0.name().into();
         }
@@ -291,6 +372,14 @@ impl Inputs {
 
     fn actor(&self, i: usize) -> &String {
         &self.actors[i % self.actors.len()]
+    }
+
+    pub fn viewers(&self, p: mixfile::Pool) -> &[Viewer] {
+        match p {
+            mixfile::Pool::Active => &self.viewers_active,
+            mixfile::Pool::Heavy => &self.viewers_heavy,
+            _ => &self.viewers_random,
+        }
     }
 }
 
@@ -360,6 +449,61 @@ impl Engine {
                     inp.filter_pages[i % inp.filter_pages.len()].iter().filter_map(|a| g.id_of(a)).collect();
                 dids(g.filter_id(v, &ids, &[(b, Dir::Out), (b, Dir::In)]))
             }
+            Shape::File(k) => self.call_req(mixfile::req(k, i)),
+        }
+    }
+
+    /// A request as the handlers serve it, minus the codec: names to ids, then the graph.
+    fn call_req(&self, r: &Req) -> usize {
+        let g = self.app.graph();
+        let rel = |n: &str| g.relations().by_name(n).expect("the mix's relations are in the graph");
+        let dir = |d: &buffa::EnumValue<marco_proto::v1::Dir>| match d.as_known() {
+            Some(marco_proto::v1::Dir::DIR_IN) => Dir::In,
+            _ => Dir::Out,
+        };
+        let dids = |ids: Vec<u32>| ids.into_iter().filter_map(|x| g.did_of(x)).count();
+        match r {
+            Req::Has(r) => g.has(rel(&r.rel), &r.from, &r.to).is_some() as usize,
+            Req::Relationships(r) => {
+                let rels: Vec<RelId> = r.rels.iter().map(|n| rel(n)).collect();
+                let o: Vec<&str> = r.others.iter().map(String::as_str).collect();
+                g.relationships(&r.actor, &o, &rels).len()
+            }
+            Req::ListOut(r) => g.out_list(rel(&r.rel), &r.actor, r.limit as usize, None).0.len(),
+            Req::ListIn(r) => g.in_list(rel(&r.rel), &r.subject, r.limit as usize, None).0.len(),
+            Req::Counts(r) => {
+                for a in &r.actors {
+                    for n in &r.rels {
+                        std::hint::black_box(g.counts(rel(n), a));
+                    }
+                }
+                r.actors.len()
+            }
+            Req::Intersect(r) => {
+                let side =
+                    |s: &ListSide| g.id_of(&s.actor).map(|actor| ListRef { rel: rel(&s.rel), dir: dir(&s.dir), actor });
+                match (side(&r.a), side(&r.b)) {
+                    (Some(a), Some(b)) => dids(g.intersect(a, b, r.limit as usize)),
+                    _ => 0,
+                }
+            }
+            Req::Filter(r) => {
+                let Some(v) = g.id_of(&r.viewer) else { return 0 };
+                let mut drops = Vec::new();
+                let mut sets = Vec::new();
+                for d in &r.drop {
+                    match d.member_of.as_option() {
+                        Some(m) => sets.extend(g.id_of(&m.actor).map(|actor| ListRef {
+                            rel: rel(&m.rel),
+                            dir: dir(&m.dir),
+                            actor,
+                        })),
+                        None => drops.push((rel(&d.rel), dir(&d.dir))),
+                    }
+                }
+                let ids: Vec<u32> = r.actors.iter().filter_map(|a| g.id_of(a)).collect();
+                dids(g.filter_sets(v, &ids, &drops, &sets))
+            }
         }
     }
 }
@@ -371,7 +515,8 @@ fn side(rel: &str, dir: marco_proto::v1::Dir, actor: &str) -> ListSide {
 }
 
 /// One request of a shape, typed.
-enum Req {
+#[derive(Clone)]
+pub enum Req {
     Has(HasRequest),
     Relationships(RelationshipsRequest),
     ListOut(ListOutRequest),
@@ -385,6 +530,7 @@ impl Req {
     fn of(inp: &Inputs, s: Shape, i: usize) -> Req {
         use marco_proto::v1::Dir as D;
         match s {
+            Shape::File(k) => mixfile::req(k, i).clone(),
             Shape::Has | Shape::HasHit | Shape::HasMiss | Shape::HasHotHit => {
                 let (x, y) = inp.has_pair(s, i);
                 Req::Has(HasRequest { rel: "follow".into(), from: x.clone(), to: y.clone(), ..Default::default() })
@@ -530,7 +676,8 @@ pub fn raw_bodies(inp: &Inputs, mixes: &[Mix]) -> BTreeMap<Shape, (&'static str,
         for &(s, _) in &m.weights {
             out.entry(s).or_insert_with(|| {
                 let path = Req::of(inp, s, 0).path();
-                (path, (0..CYCLE).map(|i| Req::of(inp, s, i).encode()).collect())
+                let n = if matches!(s, Shape::File(_)) { mixfile::DRAWS } else { CYCLE };
+                (path, (0..n).map(|i| Req::of(inp, s, i).encode()).collect())
             });
         }
     }
@@ -556,7 +703,7 @@ impl Caller for Raw {
         let req = http::Request::post(format!("http://{}{path}", self.authority))
             .header(http::header::CONTENT_TYPE, "application/proto")
             .header("connect-protocol-version", "1")
-            .body(http_body_util::Full::new(bodies[i % CYCLE].clone()))
+            .body(http_body_util::Full::new(bodies[i % bodies.len()].clone()))
             .map_err(|e| e.to_string())?;
         let mut send = self.send.clone();
         let res = send.send_request(req).await.map_err(|e| e.to_string())?;
@@ -1060,7 +1207,8 @@ pub struct Args {
     /// Shapes, each run on its own ("all" for every one).
     #[arg(long, value_delimiter = ',')]
     pub shapes: Vec<String>,
-    /// A weighted mix run as one workload: "has:30,counts:10,…".
+    /// A weighted mix run as one workload: "has:30,counts:10,…", or a mix
+    /// file (JSON, as internal/read_mix.py writes) when the value is a file's path.
     #[arg(long)]
     pub mix: Option<String>,
     /// Closed loop: requests in flight (engine: threads), one step each.
@@ -1110,14 +1258,21 @@ pub struct Args {
     pub out: PathBuf,
 }
 
-fn shapes_of(a: &Args) -> Result<Vec<Mix>> {
+fn shapes_of(a: &Args, inp: &Inputs) -> Result<(Vec<Mix>, Vec<String>)> {
     if let Some(m) = &a.mix {
-        return Ok(vec![Mix::parse(m)?]);
+        if Path::new(m).is_file() {
+            let (mix, skipped) = mixfile::load(Path::new(m), inp)?;
+            for s in &skipped {
+                eprintln!("{s}: left out, the inputs have no pool for it");
+            }
+            return Ok((vec![mix], skipped));
+        }
+        return Ok((vec![Mix::parse(m)?], Vec::new()));
     }
     if a.shapes.iter().any(|s| s == "all") || a.shapes.is_empty() {
-        return Ok(Shape::ALL.iter().map(|&s| Mix::one(s)).collect());
+        return Ok((Shape::ALL.iter().map(|&s| Mix::one(s)).collect(), Vec::new()));
     }
-    a.shapes.iter().map(|s| Ok(Mix::one(Shape::parse(s)?))).collect()
+    Ok((a.shapes.iter().map(|s| Ok(Mix::one(Shape::parse(s)?))).collect::<Result<_>>()?, Vec::new()))
 }
 
 /// A read-only App with the snapshot mapped in before it returns, as the
@@ -1157,7 +1312,7 @@ pub fn inputs_cmd(snapshot: &Path, out: &Path, seed: u64) -> Result<()> {
 
 pub fn run(a: Args) -> Result<()> {
     let inp: Arc<Inputs> = Arc::new(serde_json::from_slice(&std::fs::read(&a.inputs)?)?);
-    let mixes = shapes_of(&a)?;
+    let (mixes, skipped) = shapes_of(&a, &inp)?;
     let warm = Duration::from_secs_f64(a.warmup);
     let secs = Duration::from_secs_f64(a.secs);
     let token = match &a.token_file {
@@ -1176,7 +1331,8 @@ pub fn run(a: Args) -> Result<()> {
     let cpus = std::thread::available_parallelism().map_or(0, |p| p.get());
     let meta = json!({"target": format!("{:?}", a.target).to_lowercase(), "mode": format!("{:?}", a.mode).to_lowercase(),
                       "label": a.label, "client_threads": a.threads, "conns": a.conns, "cpus_allowed": cpus,
-                      "secs": a.secs, "warmup": a.warmup, "writes_per_s": a.writes, "client": if a.raw { "raw" } else { "generated" }});
+                      "secs": a.secs, "warmup": a.warmup, "writes_per_s": a.writes, "client": if a.raw { "raw" } else { "generated" },
+                      "mix": a.mix, "mix_skipped": skipped});
     let mut steps: Vec<Value> = Vec::new();
 
     if a.target == Target::Engine {
@@ -1305,6 +1461,123 @@ mod tests {
         assert!(Mix::parse("nope:1").is_err());
         for s in Shape::ALL {
             assert_eq!(Shape::parse(s.name()).unwrap(), s);
+        }
+    }
+
+    fn did(i: u32) -> String {
+        let alphabet = b"abcdefghijklmnopqrstuvwxyz234567";
+        let mut v = (i as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let s: String = (0..24)
+            .map(|_| {
+                let c = alphabet[(v & 31) as usize] as char;
+                v = v.rotate_right(5) ^ 0x5bd1_e995;
+                c
+            })
+            .collect();
+        format!("did:plc:{s}")
+    }
+
+    /// 400 actors following the next 60, a few blocks, two lists.
+    fn small_snapshot(dir: &Path) -> PathBuf {
+        let mut g = Graph::new(marco_core::Relations::bsky_default());
+        let mut t = 0u64;
+        let mut rkey = || {
+            t += 1;
+            marco_server::synth::tid(t, 0)
+        };
+        for i in 0..400u32 {
+            let a = did(i);
+            for k in 1..=60 {
+                g.add(&format!("at://{a}/app.bsky.graph.follow/{}", rkey()), &did((i + k) % 400)).unwrap();
+            }
+            if i % 7 == 0 {
+                g.add(&format!("at://{a}/app.bsky.graph.block/{}", rkey()), &did((i + 200) % 400)).unwrap();
+            }
+        }
+        let owner = did(0);
+        for l in 0..2 {
+            let list = format!("at://{owner}/app.bsky.graph.list/l{l}");
+            for m in 0..30 {
+                let uri = format!("at://{owner}/app.bsky.graph.listitem/{}", rkey());
+                g.add_rec(&uri, &did(m * 3 + l), Some(&list), 0).unwrap();
+            }
+        }
+        let p = dir.join("g.marco");
+        g.write_snapshot(&p).unwrap();
+        p
+    }
+
+    const SMALL_MIX: &str = r#"{"name": "test", "shapes": [
+        {"name": "rel", "call": "relationships", "rate": 0.3, "actor": "active", "rels": ["follow", "block"],
+         "subjects": {"pool": "popular", "followed": 0.5}, "batch": [[1, 1], [30, 1]]},
+        {"name": "pairs", "call": "relationships", "rate": 0.1, "actor": "popular", "rels": ["block"], "subjects": {"pool": "uniform"}, "batch": [[2, 1]]},
+        {"name": "kf", "call": "intersect", "rate": 0.05, "actor": "active", "subjects": {"pool": "popular"}, "limit": 5,
+         "a": {"rel": "follow", "dir": "in", "of": "subject"}, "b": {"rel": "follow", "dir": "out", "of": "viewer"}},
+        {"name": "counts", "call": "counts", "rate": 0.05, "actor": "hot_in", "rels": ["follow"], "subjects": {"pool": "popular"}, "batch": [[3, 1]]},
+        {"name": "page", "call": "list_out", "rate": 0.02, "actor": "heavy", "rels": ["follow"], "limit": 10},
+        {"name": "members", "call": "list_out", "rate": 0.01, "actor": "lists", "rels": ["listitem"], "limit": 5},
+        {"name": "on_list", "call": "has", "rate": 0.01, "actor": "lists", "rels": ["listitem"], "subjects": {"pool": "random"}},
+        {"name": "mutes", "call": "filter", "rate": 0.05, "actor": "active", "subjects": {"pool": "popular"}, "batch": [[20, 1]],
+         "drop": ["block:out", "block:in"], "member_of": [[1, 1], [2, 1]]},
+        {"name": "off", "call": "has", "rate": 0, "actor": "random", "subjects": {"pool": "uniform"}}
+    ]}"#;
+
+    fn file_index(s: Shape) -> u16 {
+        match s {
+            Shape::File(k) => k,
+            _ => unreachable!("a mix file's shapes are File"),
+        }
+    }
+
+    #[test]
+    fn mix_file_runs_on_the_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap = small_snapshot(dir.path());
+        let inp = make_inputs(&snap, 42).unwrap();
+        assert_eq!(inp.viewers_random.len(), 2000);
+        assert!(!inp.viewers_active.is_empty() && inp.viewers_active.iter().all(|v| v.follows.len() == 60));
+        assert_eq!(inp.viewers_heavy.len(), 20);
+        assert_eq!(inp.popular.len(), 20_000);
+        assert!(!inp.lists.is_empty() && inp.lists.iter().all(|l| l.contains("/app.bsky.graph.list/")));
+
+        let file = dir.path().join("mix.json");
+        std::fs::write(&file, SMALL_MIX).unwrap();
+        let (mix, skipped) = mixfile::load(&file, &inp).unwrap();
+        assert!(skipped.is_empty());
+        assert_eq!(mix.weights.len(), 8, "a zero rate is left out");
+        let total: u32 = mix.weights.iter().map(|w| w.1).sum();
+        assert_eq!(mix.weights[0].1 * 100 / total, 50, "rel is 0.3 of 0.59");
+        assert_eq!(mix.weights[0].0.name(), "rel");
+
+        let e = Engine::new(read_only_app(&snap).unwrap()).unwrap();
+        let mut sizes: BTreeMap<(&str, usize), usize> = BTreeMap::new();
+        let mut answered = 0;
+        for i in 0..mixfile::DRAWS {
+            for &(s, _) in &mix.weights {
+                let n = e.call(&inp, s, i);
+                if let Req::Relationships(r) = mixfile::req(file_index(s), i) {
+                    *sizes.entry((s.name(), r.others.len())).or_default() += 1;
+                    answered += (n == r.others.len()) as usize;
+                }
+            }
+        }
+        assert_eq!(sizes.keys().filter(|k| k.0 == "rel").map(|k| k.1).collect::<Vec<_>>(), [1, 30]);
+        assert_eq!(sizes.keys().filter(|k| k.0 == "pairs").map(|k| k.1).collect::<Vec<_>>(), [2]);
+        assert_eq!(answered, 2 * mixfile::DRAWS, "every relationships call answers each other");
+        match mixfile::req(4, 0) {
+            Req::ListOut(r) => assert!(r.actor.starts_with("did:plc:") && r.limit == 10),
+            _ => panic!("page is a ListOut"),
+        }
+        match mixfile::req(5, 0) {
+            Req::ListOut(r) => assert!(r.actor.starts_with("at://") && r.rel == "listitem"),
+            _ => panic!("members is a ListOut"),
+        }
+        match mixfile::req(7, 3) {
+            Req::Filter(r) => {
+                assert_eq!(r.actors.len(), 20);
+                assert!(r.drop.iter().any(|d| d.member_of.as_option().is_some()));
+            }
+            _ => panic!("mutes is a Filter"),
         }
     }
 
