@@ -35,11 +35,6 @@ pub fn len(mut v: u64) -> usize {
 }
 
 #[inline]
-pub fn u16_at(b: &[u8], off: usize) -> u16 {
-    u16::from_le_bytes(b[off..off + 2].try_into().unwrap())
-}
-
-#[inline]
 pub fn u32_at(b: &[u8], off: usize) -> u32 {
     u32::from_le_bytes(b[off..off + 4].try_into().unwrap())
 }

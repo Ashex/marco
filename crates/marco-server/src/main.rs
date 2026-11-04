@@ -60,11 +60,11 @@ struct Serve {
     /// The logins the proxy header may name.
     #[arg(long, env = "MARCO_ADMIN_OPERATORS", value_delimiter = ',', requires = "admin_proxy_header")]
     admin_operators: Vec<String>,
-    /// A list's delta merges past this share of its base; a shard past it is over threshold.
+    /// With --compact-min, a list's delta merges past this share of its base.
     #[arg(long, env = "MARCO_MERGE_RATIO", default_value_t = 0.125)]
     merge_ratio: f64,
-    /// A delta merges only once it holds this many entries.
-    #[arg(long, env = "MARCO_COMPACT_MIN", default_value_t = 64)]
+    /// Merge a list's delta inside the write once it holds this many entries; 0 never (checkpoints fold deltas).
+    #[arg(long, env = "MARCO_COMPACT_MIN", default_value_t = 0)]
     compact_min: usize,
     /// The share of ops that get a span, 0 to 1.
     #[arg(long, env = "MARCO_TRACE_RATIO", default_value_t = 0.0)]
@@ -90,6 +90,12 @@ struct Serve {
     /// Answer Graph reads before every expected source has caught up (they're counted either way).
     #[arg(long, env = "MARCO_SERVE_BEFORE_READY")]
     serve_before_ready: bool,
+    /// Checkpoints drop tombstones older than this many days: past what any source still replays.
+    #[arg(long, env = "MARCO_TOMBSTONE_DAYS", default_value_t = 7.0)]
+    tombstone_days: f64,
+    /// Don't map the snapshot's pages in after open (they then fault in as reads touch them).
+    #[arg(long, env = "MARCO_NO_PREFAULT")]
+    no_prefault: bool,
 }
 
 fn flags(m: &ArgMatches, s: &Serve) -> Vec<FlagInfo> {
@@ -113,6 +119,8 @@ fn flags(m: &ArgMatches, s: &Serve) -> Vec<FlagInfo> {
         ("checkpoint_ops", s.checkpoint_ops.to_string()),
         ("checkpoint_age", s.checkpoint_age.to_string()),
         ("serve_before_ready", s.serve_before_ready.to_string()),
+        ("tombstone_days", s.tombstone_days.to_string()),
+        ("no_prefault", s.no_prefault.to_string()),
     ];
     rows.into_iter()
         .map(|(id, value)| {
@@ -195,6 +203,8 @@ fn main() -> Result<()> {
                 checkpoint_ops: s.checkpoint_ops,
                 checkpoint_age: std::time::Duration::from_secs_f64(s.checkpoint_age),
                 serve_before_ready: s.serve_before_ready,
+                prefault: !s.no_prefault,
+                tombstone_ttl: std::time::Duration::from_secs_f64(s.tombstone_days.max(0.0) * 86_400.0),
                 ..Config::new(s.snapshot.clone())
             };
             let ui = Arc::new(marco_server::ui::Ui::load(s.ui_dir.as_deref())?);

@@ -198,10 +198,15 @@ message WriteOp {
 message AddOp {
   string uri = 1;
   string subject = 2;
+  // When the source saw the create (µs since the epoch); 0: when marco applies it.
+  // An add older than a delete of the same record stays deleted.
+  int64 time_us = 3;
 }
 
 message DeleteOp {
   string uri = 1;
+  // When the source saw the delete (µs since the epoch); 0: when marco applies it.
+  int64 time_us = 2;
 }
 
 message WriteResult {
@@ -210,7 +215,7 @@ message WriteResult {
     bool added = 1;
     // A repeat create.
     bool exists = 2;
-    // A delete for this record came first, so it stays deleted.
+    // A delete of this record newer than the add came first, so it stays deleted.
     bool deleted = 3;
     // The record is gone; this is the subject it named.
     string removed = 4;

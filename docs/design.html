@@ -397,7 +397,7 @@ subject = "subject"</pre>
 <tr><td>vlDB integration</td><td>Ignored for now.</td></tr>
 <tr><td>API protocol</td><td>ConnectRPC: gRPC and JSON over HTTP from one proto.</td></tr>
 <tr><td>Durability</td><td>No WAL: change segments every few seconds with the sources' cursors, rare checkpoints at one cut, sources replay the rest. Ready once every source has caught up.</td></tr>
-<tr><td>A delete before its create</td><td>Leaves a tombstone naming its source. A later add from the same source re-adds (an ordered stream's re-create); one from another source stays deleted.</td></tr>
+<tr><td>A delete before its create</td><td>Every delete leaves a tombstone with the time its source saw it. An add seen later re-adds, from any source (a re-create under a freed rkey); one seen earlier stays deleted (a backfill landing after the live tail). Checkpoints drop tombstones older than 7 days, past any source's replay window.</td></tr>
 </table></div>
 </main>
 </body>

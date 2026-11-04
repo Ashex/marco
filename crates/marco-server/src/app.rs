@@ -64,8 +64,13 @@ pub struct Config {
     pub checkpoint_age: Duration,
     /// Answer Graph reads before every expected source has caught up.
     pub serve_before_ready: bool,
+    /// Checkpoints drop tombstones older than this.
+    pub tombstone_ttl: Duration,
     /// Sources readiness waits for (expect_source adds more).
     pub expected_sources: Vec<String>,
+    /// Map the snapshot's pages in after open and after each checkpoint, in
+    /// the background, so reads and writes don't take page faults.
+    pub prefault: bool,
 }
 
 impl Config {
@@ -74,7 +79,7 @@ impl Config {
             snapshot,
             read_only: false,
             merge_ratio: 0.125,
-            compact_min: 64,
+            compact_min: 0,
             api_listen: "127.0.0.1:0".into(),
             admin_listen: "127.0.0.1:0".into(),
             auth: AuthConfig::default(),
@@ -83,7 +88,9 @@ impl Config {
             checkpoint_ops: 3_000_000,
             checkpoint_age: Duration::from_secs(86_400),
             serve_before_ready: false,
+            tombstone_ttl: Duration::from_secs(7 * 86_400),
             expected_sources: Vec::new(),
+            prefault: true,
         }
     }
 }
@@ -111,16 +118,16 @@ impl Outcome {
     }
 }
 
-/// Applies one op from `source`.
-pub fn apply_op(g: &mut Graph, source: &str, op: &Op) -> Outcome {
+/// Applies one op.
+pub fn apply_op(g: &mut Graph, op: &Op) -> Outcome {
     match op {
-        Op::Add { uri, subject } => match g.add_from(source, uri, subject) {
+        Op::Add { uri, subject, time_us } => match g.add_at(uri, subject, *time_us) {
             Ok(Added::Added) => Outcome::Added,
             Ok(Added::Exists) => Outcome::Exists,
             Ok(Added::Deleted) => Outcome::Deleted,
             Err(e) => Outcome::Error(e.to_string()),
         },
-        Op::Delete { uri } => match g.delete_from(source, uri) {
+        Op::Delete { uri, time_us } => match g.delete_at(uri, *time_us) {
             Ok(Removed::Subject(s)) => Outcome::Removed(s),
             Ok(Removed::NotFound) => Outcome::NotFound,
             Err(e) => Outcome::Error(e.to_string()),
@@ -137,9 +144,9 @@ pub enum Applied {
 /// a checkpoint's replay all go through here, so they agree.
 pub fn apply_rec(g: &mut Graph, rec: &Rec) -> Applied {
     match rec {
-        Rec::Apply { source, ops, .. } => Applied::Ops(ops.iter().map(|op| apply_op(g, source, op)).collect()),
-        Rec::Status { source, did, status, .. } => {
-            Applied::Status(g.set_status_from(source, did, *status).map_err(|e| e.to_string()))
+        Rec::Apply { ops, .. } => Applied::Ops(ops.iter().map(|op| apply_op(g, op)).collect()),
+        Rec::Status { did, status, time_us, .. } => {
+            Applied::Status(g.set_status(did, *status, *time_us).map_err(|e| e.to_string()))
         }
     }
 }
@@ -278,6 +285,7 @@ pub fn open_replayed(cfg: &Config, upto: Option<u64>) -> Result<Replayed> {
     let mut g = Graph::open(path)?;
     g.merge_ratio = cfg.merge_ratio;
     g.compact_min = cfg.compact_min;
+    g.tombstone_ttl_us = cfg.tombstone_ttl.as_micros() as i64;
     let m = g.manifest().context("no manifest")?.clone();
     let mut cursors = m.cursors.clone();
     let (mut n, mut ops, mut last) = (0u32, 0u64, m.segment);
@@ -376,6 +384,7 @@ impl App {
             *app.tx.lock().unwrap() = Some(tx);
         }
         crate::metrics::READY.set(ready as i64);
+        app.prefault();
         Ok(app)
     }
 
@@ -412,7 +421,7 @@ impl App {
     pub fn validate(g: &Graph, ops: &[Op]) -> Result<(), String> {
         for (i, op) in ops.iter().enumerate() {
             let uri = match op {
-                Op::Add { uri, .. } | Op::Delete { uri } => uri,
+                Op::Add { uri, .. } | Op::Delete { uri, .. } => uri,
             };
             let Some((_, coll, _)) = parse_uri(uri) else { return Err(format!("op {i}: {uri:?} isn't a record URI")) };
             if g.relations().by_collection(coll).is_none() {
@@ -434,10 +443,13 @@ impl App {
     /// the next change segment (a few seconds). An empty `cursor` leaves the
     /// source's cursor as it was; empty `ops` just advance it. A source's
     /// first call that sets a cursor returns once that's in a segment, so a
-    /// source never restarts from nothing after it began.
+    /// source never restarts from nothing after it began. An op's `time_us`
+    /// of 0 becomes now.
     pub async fn apply_from(&self, source: &str, cursor: &str, ops: &[Op]) -> Result<Vec<Outcome>> {
         let (reply, rx) = tokio::sync::oneshot::channel();
-        let rec = Rec::Apply { source: source.into(), cursor: cursor.into(), ops: ops.to_vec() };
+        let now = now_ms() * 1000;
+        let ops = ops.iter().map(|o| o.clone().stamped(now)).collect();
+        let rec = Rec::Apply { source: source.into(), cursor: cursor.into(), ops };
         self.send(Req::Apply { rec, durable: false, reply })?;
         match rx.await.context("the writer dropped the write")?? {
             Applied::Ops(o) => Ok(o),
@@ -463,7 +475,13 @@ impl App {
             bail!("{did:?} isn't a DID");
         }
         let (reply, rx) = tokio::sync::oneshot::channel();
-        let rec = Rec::Status { source: source.into(), cursor: cursor.into(), did: did.into(), status };
+        let rec = Rec::Status {
+            source: source.into(),
+            cursor: cursor.into(),
+            did: did.into(),
+            status,
+            time_us: now_ms() * 1000,
+        };
         self.send(Req::Apply { rec, durable, reply })?;
         match rx.await.context("the writer dropped the write")?? {
             Applied::Status(r) => r.map_err(anyhow::Error::msg),
@@ -591,8 +609,8 @@ impl App {
         let mut ring = self.recent.lock().unwrap();
         for (op, o) in ops.iter().zip(outs) {
             let (uri, add, subject_in) = match op {
-                Op::Add { uri, subject } => (uri, true, subject.as_str()),
-                Op::Delete { uri } => (uri, false, ""),
+                Op::Add { uri, subject, .. } => (uri, true, subject.as_str()),
+                Op::Delete { uri, .. } => (uri, false, ""),
             };
             let subject = match o {
                 Outcome::Removed(s) => s.clone(),
@@ -688,6 +706,16 @@ impl App {
                 bail!("{}", j.error);
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Maps the served snapshot's pages in, on a thread of its own.
+    pub(crate) fn prefault(&self) {
+        if !self.cfg.prefault {
+            return;
+        }
+        if let Some(s) = self.graph().shared_snapshot() {
+            std::thread::Builder::new().name("marco-prefault".into()).spawn(move || s.populate()).ok();
         }
     }
 

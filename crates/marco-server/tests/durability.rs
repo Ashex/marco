@@ -31,7 +31,10 @@ fn stream(n: usize) -> Vec<W> {
         seed % m.max(1)
     };
     let mut made: Vec<String> = Vec::new();
+    // event times from a day ago, inside the tombstone TTL
+    let t0 = marco_server::app::now_ms() * 1000 - 86_400_000_000;
     for i in 0..n {
+        let t = t0 + i as i64 * 1000;
         if rnd(40) == 0 {
             let st = [None, Some(Status::Takendown), Some(Status::Deleted)][rnd(3) as usize];
             v.push(W::Status(did(rnd(N as u64 + 20) as u32), st));
@@ -44,9 +47,9 @@ fn stream(n: usize) -> Vec<W> {
             match rnd(10) {
                 0..=2 if !made.is_empty() => {
                     let u = made[rnd(made.len() as u64) as usize].clone();
-                    ops.push(Op::Delete { uri: u });
+                    ops.push(Op::Delete { uri: u, time_us: t });
                 }
-                3 => ops.push(Op::Delete { uri: uri(&a, coll, &tid(50_000_000 + rnd(500), 1)) }),
+                3 => ops.push(Op::Delete { uri: uri(&a, coll, &tid(50_000_000 + rnd(500), 1)), time_us: t }),
                 _ => {
                     let u = if rnd(12) == 0 && !made.is_empty() {
                         made[rnd(made.len() as u64) as usize].clone()
@@ -54,7 +57,7 @@ fn stream(n: usize) -> Vec<W> {
                         uri(&a, coll, &tid(40_000_000 + i as u64 * 10 + rnd(10), 1))
                     };
                     made.push(u.clone());
-                    ops.push(Op::Add { uri: u, subject: did(rnd(N as u64 + 10) as u32) });
+                    ops.push(Op::Add { uri: u, subject: did(rnd(N as u64 + 10) as u32), time_us: t });
                 }
             }
         }
@@ -174,8 +177,7 @@ async fn replaying_more_than_needed_converges() {
     feed(&app, &s, 250, s.len()).await;
     let got = dump(&app.graph());
     let differ: Vec<_> = got.iter().zip(&want).filter(|(a, b)| a != b).collect();
-    // the replayed deletes of records already gone leave tombstones; nothing else differs
-    assert!(differ.iter().all(|(a, _)| a.contains("tombstones")), "{:?}", &differ[..differ.len().min(3)]);
+    assert!(differ.is_empty(), "{:?}", &differ[..differ.len().min(3)]);
     app.shutdown().await.unwrap();
 }
 
@@ -287,7 +289,7 @@ async fn a_corrupt_or_missing_segment_refuses_to_start() {
         app.apply_from(
             SRC,
             &i.to_string(),
-            &[Op::Add { uri: uri(&did(1), FOLLOW, &tid(60_000_000 + i, 1)), subject: did(2) }],
+            &[Op::Add { uri: uri(&did(1), FOLLOW, &tid(60_000_000 + i, 1)), subject: did(2), time_us: 0 }],
         )
         .await
         .unwrap();

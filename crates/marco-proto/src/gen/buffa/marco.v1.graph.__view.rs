@@ -6986,6 +6986,11 @@ pub struct AddOpView<'a> {
     pub uri: &'a str,
     /// Field 2: `subject`
     pub subject: &'a str,
+    /// When the source saw the create (µs since the epoch); 0: when marco applies it.
+    /// An add older than a delete of the same record stays deleted.
+    ///
+    /// Field 3: `time_us`
+    pub time_us: i64,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for AddOpView<'a> {
@@ -7032,6 +7037,13 @@ impl<'a> ::buffa::MessageView<'a> for AddOpView<'a> {
                 )?;
                 view.subject = ::buffa::types::borrow_str(&mut cur)?;
             }
+            3u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.time_us = ::buffa::types::decode_int64(&mut cur)?;
+            }
             _ => {
                 ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
                 let span_len = before_tag.len() - cur.len();
@@ -7056,6 +7068,7 @@ impl<'a> ::buffa::MessageView<'a> for AddOpView<'a> {
         ::core::result::Result::Ok(super::super::AddOp {
             uri: self.uri.to_string(),
             subject: self.subject.to_string(),
+            time_us: self.time_us,
             __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
@@ -7073,6 +7086,9 @@ impl<'a> ::buffa::ViewEncode<'a> for AddOpView<'a> {
         if !self.subject.is_empty() {
             size += 1u64 + ::buffa::types::string_encoded_len(&self.subject) as u64;
         }
+        if self.time_us != 0i64 {
+            size += 1u64 + ::buffa::types::int64_encoded_len(self.time_us) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -7089,6 +7105,9 @@ impl<'a> ::buffa::ViewEncode<'a> for AddOpView<'a> {
         }
         if !self.subject.is_empty() {
             ::buffa::types::put_string_field(2u32, &self.subject, buf);
+        }
+        if self.time_us != 0i64 {
+            ::buffa::types::put_int64_field(3u32, self.time_us, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -7116,6 +7135,13 @@ impl<'__a> ::serde::Serialize for AddOpView<'__a> {
         }
         if !::buffa::json_helpers::skip_if::is_empty_str(self.subject) {
             __map.serialize_entry("subject", self.subject)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_i64(&self.time_us) {
+            __map
+                .serialize_entry(
+                    "timeUs",
+                    &::buffa::json_helpers::ProtoJson(&self.time_us),
+                )?;
         }
         __map.end()
     }
@@ -7214,6 +7240,14 @@ impl AddOpOwnedView {
     pub fn subject(&self) -> &'_ str {
         self.0.reborrow().subject
     }
+    /// When the source saw the create (µs since the epoch); 0: when marco applies it.
+    /// An add older than a delete of the same record stays deleted.
+    ///
+    /// Field 3: `time_us`
+    #[must_use]
+    pub fn time_us(&self) -> i64 {
+        self.0.reborrow().time_us
+    }
 }
 impl ::core::convert::From<::buffa::OwnedView<AddOpView<'static>>> for AddOpOwnedView {
     fn from(inner: ::buffa::OwnedView<AddOpView<'static>>) -> Self {
@@ -7246,6 +7280,10 @@ impl ::serde::Serialize for AddOpOwnedView {
 pub struct DeleteOpView<'a> {
     /// Field 1: `uri`
     pub uri: &'a str,
+    /// When the source saw the delete (µs since the epoch); 0: when marco applies it.
+    ///
+    /// Field 2: `time_us`
+    pub time_us: i64,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for DeleteOpView<'a> {
@@ -7285,6 +7323,13 @@ impl<'a> ::buffa::MessageView<'a> for DeleteOpView<'a> {
                 )?;
                 view.uri = ::buffa::types::borrow_str(&mut cur)?;
             }
+            2u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.time_us = ::buffa::types::decode_int64(&mut cur)?;
+            }
             _ => {
                 ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
                 let span_len = before_tag.len() - cur.len();
@@ -7308,6 +7353,7 @@ impl<'a> ::buffa::MessageView<'a> for DeleteOpView<'a> {
         let _ = __buffa_src;
         ::core::result::Result::Ok(super::super::DeleteOp {
             uri: self.uri.to_string(),
+            time_us: self.time_us,
             __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
@@ -7322,6 +7368,9 @@ impl<'a> ::buffa::ViewEncode<'a> for DeleteOpView<'a> {
         if !self.uri.is_empty() {
             size += 1u64 + ::buffa::types::string_encoded_len(&self.uri) as u64;
         }
+        if self.time_us != 0i64 {
+            size += 1u64 + ::buffa::types::int64_encoded_len(self.time_us) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -7335,6 +7384,9 @@ impl<'a> ::buffa::ViewEncode<'a> for DeleteOpView<'a> {
         use ::buffa::Enumeration as _;
         if !self.uri.is_empty() {
             ::buffa::types::put_string_field(1u32, &self.uri, buf);
+        }
+        if self.time_us != 0i64 {
+            ::buffa::types::put_int64_field(2u32, self.time_us, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -7359,6 +7411,13 @@ impl<'__a> ::serde::Serialize for DeleteOpView<'__a> {
         let mut __map = __s.serialize_map(::core::option::Option::None)?;
         if !::buffa::json_helpers::skip_if::is_empty_str(self.uri) {
             __map.serialize_entry("uri", self.uri)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_i64(&self.time_us) {
+            __map
+                .serialize_entry(
+                    "timeUs",
+                    &::buffa::json_helpers::ProtoJson(&self.time_us),
+                )?;
         }
         __map.end()
     }
@@ -7453,6 +7512,13 @@ impl DeleteOpOwnedView {
     #[must_use]
     pub fn uri(&self) -> &'_ str {
         self.0.reborrow().uri
+    }
+    /// When the source saw the delete (µs since the epoch); 0: when marco applies it.
+    ///
+    /// Field 2: `time_us`
+    #[must_use]
+    pub fn time_us(&self) -> i64 {
+        self.0.reborrow().time_us
     }
 }
 impl ::core::convert::From<::buffa::OwnedView<DeleteOpView<'static>>>

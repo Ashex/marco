@@ -4128,6 +4128,17 @@ pub struct AddOp {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
     )]
     pub subject: ::buffa::alloc::string::String,
+    /// When the source saw the create (µs since the epoch); 0: when marco applies it.
+    /// An add older than a delete of the same record stays deleted.
+    ///
+    /// Field 3: `time_us`
+    #[serde(
+        rename = "timeUs",
+        alias = "time_us",
+        with = "::buffa::json_helpers::int64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_i64"
+    )]
+    pub time_us: i64,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -4137,6 +4148,7 @@ impl ::core::fmt::Debug for AddOp {
         f.debug_struct("AddOp")
             .field("uri", &self.uri)
             .field("subject", &self.subject)
+            .field("time_us", &self.time_us)
             .finish()
     }
 }
@@ -4173,6 +4185,9 @@ impl ::buffa::Message for AddOp {
         if !self.subject.is_empty() {
             size += 1u64 + ::buffa::types::string_encoded_len(&self.subject) as u64;
         }
+        if self.time_us != 0i64 {
+            size += 1u64 + ::buffa::types::int64_encoded_len(self.time_us) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -4188,6 +4203,9 @@ impl ::buffa::Message for AddOp {
         }
         if !self.subject.is_empty() {
             ::buffa::types::put_string_field(2u32, &self.subject, buf);
+        }
+        if self.time_us != 0i64 {
+            ::buffa::types::put_int64_field(3u32, self.time_us, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -4216,6 +4234,13 @@ impl ::buffa::Message for AddOp {
                 )?;
                 ::buffa::types::merge_string(&mut self.subject, buf)?;
             }
+            3u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.time_us = ::buffa::types::decode_int64(buf)?;
+            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -4226,6 +4251,7 @@ impl ::buffa::Message for AddOp {
     fn clear(&mut self) {
         self.uri.clear();
         self.subject.clear();
+        self.time_us = 0i64;
         self.__buffa_unknown_fields.clear();
     }
 }
@@ -4269,13 +4295,26 @@ pub struct DeleteOp {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
     )]
     pub uri: ::buffa::alloc::string::String,
+    /// When the source saw the delete (µs since the epoch); 0: when marco applies it.
+    ///
+    /// Field 2: `time_us`
+    #[serde(
+        rename = "timeUs",
+        alias = "time_us",
+        with = "::buffa::json_helpers::int64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_i64"
+    )]
+    pub time_us: i64,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
 }
 impl ::core::fmt::Debug for DeleteOp {
     fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
-        f.debug_struct("DeleteOp").field("uri", &self.uri).finish()
+        f.debug_struct("DeleteOp")
+            .field("uri", &self.uri)
+            .field("time_us", &self.time_us)
+            .finish()
     }
 }
 impl DeleteOp {
@@ -4308,6 +4347,9 @@ impl ::buffa::Message for DeleteOp {
         if !self.uri.is_empty() {
             size += 1u64 + ::buffa::types::string_encoded_len(&self.uri) as u64;
         }
+        if self.time_us != 0i64 {
+            size += 1u64 + ::buffa::types::int64_encoded_len(self.time_us) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -4320,6 +4362,9 @@ impl ::buffa::Message for DeleteOp {
         use ::buffa::Enumeration as _;
         if !self.uri.is_empty() {
             ::buffa::types::put_string_field(1u32, &self.uri, buf);
+        }
+        if self.time_us != 0i64 {
+            ::buffa::types::put_int64_field(2u32, self.time_us, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -4341,6 +4386,13 @@ impl ::buffa::Message for DeleteOp {
                 )?;
                 ::buffa::types::merge_string(&mut self.uri, buf)?;
             }
+            2u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.time_us = ::buffa::types::decode_int64(buf)?;
+            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -4350,6 +4402,7 @@ impl ::buffa::Message for DeleteOp {
     }
     fn clear(&mut self) {
         self.uri.clear();
+        self.time_us = 0i64;
         self.__buffa_unknown_fields.clear();
     }
 }

@@ -7,8 +7,8 @@
 //! ```text
 //! "MARCOSG1"  u32 header length  header (JSON)  records  u64 xxh3 of all before it
 //! record: 1 apply   source, cursor (varint-length strings), varint n, n ops
-//!         2 status  source, cursor, did, u8 status (0 active, 1 deleted, 2 takendown)
-//! op:     1 add uri subject | 2 delete uri
+//!         2 status  source, cursor, did, u8 status (0 active, 1 deleted, 2 takendown), varint time_us
+//! op:     1 add uri subject varint time_us | 2 delete uri varint time_us
 //! ```
 
 use std::collections::BTreeMap;
@@ -57,16 +57,35 @@ impl Status {
     }
 }
 
+/// A write. `time_us` is when its source saw it (Jetstream's time_us, a
+/// firehose commit's time); 0 means when marco applies it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Op {
-    Add { uri: String, subject: String },
-    Delete { uri: String },
+    Add { uri: String, subject: String, time_us: i64 },
+    Delete { uri: String, time_us: i64 },
+}
+
+impl Op {
+    pub fn time_us(&self) -> i64 {
+        match self {
+            Op::Add { time_us, .. } | Op::Delete { time_us, .. } => *time_us,
+        }
+    }
+
+    /// The op with a 0 time set to `now`.
+    pub fn stamped(mut self, now: i64) -> Op {
+        match &mut self {
+            Op::Add { time_us, .. } | Op::Delete { time_us, .. } if *time_us == 0 => *time_us = now,
+            _ => {}
+        }
+        self
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Rec {
     Apply { source: String, cursor: String, ops: Vec<Op> },
-    Status { source: String, cursor: String, did: String, status: Option<Status> },
+    Status { source: String, cursor: String, did: String, status: Option<Status>, time_us: i64 },
 }
 
 impl Rec {
@@ -121,6 +140,13 @@ fn put_str(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(s.as_bytes());
 }
 
+fn get_varint(b: &[u8], pos: &mut usize) -> Result<u64> {
+    if *pos >= b.len() {
+        bail!("segment truncated");
+    }
+    Ok(varint::get(b, pos))
+}
+
 fn get_str(b: &[u8], pos: &mut usize) -> Result<String> {
     let n = varint::get(b, pos) as usize;
     let s = b.get(*pos..*pos + n).context("segment truncated")?;
@@ -143,24 +169,27 @@ pub fn encode(h: &Header, records: &[Rec]) -> Result<Vec<u8>> {
                 varint::put(&mut out, ops.len() as u64);
                 for op in ops {
                     match op {
-                        Op::Add { uri, subject } => {
+                        Op::Add { uri, subject, time_us } => {
                             out.push(1);
                             put_str(&mut out, uri);
                             put_str(&mut out, subject);
+                            varint::put(&mut out, *time_us as u64);
                         }
-                        Op::Delete { uri } => {
+                        Op::Delete { uri, time_us } => {
                             out.push(2);
                             put_str(&mut out, uri);
+                            varint::put(&mut out, *time_us as u64);
                         }
                     }
                 }
             }
-            Rec::Status { source, cursor, did, status } => {
+            Rec::Status { source, cursor, did, status, time_us } => {
                 out.push(2);
                 put_str(&mut out, source);
                 put_str(&mut out, cursor);
                 put_str(&mut out, did);
                 out.push(Status::code(*status));
+                varint::put(&mut out, *time_us as u64);
             }
         }
     }
@@ -196,8 +225,11 @@ pub fn decode(b: &[u8]) -> Result<Segment> {
                     pos += 1;
                     let uri = get_str(body, &mut pos)?;
                     ops.push(match t {
-                        1 => Op::Add { uri, subject: get_str(body, &mut pos)? },
-                        2 => Op::Delete { uri },
+                        1 => {
+                            let subject = get_str(body, &mut pos)?;
+                            Op::Add { uri, subject, time_us: get_varint(body, &mut pos)? as i64 }
+                        }
+                        2 => Op::Delete { uri, time_us: get_varint(body, &mut pos)? as i64 },
                         _ => bail!("bad op tag {t}"),
                     });
                 }
@@ -208,7 +240,8 @@ pub fn decode(b: &[u8]) -> Result<Segment> {
                 let c = *body.get(pos).context("segment truncated")?;
                 pos += 1;
                 let status = Status::from_code(c).context("bad status")?;
-                records.push(Rec::Status { source, cursor, did, status });
+                let time_us = get_varint(body, &mut pos)? as i64;
+                records.push(Rec::Status { source, cursor, did, status, time_us });
             }
             _ => bail!("bad record tag {tag}"),
         }
@@ -242,8 +275,9 @@ mod tests {
                     Op::Add {
                         uri: "at://did:plc:a/app.bsky.graph.follow/3lab2xyz7qk2c".into(),
                         subject: "did:plc:b".into(),
+                        time_us: 1_730_000_000_000_000,
                     },
-                    Op::Delete { uri: "at://did:plc:a/app.bsky.graph.block/x".into() },
+                    Op::Delete { uri: "at://did:plc:a/app.bsky.graph.block/x".into(), time_us: 7 },
                 ],
             },
             Rec::Apply { source: "api".into(), cursor: String::new(), ops: vec![] },
@@ -252,6 +286,7 @@ mod tests {
                 cursor: String::new(),
                 did: "did:web:a.example".into(),
                 status: Some(Status::Takendown),
+                time_us: 9,
             },
         ];
         let h = Header { segment: 7, build: 9, records: 3, ops: 3, ..Default::default() };

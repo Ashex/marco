@@ -5,12 +5,12 @@
 //! the actor's records names the subject. Deletes come by URI alone, so the
 //! out log is what finds the subject.
 //!
-//! A delete for a record marco doesn't have leaves a tombstone naming the
-//! delete's source. An add from the same source clears it and adds: a
-//! source is an ordered stream, so its later add is a re-create (the archive
-//! has 1,841 records recreated under the rkey a delete freed). An add from
-//! another source stays deleted: that's the add whose order against the
-//! delete marco can't know, such as a backfill landing after the live tail.
+//! Every delete leaves a tombstone with the time its source saw it. An add
+//! seen after that clears it and adds, whatever source it comes from: a
+//! re-create under the rkey a delete freed (the archive has 1,841). An add
+//! seen before it stays deleted: a backfill landing after the live tail
+//! deleted the record. Checkpoints drop tombstones older than
+//! `tombstone_ttl_us`, past what any source still replays.
 //!
 //! Writes take `&mut self` and reads `&self`. The graph is `Clone`, and
 //! everything a snapshot holds is shared, so the server keeps two copies and
@@ -36,7 +36,7 @@ use crate::snapshot::{
     rel_section, write_directory, BaseDir, DidAt, DirParts, Index, Meta, RelStats, ShardMeta, Side, Writer, FORMAT,
 };
 use crate::store::{now_ms, shard_file, Manifest, SetWriter, ShardFile, Store, DEFAULT_SHARDS};
-use crate::varint::{u16_at, u32_at, u64_at};
+use crate::varint::u32_at;
 
 /// Out logs at least this long get a by-subject index in a snapshot.
 pub const DEFAULT_SUBJ_INDEX: usize = 4096;
@@ -44,9 +44,6 @@ pub const DEFAULT_SUBJ_INDEX: usize = 4096;
 /// `relationships` scans an actor's out log once up to this length, rather
 /// than looking each other up.
 const RELATIONSHIPS_SCAN: u64 = 1024;
-
-/// The source of writes that name none (the engine's own calls, tests).
-pub const DEFAULT_SOURCE: &str = "api";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Added {
@@ -144,8 +141,8 @@ struct RelState {
     /// Lists re-encoded after their delta grew; they stand in for the base.
     out_over: FxHashMap<u32, Arc<[u8]>>,
     in_over: FxHashMap<u32, Arc<[u8]>>,
-    /// Tombstones set since the snapshot, with their source.
-    tomb: FxHashMap<(u32, u64), u16>,
+    /// Tombstones set since the snapshot, with the delete's time.
+    tomb: FxHashMap<(u32, u64), i64>,
     /// Snapshot tombstones cleared since.
     untomb: FxHashSet<(u32, u64)>,
     /// Non-TID rkeys added since the snapshot.
@@ -156,10 +153,10 @@ struct RelState {
 /// copy of the graph.
 struct Base {
     store: Store,
-    /// Per shard, its file's tombstone source indexes as the graph's.
-    srcs: Vec<Vec<u16>>,
     /// Ids with a status in a shard file.
     status_bits: Vec<u64>,
+    /// Per relation, the shard files' tombstones: a lookup on every add.
+    tombs: Vec<FxHashMap<(u32, u64), i64>>,
 }
 
 #[derive(Clone)]
@@ -187,12 +184,14 @@ pub struct Graph {
     state: Vec<RelState>,
     /// Statuses set since the snapshot (None: made active).
     status: FxHashMap<u32, Option<Status>>,
-    /// Tombstone sources, by index.
-    sources: Vec<String>,
+    /// Checkpoints drop tombstones this much older than the wall clock (0: never).
+    pub tombstone_ttl_us: i64,
     records: Vec<i64>,
     pairs: Vec<i64>,
     /// A list's delta merges into an override once it's this big and over
-    /// `merge_ratio` of the base.
+    /// `merge_ratio` of the base; 0 never. Off by default: a merge re-encodes
+    /// the list inside the write that tips it, which was the tail of P0's
+    /// delete latency, and checkpoints fold deltas into the shards anyway.
     pub compact_min: usize,
     pub merge_ratio: f64,
     obs: Arc<obs::Metrics>,
@@ -216,10 +215,10 @@ impl Graph {
             live_dids: Vec::new(),
             state,
             status: FxHashMap::default(),
-            sources: vec![DEFAULT_SOURCE.to_string()],
+            tombstone_ttl_us: 0,
             records: vec![0; n],
             pairs: vec![0; n],
-            compact_min: 64,
+            compact_min: 0,
             merge_ratio: 0.125,
             obs: Arc::new(obs::Metrics::new(&names)),
             quiet: false,
@@ -245,15 +244,11 @@ impl Graph {
         if n != g.base_n as usize {
             bail!("directory holds {n} DIDs, meta says {}", g.base_n);
         }
-        let mut srcs = Vec::with_capacity(store.shards.len());
         let mut live: Vec<(u32, Vec<DidKey>)> = Vec::new();
         let mut bits: Vec<(u32, bool)> = Vec::new();
+        let mut tombs: Vec<FxHashMap<(u32, u64), i64>> = vec![FxHashMap::default(); g.rels.len()];
         for f in &store.shards {
-            let Some(f) = f else {
-                srcs.push(Vec::new());
-                continue;
-            };
-            srcs.push(f.meta.sources.iter().map(|s| g.source_id(s)).collect());
+            let Some(f) = f else { continue };
             for (i, st) in f.meta.stats.iter().enumerate().take(g.rels.len()) {
                 g.records[i] += st.out_records as i64;
                 g.pairs[i] += st.in_pairs as i64;
@@ -266,6 +261,11 @@ impl Graph {
                 live.push((f.meta.live_lo, v));
             }
             decode_statuses(&f.bytes()[f.status.clone()], |id, _| bits.push((id, true)));
+            for (i, m) in tombs.iter_mut().enumerate() {
+                decode_tombs(&f.bytes()[f.rels[i].tomb.clone()], |a, k, t| {
+                    m.insert((a, k), t);
+                });
+            }
         }
         live.sort_unstable_by_key(|l| l.0);
         for (lo, v) in live {
@@ -282,7 +282,7 @@ impl Graph {
                 *w |= 1 << (id % 64);
             }
         }
-        g.base = Some(Arc::new(Base { store, srcs, status_bits }));
+        g.base = Some(Arc::new(Base { store, status_bits, tombs }));
         Ok(g)
     }
 
@@ -328,14 +328,6 @@ impl Graph {
     /// Live records (out) and pairs (in) per relation.
     pub fn records(&self, rel: RelId) -> (u64, u64) {
         (self.records[rel as usize].max(0) as u64, self.pairs[rel as usize].max(0) as u64)
-    }
-
-    fn source_id(&mut self, name: &str) -> u16 {
-        if let Some(i) = self.sources.iter().position(|s| s == name) {
-            return i as u16;
-        }
-        self.sources.push(name.to_string());
-        (self.sources.len() - 1) as u16
     }
 
     // ------------------------------------------------------------ directory
@@ -460,15 +452,15 @@ impl Graph {
         self.any_status() && self.status_of_id(id).is_some()
     }
 
-    /// Sets an actor's status. Deleted drops its records as deletes from
-    /// `source`; returns how many.
-    pub fn set_status_from(&mut self, source: &str, did: &str, status: Option<Status>) -> Result<u64> {
+    /// Sets an actor's status. Deleted drops its records as deletes at
+    /// `time_us`; returns how many.
+    pub fn set_status(&mut self, did: &str, status: Option<Status>, time_us: i64) -> Result<u64> {
         let a = self.intern(did)?;
         let mut removed = 0;
         if status == Some(Status::Deleted) {
             for rel in 0..self.rels.len() as RelId {
                 for (k, _) in self.out_all(rel, a) {
-                    if self.delete_id(source, rel, a, k).is_some() {
+                    if self.delete_id(rel, a, k, time_us).is_some() {
                         removed += 1;
                     }
                 }
@@ -504,30 +496,15 @@ impl Graph {
 
     // ------------------------------------------------------------ tombstones
 
-    fn base_tomb(&self, rel: RelId, actor: u32, key: u64) -> Option<u16> {
-        let (f, r, _, _) = self.shard(rel, actor)?;
-        let b = &f.bytes()[r.tomb.clone()];
-        let (mut lo, mut hi) = (0, b.len() / 14);
-        while lo < hi {
-            let mid = (lo + hi) / 2;
-            match (u32_at(b, 14 * mid), u64_at(b, 14 * mid + 4)).cmp(&(actor, key)) {
-                std::cmp::Ordering::Equal => {
-                    let src = u16_at(b, 14 * mid + 12);
-                    let k = (actor / self.width) as usize;
-                    return self.base.as_ref()?.srcs.get(k)?.get(src as usize).copied();
-                }
-                std::cmp::Ordering::Less => lo = mid + 1,
-                std::cmp::Ordering::Greater => hi = mid,
-            }
-        }
-        None
+    fn base_tomb(&self, rel: RelId, actor: u32, key: u64) -> Option<i64> {
+        self.base.as_ref()?.tombs[rel as usize].get(&(actor, key)).copied()
     }
 
-    /// The source of the tombstone on `actor`'s record `key`, if one is set.
-    fn tomb_src(&self, rel: RelId, actor: u32, key: u64) -> Option<u16> {
+    /// The time of the delete that left a tombstone on `actor`'s record `key`.
+    pub fn tombstone(&self, rel: RelId, actor: u32, key: u64) -> Option<i64> {
         let st = &self.state[rel as usize];
-        if let Some(&s) = st.tomb.get(&(actor, key)) {
-            return Some(s);
+        if let Some(&t) = st.tomb.get(&(actor, key)) {
+            return Some(t);
         }
         if !st.untomb.is_empty() && st.untomb.contains(&(actor, key)) {
             return None;
@@ -536,18 +513,14 @@ impl Graph {
     }
 
     pub fn is_tombstoned(&self, rel: RelId, actor: u32, key: u64) -> bool {
-        self.tomb_src(rel, actor, key).is_some()
+        self.tombstone(rel, actor, key).is_some()
     }
 
-    /// The source that left a tombstone, if any.
-    pub fn tombstone_source(&self, rel: RelId, actor: u32, key: u64) -> Option<&str> {
-        self.tomb_src(rel, actor, key).and_then(|s| self.sources.get(s as usize)).map(String::as_str)
-    }
-
-    fn set_tomb(&mut self, rel: RelId, actor: u32, key: u64, src: u16) {
+    fn set_tomb(&mut self, rel: RelId, actor: u32, key: u64, time_us: i64) {
+        let t = self.tombstone(rel, actor, key).map_or(time_us, |t| t.max(time_us));
         let st = &mut self.state[rel as usize];
         st.untomb.remove(&(actor, key));
-        st.tomb.insert((actor, key), src);
+        st.tomb.insert((actor, key), t);
     }
 
     fn clear_tomb(&mut self, rel: RelId, actor: u32, key: u64) {
@@ -644,8 +617,9 @@ impl Graph {
         l.find_key(key).map(|p| l.subject(p))
     }
 
-    /// Whether any live record of `actor` names `subject`.
-    fn out_names(&self, rel: RelId, actor: u32, subject: u32) -> bool {
+    /// Whether a live record of `actor` other than base position `skip`
+    /// names `subject`: what a delete asks before it drops the pair.
+    fn out_names_other(&self, rel: RelId, actor: u32, subject: u32, skip: Option<usize>) -> bool {
         let d = self.state[rel as usize].out.get(&actor);
         if d.is_some_and(|d| d.adds_naming(subject).next().is_some()) {
             return true;
@@ -654,7 +628,7 @@ impl Graph {
         let dels = d.filter(|d| d.dels_name(subject)).map(|d| &d.dels);
         let mut hit = false;
         l.for_subject(subject, |p| {
-            if dels.is_some_and(|m| m.contains_key(&l.key_at(p))) {
+            if Some(p) == skip || dels.is_some_and(|m| m.contains_key(&l.key_at(p))) {
                 return true;
             }
             hit = true;
@@ -1048,17 +1022,20 @@ impl Graph {
         r
     }
 
+    /// An add with no time: it wins over any tombstone left by a delete
+    /// with no time.
     pub fn add(&mut self, uri: &str, subject: &str) -> Result<Added> {
-        self.add_from(DEFAULT_SOURCE, uri, subject)
+        self.add_at(uri, subject, 0)
     }
 
     pub fn delete(&mut self, uri: &str) -> Result<Removed> {
-        self.delete_from(DEFAULT_SOURCE, uri)
+        self.delete_at(uri, 0)
     }
 
-    pub fn add_from(&mut self, source: &str, uri: &str, subject: &str) -> Result<Added> {
+    /// Adds a record its source saw at `time_us`.
+    pub fn add_at(&mut self, uri: &str, subject: &str, time_us: i64) -> Result<Added> {
         let g = (!self.quiet).then(|| self.obs.op(Op::Add, self.obs.multi(), 1));
-        let r = self.add_(source, uri, subject);
+        let r = self.add_(uri, subject, time_us);
         if let Some(g) = g {
             if let Ok((rel, a)) = &r {
                 let o = match a {
@@ -1073,9 +1050,10 @@ impl Graph {
         r.map(|(_, a)| a)
     }
 
-    pub fn delete_from(&mut self, source: &str, uri: &str) -> Result<Removed> {
+    /// Deletes a record by URI; its source saw the delete at `time_us`.
+    pub fn delete_at(&mut self, uri: &str, time_us: i64) -> Result<Removed> {
         let g = (!self.quiet).then(|| self.obs.op(Op::Delete, self.obs.multi(), 1));
-        let r = self.delete_(source, uri);
+        let r = self.delete_(uri, time_us);
         if let Some(g) = g {
             if let Ok((rel, d)) = &r {
                 self.obs.applied(
@@ -1124,7 +1102,7 @@ impl Graph {
 
     // ------------------------------------------------------------ writes
 
-    fn add_(&mut self, source: &str, uri: &str, subject: &str) -> Result<(RelId, Added)> {
+    fn add_(&mut self, uri: &str, subject: &str, time_us: i64) -> Result<(RelId, Added)> {
         let Some((did, coll, rkey_s)) = parse_uri(uri) else { bail!("{uri:?} isn't a record URI") };
         let Some(rel) = self.rels.by_collection(coll) else { bail!("no relation for {coll}") };
         let a = self.intern(did)?;
@@ -1137,16 +1115,16 @@ impl Graph {
                 }
             }
         }
-        let r = self.add_id(source, rel, a, key, s);
+        let r = self.add_id(rel, a, key, s, time_us);
         if side && r == Added::Added {
             self.state[rel as usize].side.insert((a, key), rkey_s.into());
         }
         Ok((rel, r))
     }
 
-    pub fn add_id(&mut self, source: &str, rel: RelId, actor: u32, key: u64, subject: u32) -> Added {
-        if let Some(t) = self.tomb_src(rel, actor, key) {
-            if self.sources.get(t as usize).map(String::as_str) != Some(source) {
+    pub fn add_id(&mut self, rel: RelId, actor: u32, key: u64, subject: u32, time_us: i64) -> Added {
+        if let Some(t) = self.tombstone(rel, actor, key) {
+            if time_us < t {
                 return Added::Deleted;
             }
             self.clear_tomb(rel, actor, key);
@@ -1169,53 +1147,54 @@ impl Graph {
         Added::Added
     }
 
-    fn delete_(&mut self, source: &str, uri: &str) -> Result<(RelId, Removed)> {
+    fn delete_(&mut self, uri: &str, time_us: i64) -> Result<(RelId, Removed)> {
         let Some((did, coll, rkey_s)) = parse_uri(uri) else { bail!("{uri:?} isn't a record URI") };
         let Some(rel) = self.rels.by_collection(coll) else { bail!("no relation for {coll}") };
         let a = self.intern(did)?;
         let (key, _) = key_of(rkey_s);
         Ok((
             rel,
-            match self.delete_id(source, rel, a, key) {
+            match self.delete_id(rel, a, key, time_us) {
                 Some(s) => Removed::Subject(self.did_of(s).unwrap_or_default()),
                 None => Removed::NotFound,
             },
         ))
     }
 
-    /// Removes `actor`'s record `key`, returning its subject. Unknown records
-    /// leave a tombstone naming `source`.
-    pub fn delete_id(&mut self, source: &str, rel: RelId, actor: u32, key: u64) -> Option<u32> {
+    /// Removes `actor`'s record `key`, returning its subject, and leaves a
+    /// tombstone at `time_us` either way.
+    pub fn delete_id(&mut self, rel: RelId, actor: u32, key: u64, time_us: i64) -> Option<u32> {
+        self.set_tomb(rel, actor, key, time_us);
         let in_adds = self.state[rel as usize].out.get(&actor).and_then(|d| d.adds.get(&key).copied());
-        let subject = match in_adds {
+        let (subject, others) = match in_adds {
             Some(s) => {
                 let st = &mut self.state[rel as usize];
                 st.out.get_mut(&actor).unwrap().remove_add(key);
                 st.side.remove(&(actor, key));
-                s
+                // a re-add of a base record keeps its base position masked by dels
+                (s, self.out_names_other(rel, actor, s, None))
             }
             None => {
                 let deleted = self.state[rel as usize].out.get(&actor).is_some_and(|d| d.dels.contains_key(&key));
                 let base = if deleted {
                     None
                 } else {
-                    self.base_out(rel, actor).and_then(|l| l.find_key(key).map(|p| l.subject(p)))
+                    self.base_out(rel, actor).and_then(|l| l.find_key(key).map(|p| (p, l.subject(p))))
                 };
                 match base {
-                    Some(s) => {
+                    Some((p, s)) => {
+                        // asked before the delete lands in dels, so the base scan skips
+                        // this position instead of decoding keys to check dels
+                        let others = self.out_names_other(rel, actor, s, Some(p));
                         self.state[rel as usize].out.entry(actor).or_default().del(key, s);
-                        s
+                        (s, others)
                     }
-                    None => {
-                        let src = self.source_id(source);
-                        self.set_tomb(rel, actor, key, src);
-                        return None;
-                    }
+                    None => return None,
                 }
             }
         };
         self.records[rel as usize] -= 1;
-        if !self.out_names(rel, actor, subject) {
+        if !others {
             let d = self.state[rel as usize].inn.entry(subject).or_default();
             if !d.adds.remove(&actor) {
                 d.dels.insert(actor);
@@ -1284,6 +1263,9 @@ impl Graph {
 
     fn maybe_compact(&mut self, rel: RelId, actor: u32, subject: u32) {
         let min = self.compact_min;
+        if min == 0 {
+            return;
+        }
         let r = rel as usize;
         let out_due = self.state[r].out.get(&actor).is_some_and(|d| {
             let n = d.adds.len() + d.dels.len();
@@ -1375,7 +1357,6 @@ impl Graph {
             let mut w = set.shards[k].take().unwrap();
             let body = self.write_shard_body(&mut w, lo, hi, None, false)?;
             let mut m = set.shard_meta(k, body.stats);
-            m.sources = self.sources.clone();
             m.statuses = body.statuses;
             SetWriter::finish_shard(w, &m)?;
         }
@@ -1471,7 +1452,6 @@ impl Graph {
                 live_lo: lo.max(self.base_n).min(hi),
                 checkpoint,
                 written_ms: now_ms(),
-                sources: self.sources.clone(),
                 statuses: body.statuses,
                 stats: body.stats,
             };
@@ -1662,13 +1642,11 @@ impl Graph {
         w.end()?;
         w.section(&rel_section(r, "in.idx"), &encode_index(&offsets)?)?;
 
-        let mut tombs: Vec<(u32, u64, u16)> = Vec::new();
-        let base_tombs = |f: &ShardFile, tombs: &mut Vec<(u32, u64, u16)>| {
-            let k = (f.meta.lo / self.width) as usize;
-            let map = self.base.as_ref().and_then(|b| b.srcs.get(k));
-            decode_tombs(&f.bytes()[f.rels[r].tomb.clone()], |a, key, s| {
+        let mut tombs: Vec<(u32, u64, i64)> = Vec::new();
+        let base_tombs = |f: &ShardFile, tombs: &mut Vec<(u32, u64, i64)>| {
+            decode_tombs(&f.bytes()[f.rels[r].tomb.clone()], |a, key, t| {
                 if (lo..hi).contains(&a) && !st.untomb.contains(&(a, key)) && !st.tomb.contains_key(&(a, key)) {
-                    tombs.push((a, key, map.and_then(|m| m.get(s as usize).copied()).unwrap_or(0)));
+                    tombs.push((a, key, t));
                 }
             });
         };
@@ -1677,7 +1655,11 @@ impl Graph {
             (None, Some(s)) => s.shards.iter().flatten().for_each(|f| base_tombs(f, &mut tombs)),
             (None, None) => {}
         }
-        tombs.extend(st.tomb.iter().filter(|((a, _), _)| (lo..hi).contains(a)).map(|(&(a, k), &s)| (a, k, s)));
+        tombs.extend(st.tomb.iter().filter(|((a, _), _)| (lo..hi).contains(a)).map(|(&(a, k), &t)| (a, k, t)));
+        if self.tombstone_ttl_us > 0 {
+            let cutoff = now_ms() * 1000 - self.tombstone_ttl_us;
+            tombs.retain(|t| t.2 >= cutoff);
+        }
         tombs.sort_unstable();
         stats.tombstones = tombs.len() as u64;
         w.section(&rel_section(r, "tomb"), &encode_tombs(&tombs))?;

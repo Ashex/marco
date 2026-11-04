@@ -130,34 +130,56 @@ impl CloneViaSnapshot for Graph {
 }
 
 #[test]
-fn a_delete_before_the_create_holds_only_against_other_sources() {
+fn a_delete_holds_against_older_adds_only() {
     let (a, b) = (did(1), did(2));
     for base in [false, true] {
         let mut g = graph();
         g.add(&follow(&did(9), &tid(1)), &b).unwrap();
-        assert_eq!(g.delete_from("live", &follow(&a, &tid(7))).unwrap(), Removed::NotFound);
+        // the live tail deletes a record marco never saw, at t=100
+        assert_eq!(g.delete_at(&follow(&a, &tid(7)), 100).unwrap(), Removed::NotFound);
         assert_eq!(g.tombstones(FOLLOW), 1);
         if base {
             g = reopen(&g);
             assert_eq!(g.tombstones(FOLLOW), 1, "tombstones persist");
         }
-        // a backfill landing after the live tail deleted the record
-        assert_eq!(g.add_from("backfill", &follow(&a, &tid(7)), &b).unwrap(), Added::Deleted);
+        // a backfill that saw the record before the delete
+        assert_eq!(g.add_at(&follow(&a, &tid(7)), &b, 50).unwrap(), Added::Deleted);
         assert_eq!(g.has(FOLLOW, &a, &b), None);
         assert_eq!(g.counts(FOLLOW, &b), (0, 1));
         // another rkey for the same pair is a different record
-        assert_eq!(g.add_from("backfill", &follow(&a, &tid(8)), &b).unwrap(), Added::Added);
+        assert_eq!(g.add_at(&follow(&a, &tid(8)), &b, 50).unwrap(), Added::Added);
         assert_eq!(g.has(FOLLOW, &a, &b), Some(follow(&a, &tid(8))));
-        // the same stream re-creating the rkey later is a re-create
-        assert_eq!(g.add_from("live", &follow(&a, &tid(7)), &b).unwrap(), Added::Added);
+        // a re-create seen after the delete, from any source
+        assert_eq!(g.add_at(&follow(&a, &tid(7)), &b, 150).unwrap(), Added::Added);
         assert_eq!(g.tombstones(FOLLOW), 0);
         assert_eq!(g.counts(FOLLOW, &a), (2, 0));
+        // a delete of a record it has leaves a tombstone too
+        assert_eq!(g.delete_at(&follow(&a, &tid(7)), 200).unwrap(), removed(&b));
+        assert_eq!(g.add_at(&follow(&a, &tid(7)), &b, 180).unwrap(), Added::Deleted);
         if base {
             let g2 = reopen(&g);
-            assert_eq!(g2.tombstones(FOLLOW), 0, "the cleared tombstone stays cleared");
-            assert_eq!(g2.counts(FOLLOW, &a), (2, 0));
+            assert_eq!(g2.tombstones(FOLLOW), 1);
+            assert_eq!(g2.counts(FOLLOW, &a), (1, 0));
         }
     }
+}
+
+#[test]
+fn checkpoints_drop_tombstones_past_their_ttl() {
+    let mut g = graph();
+    g.add(&follow(&did(1), &tid(1)), &did(2)).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("g");
+    g.write_snapshot(&p).unwrap();
+    let mut g = Graph::open(&p).unwrap();
+    let now = marco_core::store::now_ms() * 1000;
+    let day = 86_400_000_000i64;
+    g.delete_at(&follow(&did(3), &tid(1)), now - 10 * day).unwrap();
+    g.delete_at(&follow(&did(3), &tid(2)), now - day).unwrap();
+    g.tombstone_ttl_us = 7 * day;
+    let m = g.write_checkpoint(&p, 1, 0, Default::default()).unwrap();
+    marco_core::store::remove_unlisted(&p, &m).unwrap();
+    assert_eq!(Graph::open(&p).unwrap().tombstones(FOLLOW), 1);
 }
 
 #[test]
@@ -166,9 +188,9 @@ fn statuses_persist_and_hide() {
     let mut g = graph();
     g.add(&follow(&a, &tid(1)), &b).unwrap();
     g.add(&follow(&c, &tid(1)), &a).unwrap();
-    assert_eq!(g.set_status_from("live", &a, Some(Status::Deleted)).unwrap(), 1);
-    g.set_status_from("live", &c, Some(Status::Takendown)).unwrap();
-    g.set_status_from("live", "did:web:never.example", Some(Status::Takendown)).unwrap();
+    assert_eq!(g.set_status(&a, Some(Status::Deleted), 10).unwrap(), 1);
+    g.set_status(&c, Some(Status::Takendown), 10).unwrap();
+    g.set_status("did:web:never.example", Some(Status::Takendown), 10).unwrap();
     let mut g = reopen(&g);
     assert_eq!(g.status_of(&a), Some(Status::Deleted));
     assert_eq!(g.status_of(&c), Some(Status::Takendown));
@@ -176,7 +198,7 @@ fn statuses_persist_and_hide() {
     assert_eq!(g.status_of(&b), None);
     assert_eq!(g.counts(FOLLOW, &a).0, 0, "deleted drops its records");
     assert_eq!(g.counts(FOLLOW, &c).0, 1, "takendown keeps them");
-    g.set_status_from("live", &c, None).unwrap();
+    g.set_status(&c, None, 20).unwrap();
     let g = reopen(&g);
     assert_eq!(g.status_of(&c), None);
     assert_eq!(g.statuses().len(), 2);
@@ -327,8 +349,8 @@ fn ids_survive_snapshots_with_live_dids() {
 #[derive(Default)]
 struct Model {
     records: BTreeMap<(u8, u32, String), u32>,
-    /// Tombstones with the source that left them.
-    tomb: BTreeMap<(u8, u32, String), usize>,
+    /// Tombstones with the time of the delete that left them.
+    tomb: BTreeMap<(u8, u32, String), i64>,
 }
 
 impl Model {
@@ -389,24 +411,23 @@ fn run_model(subj_index: usize) {
             _ => tid(rnd(120)),
         };
         let uri = format!("at://{}/{coll}/{rkey}", did(a));
-        let src = (rnd(4) == 0) as usize;
-        let source = ["live", "backfill"][src];
+        // mostly in order, a quarter from a backfill that saw things up to 300 steps ago
+        let t = step as i64 * 10 - if rnd(4) == 0 { rnd(3000) as i64 } else { 0 };
         if rnd(3) == 0 {
-            let got = g.delete_from(source, &uri).unwrap();
+            let got = g.delete_at(&uri, t).unwrap();
             let key = (rel, a, rkey.clone());
             match m.records.remove(&key) {
                 Some(s) => assert_eq!(got, removed(&did(s)), "step {step}"),
-                None => {
-                    assert_eq!(got, Removed::NotFound, "step {step}");
-                    m.tomb.insert(key, src);
-                }
+                None => assert_eq!(got, Removed::NotFound, "step {step}"),
             }
+            let e = m.tomb.entry(key).or_insert(t);
+            *e = (*e).max(t);
         } else {
             let b = rnd(actors) as u32;
-            let got = g.add_from(source, &uri, &did(b)).unwrap();
+            let got = g.add_at(&uri, &did(b), t).unwrap();
             let key = (rel, a, rkey.clone());
             let blocked = match m.tomb.get(&key) {
-                Some(&t) if t != src => true,
+                Some(&d) if t < d => true,
                 Some(_) => {
                     m.tomb.remove(&key);
                     false

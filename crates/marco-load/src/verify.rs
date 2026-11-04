@@ -49,6 +49,9 @@ pub struct ReplayArgs {
     /// The crawl's start (µs), for bucketing deletes by time.
     #[arg(long, default_value_t = 1_771_484_880_000_000)]
     crawl_us: i64,
+    /// A list's delta merges once it holds this many entries (and past merge_ratio of its base); 0 never.
+    #[arg(long, default_value_t = 0)]
+    compact_min: usize,
 }
 
 pub fn verify(a: &VerifyArgs) -> Result<Value> {
@@ -191,6 +194,7 @@ struct Del {
 
 pub fn replay(a: &ReplayArgs) -> Result<Value> {
     let mut g = Graph::open(&a.snapshot)?;
+    g.compact_min = a.compact_min;
     let rss0 = sys::rss_gb();
     let mut dels = Vec::new();
     let t = Instant::now();

@@ -239,6 +239,13 @@ impl Store {
             f.advise_willneed();
         }
     }
+
+    /// Maps every file's pages in (Snapshot::populate).
+    pub fn populate(&self) {
+        for (_, f) in self.files() {
+            f.populate();
+        }
+    }
 }
 
 /// Deletes shard files `m` doesn't name and temp files: what a checkpoint
@@ -307,7 +314,6 @@ impl SetWriter {
             live_lo: hi,
             checkpoint: 0,
             written_ms: now_ms(),
-            sources: Vec::new(),
             statuses: 0,
             stats,
         }

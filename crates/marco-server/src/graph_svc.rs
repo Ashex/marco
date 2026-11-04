@@ -59,8 +59,10 @@ fn ops_of(ops: &[WriteOp]) -> Result<Vec<Op>, ConnectError> {
     ops.iter()
         .enumerate()
         .map(|(i, o)| match &o.op {
-            Some(write_op::Op::Add(a)) => Ok(Op::Add { uri: a.uri.clone(), subject: a.subject.clone() }),
-            Some(write_op::Op::Delete(d)) => Ok(Op::Delete { uri: d.uri.clone() }),
+            Some(write_op::Op::Add(a)) => {
+                Ok(Op::Add { uri: a.uri.clone(), subject: a.subject.clone(), time_us: a.time_us })
+            }
+            Some(write_op::Op::Delete(d)) => Ok(Op::Delete { uri: d.uri.clone(), time_us: d.time_us }),
             None => Err(bad(format!("op {i} is neither add nor delete"))),
         })
         .collect()

@@ -99,8 +99,8 @@ pub fn parse_uri(uri: &str) -> Option<(&str, &str, &str)> {
     let rest = uri.strip_prefix("at://")?;
     let mut it = rest.splitn(3, '/');
     let (did, coll, rkey) = (it.next()?, it.next()?, it.next()?);
-    (vlatproto::syntax::valid_did(did) && vlatproto::syntax::valid_rkey(rkey) && !coll.is_empty())
-        .then_some((did, coll, rkey))
+    let did_ok = crate::did::pack_plc(did).is_some() || vlatproto::syntax::valid_did(did);
+    (did_ok && vlatproto::syntax::valid_rkey(rkey) && !coll.is_empty()).then_some((did, coll, rkey))
 }
 
 #[cfg(test)]

@@ -41,6 +41,9 @@ struct Args {
     /// Skip the checkpoint phase.
     #[arg(long)]
     no_checkpoint: bool,
+    /// Drop the page cache (sudo) before the restart, as after a reboot.
+    #[arg(long)]
+    cold_restart: bool,
 }
 
 struct Rng(u64);
@@ -55,6 +58,16 @@ impl Rng {
     fn below(&mut self, n: u64) -> u64 {
         self.next() % n.max(1)
     }
+}
+
+/// Anonymous resident bytes (the heap, both graph copies' deltas), apart
+/// from the mapped snapshot.
+fn rss_anon() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| s.lines().find(|l| l.starts_with("RssAnon:")).map(|l| l.to_string()))
+        .and_then(|l| l.split_whitespace().nth(1).and_then(|k| k.parse::<u64>().ok()))
+        .map_or(0, |k| k * 1024)
 }
 
 fn pct(mut v: Vec<u64>) -> Value {
@@ -137,7 +150,7 @@ impl Gen {
             .map(|_| {
                 if self.rng.below(5) == 0 && !self.made.is_empty() {
                     let i = self.rng.below(self.made.len() as u64) as usize;
-                    Op::Delete { uri: self.made.swap_remove(i) }
+                    Op::Delete { uri: self.made.swap_remove(i), time_us: 0 }
                 } else {
                     self.clock += 1;
                     let a = &s.dids[self.rng.below(s.dids.len() as u64) as usize];
@@ -146,7 +159,7 @@ impl Gen {
                         .to_string();
                     let uri = format!("at://{a}/app.bsky.graph.follow/{rkey}");
                     self.made.push(uri.clone());
-                    Op::Add { uri, subject: b.clone() }
+                    Op::Add { uri, subject: b.clone(), time_us: 0 }
                 }
             })
             .collect()
@@ -190,6 +203,7 @@ async fn run(a: Args) -> Result<Value> {
     let t = Instant::now();
     let app = App::open(cfg())?;
     out.insert("open_secs".into(), json!(t.elapsed().as_secs_f64()));
+    out.insert("rss_anon_open".into(), json!(rss_anon()));
     let mut rng = Rng(0x2545_f491_4f6c_dd1d);
     let s = Arc::new(sample(&app.graph(), &mut rng));
     let gen = Arc::new(Mutex::new(Gen { rng: Rng(0x9e37_79b9_7f4a_7c15), made: Vec::new(), clock: 0 }));
@@ -242,6 +256,12 @@ async fn run(a: Args) -> Result<Value> {
     stop.store(true, Ordering::Relaxed);
     let steady_ops = w.await?;
     out.insert("steady_ops".into(), json!(steady_ops));
+    let h = &marco_server::metrics::SEGMENT_SECONDS;
+    out.insert(
+        "segment_writes".into(),
+        json!({"n": h.get_sample_count(), "mean_secs": h.get_sample_sum() / h.get_sample_count().max(1) as f64,
+               "bytes": marco_server::metrics::SEGMENT_BYTES.get()}),
+    );
 
     // the writer's ceiling: four callers, 1000-op batches, back to back
     let t = Instant::now();
@@ -275,15 +295,28 @@ async fn run(a: Args) -> Result<Value> {
         }
         let feed = t.elapsed().as_secs_f64();
         app.flush().await?;
+        out.insert("rss_anon_fed".into(), json!(rss_anon()));
+        // the bench's own record of the URIs it made, inside that figure
+        let held: usize = gen.lock().unwrap().made.iter().map(|u| u.capacity() + 24).sum();
+        out.insert("bench_held_bytes".into(), json!(held));
+        out.insert("segment_ops_fed".into(), json!(app.durability.lock().unwrap().segment_ops));
         let d = app.durability.lock().unwrap().clone();
+        // a clean stop, so the old process's mappings are gone before the reopen
+        app.shutdown().await?;
         drop(app);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        if a.cold_restart {
+            std::process::Command::new("sudo")
+                .args(["-n", "sh", "-c", "sync; echo 3 > /proc/sys/vm/drop_caches"])
+                .status()?;
+        }
         let t = Instant::now();
         let app = App::open(cfg())?;
         let open = t.elapsed().as_secs_f64();
         let d2 = app.durability.lock().unwrap().clone();
         out.insert(
             "restart".into(),
-            json!({"fed_ops": n, "feed_secs": feed, "segments": d.segments, "segment_bytes": d.segment_bytes,
+            json!({"cold": a.cold_restart, "fed_ops": n, "feed_secs": feed, "segments": d.segments, "segment_bytes": d.segment_bytes,
                    "segment_ops": d.segment_ops, "open_and_replay_secs": open, "replayed_segments": d2.replayed_segments,
                    "replayed_ops": d2.replayed_ops}),
         );
@@ -293,15 +326,43 @@ async fn run(a: Args) -> Result<Value> {
     }
 
     if a.deletes > 0 {
-        out.insert("delete_by_uri".into(), deletes(&a.snapshot, a.deletes)?);
+        out.insert("delete_by_uri".into(), deletes(&a.snapshot, a.deletes, false, 0x5851_f42d_4c95_7f2d, 0)?);
+        out.insert("delete_by_uri_populated".into(), deletes(&a.snapshot, a.deletes, true, 0x2545_f491_4f6c_dd1d, 0)?);
+        // the most deltas a checkpoint lets build up
+        out.insert(
+            "delete_by_uri_after_3m_ops".into(),
+            deletes(&a.snapshot, a.deletes, true, 0x9e37_79b9_7f4a_7c15, 3_000_000)?,
+        );
     }
     Ok(Value::Object(out))
 }
 
 /// Deletes random base records by URI on the engine, one at a time, timed.
-fn deletes(path: &std::path::Path, n: usize) -> Result<Value> {
+/// With `populate`, the snapshot's pages are mapped in first; `prefill`
+/// firehose-shaped writes go in before.
+fn deletes(path: &std::path::Path, n: usize, populate: bool, seed: u64, prefill: usize) -> Result<Value> {
     let mut g = Graph::open(path)?;
-    let mut rng = Rng(0x5851_f42d_4c95_7f2d);
+    let t = Instant::now();
+    if populate {
+        g.snapshot().unwrap().populate();
+    }
+    let populate_secs = t.elapsed().as_secs_f64();
+    let mut rng = Rng(seed);
+    if prefill > 0 {
+        let s = sample(&g, &mut rng);
+        let mut gen = Gen { rng: Rng(seed ^ 1), made: Vec::new(), clock: 0 };
+        let now = marco_server::app::now_ms() * 1000;
+        for (i, op) in gen.ops(&s, prefill).into_iter().enumerate() {
+            match op {
+                Op::Add { uri, subject, .. } => {
+                    g.add_at(&uri, &subject, now + i as i64)?;
+                }
+                Op::Delete { uri, .. } => {
+                    g.delete_at(&uri, now + i as i64)?;
+                }
+            }
+        }
+    }
     let ids = g.base_n() as u64;
     let mut uris = Vec::with_capacity(n);
     while uris.len() < n {
@@ -325,11 +386,11 @@ fn deletes(path: &std::path::Path, n: usize) -> Result<Value> {
     let mut removed = 0;
     for &i in &order {
         let t = Instant::now();
-        let r = g.delete(&uris[i])?;
+        let r = g.delete_at(&uris[i], i64::MAX / 2)?;
         lat.push(t.elapsed().as_nanos() as u64);
         removed += matches!(r, marco_core::Removed::Subject(_)) as usize;
     }
-    Ok(json!({"deleted": removed, "latency": pct(lat)}))
+    Ok(json!({"deleted": removed, "populate_secs": populate_secs, "latency": pct(lat)}))
 }
 
 fn main() -> Result<()> {

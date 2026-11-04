@@ -18,7 +18,7 @@
 //! r{i}.in.dat    in sets, by subject id (inset.rs)
 //! r{i}.in.idx
 //! r{i}.side      non-TID rkeys: sorted (actor u32, key u64, off u32), then the strings
-//! r{i}.tomb      deletes that found nothing: sorted (actor u32, key u64, source u16)
+//! r{i}.tomb      deletes: sorted (actor u32, key u64, time_us i64)
 //! status         actor statuses from sources: sorted (id u32, status u8)
 //! live           DIDs of the shard's ids past the directory, from live_lo up
 //! ```
@@ -97,8 +97,6 @@ pub struct ShardMeta {
     /// The checkpoint that wrote it.
     pub checkpoint: u64,
     pub written_ms: i64,
-    /// Tombstones' sources, by the index they carry.
-    pub sources: Vec<String>,
     pub statuses: u64,
     pub stats: Vec<RelStats>,
 }
@@ -297,6 +295,15 @@ impl Snapshot {
             }
         }
         Ok(())
+    }
+
+    /// Maps every page of the file into this process now (MADV_POPULATE_READ),
+    /// reading what isn't cached: later reads take no page faults.
+    pub fn populate(&self) {
+        #[cfg(target_os = "linux")]
+        if let Bytes::Map(m) = &self.bytes {
+            let _ = m.advise(memmap2::Advice::PopulateRead);
+        }
     }
 
     /// Asks the kernel to read the whole file ahead (MADV_WILLNEED).
@@ -636,19 +643,19 @@ pub fn rel_section(rel: usize, part: &str) -> String {
     format!("r{rel}.{part}")
 }
 
-pub fn encode_tombs(entries: &[(u32, u64, u16)]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(14 * entries.len());
-    for &(a, k, s) in entries {
+pub fn encode_tombs(entries: &[(u32, u64, i64)]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(20 * entries.len());
+    for &(a, k, t) in entries {
         out.extend_from_slice(&a.to_le_bytes());
         out.extend_from_slice(&k.to_le_bytes());
-        out.extend_from_slice(&s.to_le_bytes());
+        out.extend_from_slice(&t.to_le_bytes());
     }
     out
 }
 
-pub fn decode_tombs(b: &[u8], mut f: impl FnMut(u32, u64, u16)) {
-    for c in b.as_chunks::<14>().0 {
-        f(u32_at(c, 0), u64_at(c, 4), u16::from_le_bytes([c[12], c[13]]));
+pub fn decode_tombs(b: &[u8], mut f: impl FnMut(u32, u64, i64)) {
+    for c in b.as_chunks::<20>().0 {
+        f(u32_at(c, 0), u64_at(c, 4), u64_at(c, 12) as i64);
     }
 }
 

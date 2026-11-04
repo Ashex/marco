@@ -357,8 +357,9 @@ impl Writer {
         }
         g.quiet = false;
         t.quiet = false;
-        drop(self.app.publish(Arc::new(g)));
-        self.spare = Some(Arc::new(t));
+        let old = (self.app.publish(Arc::new(g)), self.spare.replace(Arc::new(t)));
+        // freeing a day of deltas twice takes long enough to stall writes
+        std::thread::Builder::new().name("marco-free".into()).spawn(move || drop(old)).ok();
         self.ops_since_ckpt = ops;
         self.ckpt_at = Instant::now();
         self.next_ckpt = r.manifest.checkpoint + 1;
@@ -397,6 +398,12 @@ fn rewrite(app: &App, id: u64, upto: u64, cursors: BTreeMap<String, String>) -> 
     remove_unlisted(&cfg.snapshot, &m)?;
     let r = open_replayed(cfg, None)?;
     let (g, n, last) = (r.graph, r.segments, r.last);
+    if cfg.prefault {
+        // before the switch: the new files' first reads would fault every page
+        if let Some(s) = g.snapshot() {
+            s.populate();
+        }
+    }
     let seconds = t.elapsed().as_secs_f64();
     let seg_bytes = segment::list(&cfg.snapshot)?
         .iter()

@@ -493,8 +493,9 @@ async fn admin_rpcs() {
         .await
         .unwrap();
     let tomb = uri(&a5, FOLLOW, &tid(9_500_001, 2));
-    // a tombstone from a live source: a later API add of the record stays deleted
-    s.app.apply_from("live", "1", &[Op::Delete { uri: tomb.clone() }]).await.unwrap();
+    // a delete the live tail saw at t; a backfill's add seen before it stays deleted
+    let t_del = marco_server::app::now_ms() * 1000 - 3_600_000_000;
+    s.app.apply_from("live", "1", &[Op::Delete { uri: tomb.clone(), time_us: t_del }]).await.unwrap();
     let o = a.get_overview(GetOverviewRequest::default()).await.unwrap().into_owned();
     assert_eq!(o.delta_entries, 2, "out add + in add");
     assert_eq!(o.tombstones, 1);
@@ -708,19 +709,33 @@ async fn admin_rpcs() {
 
     let u7 = uri(&did(7), FOLLOW, &tid(9_600_000, 2));
     g.write_batch(WriteBatchRequest { ops: vec![add(&u7, &did(8))], ..Default::default() }).await.unwrap();
+    let tombs = a.get_overview(GetOverviewRequest::default()).await.unwrap().into_owned().tombstones;
+    // a delete for each record the deleted status removed, and the unknown one
+    assert!(tombs > 1);
     let r = a.checkpoint(CheckpointRequest::default()).await.unwrap().into_owned();
     assert_eq!(r.job.kind, "checkpoint");
     let j = wait().await;
     assert_eq!((j.kind.as_str(), j.error.as_str()), ("checkpoint", ""));
     let o = a.get_overview(GetOverviewRequest::default()).await.unwrap().into_owned();
     assert_eq!(o.delta_entries, 0);
-    assert_eq!(o.tombstones, 1, "in the new shard files");
+    assert_eq!(o.tombstones, tombs, "in the new shard files");
     assert_eq!(o.dirty_shards, 0);
     let d = o.durability.into_option().unwrap();
     assert_eq!((d.checkpoint, d.segments), (1, 0));
     assert!(!has(&did(7), &did(8)).await.is_empty());
     let late = g
-        .write_batch(WriteBatchRequest { ops: vec![add(&tomb, &a6)], ..Default::default() })
+        .write_batch(WriteBatchRequest {
+            ops: vec![WriteOp {
+                op: Some(write_op::Op::Add(Box::new(AddOp {
+                    uri: tomb.clone(),
+                    subject: a6.clone(),
+                    time_us: t_del - 1_000_000,
+                    ..Default::default()
+                }))),
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
         .await
         .unwrap()
         .into_owned();
