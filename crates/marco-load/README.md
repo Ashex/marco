@@ -162,8 +162,9 @@ actor with a very long list adds its size on top for as long as it's
 read. The scan keeps one file per bucket per table open (1,025 each), plus
 a connection per shard per node, and raises its soft open-file limit to the
 hard one; it stops with a message if that's still too few. The output
-takes about as much disk as the rows compressed with zstd: measure a sample, or see the results page for the
-whole network's follows and blocks.
+takes about as much disk as the rows compressed with zstd: the whole
+network's follows and blocks (2.97B rows) took 66 GB, 22 B a row
+(docs/scylla-results.html).
 
 **Resume.** A checkpoint every `--checkpoint-secs` (10) fsyncs the bucket
 files and records each file's length and each range's position (its last
