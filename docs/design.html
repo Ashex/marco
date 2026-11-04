@@ -283,12 +283,13 @@ subject = "subject"</pre>
   <path class="aline" d="M390 84 H430"/>
   <rect class="acc" x="430" y="62" width="150" height="44" rx="6"/><text x="442" y="80">apply in RAM</text><text x="442" y="97" class="m" font-size="12">deltas, one writer</text>
   <path class="aline" d="M580 84 H620"/>
-  <rect class="box" x="620" y="62" width="270" height="44" rx="6"/><text x="632" y="80">snapshot every N minutes</text><text x="632" y="97" class="m" font-size="12">merged lists to one file; WAL trimmed</text>
+  <rect class="box" x="620" y="62" width="270" height="44" rx="6"/><text x="632" y="80">rewrite dirty shards</text><text x="632" y="97" class="m" font-size="12">one file per id range; WAL trimmed</text>
   <text x="240" y="140" class="m">Readers see a list's base + delta without locks (epoch swap per list).</text>
   </g>
 </svg>
 </div>
-<p>One writer thread applies ops in order. That's plenty: the firehose's follow and block rate is hundreds per second, and a bulk load skips the WAL entirely. The offline builder takes a CAR backfill or a CSV of (uri, subject) and writes the snapshot file directly, the way vlDB P2 built its node. Restart is mmap the snapshot, then replay the WAL tail, so it takes seconds.</p>
+<p>One writer thread applies ops in order. That's plenty: follows and blocks together averaged 28 ops/s over the last 30 days, and a bulk load skips the WAL entirely. The offline builder takes a CAR backfill or a CSV of (uri, subject) and writes the snapshot directly, the way vlDB P2 built its node. Restart is mmap the snapshot, then replay the WAL tail, so it takes seconds.</p>
+<p>A snapshot is a set of shard files, one per id range (64 to start), not one file. A day changes about 2.4M edges out of 2.5B, so rewriting the whole graph to persist that would write 31 GB for 0.1% of it. Each shard is rewritten only when its deltas pass a threshold, and the WAL is trimmed to the oldest shard's sequence number. Shards also let the loader build in parallel.</p>
 
 <h2>Size at network scale</h2>
 <div class="fig">
@@ -303,6 +304,40 @@ subject = "subject"</pre>
 </svg>
 </div>
 <p>These are estimates from the 1/256 sample and vlDB P0's set measurements. P0 measures them for real. For comparison, vlDB's follow lists alone were 49 GB on NVMe next to a 2.6 TB record store.</p>
+
+<h2>Growth</h2>
+<p>The last 30 days of the firehose (2026-10-05 to 11-03), against today's graph:</p>
+<div class="tw"><table>
+<tr><th></th><th class="n">Creates / 30 d</th><th class="n">Deletes / 30 d</th><th class="n">Net / 30 d</th><th class="n">vs today</th><th class="n">Net / year</th></tr>
+<tr><td>Follows</td><td class="n">61.3M</td><td class="n">10.8M</td><td class="n">+50.5M</td><td class="n">+2.1%</td><td class="n">+614M (+26%)</td></tr>
+<tr><td>Blocks</td><td class="n">9.33M</td><td class="n">0.38M</td><td class="n">+8.9M</td><td class="n">+4.9%</td><td class="n">+109M (+59%)</td></tr>
+<tr><td>New profiles (signup proxy)</td><td class="n">548k</td><td class="n"></td><td class="n">+548k</td><td class="n">+1.3%</td><td class="n">+6.7M (+16%)</td></tr>
+</table></div>
+<p>The second half of the window ran 2% to 16% above the first, so the plan takes the linear year and adds half again for headroom.</p>
+<div class="fig">
+<svg viewBox="0 0 900 250" role="img" aria-label="Size now, in a year, in a year with headroom, and at 10x">
+  <g font-size="13">
+  <text x="10" y="20" font-weight="600">Graph size: in sets (RAM) and out logs (mmap)</text>
+  <text x="10" y="54">Today</text><rect class="bar" x="220" y="40" width="7" height="20"/><rect class="bar2" x="227" y="40" width="20" height="20"/><text x="255" y="55">2.5B edges · 41M actors · 31 GB</text>
+  <text x="10" y="94">One year</text><rect class="bar" x="220" y="80" width="9" height="20"/><rect class="bar2" x="229" y="80" width="25" height="20"/><text x="262" y="95">3.3B · 48M · 40 GB</text>
+  <text x="10" y="134">One year + 50%</text><rect class="bar" x="220" y="120" width="10" height="20"/><rect class="bar2" x="230" y="120" width="28" height="20"/><text x="266" y="135">3.6B · 51M · 44 GB</text>
+  <text x="10" y="174">10x today</text><rect class="bar" x="220" y="160" width="73" height="20"/><rect class="bar2" x="293" y="160" width="213" height="20"/><text x="514" y="175">25B · 410M · 315 GB (73 GB in sets)</text>
+  <rect class="bar" x="220" y="210" width="12" height="12"/><text x="238" y="221" class="m">in sets, hot in RAM</text>
+  <rect class="bar2" x="380" y="210" width="12" height="12"/><text x="398" y="221" class="m">out logs + directory, mmapped</text>
+  </g>
+</svg>
+</div>
+<div class="tw"><table>
+<tr><th>Part</th><th>One year</th><th>10x</th></tr>
+<tr><td>u32 actor ids</td><td>48M of 4.29B</td><td>410M of 4.29B. The ceiling is ~100x today.</td></tr>
+<tr><td>Memory</td><td>~13 GB hot, 40 GB in all: any 64 GB box</td><td>73 GB hot, 315 GB in all: 128 GB RAM and NVMe for the out logs. A URI lookup that misses the page cache costs one NVMe read (~100 µs). Membership and intersections stay in RAM.</td></tr>
+<tr><td>Writes</td><td>~35 ops/s average</td><td>~300 ops/s average. One writer does 100k+.</td></tr>
+<tr><td>Persisting changes</td><td>dirty shards only</td><td>dirty shards only. A single-file snapshot would rewrite 315 GB at a time, which is why it's sharded from the start.</td></tr>
+<tr><td>Bulk build</td><td>P0 measures it (target &lt; 30 min)</td><td>Shards build in parallel, and the sort spills to disk. One box at 10x is a few hours, so actor-range shards across nodes become worth it here, for rebuild time and redundancy rather than capacity.</td></tr>
+<tr><td>Hot lists</td><td>top account ~6M followers</td><td>Even a 60M-follower in set is ~100 MB of Elias-Fano. Intersections cost the smaller side.</td></tr>
+<tr><td>Elias-Fano bytes/edge</td><td>~2.9</td><td>~3.3. It grows with log₂(ids / set size), so 10x the ids adds ~3 bits per edge.</td></tr>
+</table></div>
+<p>So the design holds for a year on one ordinary box, and at 10x on one big one. The one change it needed was a sharded snapshot, which is cheap now and expensive later. The design keeps one write path and one read path, and sharding across nodes stays a later option, not a rewrite.</p>
 
 <h2>Targets</h2>
 <div class="tw"><table>
