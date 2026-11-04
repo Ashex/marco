@@ -13,6 +13,7 @@ marco-load fill-scylla  --config TOML --input DIR        build input -> Scylla t
 marco-load diff         --a SNAP --b SNAP                two snapshots, record by record
 marco-load verify       --snapshot SNAP                  checksums, every list decoded, both directions agree
 marco-load open | bench | replay                         the P0 measurements
+marco-load bench-lists  --snapshot SNAP                  list sizes, lookups, set ops, listitem writes
 ```
 
 `--ops 127.0.0.1:PORT` serves `/metrics` and `/debug/pprof/*` while any of

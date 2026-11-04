@@ -4,6 +4,7 @@
 //! marco-load build  --input DIR --out FILE     export files -> snapshot
 //! marco-load open   --snapshot FILE            open time and first queries (drop caches first for cold)
 //! marco-load bench  --snapshot FILE            read latencies and throughput
+//! marco-load bench-lists --snapshot FILE      list sizes, lookups, set ops and listitem writes
 //! marco-load verify --snapshot FILE            checksums, every list decoded, a sampled export checked
 //! marco-load replay --snapshot FILE --deletes DIR   delete-by-URI replay through the mutable path
 //! marco-load diff   --a SNAP --b SNAP              two snapshots compared record by record
@@ -23,6 +24,7 @@ mod build;
 #[cfg(feature = "scylla")]
 mod cql;
 mod diff;
+mod lists_bench;
 mod metrics;
 mod rows;
 mod stats;
@@ -83,6 +85,7 @@ enum Cmd {
         snapshot: PathBuf,
     },
     Bench(bench::Args),
+    BenchLists(lists_bench::Args),
     Verify(verify::VerifyArgs),
     Replay(verify::ReplayArgs),
     Diff(diff::Args),
@@ -130,6 +133,7 @@ fn main() -> Result<()> {
         }
         Cmd::Open { snapshot } => bench::open(&snapshot)?,
         Cmd::Bench(a) => bench::run(&a)?,
+        Cmd::BenchLists(a) => lists_bench::run(&a)?,
         Cmd::Verify(a) => verify::verify(&a)?,
         Cmd::Replay(a) => verify::replay(&a)?,
         Cmd::Diff(a) => diff::run(&a)?,
