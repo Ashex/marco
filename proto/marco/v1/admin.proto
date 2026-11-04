@@ -349,6 +349,10 @@ message RelationInfo {
   // Records less pairs: an actor's repeat records naming one subject.
   uint64 duplicates = 6;
   uint64 non_tid = 7;
+  // A list relation: the record's path to its list.
+  string list = 8;
+  // A companion: the list relation whose records it holds by owner.
+  string owner_of = 9;
 }
 
 message GetListStatsRequest {
@@ -414,7 +418,7 @@ message Source {
 }
 
 message GetActorRequest {
-  // A DID.
+  // A DID, or a list's AT URI.
   string actor = 1;
 }
 
@@ -427,6 +431,8 @@ message GetActorResponse {
   // active, deleted or takendown.
   string status = 5;
   repeated ActorRelation rels = 6;
+  // A list node rather than a DID.
+  bool list = 7;
 }
 
 message ActorRelation {
@@ -440,6 +446,8 @@ message ActorRelation {
   // Where the lists are: base, delta or merged.
   string out_stored = 6;
   string in_stored = 7;
+  // Distinct subjects of the out records: a list's members.
+  uint64 out_subjects = 8;
 }
 
 message ListEdgesRequest {
@@ -498,6 +506,8 @@ message ResolveUriResponse {
   uint64 subject_in_count = 17;
   uint32 subject_shard = 18;
   string subject_in_stored = 19;
+  // A list relation's record: its list, whose log holds the member edge.
+  string list = 20;
 }
 
 message GetSettingsRequest {}

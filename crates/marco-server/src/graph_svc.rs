@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use connectrpc::{ConnectError, InboundStream, RequestContext, Response, ServiceRequest, ServiceResult};
 use futures::StreamExt;
-use marco_core::{Dir, Graph, ListRef, RelId};
+use marco_core::{Dir, Graph, ListRef, RelId, SetOp};
 use marco_proto::connect::marco::v1 as svc;
 use marco_proto::v1::__buffa::oneof::{write_op, write_result};
 use marco_proto::v1::*;
@@ -60,9 +60,12 @@ fn ops_of(ops: &[WriteOp]) -> Result<Vec<Op>, ConnectError> {
     ops.iter()
         .enumerate()
         .map(|(i, o)| match &o.op {
-            Some(write_op::Op::Add(a)) => {
-                Ok(Op::Add { uri: a.uri.clone(), subject: a.subject.clone(), list: None, time_us: a.time_us })
-            }
+            Some(write_op::Op::Add(a)) => Ok(Op::Add {
+                uri: a.uri.clone(),
+                subject: a.subject.clone(),
+                list: (!a.list.is_empty()).then(|| a.list.clone()),
+                time_us: a.time_us,
+            }),
             Some(write_op::Op::Delete(d)) => Ok(Op::Delete { uri: d.uri.clone(), time_us: d.time_us }),
             None => Err(bad(format!("op {i} is neither add nor delete"))),
         })
@@ -168,7 +171,7 @@ impl svc::Graph for GraphApi {
             return Response::ok(ListOutResponse::default());
         }
         let cursor = (!req.cursor.is_empty()).then_some(req.cursor);
-        let (items, next) = g.out_list(rel, req.actor, limit(req.limit, 50, 1000), cursor);
+        let (items, next) = g.out_list_opts(rel, req.actor, limit(req.limit, 50, 1000), cursor, req.distinct);
         let edges = items
             .into_iter()
             .filter(|(_, s)| !g.hidden(s))
@@ -213,10 +216,12 @@ impl svc::Graph for GraphApi {
                         .iter()
                         .map(|&r| {
                             let (o, i) = if hide { (0, 0) } else { g.counts(r, a) };
+                            let subjects = if o == 0 { 0 } else { g.id_of(a).map_or(0, |id| g.out_distinct(r, id)) };
                             RelCounts {
                                 rel: g.relations().get(r).name.clone(),
                                 out_records: o,
                                 in_actors: i,
+                                out_subjects: subjects,
                                 ..Default::default()
                             }
                         })
@@ -251,16 +256,39 @@ impl svc::Graph for GraphApi {
                 Dir::In => g.in_count(s.rel, s.actor),
             })
         };
-        let actors = match (a, b) {
-            (Some(x), Some(y)) => g
-                .intersect(x, y, limit(req.limit, 100, 10_000))
-                .into_iter()
-                .filter_map(|id| g.did_of(id))
-                .filter(|d| !g.hidden(d))
-                .collect(),
+        let op = match req.op.as_known() {
+            Some(marco_proto::v1::SetOp::SET_OP_AND_NOT) => SetOp::AndNot,
+            Some(_) => SetOp::And,
+            None => return Err(bad("op must be SET_OP_AND or SET_OP_AND_NOT")),
+        };
+        let after = match req.cursor.as_str() {
+            "" => None,
+            c => Some(g.id_of(c).ok_or_else(|| bad("cursor isn't in this graph"))?),
+        };
+        let lim = limit(req.limit, 100, 10_000);
+        let ids = match (a, b, op) {
+            (Some(x), Some(y), _) => g.combine(x, y, op, lim, after),
+            // a without a missing (or hidden) b is all of a
+            (Some(x), None, SetOp::AndNot) => {
+                let mut v = match x.dir {
+                    Dir::Out => g.out_set(x.rel, x.actor),
+                    Dir::In => g.in_set(x.rel, x.actor),
+                };
+                v.retain(|&i| after.is_none_or(|a| i > a));
+                v.truncate(lim);
+                v
+            }
             _ => Vec::new(),
         };
-        Response::ok(IntersectResponse { actors, a_len: len(a), b_len: len(b), ..Default::default() })
+        let cursor = if ids.len() == lim { ids.last().and_then(|&i| g.did_of(i)) } else { None };
+        let actors = ids.into_iter().filter_map(|id| g.did_of(id)).filter(|d| !g.hidden(d)).collect();
+        Response::ok(IntersectResponse {
+            actors,
+            a_len: len(a),
+            b_len: len(b),
+            cursor: cursor.unwrap_or_default(),
+            ..Default::default()
+        })
     }
 
     async fn filter(&self, _: RequestContext, req: ServiceRequest<'_, FilterRequest>) -> ServiceResult<FilterResponse> {
@@ -270,13 +298,26 @@ impl svc::Graph for GraphApi {
             return Err(bad("at most 1000 actors"));
         }
         let g = self.0.graph();
-        let drops: Vec<(RelId, Dir)> =
-            req.drop.iter().map(|d| Ok((rel_id(&g, &d.rel)?, dir_of(&d.dir)?))).collect::<Result<_, ConnectError>>()?;
+        let mut drops: Vec<(RelId, Dir)> = Vec::new();
+        let mut sets: Vec<ListRef> = Vec::new();
+        for d in &req.drop {
+            match d.member_of.as_option() {
+                Some(m) => {
+                    let (rel, dir) = (rel_id(&g, &m.rel)?, dir_of(&m.dir)?);
+                    // an unknown or hidden list drops nobody
+                    if let Some(actor) = g.id_of(&m.actor).filter(|_| !g.hidden(&m.actor)) {
+                        sets.push(ListRef { rel, dir, actor });
+                    }
+                }
+                None => drops.push((rel_id(&g, &d.rel)?, dir_of(&d.dir)?)),
+            }
+        }
         let viewer = g.id_of(&req.viewer);
         let ids: Vec<Option<u32>> = req.actors.iter().map(|a| g.id_of(a)).collect();
+        let known: Vec<u32> = ids.iter().flatten().copied().collect();
         let kept: std::collections::HashSet<u32> = match viewer {
-            Some(v) => g.filter_id(v, &ids.iter().flatten().copied().collect::<Vec<_>>(), &drops).into_iter().collect(),
-            None => ids.iter().flatten().copied().collect(),
+            Some(v) => g.filter_sets(v, &known, &drops, &sets).into_iter().collect(),
+            None => g.filter_sets(u32::MAX, &known, &[], &sets).into_iter().collect(),
         };
         let mut actors = Vec::new();
         let mut dropped = Vec::new();
@@ -288,11 +329,15 @@ impl svc::Graph for GraphApi {
             match id {
                 Some(x) if !kept.contains(x) => {
                     let v = viewer.unwrap_or_default();
-                    let hit = drops.iter().find(|&&(r, d)| match d {
-                        Dir::Out => g.has_id(r, v, *x).is_some(),
-                        Dir::In => g.in_contains(r, v, *x),
+                    let hit = drops.iter().copied().find(|&(r, d)| {
+                        viewer.is_some()
+                            && match d {
+                                Dir::Out => g.has_id(r, v, *x).is_some(),
+                                Dir::In => g.in_contains(r, v, *x),
+                            }
                     });
-                    let (r, d) = hit.copied().unwrap_or(drops[0]);
+                    let set = sets.iter().find(|&&s| g.side_contains(s, *x)).map(|s| (s.rel, s.dir));
+                    let (r, d) = hit.or(set).unwrap_or((0, Dir::Out));
                     dropped.push(Dropped {
                         actor: a.clone(),
                         rel: g.relations().get(r).name.clone(),

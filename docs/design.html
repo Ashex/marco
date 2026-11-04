@@ -372,10 +372,10 @@ list = "list"     # the edge starts at this record, which must be in the same re
 
 <div class="tw"><table>
 <tr><th>Lookup</th><th>How</th></tr>
-<tr><td>A list's members, paged</td><td><code>ListOut(listitem, L)</code>: newest first, rkey cursor. <code>distinct</code> keeps the newest record per member.</td></tr>
+<tr><td>A list's members, paged</td><td><code>ListOut(listitem, L)</code>: newest first, rkey cursor. <code>distinct</code> keeps each member's oldest record, as the appview does, so a repeat added later can't move a member past a cursor.</td></tr>
 <tr><td>The lists a DID is on</td><td><code>ListIn(listitem, did)</code>: list URIs in id order, URI cursor</td></tr>
 <tr><td>Counts</td><td><code>Counts</code> gains <code>out_subjects</code>: distinct members, from a per-list repeat count in the out-log header</td></tr>
-<tr><td>has(list, did)</td><td><code>Has(listitem, L, did)</code>: the newest listitem URI</td></tr>
+<tr><td>has(list, did)</td><td><code>Has(listitem, L, did)</code>: the member's oldest listitem URI</td></tr>
 <tr><td>L1 ∩ L2, L1 − L2, L against a relation</td><td><code>Intersect</code> with an op (and, and-not) and an id cursor</td></tr>
 <tr><td>Drop a list's members from a page of actors</td><td><code>Filter</code> drop rule <code>member_of</code></td></tr>
 <tr><td>The owner's listitems</td><td><code>ListOut(listitem.owner, owner)</code>: listitem URI and list</td></tr>
@@ -394,12 +394,16 @@ list = "list"     # the edge starts at this record, which must be in the same re
 
 <h3>Ingest, build and durability</h3>
 <p>Jetstream and the firehose read the list path from the record next to the subject, and an add op carries it (<code>AddOp.list</code>, segment op 3). The bulk build reads listitem chunks with a fourth string column, the list URI, after the subject. It resolves each (owner, rkey) to its latest op, as for every relation, then writes the record twice: by owner into the owner log and by list into the list log. Since a list's URI starts with its owner's DID, a repo-prefix chunk's lists are a contiguous id range too, so the out pass places them the same way. Deletes, tombstones, deleted accounts and change segments all go through the owner log, so the durability tests run unchanged with listitems mixed in.</p>
+<p>An update can move a listitem to another list, or a follow to another subject, under the same rkey. An add of a key that holds something else replaces the record in every structure, and a create or update that isn't an edge (a list in another repo, a subject that isn't a DID) empties the key like a delete. Applied in order, a source's ops end where the bulk build's latest op per key does.</p>
+<p>Two sources overlap: a backfill, or a rebuild's catch-up, hands over ops the live tail already passed. So each key keeps a stamp, the time and source of its last change. From another source, an add older than it changes nothing, and so does a delete of a record changed after the delete. The stamp's own source always applies, in arrival order: 2.3% of deletes land within a second of their create, so a clock that steps back, or a switch between Jetstream and the firehose, would otherwise strand a source's own deletes. An account's deletion takes every record, stamped or not. A plain create's stamp lives in memory until the next checkpoint. A key that was replaced, or re-created after a delete, keeps its stamp in the snapshot beside the tombstones, with their TTL, since no source replays further back. Records never replaced carry nothing, so the cost is about zero.</p>
+<p>A firehose frame whose record block is missing or unreadable is skipped, not mapped to a delete. It says nothing about the new record: a delete would drop a good record whenever a relay elides a block, and a rebuild would keep it. These are counted (<code>missing_block</code>, <code>bad_record</code>), and the next update or the next rebuild settles the key.</p>
 
 <h3>Left out</h3>
 <div class="tw"><table>
 <tr><th>Question</th><th>Answer (2026-11-04)</th></tr>
 <tr><td>List kinds (modlist, curatelist, reference)</td><td>Not stored. Lists are sets; callers that care about kinds hold the list records.</td></tr>
 <tr><td>The <code>app.bsky.graph.list</code> record</td><td>Not stored. Nothing here needs it: the appview doesn't cascade a list's delete to its items either, and the list node exists while it has items.</td></tr>
+<tr><td>Later: order by the repo's rev</td><td>A commit's <code>rev</code> orders a repo's changes across sources better than event times do. Scylla rows and API writes don't carry it, so stamps use times and sources for now.</td></tr>
 <tr><td>Later: list subjects (listblock)</td><td>Every subject stays a DID. Because a list is already a directory node, <code>app.bsky.graph.listblock</code> could become an ordinary relation whose subject is a list, and blockingByList / blockedByList become set ops: t's lists against the viewer's subscriptions, and the viewer's lists against t's.</td></tr>
 </table></div>
 

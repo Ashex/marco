@@ -15,6 +15,7 @@ const out = resolve(args[0] ?? 'shots')
 mkdirSync(out, { recursive: true })
 const UI = new URL('..', import.meta.url).pathname
 const ACTOR = process.env.MARCO_ACTOR ?? 'did:plc:k3ltx7rq2a5m6uoyzwbnf4hc'
+const LIST = process.env.MARCO_LIST ?? `at://${ACTOR}/app.bsky.graph.list/3kdkwdle4qh2g`
 
 let server
 async function serve(port) {
@@ -86,6 +87,7 @@ async function fillExplorer(pg) {
 const ROUTES = [
   ['overview', '/admin/', 'Edges by relation'],
   ['explorer', `/admin/explorer?actor=${encodeURIComponent(ACTOR)}`, 'Followers ←'],
+  ['explorer-list', `/admin/explorer?actor=${encodeURIComponent(LIST)}`, 'Members →'],
   ['relations', '/admin/relations', 'List lengths'],
   ['storage', '/admin/storage', 'Bytes by section'],
   ['ingest', '/admin/ingest', 'Ops by outcome'],

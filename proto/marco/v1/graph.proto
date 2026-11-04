@@ -5,10 +5,19 @@ package marco.v1;
 // The graph API: actor-to-actor edges. Reads are open. Writes need the admin
 // token (`Authorization: Bearer <token>`).
 //
-// Relations are named in config ("follow", "block"). A rel field takes a
-// name; an empty rels list means every relation.
+// Relations are named in config ("follow", "block", "listitem"). A rel field
+// takes a name; an empty rels list means every relation.
+//
+// Lists: a list relation (listitem) keeps edges from a list to its members,
+// and an actor field there takes the list's AT URI. ListOut of a list is its
+// members, newest first; ListIn of a DID is the lists it's on; Has(list, did)
+// is the listitem's URI. Its companion, "listitem.owner", holds the records by
+// owner: ListOut(listitem.owner, owner) is the owner's listitems with their lists.
+// Has(list, did) returns the member's oldest listitem. An add of a key that
+// holds another subject or list replaces the record (an update).
 service Graph {
-  // The newest record of `from` naming `to`, as its URI, or empty.
+  // The newest record of `from` naming `to`, as its URI, or empty. For a
+  // list relation, the member's oldest listitem.
   rpc Has(HasRequest) returns (HasResponse) {
     option idempotency_level = NO_SIDE_EFFECTS;
   }
@@ -30,7 +39,8 @@ service Graph {
   rpc Counts(CountsRequest) returns (CountsResponse) {
     option idempotency_level = NO_SIDE_EFFECTS;
   }
-  // The actors in both lists (mutuals, "followed by people you follow").
+  // The actors in both sides (mutuals, "followed by people you follow"), or
+  // in the first and not the second. A side can be a list.
   rpc Intersect(IntersectRequest) returns (IntersectResponse) {
     option idempotency_level = NO_SIDE_EFFECTS;
   }
@@ -88,10 +98,14 @@ message RelationshipEdge {
 
 message ListOutRequest {
   string rel = 1;
+  // A DID, or for a list relation the list's AT URI.
   string actor = 2;
   // Default 50, at most 1000.
   uint32 limit = 3;
   string cursor = 4;
+  // One record per subject, its oldest (the appview keeps the first): a
+  // list's members, where some records repeat one. Stable under a cursor.
+  bool distinct = 5;
 }
 
 message ListOutResponse {
@@ -138,12 +152,23 @@ message RelCounts {
   uint64 out_records = 2;
   // The actors with a record naming this actor.
   uint64 in_actors = 3;
+  // The distinct subjects of the actor's records: a list's member count.
+  uint64 out_subjects = 4;
 }
 
 message ListSide {
   string rel = 1;
   Dir dir = 2;
+  // A DID, or a list's AT URI: (listitem, DIR_OUT, list) is its members.
   string actor = 3;
+}
+
+enum SetOp {
+  // a and b.
+  SET_OP_UNSPECIFIED = 0;
+  SET_OP_AND = 1;
+  // a and not b.
+  SET_OP_AND_NOT = 2;
 }
 
 message IntersectRequest {
@@ -151,6 +176,9 @@ message IntersectRequest {
   ListSide b = 2;
   // Default 100, at most 10000.
   uint32 limit = 3;
+  SetOp op = 4;
+  // The last response's cursor: the actors after it, in id order.
+  string cursor = 5;
 }
 
 message IntersectResponse {
@@ -159,6 +187,8 @@ message IntersectResponse {
   // The two sides' lengths.
   uint64 a_len = 2;
   uint64 b_len = 3;
+  // Empty on the last page.
+  string cursor = 4;
 }
 
 message FilterDrop {
@@ -166,6 +196,9 @@ message FilterDrop {
   // DIR_OUT drops the viewer's subjects (the viewer blocks them), DIR_IN
   // those naming the viewer (they block the viewer).
   Dir dir = 2;
+  // Set instead of rel and dir: drops the actors in this side, whoever the
+  // viewer is (a list's members: listitem, DIR_OUT, the list's URI).
+  ListSide member_of = 3;
 }
 
 message FilterRequest {
@@ -198,8 +231,11 @@ message WriteOp {
 message AddOp {
   string uri = 1;
   string subject = 2;
+  // A list relation's record names its list, an AT URI in the same repo.
+  string list = 4;
   // When the source saw the create (µs since the epoch); 0: when marco applies it.
-  // An add older than a delete of the same record stays deleted.
+  // An add older than a delete of the same record stays deleted; one older
+  // than the record's last change from another source changes nothing.
   int64 time_us = 3;
 }
 

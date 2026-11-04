@@ -10113,6 +10113,14 @@ pub struct RelationInfoView<'a> {
     pub duplicates: u64,
     /// Field 7: `non_tid`
     pub non_tid: u64,
+    /// A list relation: the record's path to its list.
+    ///
+    /// Field 8: `list`
+    pub list: &'a str,
+    /// A companion: the list relation whose records it holds by owner.
+    ///
+    /// Field 9: `owner_of`
+    pub owner_of: &'a str,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for RelationInfoView<'a> {
@@ -10194,6 +10202,20 @@ impl<'a> ::buffa::MessageView<'a> for RelationInfoView<'a> {
                 )?;
                 view.non_tid = ::buffa::types::decode_uint64(&mut cur)?;
             }
+            8u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                view.list = ::buffa::types::borrow_str(&mut cur)?;
+            }
+            9u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                view.owner_of = ::buffa::types::borrow_str(&mut cur)?;
+            }
             _ => {
                 ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
                 let span_len = before_tag.len() - cur.len();
@@ -10223,6 +10245,8 @@ impl<'a> ::buffa::MessageView<'a> for RelationInfoView<'a> {
             pairs: self.pairs,
             duplicates: self.duplicates,
             non_tid: self.non_tid,
+            list: self.list.to_string(),
+            owner_of: self.owner_of.to_string(),
             __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
@@ -10255,6 +10279,12 @@ impl<'a> ::buffa::ViewEncode<'a> for RelationInfoView<'a> {
         if self.non_tid != 0u64 {
             size += 1u64 + ::buffa::types::uint64_encoded_len(self.non_tid) as u64;
         }
+        if !self.list.is_empty() {
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.list) as u64;
+        }
+        if !self.owner_of.is_empty() {
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.owner_of) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -10286,6 +10316,12 @@ impl<'a> ::buffa::ViewEncode<'a> for RelationInfoView<'a> {
         }
         if self.non_tid != 0u64 {
             ::buffa::types::put_uint64_field(7u32, self.non_tid, buf);
+        }
+        if !self.list.is_empty() {
+            ::buffa::types::put_string_field(8u32, &self.list, buf);
+        }
+        if !self.owner_of.is_empty() {
+            ::buffa::types::put_string_field(9u32, &self.owner_of, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -10344,6 +10380,12 @@ impl<'__a> ::serde::Serialize for RelationInfoView<'__a> {
                     "nonTid",
                     &::buffa::json_helpers::ProtoJson(&self.non_tid),
                 )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.list) {
+            __map.serialize_entry("list", self.list)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.owner_of) {
+            __map.serialize_entry("ownerOf", self.owner_of)?;
         }
         __map.end()
     }
@@ -10472,6 +10514,20 @@ impl RelationInfoOwnedView {
     #[must_use]
     pub fn non_tid(&self) -> u64 {
         self.0.reborrow().non_tid
+    }
+    /// A list relation: the record's path to its list.
+    ///
+    /// Field 8: `list`
+    #[must_use]
+    pub fn list(&self) -> &'_ str {
+        self.0.reborrow().list
+    }
+    /// A companion: the list relation whose records it holds by owner.
+    ///
+    /// Field 9: `owner_of`
+    #[must_use]
+    pub fn owner_of(&self) -> &'_ str {
+        self.0.reborrow().owner_of
     }
 }
 impl ::core::convert::From<::buffa::OwnedView<RelationInfoView<'static>>>
@@ -13136,7 +13192,7 @@ impl ::serde::Serialize for SourceOwnedView {
 }
 #[derive(Clone, Debug, Default)]
 pub struct GetActorRequestView<'a> {
-    /// A DID.
+    /// A DID, or a list's AT URI.
     ///
     /// Field 1: `actor`
     pub actor: &'a str,
@@ -13347,7 +13403,7 @@ impl GetActorRequestOwnedView {
     pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
         self.0.into_bytes()
     }
-    /// A DID.
+    /// A DID, or a list's AT URI.
     ///
     /// Field 1: `actor`
     #[must_use]
@@ -13406,6 +13462,10 @@ pub struct GetActorResponseView<'a> {
         'a,
         super::super::__buffa::view::ActorRelationView<'a>,
     >,
+    /// A list node rather than a DID.
+    ///
+    /// Field 7: `list`
+    pub list: bool,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for GetActorResponseView<'a> {
@@ -13473,6 +13533,13 @@ impl<'a> ::buffa::MessageView<'a> for GetActorResponseView<'a> {
                 )?;
                 view.status = ::buffa::types::borrow_str(&mut cur)?;
             }
+            7u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.list = ::buffa::types::decode_bool(&mut cur)?;
+            }
             6u32 => {
                 ::buffa::encoding::check_wire_type(
                     tag,
@@ -13525,6 +13592,7 @@ impl<'a> ::buffa::MessageView<'a> for GetActorResponseView<'a> {
                 .iter()
                 .map(|v| v.to_owned_from_source(__buffa_src))
                 .collect::<::core::result::Result<_, ::buffa::DecodeError>>()?,
+            list: self.list,
             __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
@@ -13559,6 +13627,9 @@ impl<'a> ::buffa::ViewEncode<'a> for GetActorResponseView<'a> {
                 += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
                     + inner_size as u64;
         }
+        if self.list {
+            size += 1u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -13592,6 +13663,9 @@ impl<'a> ::buffa::ViewEncode<'a> for GetActorResponseView<'a> {
                 buf,
             );
             v.write_to(__cache, buf);
+        }
+        if self.list {
+            ::buffa::types::put_bool_field(7u32, self.list, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -13635,6 +13709,9 @@ impl<'__a> ::serde::Serialize for GetActorResponseView<'__a> {
         }
         if !self.rels.is_empty() {
             __map.serialize_entry("rels", &*self.rels)?;
+        }
+        if self.list {
+            __map.serialize_entry("list", &self.list)?;
         }
         __map.end()
     }
@@ -13765,6 +13842,13 @@ impl GetActorResponseOwnedView {
     ) -> &::buffa::RepeatedView<'_, super::super::__buffa::view::ActorRelationView<'_>> {
         &self.0.reborrow().rels
     }
+    /// A list node rather than a DID.
+    ///
+    /// Field 7: `list`
+    #[must_use]
+    pub fn list(&self) -> bool {
+        self.0.reborrow().list
+    }
 }
 impl ::core::convert::From<::buffa::OwnedView<GetActorResponseView<'static>>>
 for GetActorResponseOwnedView {
@@ -13818,6 +13902,10 @@ pub struct ActorRelationView<'a> {
     pub out_stored: &'a str,
     /// Field 7: `in_stored`
     pub in_stored: &'a str,
+    /// Distinct subjects of the out records: a list's members.
+    ///
+    /// Field 8: `out_subjects`
+    pub out_subjects: u64,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for ActorRelationView<'a> {
@@ -13899,6 +13987,13 @@ impl<'a> ::buffa::MessageView<'a> for ActorRelationView<'a> {
                 )?;
                 view.in_stored = ::buffa::types::borrow_str(&mut cur)?;
             }
+            8u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.out_subjects = ::buffa::types::decode_uint64(&mut cur)?;
+            }
             _ => {
                 ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
                 let span_len = before_tag.len() - cur.len();
@@ -13928,6 +14023,7 @@ impl<'a> ::buffa::MessageView<'a> for ActorRelationView<'a> {
             first_us: self.first_us,
             out_stored: self.out_stored.to_string(),
             in_stored: self.in_stored.to_string(),
+            out_subjects: self.out_subjects,
             __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
@@ -13960,6 +14056,9 @@ impl<'a> ::buffa::ViewEncode<'a> for ActorRelationView<'a> {
         if !self.in_stored.is_empty() {
             size += 1u64 + ::buffa::types::string_encoded_len(&self.in_stored) as u64;
         }
+        if self.out_subjects != 0u64 {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(self.out_subjects) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -13991,6 +14090,9 @@ impl<'a> ::buffa::ViewEncode<'a> for ActorRelationView<'a> {
         }
         if !self.in_stored.is_empty() {
             ::buffa::types::put_string_field(7u32, &self.in_stored, buf);
+        }
+        if self.out_subjects != 0u64 {
+            ::buffa::types::put_uint64_field(8u32, self.out_subjects, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -14041,6 +14143,13 @@ impl<'__a> ::serde::Serialize for ActorRelationView<'__a> {
         }
         if !::buffa::json_helpers::skip_if::is_empty_str(self.in_stored) {
             __map.serialize_entry("inStored", self.in_stored)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.out_subjects) {
+            __map
+                .serialize_entry(
+                    "outSubjects",
+                    &::buffa::json_helpers::ProtoJson(&self.out_subjects),
+                )?;
         }
         __map.end()
     }
@@ -14173,6 +14282,13 @@ impl ActorRelationOwnedView {
     #[must_use]
     pub fn in_stored(&self) -> &'_ str {
         self.0.reborrow().in_stored
+    }
+    /// Distinct subjects of the out records: a list's members.
+    ///
+    /// Field 8: `out_subjects`
+    #[must_use]
+    pub fn out_subjects(&self) -> u64 {
+        self.0.reborrow().out_subjects
     }
 }
 impl ::core::convert::From<::buffa::OwnedView<ActorRelationView<'static>>>
@@ -15567,6 +15683,10 @@ pub struct ResolveUriResponseView<'a> {
     pub subject_shard: u32,
     /// Field 19: `subject_in_stored`
     pub subject_in_stored: &'a str,
+    /// A list relation's record: its list, whose log holds the member edge.
+    ///
+    /// Field 20: `list`
+    pub list: &'a str,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for ResolveUriResponseView<'a> {
@@ -15732,6 +15852,13 @@ impl<'a> ::buffa::MessageView<'a> for ResolveUriResponseView<'a> {
                 )?;
                 view.subject_in_stored = ::buffa::types::borrow_str(&mut cur)?;
             }
+            20u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                view.list = ::buffa::types::borrow_str(&mut cur)?;
+            }
             _ => {
                 ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
                 let span_len = before_tag.len() - cur.len();
@@ -15773,6 +15900,7 @@ impl<'a> ::buffa::MessageView<'a> for ResolveUriResponseView<'a> {
             subject_in_count: self.subject_in_count,
             subject_shard: self.subject_shard,
             subject_in_stored: self.subject_in_stored.to_string(),
+            list: self.list.to_string(),
             __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
@@ -15845,6 +15973,9 @@ impl<'a> ::buffa::ViewEncode<'a> for ResolveUriResponseView<'a> {
                 += 2u64
                     + ::buffa::types::string_encoded_len(&self.subject_in_stored) as u64;
         }
+        if !self.list.is_empty() {
+            size += 2u64 + ::buffa::types::string_encoded_len(&self.list) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -15912,6 +16043,9 @@ impl<'a> ::buffa::ViewEncode<'a> for ResolveUriResponseView<'a> {
         }
         if !self.subject_in_stored.is_empty() {
             ::buffa::types::put_string_field(19u32, &self.subject_in_stored, buf);
+        }
+        if !self.list.is_empty() {
+            ::buffa::types::put_string_field(20u32, &self.list, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -16026,6 +16160,9 @@ impl<'__a> ::serde::Serialize for ResolveUriResponseView<'__a> {
         }
         if !::buffa::json_helpers::skip_if::is_empty_str(self.subject_in_stored) {
             __map.serialize_entry("subjectInStored", self.subject_in_stored)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.list) {
+            __map.serialize_entry("list", self.list)?;
         }
         __map.end()
     }
@@ -16224,6 +16361,13 @@ impl ResolveUriResponseOwnedView {
     #[must_use]
     pub fn subject_in_stored(&self) -> &'_ str {
         self.0.reborrow().subject_in_stored
+    }
+    /// A list relation's record: its list, whose log holds the member edge.
+    ///
+    /// Field 20: `list`
+    #[must_use]
+    pub fn list(&self) -> &'_ str {
+        self.0.reborrow().list
     }
 }
 impl ::core::convert::From<::buffa::OwnedView<ResolveUriResponseView<'static>>>

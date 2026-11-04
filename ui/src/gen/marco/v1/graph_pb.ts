@@ -10,7 +10,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file marco/v1/graph.proto.
  */
 export const file_marco_v1_graph: GenFile = /*@__PURE__*/
-  fileDesc("ChRtYXJjby92MS9ncmFwaC5wcm90bxIIbWFyY28udjEiMwoKSGFzUmVxdWVzdBILCgNyZWwYASABKAkSDAoEZnJvbRgCIAEoCRIKCgJ0bxgDIAEoCSIaCgtIYXNSZXNwb25zZRILCgN1cmkYASABKAkiQwoUUmVsYXRpb25zaGlwc1JlcXVlc3QSDQoFYWN0b3IYASABKAkSDgoGb3RoZXJzGAIgAygJEgwKBHJlbHMYAyADKAkiRgoVUmVsYXRpb25zaGlwc1Jlc3BvbnNlEi0KDXJlbGF0aW9uc2hpcHMYASADKAsyFi5tYXJjby52MS5SZWxhdGlvbnNoaXAiRwoMUmVsYXRpb25zaGlwEg0KBW90aGVyGAEgASgJEigKBHJlbHMYAiADKAsyGi5tYXJjby52MS5SZWxhdGlvbnNoaXBFZGdlIkAKEFJlbGF0aW9uc2hpcEVkZ2USCwoDcmVsGAEgASgJEg8KB291dF91cmkYAiABKAkSDgoGaW5fdXJpGAMgASgJIksKDkxpc3RPdXRSZXF1ZXN0EgsKA3JlbBgBIAEoCRINCgVhY3RvchgCIAEoCRINCgVsaW1pdBgDIAEoDRIOCgZjdXJzb3IYBCABKAkiQwoPTGlzdE91dFJlc3BvbnNlEiAKBWVkZ2VzGAEgAygLMhEubWFyY28udjEuT3V0RWRnZRIOCgZjdXJzb3IYAiABKAkiJwoHT3V0RWRnZRILCgN1cmkYASABKAkSDwoHc3ViamVjdBgCIAEoCSJMCg1MaXN0SW5SZXF1ZXN0EgsKA3JlbBgBIAEoCRIPCgdzdWJqZWN0GAIgASgJEg0KBWxpbWl0GAMgASgNEg4KBmN1cnNvchgEIAEoCSIwCg5MaXN0SW5SZXNwb25zZRIOCgZhY3RvcnMYASADKAkSDgoGY3Vyc29yGAIgASgJIi0KDUNvdW50c1JlcXVlc3QSDgoGYWN0b3JzGAEgAygJEgwKBHJlbHMYAiADKAkiNwoOQ291bnRzUmVzcG9uc2USJQoGY291bnRzGAEgAygLMhUubWFyY28udjEuQWN0b3JDb3VudHMiPwoLQWN0b3JDb3VudHMSDQoFYWN0b3IYASABKAkSIQoEcmVscxgCIAMoCzITLm1hcmNvLnYxLlJlbENvdW50cyJACglSZWxDb3VudHMSCwoDcmVsGAEgASgJEhMKC291dF9yZWNvcmRzGAIgASgEEhEKCWluX2FjdG9ycxgDIAEoBCJCCghMaXN0U2lkZRILCgNyZWwYASABKAkSGgoDZGlyGAIgASgOMg0ubWFyY28udjEuRGlyEg0KBWFjdG9yGAMgASgJIl8KEEludGVyc2VjdFJlcXVlc3QSHQoBYRgBIAEoCzISLm1hcmNvLnYxLkxpc3RTaWRlEh0KAWIYAiABKAsyEi5tYXJjby52MS5MaXN0U2lkZRINCgVsaW1pdBgDIAEoDSJBChFJbnRlcnNlY3RSZXNwb25zZRIOCgZhY3RvcnMYASADKAkSDQoFYV9sZW4YAiABKAQSDQoFYl9sZW4YAyABKAQiNQoKRmlsdGVyRHJvcBILCgNyZWwYASABKAkSGgoDZGlyGAIgASgOMg0ubWFyY28udjEuRGlyIlMKDUZpbHRlclJlcXVlc3QSDgoGdmlld2VyGAEgASgJEg4KBmFjdG9ycxgCIAMoCRIiCgRkcm9wGAMgAygLMhQubWFyY28udjEuRmlsdGVyRHJvcCJECg5GaWx0ZXJSZXNwb25zZRIOCgZhY3RvcnMYASADKAkSIgoHZHJvcHBlZBgCIAMoCzIRLm1hcmNvLnYxLkRyb3BwZWQiQQoHRHJvcHBlZBINCgVhY3RvchgBIAEoCRILCgNyZWwYAiABKAkSGgoDZGlyGAMgASgOMg0ubWFyY28udjEuRGlyIlUKB1dyaXRlT3ASHgoDYWRkGAEgASgLMg8ubWFyY28udjEuQWRkT3BIABIkCgZkZWxldGUYAiABKAsyEi5tYXJjby52MS5EZWxldGVPcEgAQgQKAm9wIjYKBUFkZE9wEgsKA3VyaRgBIAEoCRIPCgdzdWJqZWN0GAIgASgJEg8KB3RpbWVfdXMYAyABKAMiKAoIRGVsZXRlT3ASCwoDdXJpGAEgASgJEg8KB3RpbWVfdXMYAiABKAMihwEKC1dyaXRlUmVzdWx0Eg8KBWFkZGVkGAEgASgISAASEAoGZXhpc3RzGAIgASgISAASEQoHZGVsZXRlZBgDIAEoCEgAEhEKB3JlbW92ZWQYBCABKAlIABITCglub3RfZm91bmQYBSABKAhIABIPCgVlcnJvchgGIAEoCUgAQgkKB291dGNvbWUiPgoMV3JpdGVSZXF1ZXN0Eh4KA29wcxgBIAMoCzIRLm1hcmNvLnYxLldyaXRlT3ASDgoGY3Vyc29yGAIgASgJIkcKDVdyaXRlUmVzcG9uc2USJgoHcmVzdWx0cxgBIAMoCzIVLm1hcmNvLnYxLldyaXRlUmVzdWx0Eg4KBmN1cnNvchgCIAEoCSJDChFXcml0ZUJhdGNoUmVxdWVzdBIeCgNvcHMYASADKAsyES5tYXJjby52MS5Xcml0ZU9wEg4KBmN1cnNvchgCIAEoCSJMChJXcml0ZUJhdGNoUmVzcG9uc2USJgoHcmVzdWx0cxgBIAMoCzIVLm1hcmNvLnYxLldyaXRlUmVzdWx0Eg4KBmN1cnNvchgCIAEoCSozCgNEaXISEwoPRElSX1VOU1BFQ0lGSUVEEAASCwoHRElSX09VVBABEgoKBkRJUl9JThACMvIECgVHcmFwaBI3CgNIYXMSFC5tYXJjby52MS5IYXNSZXF1ZXN0GhUubWFyY28udjEuSGFzUmVzcG9uc2UiA5ACARJVCg1SZWxhdGlvbnNoaXBzEh4ubWFyY28udjEuUmVsYXRpb25zaGlwc1JlcXVlc3QaHy5tYXJjby52MS5SZWxhdGlvbnNoaXBzUmVzcG9uc2UiA5ACARJDCgdMaXN0T3V0EhgubWFyY28udjEuTGlzdE91dFJlcXVlc3QaGS5tYXJjby52MS5MaXN0T3V0UmVzcG9uc2UiA5ACARJACgZMaXN0SW4SFy5tYXJjby52MS5MaXN0SW5SZXF1ZXN0GhgubWFyY28udjEuTGlzdEluUmVzcG9uc2UiA5ACARJACgZDb3VudHMSFy5tYXJjby52MS5Db3VudHNSZXF1ZXN0GhgubWFyY28udjEuQ291bnRzUmVzcG9uc2UiA5ACARJJCglJbnRlcnNlY3QSGi5tYXJjby52MS5JbnRlcnNlY3RSZXF1ZXN0GhsubWFyY28udjEuSW50ZXJzZWN0UmVzcG9uc2UiA5ACARJACgZGaWx0ZXISFy5tYXJjby52MS5GaWx0ZXJSZXF1ZXN0GhgubWFyY28udjEuRmlsdGVyUmVzcG9uc2UiA5ACARI6CgVXcml0ZRIWLm1hcmNvLnYxLldyaXRlUmVxdWVzdBoXLm1hcmNvLnYxLldyaXRlUmVzcG9uc2UoARJHCgpXcml0ZUJhdGNoEhsubWFyY28udjEuV3JpdGVCYXRjaFJlcXVlc3QaHC5tYXJjby52MS5Xcml0ZUJhdGNoUmVzcG9uc2ViBnByb3RvMw");
+  fileDesc("ChRtYXJjby92MS9ncmFwaC5wcm90bxIIbWFyY28udjEiMwoKSGFzUmVxdWVzdBILCgNyZWwYASABKAkSDAoEZnJvbRgCIAEoCRIKCgJ0bxgDIAEoCSIaCgtIYXNSZXNwb25zZRILCgN1cmkYASABKAkiQwoUUmVsYXRpb25zaGlwc1JlcXVlc3QSDQoFYWN0b3IYASABKAkSDgoGb3RoZXJzGAIgAygJEgwKBHJlbHMYAyADKAkiRgoVUmVsYXRpb25zaGlwc1Jlc3BvbnNlEi0KDXJlbGF0aW9uc2hpcHMYASADKAsyFi5tYXJjby52MS5SZWxhdGlvbnNoaXAiRwoMUmVsYXRpb25zaGlwEg0KBW90aGVyGAEgASgJEigKBHJlbHMYAiADKAsyGi5tYXJjby52MS5SZWxhdGlvbnNoaXBFZGdlIkAKEFJlbGF0aW9uc2hpcEVkZ2USCwoDcmVsGAEgASgJEg8KB291dF91cmkYAiABKAkSDgoGaW5fdXJpGAMgASgJIl0KDkxpc3RPdXRSZXF1ZXN0EgsKA3JlbBgBIAEoCRINCgVhY3RvchgCIAEoCRINCgVsaW1pdBgDIAEoDRIOCgZjdXJzb3IYBCABKAkSEAoIZGlzdGluY3QYBSABKAgiQwoPTGlzdE91dFJlc3BvbnNlEiAKBWVkZ2VzGAEgAygLMhEubWFyY28udjEuT3V0RWRnZRIOCgZjdXJzb3IYAiABKAkiJwoHT3V0RWRnZRILCgN1cmkYASABKAkSDwoHc3ViamVjdBgCIAEoCSJMCg1MaXN0SW5SZXF1ZXN0EgsKA3JlbBgBIAEoCRIPCgdzdWJqZWN0GAIgASgJEg0KBWxpbWl0GAMgASgNEg4KBmN1cnNvchgEIAEoCSIwCg5MaXN0SW5SZXNwb25zZRIOCgZhY3RvcnMYASADKAkSDgoGY3Vyc29yGAIgASgJIi0KDUNvdW50c1JlcXVlc3QSDgoGYWN0b3JzGAEgAygJEgwKBHJlbHMYAiADKAkiNwoOQ291bnRzUmVzcG9uc2USJQoGY291bnRzGAEgAygLMhUubWFyY28udjEuQWN0b3JDb3VudHMiPwoLQWN0b3JDb3VudHMSDQoFYWN0b3IYASABKAkSIQoEcmVscxgCIAMoCzITLm1hcmNvLnYxLlJlbENvdW50cyJWCglSZWxDb3VudHMSCwoDcmVsGAEgASgJEhMKC291dF9yZWNvcmRzGAIgASgEEhEKCWluX2FjdG9ycxgDIAEoBBIUCgxvdXRfc3ViamVjdHMYBCABKAQiQgoITGlzdFNpZGUSCwoDcmVsGAEgASgJEhoKA2RpchgCIAEoDjINLm1hcmNvLnYxLkRpchINCgVhY3RvchgDIAEoCSKMAQoQSW50ZXJzZWN0UmVxdWVzdBIdCgFhGAEgASgLMhIubWFyY28udjEuTGlzdFNpZGUSHQoBYhgCIAEoCzISLm1hcmNvLnYxLkxpc3RTaWRlEg0KBWxpbWl0GAMgASgNEhsKAm9wGAQgASgOMg8ubWFyY28udjEuU2V0T3ASDgoGY3Vyc29yGAUgASgJIlEKEUludGVyc2VjdFJlc3BvbnNlEg4KBmFjdG9ycxgBIAMoCRINCgVhX2xlbhgCIAEoBBINCgViX2xlbhgDIAEoBBIOCgZjdXJzb3IYBCABKAkiXAoKRmlsdGVyRHJvcBILCgNyZWwYASABKAkSGgoDZGlyGAIgASgOMg0ubWFyY28udjEuRGlyEiUKCW1lbWJlcl9vZhgDIAEoCzISLm1hcmNvLnYxLkxpc3RTaWRlIlMKDUZpbHRlclJlcXVlc3QSDgoGdmlld2VyGAEgASgJEg4KBmFjdG9ycxgCIAMoCRIiCgRkcm9wGAMgAygLMhQubWFyY28udjEuRmlsdGVyRHJvcCJECg5GaWx0ZXJSZXNwb25zZRIOCgZhY3RvcnMYASADKAkSIgoHZHJvcHBlZBgCIAMoCzIRLm1hcmNvLnYxLkRyb3BwZWQiQQoHRHJvcHBlZBINCgVhY3RvchgBIAEoCRILCgNyZWwYAiABKAkSGgoDZGlyGAMgASgOMg0ubWFyY28udjEuRGlyIlUKB1dyaXRlT3ASHgoDYWRkGAEgASgLMg8ubWFyY28udjEuQWRkT3BIABIkCgZkZWxldGUYAiABKAsyEi5tYXJjby52MS5EZWxldGVPcEgAQgQKAm9wIkQKBUFkZE9wEgsKA3VyaRgBIAEoCRIPCgdzdWJqZWN0GAIgASgJEgwKBGxpc3QYBCABKAkSDwoHdGltZV91cxgDIAEoAyIoCghEZWxldGVPcBILCgN1cmkYASABKAkSDwoHdGltZV91cxgCIAEoAyKHAQoLV3JpdGVSZXN1bHQSDwoFYWRkZWQYASABKAhIABIQCgZleGlzdHMYAiABKAhIABIRCgdkZWxldGVkGAMgASgISAASEQoHcmVtb3ZlZBgEIAEoCUgAEhMKCW5vdF9mb3VuZBgFIAEoCEgAEg8KBWVycm9yGAYgASgJSABCCQoHb3V0Y29tZSI+CgxXcml0ZVJlcXVlc3QSHgoDb3BzGAEgAygLMhEubWFyY28udjEuV3JpdGVPcBIOCgZjdXJzb3IYAiABKAkiRwoNV3JpdGVSZXNwb25zZRImCgdyZXN1bHRzGAEgAygLMhUubWFyY28udjEuV3JpdGVSZXN1bHQSDgoGY3Vyc29yGAIgASgJIkMKEVdyaXRlQmF0Y2hSZXF1ZXN0Eh4KA29wcxgBIAMoCzIRLm1hcmNvLnYxLldyaXRlT3ASDgoGY3Vyc29yGAIgASgJIkwKEldyaXRlQmF0Y2hSZXNwb25zZRImCgdyZXN1bHRzGAEgAygLMhUubWFyY28udjEuV3JpdGVSZXN1bHQSDgoGY3Vyc29yGAIgASgJKjMKA0RpchITCg9ESVJfVU5TUEVDSUZJRUQQABILCgdESVJfT1VUEAESCgoGRElSX0lOEAIqQwoFU2V0T3ASFgoSU0VUX09QX1VOU1BFQ0lGSUVEEAASDgoKU0VUX09QX0FORBABEhIKDlNFVF9PUF9BTkRfTk9UEAIy8gQKBUdyYXBoEjcKA0hhcxIULm1hcmNvLnYxLkhhc1JlcXVlc3QaFS5tYXJjby52MS5IYXNSZXNwb25zZSIDkAIBElUKDVJlbGF0aW9uc2hpcHMSHi5tYXJjby52MS5SZWxhdGlvbnNoaXBzUmVxdWVzdBofLm1hcmNvLnYxLlJlbGF0aW9uc2hpcHNSZXNwb25zZSIDkAIBEkMKB0xpc3RPdXQSGC5tYXJjby52MS5MaXN0T3V0UmVxdWVzdBoZLm1hcmNvLnYxLkxpc3RPdXRSZXNwb25zZSIDkAIBEkAKBkxpc3RJbhIXLm1hcmNvLnYxLkxpc3RJblJlcXVlc3QaGC5tYXJjby52MS5MaXN0SW5SZXNwb25zZSIDkAIBEkAKBkNvdW50cxIXLm1hcmNvLnYxLkNvdW50c1JlcXVlc3QaGC5tYXJjby52MS5Db3VudHNSZXNwb25zZSIDkAIBEkkKCUludGVyc2VjdBIaLm1hcmNvLnYxLkludGVyc2VjdFJlcXVlc3QaGy5tYXJjby52MS5JbnRlcnNlY3RSZXNwb25zZSIDkAIBEkAKBkZpbHRlchIXLm1hcmNvLnYxLkZpbHRlclJlcXVlc3QaGC5tYXJjby52MS5GaWx0ZXJSZXNwb25zZSIDkAIBEjoKBVdyaXRlEhYubWFyY28udjEuV3JpdGVSZXF1ZXN0GhcubWFyY28udjEuV3JpdGVSZXNwb25zZSgBEkcKCldyaXRlQmF0Y2gSGy5tYXJjby52MS5Xcml0ZUJhdGNoUmVxdWVzdBocLm1hcmNvLnYxLldyaXRlQmF0Y2hSZXNwb25zZWIGcHJvdG8z");
 
 /**
  * @generated from message marco.v1.HasRequest
@@ -165,6 +165,8 @@ export type ListOutRequest = Message<"marco.v1.ListOutRequest"> & {
   rel: string;
 
   /**
+   * A DID, or for a list relation the list's AT URI.
+   *
    * @generated from field: string actor = 2;
    */
   actor: string;
@@ -180,6 +182,14 @@ export type ListOutRequest = Message<"marco.v1.ListOutRequest"> & {
    * @generated from field: string cursor = 4;
    */
   cursor: string;
+
+  /**
+   * One record per subject, its oldest (the appview keeps the first): a
+   * list's members, where some records repeat one. Stable under a cursor.
+   *
+   * @generated from field: bool distinct = 5;
+   */
+  distinct: boolean;
 };
 
 /**
@@ -374,6 +384,13 @@ export type RelCounts = Message<"marco.v1.RelCounts"> & {
    * @generated from field: uint64 in_actors = 3;
    */
   inActors: bigint;
+
+  /**
+   * The distinct subjects of the actor's records: a list's member count.
+   *
+   * @generated from field: uint64 out_subjects = 4;
+   */
+  outSubjects: bigint;
 };
 
 /**
@@ -398,6 +415,8 @@ export type ListSide = Message<"marco.v1.ListSide"> & {
   dir: Dir;
 
   /**
+   * A DID, or a list's AT URI: (listitem, DIR_OUT, list) is its members.
+   *
    * @generated from field: string actor = 3;
    */
   actor: string;
@@ -430,6 +449,18 @@ export type IntersectRequest = Message<"marco.v1.IntersectRequest"> & {
    * @generated from field: uint32 limit = 3;
    */
   limit: number;
+
+  /**
+   * @generated from field: marco.v1.SetOp op = 4;
+   */
+  op: SetOp;
+
+  /**
+   * The last response's cursor: the actors after it, in id order.
+   *
+   * @generated from field: string cursor = 5;
+   */
+  cursor: string;
 };
 
 /**
@@ -461,6 +492,13 @@ export type IntersectResponse = Message<"marco.v1.IntersectResponse"> & {
    * @generated from field: uint64 b_len = 3;
    */
   bLen: bigint;
+
+  /**
+   * Empty on the last page.
+   *
+   * @generated from field: string cursor = 4;
+   */
+  cursor: string;
 };
 
 /**
@@ -486,6 +524,14 @@ export type FilterDrop = Message<"marco.v1.FilterDrop"> & {
    * @generated from field: marco.v1.Dir dir = 2;
    */
   dir: Dir;
+
+  /**
+   * Set instead of rel and dir: drops the actors in this side, whoever the
+   * viewer is (a list's members: listitem, DIR_OUT, the list's URI).
+   *
+   * @generated from field: marco.v1.ListSide member_of = 3;
+   */
+  memberOf?: ListSide | undefined;
 };
 
 /**
@@ -621,8 +667,16 @@ export type AddOp = Message<"marco.v1.AddOp"> & {
   subject: string;
 
   /**
+   * A list relation's record names its list, an AT URI in the same repo.
+   *
+   * @generated from field: string list = 4;
+   */
+  list: string;
+
+  /**
    * When the source saw the create (µs since the epoch); 0: when marco applies it.
-   * An add older than a delete of the same record stays deleted.
+   * An add older than a delete of the same record stays deleted; one older
+   * than the record's last change from another source changes nothing.
    *
    * @generated from field: int64 time_us = 3;
    */
@@ -854,17 +908,56 @@ export const DirSchema: GenEnum<Dir> = /*@__PURE__*/
   enumDesc(file_marco_v1_graph, 0);
 
 /**
+ * @generated from enum marco.v1.SetOp
+ */
+export enum SetOp {
+  /**
+   * a and b.
+   *
+   * @generated from enum value: SET_OP_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: SET_OP_AND = 1;
+   */
+  AND = 1,
+
+  /**
+   * a and not b.
+   *
+   * @generated from enum value: SET_OP_AND_NOT = 2;
+   */
+  AND_NOT = 2,
+}
+
+/**
+ * Describes the enum marco.v1.SetOp.
+ */
+export const SetOpSchema: GenEnum<SetOp> = /*@__PURE__*/
+  enumDesc(file_marco_v1_graph, 1);
+
+/**
  * The graph API: actor-to-actor edges. Reads are open. Writes need the admin
  * token (`Authorization: Bearer <token>`).
  *
- * Relations are named in config ("follow", "block"). A rel field takes a
- * name; an empty rels list means every relation.
+ * Relations are named in config ("follow", "block", "listitem"). A rel field
+ * takes a name; an empty rels list means every relation.
+ *
+ * Lists: a list relation (listitem) keeps edges from a list to its members,
+ * and an actor field there takes the list's AT URI. ListOut of a list is its
+ * members, newest first; ListIn of a DID is the lists it's on; Has(list, did)
+ * is the listitem's URI. Its companion, "listitem.owner", holds the records by
+ * owner: ListOut(listitem.owner, owner) is the owner's listitems with their lists.
+ * Has(list, did) returns the member's oldest listitem. An add of a key that
+ * holds another subject or list replaces the record (an update).
  *
  * @generated from service marco.v1.Graph
  */
 export const Graph: GenService<{
   /**
-   * The newest record of `from` naming `to`, as its URI, or empty.
+   * The newest record of `from` naming `to`, as its URI, or empty. For a
+   * list relation, the member's oldest listitem.
    *
    * @generated from rpc marco.v1.Graph.Has
    */
@@ -916,7 +1009,8 @@ export const Graph: GenService<{
     output: typeof CountsResponseSchema;
   },
   /**
-   * The actors in both lists (mutuals, "followed by people you follow").
+   * The actors in both sides (mutuals, "followed by people you follow"), or
+   * in the first and not the second. A side can be a list.
    *
    * @generated from rpc marco.v1.Graph.Intersect
    */

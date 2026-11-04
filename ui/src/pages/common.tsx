@@ -33,9 +33,14 @@ export const windowLabel = (w: number) => WINDOWS.find((x) => Number(x.v) === w)
 
 export const shardName = (k: number) => `shard-${String(k).padStart(3, '0')}`
 
-/** "follows →" style labels for the two built-in relations, `rel →` for others. */
+/** "follows →" style labels for the built-in relations, `rel →` for others. */
 export function listLabel(rel: string, dir: 'out' | 'in', cap = true): string {
-  const w: Record<string, [string, string]> = { follow: ['follows', 'followers'], block: ['blocks', 'blocked by'] }
+  const w: Record<string, [string, string]> = {
+    follow: ['follows', 'followers'],
+    block: ['blocks', 'blocked by'],
+    listitem: ['members', 'on lists'],
+    'listitem.owner': ['listitems', 'owner'],
+  }
   const s = w[rel]?.[dir === 'out' ? 0 : 1] ?? `${rel} ${dir}`
   return cap ? s[0].toUpperCase() + s.slice(1) : s
 }
@@ -52,3 +57,6 @@ export const cursorText = (c: string, kind: string) => (!c ? '—' : kind === 't
 export const lagText = (s: number) => (!isFinite(s) ? '—' : s < 10 ? `${s.toFixed(1)} s` : s < 60 ? `${Math.round(s)} s` : dur(s * 1000))
 
 export const sourceNamed = (xs: Source[] | undefined, name: string) => xs?.find((x) => x.name === name)
+
+/** A list node's AT URI rather than a DID. */
+export const isListUri = (s: string) => /^at:\/\/[^/]+\/[^/]+\/[^/]+$/.test(s)

@@ -48,11 +48,18 @@ const SHARDS = 64
 const W = 709_577
 const FOLLOW = 'app.bsky.graph.follow'
 const BLOCK = 'app.bsky.graph.block'
+const LISTITEM = 'app.bsky.graph.listitem'
+const LIST = 'app.bsky.graph.list'
+const COLL: Record<string, string> = { follow: FOLLOW, block: BLOCK, listitem: LISTITEM, 'listitem.owner': LISTITEM }
+const isList = (x: string) => x.startsWith('at://')
+const ownerOf = (l: string) => l.slice(5).split('/')[0]
 export const A = 'did:plc:k3ltx7rq2a5m6uoyzwbnf4hc'
 
 const rels = [
   { name: 'follow', collection: FOLLOW, records: 2_740_118_442, pairs: 2_736_830_301, outLists: 33_812_447, inLists: 41_203_118, nonTid: 172_412 },
   { name: 'block', collection: BLOCK, records: 227_034_918, pairs: 226_980_112, outLists: 6_104_330, inLists: 9_871_206, nonTid: 2_010 },
+  { name: 'listitem', collection: LISTITEM, records: 60_833_013, pairs: 56_294_155, outLists: 1_262_107, inLists: 7_906_218, nonTid: 313_899, list: 'list' },
+  { name: 'listitem.owner', collection: LISTITEM, records: 60_833_013, pairs: 1_262_107, outLists: 693_326, inLists: 1_262_107, nonTid: 313_899, ownerOf: 'listitem' },
 ]
 const base = rels.reduce((a, r) => a + r.records + r.pairs, 0)
 const DIRTY: Record<number, number> = { 3: 0.041, 9: 0.022, 17: 0.098, 22: 0.014, 30: 0.06, 41: 0.131, 47: 0.033, 55: 0.009, 60: 0.027 }
@@ -214,10 +221,13 @@ function getSeries(windowSeconds: number) {
 
 // ---------------------------------------------------------------- explorer
 
-const COUNTS: Record<string, [number, number, number]> = { follow: [1204, 88312, 931], block: [37, 412, 0] }
+const COUNTS: Record<string, [number, number, number]> = { follow: [1204, 88312, 931], block: [37, 412, 0], listitem: [0, 214, 0], 'listitem.owner': [57, 0, 0] }
 function countsOf(d: string, rel: string): [number, number, number] {
+  if (isList(d)) return rel === 'listitem' ? [(hash(d) % 900) + 12, 0, 0] : [0, 0, 0]
   if (d === A) return COUNTS[rel] ?? [0, 0, 0]
   const h = hash(d + rel)
+  if (rel === 'listitem') return [0, h % 30, 0]
+  if (rel === 'listitem.owner') return [h % 4 ? 0 : h % 200, 0, 0]
   return rel === 'follow' ? [(h % 3000) + 3, (h >> 8) % 20000, (h >> 4) % 600] : [h % 40, (h >> 8) % 300, 0]
 }
 const idOf = (d: string) => hash(`id${d}`) % 45_391_076
@@ -229,10 +239,14 @@ function edgesOf(actor: string, rel: string, dir: Dir, cursor: string, limit: nu
   let t = NOW * 1000 - 3 * 3600e6 - 4 * 60e6
   const edges = []
   for (let i = 0; i < Math.min(total, start + limit); i++) {
-    const other = did(`${actor}${rel}${dir}${i}`)
     const rk = tid(t, Math.floor(r() * 1024))
+    // listitem in: the lists naming the actor; listitem.owner out: the owner's lists
+    const listy = (rel === 'listitem' && dir === Dir.IN) || (rel === 'listitem.owner' && dir === Dir.OUT)
+    const other = listy ? `at://${dir === Dir.OUT ? actor : did(`${actor}o${i % 7}`)}/${LIST}/${tid(t - 9e9, i % 5)}` : did(`${actor}${rel}${dir}${i}`)
+    const owner = isList(actor) ? ownerOf(actor) : actor
+    const recOwner = dir === Dir.OUT ? owner : isList(other) ? ownerOf(other) : other
     if (i >= start)
-      edges.push({ did: other, id: idOf(other), rkey: rk, uri: dir === Dir.OUT ? `at://${actor}/${rel === 'follow' ? FOLLOW : BLOCK}/${rk}` : `at://${other}/${rel === 'follow' ? FOLLOW : BLOCK}/${rk}`, createdUs: BigInt(Math.floor(t)), stored: i < 2 && dir === Dir.OUT ? 'delta' : 'base' })
+      edges.push({ did: other, id: idOf(other), rkey: rk, uri: `at://${recOwner}/${COLL[rel] ?? FOLLOW}/${rk}`, createdUs: BigInt(Math.floor(t)), stored: i < 2 && dir === Dir.OUT ? 'delta' : 'base' })
     t -= (5 + r() * 295) * 3600e6
   }
   const next = start + limit < total ? `${edges[edges.length - 1]?.rkey}.${start + limit}` : ''
@@ -243,10 +257,11 @@ function resolve(uri: string) {
   const m = uri.match(/^at:\/\/([^/]+)\/([^/]+)\/(.+)$/)
   if (!m) throw new ConnectError(`"${uri}" isn't a record URI`, Code.InvalidArgument)
   const [, actor, coll, rkey] = m
-  const rel = coll === FOLLOW ? 'follow' : coll === BLOCK ? 'block' : ''
+  const rel = coll === FOLLOW ? 'follow' : coll === BLOCK ? 'block' : coll === LISTITEM ? 'listitem' : ''
   if (!rel) throw new ConnectError(`no relation for ${coll}`, Code.InvalidArgument)
   const gone = state.deleted.has(uri)
-  const page = edgesOf(actor, rel, Dir.OUT, '', 8)
+  const list = rel === 'listitem' ? `at://${actor}/${LIST}/${tid(NOW * 1000 - 9e10, 3)}` : ''
+  const page = edgesOf(list || actor, rel, Dir.OUT, '', 8)
   const pos = page.edges.findIndex((e) => e.rkey === rkey)
   const subject = gone ? '' : (page.edges[pos]?.did ?? did(`subj${uri}`))
   const isTid = /^[234567a-j][234567a-z]{12}$/.test(rkey)
@@ -270,6 +285,7 @@ function resolve(uri: string) {
     subjectInCount: 9002n,
     subjectShard: subject ? Math.floor(idOf(subject) / W) : 0,
     subjectInStored: 'base',
+    list,
   }
 }
 
@@ -286,6 +302,12 @@ const SECTIONS: [string, string, number][] = [
   ['r1.in.dat', 'block', 0.66e9],
   ['r1.in.idx', 'block', 0.09e9],
   ['r1.side', 'block', 0.1e6],
+  ['r2.out.dat', 'listitem', 0.55e9],
+  ['r2.out.idx', 'listitem', 0.05e9],
+  ['r2.in.dat', 'listitem', 0.14e9],
+  ['r2.in.idx', 'listitem', 0.03e9],
+  ['r3.out.dat', 'listitem.owner', 0.5e9],
+  ['r3.in.dat', 'listitem.owner', 0.01e9],
   ['dir.plc', 'directory', 0.92e9],
   ['dir.byid', 'directory', 0.36e9],
   ['dir.plc.ids', 'directory', 0.12e9],
@@ -453,8 +475,11 @@ export function mockTransport() {
       },
       listSources: () => ({ sources: sources() }),
       listRelations: () => ({
-        config: rels.map((r) => `[[relation]]\nname = "${r.name}"\ncollection = "${r.collection}"\nsubject = "subject"`).join('\n\n'),
-        relations: rels.map((r) => ({ name: r.name, collection: r.collection, subject: 'subject', records: BigInt(r.records), pairs: BigInt(r.pairs), duplicates: BigInt(r.records - r.pairs), nonTid: BigInt(r.nonTid) })),
+        config: rels
+          .filter((r) => !r.ownerOf)
+          .map((r) => `[[relation]]\nname = "${r.name}"\ncollection = "${r.collection}"\nsubject = "subject"${r.list ? `\nlist = "${r.list}"` : ''}`)
+          .join('\n\n'),
+        relations: rels.map((r) => ({ name: r.name, collection: r.collection, subject: r.ownerOf ? 'list' : 'subject', records: BigInt(r.records), pairs: BigInt(r.pairs), duplicates: BigInt(r.records - r.pairs), nonTid: BigInt(r.nonTid), list: r.list ?? '', ownerOf: r.ownerOf ?? '' })),
       }),
       getListStats: (r) => {
         const k = r.rel === 'block' ? 0.08 : 1
@@ -477,17 +502,19 @@ export function mockTransport() {
         }
       },
       getActor: (r) => {
-        if (!/^did:/.test(r.actor)) throw new ConnectError(`"${r.actor}" isn't a DID`, Code.InvalidArgument)
-        const id = idOf(r.actor)
+        if (!/^did:/.test(r.actor) && !isList(r.actor)) throw new ConnectError(`"${r.actor}" isn't a DID or a list's AT URI`, Code.InvalidArgument)
+        const id = isList(r.actor) ? 45_391_076 + (hash(r.actor) % 1_262_107) : idOf(r.actor)
         return {
           did: r.actor,
           known: true,
           id,
+          list: isList(r.actor),
           shard: Math.floor(id / W),
-          status: state.statuses.get(r.actor) ?? 'active',
+          status: state.statuses.get(isList(r.actor) ? ownerOf(r.actor) : r.actor) ?? 'active',
           rels: rels.map((x) => {
             const [o, i, m] = countsOf(r.actor, x.name)
-            return { rel: x.name, out: BigInt(o), in: BigInt(i), mutual: BigInt(m), firstUs: x.name === 'follow' ? BigInt(Date.UTC(2023, 3, 29) * 1000) : 0n, outStored: 'delta', inStored: 'base' }
+            const firstUs = (x.name === 'follow' && !isList(r.actor)) || (x.name === 'listitem' && isList(r.actor)) ? BigInt(Date.UTC(2023, 3, 29) * 1000) : 0n
+            return { rel: x.name, out: BigInt(o), in: BigInt(i), mutual: BigInt(m), firstUs, outStored: 'delta', inStored: 'base', outSubjects: BigInt(x.name === 'listitem' ? Math.round(o * 0.93) : o) }
           }),
         }
       },
@@ -529,15 +556,17 @@ export function mockTransport() {
       }),
       listOut: () => ({ edges: [], cursor: '' }),
       listIn: () => ({ actors: [], cursor: '' }),
-      counts: (r) => ({ counts: r.actors.map((a) => ({ actor: a, rels: rels.map((x) => ({ rel: x.name, outRecords: BigInt(countsOf(a, x.name)[0]), inActors: BigInt(countsOf(a, x.name)[1]) })) })) }),
+      counts: (r) => ({ counts: r.actors.map((a) => ({ actor: a, rels: rels.map((x) => ({ rel: x.name, outRecords: BigInt(countsOf(a, x.name)[0]), inActors: BigInt(countsOf(a, x.name)[1]), outSubjects: BigInt(countsOf(a, x.name)[0]) })) })) }),
       intersect: (r) => {
         const n = 41
-        return { actors: Array.from({ length: n }, (_, i) => did(`x${r.a?.actor}${r.b?.actor}${i}`)), aLen: BigInt(countsOf(r.a?.actor ?? '', 'follow')[0]), bLen: 5871n }
+        const len = (x?: { rel: string; actor: string; dir: Dir }) => BigInt(Math.abs(x ? countsOf(x.actor, x.rel)[x.dir === Dir.IN ? 1 : 0] : 0))
+        return { actors: Array.from({ length: n }, (_, i) => did(`x${r.a?.actor}${r.b?.actor}${r.op}${i}`)), aLen: len(r.a), bLen: len(r.b), cursor: '' }
       },
       filter: (r) => {
         const drop = r.actors.filter((a) => hash(a + r.viewer) % 6 === 0).slice(0, 2)
         const d = r.drop[0]
-        return { actors: r.actors.filter((a) => !drop.includes(a)), dropped: drop.map((a) => ({ actor: a, rel: d?.rel ?? 'block', dir: d?.dir ?? Dir.OUT })) }
+        const rel = d?.memberOf?.rel || d?.rel || 'block'
+        return { actors: r.actors.filter((a) => !drop.includes(a)), dropped: drop.map((a) => ({ actor: a, rel, dir: d?.memberOf?.dir ?? d?.dir ?? Dir.OUT })) }
       },
       write: async () => ({ results: [], cursor: '' }),
       writeBatch: (r) => ({

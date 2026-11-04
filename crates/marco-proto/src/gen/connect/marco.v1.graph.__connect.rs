@@ -435,8 +435,16 @@ pub const GRAPH_WRITE_BATCH_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::serve
 /// The graph API: actor-to-actor edges. Reads are open. Writes need the admin
 /// token (`Authorization: Bearer <token>`).
 ///
-/// Relations are named in config ("follow", "block"). A rel field takes a
-/// name; an empty rels list means every relation.
+/// Relations are named in config ("follow", "block", "listitem"). A rel field
+/// takes a name; an empty rels list means every relation.
+///
+/// Lists: a list relation (listitem) keeps edges from a list to its members,
+/// and an actor field there takes the list's AT URI. ListOut of a list is its
+/// members, newest first; ListIn of a DID is the lists it's on; Has(list, did)
+/// is the listitem's URI. Its companion, "listitem.owner", holds the records by
+/// owner: ListOut(listitem.owner, owner) is the owner's listitems with their lists.
+/// Has(list, did) returns the member's oldest listitem. An add of a key that
+/// holds another subject or list replaces the record (an update).
 ///
 /// # Implementing handlers
 ///
@@ -487,7 +495,8 @@ pub const GRAPH_WRITE_BATCH_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::serve
 /// example` doc.
 #[allow(clippy::type_complexity)]
 pub trait Graph: Send + Sync + 'static {
-    /// The newest record of `from` naming `to`, as its URI, or empty.
+    /// The newest record of `from` naming `to`, as its URI, or empty. For a
+    /// list relation, the member's oldest listitem.
     ///
     /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
     ///
@@ -595,7 +604,8 @@ pub trait Graph: Send + Sync + 'static {
             > + Send + use<'a, Self>,
         >,
     > + Send;
-    /// The actors in both lists (mutuals, "followed by people you follow").
+    /// The actors in both sides (mutuals, "followed by people you follow"), or
+    /// in the first and not the second. A side can be a list.
     ///
     /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
     ///

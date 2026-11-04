@@ -13,7 +13,7 @@ use marco_proto::v1::__buffa::oneof::{write_op, write_result};
 use marco_proto::v1::*;
 use marco_server::app::{App, Config, Op};
 use marco_server::auth::{AuthConfig, Cidr};
-use marco_server::synth::{did, tid, uri, BLOCK, FOLLOW};
+use marco_server::synth::{did, list_uri, tid, uri, BLOCK, FOLLOW, LISTITEM};
 
 const N: u32 = 300;
 const TOKEN: &str = "test-token-0123456789";
@@ -761,4 +761,128 @@ async fn admin_rpcs() {
         .into_owned();
     assert_eq!(outcome(&late.results[0]), "deleted");
     assert_eq!(s.app.graph().snapshot().unwrap().dir.meta.n_ids, marco_server::synth::graph(N, 4).unwrap().n_ids());
+}
+
+fn add_item(u: &str, s: &str, list: &str) -> WriteOp {
+    WriteOp {
+        op: Some(write_op::Op::Add(Box::new(AddOp {
+            uri: u.into(),
+            subject: s.into(),
+            list: list.into(),
+            ..Default::default()
+        }))),
+        ..Default::default()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lists() {
+    let s = start(false, false).await;
+    let g = graph(s.api, Some(TOKEN));
+    let a = admin(s.admin, Some(TOKEN));
+    let (a5, a6, a7) = (did(5), did(6), did(7));
+    let l = list_uri(&a5, 9);
+    let item = |k: u64| uri(&a5, LISTITEM, &tid(9_600_000 + k, 2));
+    let w = |ops: Vec<WriteOp>| WriteBatchRequest { ops, ..Default::default() };
+    let r = g
+        .write_batch(w(vec![add_item(&item(1), &a6, &l), add_item(&item(2), &a7, &l), add_item(&item(3), &a6, &l)]))
+        .await
+        .unwrap()
+        .into_owned();
+    assert!(r.results.iter().all(|x| outcome(x) == "added"));
+    let err = g.write_batch(w(vec![add(&item(4), &a6)])).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::InvalidArgument, "a listitem names its list");
+    let err = g.write_batch(w(vec![add_item(&item(4), &a6, &list_uri(&a6, 0))])).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::InvalidArgument, "in its own repo");
+
+    let page = |distinct| ListOutRequest { rel: "listitem".into(), actor: l.clone(), distinct, ..Default::default() };
+    let m = g.list_out(page(false)).await.unwrap().into_owned();
+    let got: Vec<(&str, &str)> = m.edges.iter().map(|e| (e.uri.as_str(), e.subject.as_str())).collect();
+    assert_eq!(
+        got,
+        vec![(item(3).as_str(), a6.as_str()), (item(2).as_str(), a7.as_str()), (item(1).as_str(), a6.as_str())]
+    );
+    let m = g.list_out(page(true)).await.unwrap().into_owned();
+    let got: Vec<&str> = m.edges.iter().map(|e| e.uri.as_str()).collect();
+    assert_eq!(got, vec![item(2).as_str(), item(1).as_str()], "one per member, its oldest");
+
+    let c = g
+        .counts(CountsRequest {
+            actors: vec![l.clone(), a6.clone()],
+            rels: vec!["listitem".into()],
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_owned();
+    assert_eq!((c.counts[0].rels[0].out_records, c.counts[0].rels[0].out_subjects), (3, 2));
+    assert!(c.counts[1].rels[0].in_actors >= 1, "a6 is on l");
+    let h = g
+        .has(HasRequest { rel: "listitem".into(), from: l.clone(), to: a6.clone(), ..Default::default() })
+        .await
+        .unwrap()
+        .into_owned();
+    assert_eq!(h.uri, item(1), "the member's oldest listitem, as the distinct page keeps");
+    let on = g
+        .list_in(ListInRequest { rel: "listitem".into(), subject: a7.clone(), limit: 1000, ..Default::default() })
+        .await
+        .unwrap()
+        .into_owned();
+    assert!(on.actors.contains(&l));
+
+    // everyone's list (actor 2's list 0) against a5's follows, both ways, paged
+    let big = list_uri(&did(2), 0);
+    let gr = s.app.graph();
+    let follows: std::collections::BTreeSet<String> =
+        gr.out_set(0, gr.id_of(&a5).unwrap()).into_iter().filter_map(|i| gr.did_of(i)).collect();
+    drop(gr);
+    let req = |op: SetOp, cursor: String| IntersectRequest {
+        a: side("listitem", Dir::DIR_OUT, &big).into(),
+        b: side("follow", Dir::DIR_OUT, &a5).into(),
+        op: op.into(),
+        limit: 7,
+        cursor,
+        ..Default::default()
+    };
+    for (op, want_in) in [(SetOp::SET_OP_AND, true), (SetOp::SET_OP_AND_NOT, false)] {
+        let mut got = Vec::new();
+        let mut cursor = String::new();
+        loop {
+            let r = g.intersect(req(op, cursor)).await.unwrap().into_owned();
+            got.extend(r.actors);
+            if r.cursor.is_empty() {
+                break;
+            }
+            cursor = r.cursor;
+        }
+        assert!(!got.is_empty());
+        assert!(got.iter().all(|d| follows.contains(d) == want_in), "{op:?}");
+        if want_in {
+            assert_eq!(got.len(), follows.len(), "everyone's list holds every follow");
+        }
+    }
+
+    let f = g
+        .filter(FilterRequest {
+            viewer: a5.clone(),
+            actors: vec![a6.clone(), did(8), a7.clone()],
+            drop: vec![FilterDrop { member_of: side("listitem", Dir::DIR_OUT, &l).into(), ..Default::default() }],
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_owned();
+    assert_eq!(f.actors, vec![did(8)]);
+    assert_eq!(f.dropped.len(), 2);
+    assert_eq!(f.dropped[0].rel, "listitem");
+
+    let r = a.resolve_uri(ResolveUriRequest { uri: item(2), ..Default::default() }).await.unwrap().into_owned();
+    assert_eq!((r.rel.as_str(), r.list.as_str(), r.subject.as_str()), ("listitem", l.as_str(), a7.as_str()));
+    let act = a.get_actor(GetActorRequest { actor: l.clone(), ..Default::default() }).await.unwrap().into_owned();
+    assert!(act.list && act.known);
+
+    let r = g.write_batch(w(vec![del(&item(2))])).await.unwrap().into_owned();
+    assert_eq!(outcome(&r.results[0]), format!("removed {a7}"));
+    let m = g.list_out(page(true)).await.unwrap().into_owned();
+    assert_eq!(m.edges.len(), 1);
 }

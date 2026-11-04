@@ -506,11 +506,17 @@ impl svc::Admin for AdminApi {
                     pairs: st.in_pairs,
                     duplicates: st.out_records.saturating_sub(st.in_pairs),
                     non_tid: st.non_tid,
+                    list: r.list.clone().unwrap_or_default(),
+                    owner_of: r.owner_of.clone().unwrap_or_default(),
                     ..Default::default()
                 }
             })
             .collect();
-        let config = toml::to_string(g.relations()).unwrap_or_default();
+        // the config as written: companions are made, not configured
+        let user = marco_core::Relations {
+            list: g.relations().list.iter().filter(|r| r.owner_of.is_none()).cloned().collect(),
+        };
+        let config = toml::to_string(&user).unwrap_or_default();
         Response::ok(ListRelationsResponse { relations, config, ..Default::default() })
     }
 
@@ -601,13 +607,18 @@ impl svc::Admin for AdminApi {
         req: ServiceRequest<'_, GetActorRequest>,
     ) -> ServiceResult<GetActorResponse> {
         let did = req.actor.trim().to_string();
-        if marco_core::did::classify(&did).is_none() {
-            return Err(bad(format!("{did:?} isn't a DID")));
+        let list = did.starts_with("at://");
+        if marco_core::did::classify(&did).is_none() && !(list && parse_uri(&did).is_some()) {
+            return Err(bad(format!("{did:?} isn't a DID or a list's AT URI")));
         }
         let g = self.0.graph();
-        let status = Status::name(self.0.status_of(&did)).to_string();
+        let status = if list && g.hidden(&did) {
+            "owner hidden".to_string()
+        } else {
+            Status::name(self.0.status_of(&did)).to_string()
+        };
         let Some(id) = g.id_of(&did) else {
-            return Response::ok(GetActorResponse { did, status, ..Default::default() });
+            return Response::ok(GetActorResponse { did, status, list, ..Default::default() });
         };
         let w = g.shard_width().max(1);
         let rels = (0..g.relations().len() as RelId)
@@ -637,11 +648,12 @@ impl svc::Admin for AdminApi {
                     first_us,
                     out_stored: stored(g.list_stored(r, Dir::Out, id)),
                     in_stored: stored(g.list_stored(r, Dir::In, id)),
+                    out_subjects: if out == 0 { 0 } else { g.out_distinct(r, id) },
                     ..Default::default()
                 }
             })
             .collect();
-        Response::ok(GetActorResponse { did, known: true, id, shard: id / w, status, rels, ..Default::default() })
+        Response::ok(GetActorResponse { did, known: true, id, shard: id / w, status, rels, list, ..Default::default() })
     }
 
     async fn list_edges(
@@ -727,18 +739,28 @@ impl svc::Admin for AdminApi {
             ..Default::default()
         };
         let w = g.shard_width().max(1);
-        let Some(a) = g.id_of(did) else { return Response::ok(r) };
-        r.actor_id = a;
-        r.shard = a / w;
-        r.out_count = g.out_count(rel, a);
-        r.tombstoned = g.is_tombstoned(rel, a, key);
+        let Some(owner) = g.id_of(did) else { return Response::ok(r) };
+        r.actor_id = owner;
+        r.shard = owner / w;
+        // a list relation's record is its owner's; its edge is in the list's log
+        let rec = g.relations().owner_rel(rel).unwrap_or(rel);
+        r.out_count = g.out_count(rec, owner);
+        r.tombstoned = g.is_tombstoned(rec, owner, key);
+        let a = if rec == rel {
+            owner
+        } else {
+            let Some(l) = g.out_get(rec, owner, key) else { return Response::ok(r) };
+            r.list = g.did_of(l).unwrap_or_default();
+            l
+        };
         let Some(s) = g.out_get(rel, a, key) else { return Response::ok(r) };
         r.subject = g.did_of(s).unwrap_or_default();
         r.subject_id = s;
         r.subject_shard = s / w;
         r.stored = stored(g.out_stored(rel, a, key));
-        if r.out_count <= SCAN_CAP {
-            let page = g.out_page(rel, a, r.out_count as usize, None);
+        let n = g.out_count(rel, a);
+        if n <= SCAN_CAP {
+            let page = g.out_page(rel, a, n as usize, None);
             r.position = page.iter().position(|e| e.0 == key).map_or(0, |p| p as u64 + 1);
         }
         r.pair_records = g.records_naming(rel, a, s) as u64;

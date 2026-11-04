@@ -72,6 +72,12 @@ export function Relations() {
                 { id: 'name', label: 'Name', render: (r) => <b>{r.name}</b> },
                 { id: 'coll', label: 'Collection', fill: true, render: (r) => <span className="mono t2">{r.collection}</span> },
                 { id: 'subj', label: 'Subject path', render: (r) => <span className="mono">{r.subject}</span> },
+                {
+                  id: 'from',
+                  label: 'From',
+                  title: 'a list relation keeps edges from the record\'s list; its companion holds the records by owner',
+                  render: (r) => (r.list ? <span className="mono">{r.list}</span> : r.ownerOf ? <span className="muted">records of {r.ownerOf}</span> : <span className="muted">actor</span>),
+                },
                 { id: 'rec', label: 'Records', r: true, render: (r) => fmtCount(r.records) },
                 { id: 'dup', label: 'Duplicates', r: true, title: 'records less pairs', render: (r) => fmtCount(r.duplicates) },
                 { id: 'big', label: `Lists > ${fmtCount(ls.data?.threshold ?? first.data?.threshold ?? 4096)}`, r: true, title: 'out lists with a by-subject index', render: (r) => (r.name === cur && ls.data?.ready ? fmtCount(ls.data.out?.overThreshold) : r.name === names[0] && first.data?.ready ? fmtCount(first.data.out?.overThreshold) : '—') },

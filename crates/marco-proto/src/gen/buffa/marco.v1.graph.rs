@@ -142,6 +142,151 @@ impl ::buffa::Enumeration for Dir {
         &[Self::DIR_UNSPECIFIED, Self::DIR_OUT, Self::DIR_IN]
     }
 }
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[repr(i32)]
+pub enum SetOp {
+    /// a and b.
+    SET_OP_UNSPECIFIED = 0i32,
+    SET_OP_AND = 1i32,
+    /// a and not b.
+    SET_OP_AND_NOT = 2i32,
+}
+impl SetOp {
+    ///Idiomatic alias for [`Self::SET_OP_UNSPECIFIED`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const Unspecified: Self = Self::SET_OP_UNSPECIFIED;
+    ///Idiomatic alias for [`Self::SET_OP_AND`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const And: Self = Self::SET_OP_AND;
+    ///Idiomatic alias for [`Self::SET_OP_AND_NOT`]; `Debug` prints the variant name.
+    #[allow(non_upper_case_globals)]
+    pub const AndNot: Self = Self::SET_OP_AND_NOT;
+}
+impl ::core::default::Default for SetOp {
+    fn default() -> Self {
+        Self::SET_OP_UNSPECIFIED
+    }
+}
+impl ::serde::Serialize for SetOp {
+    fn serialize<S: ::serde::Serializer>(
+        &self,
+        s: S,
+    ) -> ::core::result::Result<S::Ok, S::Error> {
+        s.serialize_str(::buffa::Enumeration::proto_name(self))
+    }
+}
+impl<'de> ::serde::Deserialize<'de> for SetOp {
+    fn deserialize<D: ::serde::Deserializer<'de>>(
+        d: D,
+    ) -> ::core::result::Result<Self, D::Error> {
+        struct _V;
+        impl ::serde::de::Visitor<'_> for _V {
+            type Value = SetOp;
+            fn expecting(
+                &self,
+                f: &mut ::core::fmt::Formatter<'_>,
+            ) -> ::core::fmt::Result {
+                f.write_str(
+                    concat!("a string, integer, or null for ", stringify!(SetOp)),
+                )
+            }
+            fn visit_str<E: ::serde::de::Error>(
+                self,
+                v: &str,
+            ) -> ::core::result::Result<SetOp, E> {
+                <SetOp as ::buffa::Enumeration>::from_proto_name(v)
+                    .ok_or_else(|| { ::serde::de::Error::unknown_variant(v, &[]) })
+            }
+            fn visit_i64<E: ::serde::de::Error>(
+                self,
+                v: i64,
+            ) -> ::core::result::Result<SetOp, E> {
+                let v32 = i32::try_from(v)
+                    .map_err(|_| {
+                        ::serde::de::Error::custom(
+                            ::buffa::alloc::format!("enum value {v} out of i32 range"),
+                        )
+                    })?;
+                <SetOp as ::buffa::Enumeration>::from_i32(v32)
+                    .ok_or_else(|| {
+                        ::serde::de::Error::custom(
+                            ::buffa::alloc::format!("unknown enum value {v32}"),
+                        )
+                    })
+            }
+            fn visit_u64<E: ::serde::de::Error>(
+                self,
+                v: u64,
+            ) -> ::core::result::Result<SetOp, E> {
+                let v32 = i32::try_from(v)
+                    .map_err(|_| {
+                        ::serde::de::Error::custom(
+                            ::buffa::alloc::format!("enum value {v} out of i32 range"),
+                        )
+                    })?;
+                <SetOp as ::buffa::Enumeration>::from_i32(v32)
+                    .ok_or_else(|| {
+                        ::serde::de::Error::custom(
+                            ::buffa::alloc::format!("unknown enum value {v32}"),
+                        )
+                    })
+            }
+            fn visit_unit<E: ::serde::de::Error>(
+                self,
+            ) -> ::core::result::Result<SetOp, E> {
+                ::core::result::Result::Ok(::core::default::Default::default())
+            }
+        }
+        d.deserialize_any(_V)
+    }
+}
+impl ::buffa::json_helpers::ProtoElemJson for SetOp {
+    fn serialize_proto_json<S: ::serde::Serializer>(
+        v: &Self,
+        s: S,
+    ) -> ::core::result::Result<S::Ok, S::Error> {
+        ::serde::Serialize::serialize(v, s)
+    }
+    fn deserialize_proto_json<'de, D: ::serde::Deserializer<'de>>(
+        d: D,
+    ) -> ::core::result::Result<Self, D::Error> {
+        <Self as ::serde::Deserialize>::deserialize(d)
+    }
+}
+impl ::buffa::Enumeration for SetOp {
+    fn from_i32(value: i32) -> ::core::option::Option<Self> {
+        match value {
+            0i32 => ::core::option::Option::Some(Self::SET_OP_UNSPECIFIED),
+            1i32 => ::core::option::Option::Some(Self::SET_OP_AND),
+            2i32 => ::core::option::Option::Some(Self::SET_OP_AND_NOT),
+            _ => ::core::option::Option::None,
+        }
+    }
+    fn to_i32(&self) -> i32 {
+        *self as i32
+    }
+    fn proto_name(&self) -> &'static str {
+        match self {
+            Self::SET_OP_UNSPECIFIED => "SET_OP_UNSPECIFIED",
+            Self::SET_OP_AND => "SET_OP_AND",
+            Self::SET_OP_AND_NOT => "SET_OP_AND_NOT",
+        }
+    }
+    fn from_proto_name(name: &str) -> ::core::option::Option<Self> {
+        match name {
+            "SET_OP_UNSPECIFIED" => {
+                ::core::option::Option::Some(Self::SET_OP_UNSPECIFIED)
+            }
+            "SET_OP_AND" => ::core::option::Option::Some(Self::SET_OP_AND),
+            "SET_OP_AND_NOT" => ::core::option::Option::Some(Self::SET_OP_AND_NOT),
+            _ => ::core::option::Option::None,
+        }
+    }
+    fn values() -> &'static [Self] {
+        &[Self::SET_OP_UNSPECIFIED, Self::SET_OP_AND, Self::SET_OP_AND_NOT]
+    }
+}
 #[derive(Clone, PartialEq, Default)]
 #[derive(::serde::Serialize, ::serde::Deserialize)]
 #[serde(default)]
@@ -1107,6 +1252,8 @@ pub struct ListOutRequest {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
     )]
     pub rel: ::buffa::alloc::string::String,
+    /// A DID, or for a list relation the list's AT URI.
+    ///
     /// Field 2: `actor`
     #[serde(
         rename = "actor",
@@ -1130,6 +1277,16 @@ pub struct ListOutRequest {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
     )]
     pub cursor: ::buffa::alloc::string::String,
+    /// One record per subject, its oldest (the appview keeps the first): a
+    /// list's members, where some records repeat one. Stable under a cursor.
+    ///
+    /// Field 5: `distinct`
+    #[serde(
+        rename = "distinct",
+        with = "::buffa::json_helpers::proto_bool",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_false"
+    )]
+    pub distinct: bool,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -1141,6 +1298,7 @@ impl ::core::fmt::Debug for ListOutRequest {
             .field("actor", &self.actor)
             .field("limit", &self.limit)
             .field("cursor", &self.cursor)
+            .field("distinct", &self.distinct)
             .finish()
     }
 }
@@ -1183,6 +1341,9 @@ impl ::buffa::Message for ListOutRequest {
         if !self.cursor.is_empty() {
             size += 1u64 + ::buffa::types::string_encoded_len(&self.cursor) as u64;
         }
+        if self.distinct {
+            size += 1u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -1204,6 +1365,9 @@ impl ::buffa::Message for ListOutRequest {
         }
         if !self.cursor.is_empty() {
             ::buffa::types::put_string_field(4u32, &self.cursor, buf);
+        }
+        if self.distinct {
+            ::buffa::types::put_bool_field(5u32, self.distinct, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -1246,6 +1410,13 @@ impl ::buffa::Message for ListOutRequest {
                 )?;
                 ::buffa::types::merge_string(&mut self.cursor, buf)?;
             }
+            5u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.distinct = ::buffa::types::decode_bool(buf)?;
+            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -1258,6 +1429,7 @@ impl ::buffa::Message for ListOutRequest {
         self.actor.clear();
         self.limit = 0u32;
         self.cursor.clear();
+        self.distinct = false;
         self.__buffa_unknown_fields.clear();
     }
 }
@@ -2438,6 +2610,16 @@ pub struct RelCounts {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
     )]
     pub in_actors: u64,
+    /// The distinct subjects of the actor's records: a list's member count.
+    ///
+    /// Field 4: `out_subjects`
+    #[serde(
+        rename = "outSubjects",
+        alias = "out_subjects",
+        with = "::buffa::json_helpers::uint64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
+    )]
+    pub out_subjects: u64,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -2448,6 +2630,7 @@ impl ::core::fmt::Debug for RelCounts {
             .field("rel", &self.rel)
             .field("out_records", &self.out_records)
             .field("in_actors", &self.in_actors)
+            .field("out_subjects", &self.out_subjects)
             .finish()
     }
 }
@@ -2487,6 +2670,9 @@ impl ::buffa::Message for RelCounts {
         if self.in_actors != 0u64 {
             size += 1u64 + ::buffa::types::uint64_encoded_len(self.in_actors) as u64;
         }
+        if self.out_subjects != 0u64 {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(self.out_subjects) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -2505,6 +2691,9 @@ impl ::buffa::Message for RelCounts {
         }
         if self.in_actors != 0u64 {
             ::buffa::types::put_uint64_field(3u32, self.in_actors, buf);
+        }
+        if self.out_subjects != 0u64 {
+            ::buffa::types::put_uint64_field(4u32, self.out_subjects, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -2540,6 +2729,13 @@ impl ::buffa::Message for RelCounts {
                 )?;
                 self.in_actors = ::buffa::types::decode_uint64(buf)?;
             }
+            4u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.out_subjects = ::buffa::types::decode_uint64(buf)?;
+            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -2551,6 +2747,7 @@ impl ::buffa::Message for RelCounts {
         self.rel.clear();
         self.out_records = 0u64;
         self.in_actors = 0u64;
+        self.out_subjects = 0u64;
         self.__buffa_unknown_fields.clear();
     }
 }
@@ -2601,6 +2798,8 @@ pub struct ListSide {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_default_enum_value"
     )]
     pub dir: ::buffa::EnumValue<Dir>,
+    /// A DID, or a list's AT URI: (listitem, DIR_OUT, list) is its members.
+    ///
     /// Field 3: `actor`
     #[serde(
         rename = "actor",
@@ -2784,6 +2983,22 @@ pub struct IntersectRequest {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u32"
     )]
     pub limit: u32,
+    /// Field 4: `op`
+    #[serde(
+        rename = "op",
+        with = "::buffa::json_helpers::proto_enum",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_default_enum_value"
+    )]
+    pub op: ::buffa::EnumValue<SetOp>,
+    /// The last response's cursor: the actors after it, in id order.
+    ///
+    /// Field 5: `cursor`
+    #[serde(
+        rename = "cursor",
+        with = "::buffa::json_helpers::proto_string",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    )]
+    pub cursor: ::buffa::alloc::string::String,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -2794,6 +3009,8 @@ impl ::core::fmt::Debug for IntersectRequest {
             .field("a", &self.a)
             .field("b", &self.b)
             .field("limit", &self.limit)
+            .field("op", &self.op)
+            .field("cursor", &self.cursor)
             .finish()
     }
 }
@@ -2843,6 +3060,15 @@ impl ::buffa::Message for IntersectRequest {
         if self.limit != 0u32 {
             size += 1u64 + ::buffa::types::uint32_encoded_len(self.limit) as u64;
         }
+        {
+            let val = self.op.to_i32();
+            if val != 0 {
+                size += 1u64 + ::buffa::types::int32_encoded_len(val) as u64;
+            }
+        }
+        if !self.cursor.is_empty() {
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.cursor) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -2871,6 +3097,15 @@ impl ::buffa::Message for IntersectRequest {
         }
         if self.limit != 0u32 {
             ::buffa::types::put_uint32_field(3u32, self.limit, buf);
+        }
+        {
+            let val = self.op.to_i32();
+            if val != 0 {
+                ::buffa::types::put_int32_field(4u32, val, buf);
+            }
+        }
+        if !self.cursor.is_empty() {
+            ::buffa::types::put_string_field(5u32, &self.cursor, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -2914,6 +3149,20 @@ impl ::buffa::Message for IntersectRequest {
                 )?;
                 self.limit = ::buffa::types::decode_uint32(buf)?;
             }
+            4u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.op = ::buffa::EnumValue::from(::buffa::types::decode_int32(buf)?);
+            }
+            5u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.cursor, buf)?;
+            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -2925,6 +3174,8 @@ impl ::buffa::Message for IntersectRequest {
         self.a = ::buffa::MessageField::none();
         self.b = ::buffa::MessageField::none();
         self.limit = 0u32;
+        self.op = ::buffa::EnumValue::from(0);
+        self.cursor.clear();
         self.__buffa_unknown_fields.clear();
     }
 }
@@ -2988,6 +3239,15 @@ pub struct IntersectResponse {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
     )]
     pub b_len: u64,
+    /// Empty on the last page.
+    ///
+    /// Field 4: `cursor`
+    #[serde(
+        rename = "cursor",
+        with = "::buffa::json_helpers::proto_string",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    )]
+    pub cursor: ::buffa::alloc::string::String,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -2998,6 +3258,7 @@ impl ::core::fmt::Debug for IntersectResponse {
             .field("actors", &self.actors)
             .field("a_len", &self.a_len)
             .field("b_len", &self.b_len)
+            .field("cursor", &self.cursor)
             .finish()
     }
 }
@@ -3037,6 +3298,9 @@ impl ::buffa::Message for IntersectResponse {
         if self.b_len != 0u64 {
             size += 1u64 + ::buffa::types::uint64_encoded_len(self.b_len) as u64;
         }
+        if !self.cursor.is_empty() {
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.cursor) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -3055,6 +3319,9 @@ impl ::buffa::Message for IntersectResponse {
         }
         if self.b_len != 0u64 {
             ::buffa::types::put_uint64_field(3u32, self.b_len, buf);
+        }
+        if !self.cursor.is_empty() {
+            ::buffa::types::put_string_field(4u32, &self.cursor, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -3094,6 +3361,13 @@ impl ::buffa::Message for IntersectResponse {
                 )?;
                 self.b_len = ::buffa::types::decode_uint64(buf)?;
             }
+            4u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.cursor, buf)?;
+            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -3105,6 +3379,7 @@ impl ::buffa::Message for IntersectResponse {
         self.actors.clear();
         self.a_len = 0u64;
         self.b_len = 0u64;
+        self.cursor.clear();
         self.__buffa_unknown_fields.clear();
     }
 }
@@ -3158,6 +3433,16 @@ pub struct FilterDrop {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_default_enum_value"
     )]
     pub dir: ::buffa::EnumValue<Dir>,
+    /// Set instead of rel and dir: drops the actors in this side, whoever the
+    /// viewer is (a list's members: listitem, DIR_OUT, the list's URI).
+    ///
+    /// Field 3: `member_of`
+    #[serde(
+        rename = "memberOf",
+        alias = "member_of",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_unset_message_field"
+    )]
+    pub member_of: ::buffa::MessageField<ListSide, ::buffa::Inline<ListSide>>,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -3167,6 +3452,7 @@ impl ::core::fmt::Debug for FilterDrop {
         f.debug_struct("FilterDrop")
             .field("rel", &self.rel)
             .field("dir", &self.dir)
+            .field("member_of", &self.member_of)
             .finish()
     }
 }
@@ -3193,7 +3479,7 @@ impl ::buffa::Message for FilterDrop {
     /// above [`::buffa::MAX_MESSAGE_BYTES`] that the encode entry
     /// points reject, never a silently wrapped size.
     #[allow(clippy::let_and_return)]
-    fn compute_size(&self, _cache: &mut ::buffa::SizeCache) -> u32 {
+    fn compute_size(&self, __cache: &mut ::buffa::SizeCache) -> u32 {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
         let mut size = 0u64;
@@ -3206,12 +3492,20 @@ impl ::buffa::Message for FilterDrop {
                 size += 1u64 + ::buffa::types::int32_encoded_len(val) as u64;
             }
         }
+        if self.member_of.is_set() {
+            let __slot = __cache.reserve();
+            let inner_size = self.member_of.compute_size(__cache);
+            __cache.set(__slot, inner_size);
+            size
+                += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
+                    + inner_size as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
     fn write_to(
         &self,
-        _cache: &mut ::buffa::SizeCache,
+        __cache: &mut ::buffa::SizeCache,
         buf: &mut impl ::buffa::EncodeSink,
     ) {
         #[allow(unused_imports)]
@@ -3224,6 +3518,14 @@ impl ::buffa::Message for FilterDrop {
             if val != 0 {
                 ::buffa::types::put_int32_field(2u32, val, buf);
             }
+        }
+        if self.member_of.is_set() {
+            ::buffa::types::put_len_delimited_header(
+                3u32,
+                u64::from(__cache.consume_next()),
+                buf,
+            );
+            self.member_of.write_to(__cache, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -3252,6 +3554,17 @@ impl ::buffa::Message for FilterDrop {
                 )?;
                 self.dir = ::buffa::EnumValue::from(::buffa::types::decode_int32(buf)?);
             }
+            3u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::Message::merge_length_delimited(
+                    self.member_of.get_or_insert_default(),
+                    buf,
+                    ctx,
+                )?;
+            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -3262,6 +3575,7 @@ impl ::buffa::Message for FilterDrop {
     fn clear(&mut self) {
         self.rel.clear();
         self.dir = ::buffa::EnumValue::from(0);
+        self.member_of = ::buffa::MessageField::none();
         self.__buffa_unknown_fields.clear();
     }
 }
@@ -4128,8 +4442,18 @@ pub struct AddOp {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
     )]
     pub subject: ::buffa::alloc::string::String,
+    /// A list relation's record names its list, an AT URI in the same repo.
+    ///
+    /// Field 4: `list`
+    #[serde(
+        rename = "list",
+        with = "::buffa::json_helpers::proto_string",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    )]
+    pub list: ::buffa::alloc::string::String,
     /// When the source saw the create (µs since the epoch); 0: when marco applies it.
-    /// An add older than a delete of the same record stays deleted.
+    /// An add older than a delete of the same record stays deleted; one older
+    /// than the record's last change from another source changes nothing.
     ///
     /// Field 3: `time_us`
     #[serde(
@@ -4148,6 +4472,7 @@ impl ::core::fmt::Debug for AddOp {
         f.debug_struct("AddOp")
             .field("uri", &self.uri)
             .field("subject", &self.subject)
+            .field("list", &self.list)
             .field("time_us", &self.time_us)
             .finish()
     }
@@ -4188,6 +4513,9 @@ impl ::buffa::Message for AddOp {
         if self.time_us != 0i64 {
             size += 1u64 + ::buffa::types::int64_encoded_len(self.time_us) as u64;
         }
+        if !self.list.is_empty() {
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.list) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -4206,6 +4534,9 @@ impl ::buffa::Message for AddOp {
         }
         if self.time_us != 0i64 {
             ::buffa::types::put_int64_field(3u32, self.time_us, buf);
+        }
+        if !self.list.is_empty() {
+            ::buffa::types::put_string_field(4u32, &self.list, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -4241,6 +4572,13 @@ impl ::buffa::Message for AddOp {
                 )?;
                 self.time_us = ::buffa::types::decode_int64(buf)?;
             }
+            4u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.list, buf)?;
+            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -4252,6 +4590,7 @@ impl ::buffa::Message for AddOp {
         self.uri.clear();
         self.subject.clear();
         self.time_us = 0i64;
+        self.list.clear();
         self.__buffa_unknown_fields.clear();
     }
 }

@@ -1752,6 +1752,8 @@ impl ::serde::Serialize for RelationshipEdgeOwnedView {
 pub struct ListOutRequestView<'a> {
     /// Field 1: `rel`
     pub rel: &'a str,
+    /// A DID, or for a list relation the list's AT URI.
+    ///
     /// Field 2: `actor`
     pub actor: &'a str,
     /// Default 50, at most 1000.
@@ -1760,6 +1762,11 @@ pub struct ListOutRequestView<'a> {
     pub limit: u32,
     /// Field 4: `cursor`
     pub cursor: &'a str,
+    /// One record per subject, its oldest (the appview keeps the first): a
+    /// list's members, where some records repeat one. Stable under a cursor.
+    ///
+    /// Field 5: `distinct`
+    pub distinct: bool,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for ListOutRequestView<'a> {
@@ -1820,6 +1827,13 @@ impl<'a> ::buffa::MessageView<'a> for ListOutRequestView<'a> {
                 )?;
                 view.cursor = ::buffa::types::borrow_str(&mut cur)?;
             }
+            5u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.distinct = ::buffa::types::decode_bool(&mut cur)?;
+            }
             _ => {
                 ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
                 let span_len = before_tag.len() - cur.len();
@@ -1846,6 +1860,7 @@ impl<'a> ::buffa::MessageView<'a> for ListOutRequestView<'a> {
             actor: self.actor.to_string(),
             limit: self.limit,
             cursor: self.cursor.to_string(),
+            distinct: self.distinct,
             __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
@@ -1869,6 +1884,9 @@ impl<'a> ::buffa::ViewEncode<'a> for ListOutRequestView<'a> {
         if !self.cursor.is_empty() {
             size += 1u64 + ::buffa::types::string_encoded_len(&self.cursor) as u64;
         }
+        if self.distinct {
+            size += 1u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -1891,6 +1909,9 @@ impl<'a> ::buffa::ViewEncode<'a> for ListOutRequestView<'a> {
         }
         if !self.cursor.is_empty() {
             ::buffa::types::put_string_field(4u32, &self.cursor, buf);
+        }
+        if self.distinct {
+            ::buffa::types::put_bool_field(5u32, self.distinct, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -1928,6 +1949,9 @@ impl<'__a> ::serde::Serialize for ListOutRequestView<'__a> {
         }
         if !::buffa::json_helpers::skip_if::is_empty_str(self.cursor) {
             __map.serialize_entry("cursor", self.cursor)?;
+        }
+        if self.distinct {
+            __map.serialize_entry("distinct", &self.distinct)?;
         }
         __map.end()
     }
@@ -2027,6 +2051,8 @@ impl ListOutRequestOwnedView {
     pub fn rel(&self) -> &'_ str {
         self.0.reborrow().rel
     }
+    /// A DID, or for a list relation the list's AT URI.
+    ///
     /// Field 2: `actor`
     #[must_use]
     pub fn actor(&self) -> &'_ str {
@@ -2043,6 +2069,14 @@ impl ListOutRequestOwnedView {
     #[must_use]
     pub fn cursor(&self) -> &'_ str {
         self.0.reborrow().cursor
+    }
+    /// One record per subject, its oldest (the appview keeps the first): a
+    /// list's members, where some records repeat one. Stable under a cursor.
+    ///
+    /// Field 5: `distinct`
+    #[must_use]
+    pub fn distinct(&self) -> bool {
+        self.0.reborrow().distinct
     }
 }
 impl ::core::convert::From<::buffa::OwnedView<ListOutRequestView<'static>>>
@@ -4108,6 +4142,10 @@ pub struct RelCountsView<'a> {
     ///
     /// Field 3: `in_actors`
     pub in_actors: u64,
+    /// The distinct subjects of the actor's records: a list's member count.
+    ///
+    /// Field 4: `out_subjects`
+    pub out_subjects: u64,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for RelCountsView<'a> {
@@ -4161,6 +4199,13 @@ impl<'a> ::buffa::MessageView<'a> for RelCountsView<'a> {
                 )?;
                 view.in_actors = ::buffa::types::decode_uint64(&mut cur)?;
             }
+            4u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.out_subjects = ::buffa::types::decode_uint64(&mut cur)?;
+            }
             _ => {
                 ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
                 let span_len = before_tag.len() - cur.len();
@@ -4186,6 +4231,7 @@ impl<'a> ::buffa::MessageView<'a> for RelCountsView<'a> {
             rel: self.rel.to_string(),
             out_records: self.out_records,
             in_actors: self.in_actors,
+            out_subjects: self.out_subjects,
             __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
@@ -4206,6 +4252,9 @@ impl<'a> ::buffa::ViewEncode<'a> for RelCountsView<'a> {
         if self.in_actors != 0u64 {
             size += 1u64 + ::buffa::types::uint64_encoded_len(self.in_actors) as u64;
         }
+        if self.out_subjects != 0u64 {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(self.out_subjects) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -4225,6 +4274,9 @@ impl<'a> ::buffa::ViewEncode<'a> for RelCountsView<'a> {
         }
         if self.in_actors != 0u64 {
             ::buffa::types::put_uint64_field(3u32, self.in_actors, buf);
+        }
+        if self.out_subjects != 0u64 {
+            ::buffa::types::put_uint64_field(4u32, self.out_subjects, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -4262,6 +4314,13 @@ impl<'__a> ::serde::Serialize for RelCountsView<'__a> {
                 .serialize_entry(
                     "inActors",
                     &::buffa::json_helpers::ProtoJson(&self.in_actors),
+                )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.out_subjects) {
+            __map
+                .serialize_entry(
+                    "outSubjects",
+                    &::buffa::json_helpers::ProtoJson(&self.out_subjects),
                 )?;
         }
         __map.end()
@@ -4374,6 +4433,13 @@ impl RelCountsOwnedView {
     pub fn in_actors(&self) -> u64 {
         self.0.reborrow().in_actors
     }
+    /// The distinct subjects of the actor's records: a list's member count.
+    ///
+    /// Field 4: `out_subjects`
+    #[must_use]
+    pub fn out_subjects(&self) -> u64 {
+        self.0.reborrow().out_subjects
+    }
 }
 impl ::core::convert::From<::buffa::OwnedView<RelCountsView<'static>>>
 for RelCountsOwnedView {
@@ -4411,6 +4477,8 @@ pub struct ListSideView<'a> {
     pub rel: &'a str,
     /// Field 2: `dir`
     pub dir: ::buffa::EnumValue<super::super::Dir>,
+    /// A DID, or a list's AT URI: (listitem, DIR_OUT, list) is its members.
+    ///
     /// Field 3: `actor`
     pub actor: &'a str,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
@@ -4668,6 +4736,8 @@ impl ListSideOwnedView {
     pub fn dir(&self) -> ::buffa::EnumValue<super::super::Dir> {
         self.0.reborrow().dir
     }
+    /// A DID, or a list's AT URI: (listitem, DIR_OUT, list) is its members.
+    ///
     /// Field 3: `actor`
     #[must_use]
     pub fn actor(&self) -> &'_ str {
@@ -4714,6 +4784,12 @@ pub struct IntersectRequestView<'a> {
     ///
     /// Field 3: `limit`
     pub limit: u32,
+    /// Field 4: `op`
+    pub op: ::buffa::EnumValue<super::super::SetOp>,
+    /// The last response's cursor: the actors after it, in id order.
+    ///
+    /// Field 5: `cursor`
+    pub cursor: &'a str,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for IntersectRequestView<'a> {
@@ -4795,6 +4871,22 @@ impl<'a> ::buffa::MessageView<'a> for IntersectRequestView<'a> {
                 )?;
                 view.limit = ::buffa::types::decode_uint32(&mut cur)?;
             }
+            4u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.op = ::buffa::EnumValue::from(
+                    ::buffa::types::decode_int32(&mut cur)?,
+                );
+            }
+            5u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                view.cursor = ::buffa::types::borrow_str(&mut cur)?;
+            }
             _ => {
                 ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
                 let span_len = before_tag.len() - cur.len();
@@ -4836,6 +4928,8 @@ impl<'a> ::buffa::MessageView<'a> for IntersectRequestView<'a> {
                 None => ::buffa::MessageField::none(),
             },
             limit: self.limit,
+            op: self.op,
+            cursor: self.cursor.to_string(),
             __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
@@ -4866,6 +4960,15 @@ impl<'a> ::buffa::ViewEncode<'a> for IntersectRequestView<'a> {
         if self.limit != 0u32 {
             size += 1u64 + ::buffa::types::uint32_encoded_len(self.limit) as u64;
         }
+        {
+            let val = self.op.to_i32();
+            if val != 0 {
+                size += 1u64 + ::buffa::types::int32_encoded_len(val) as u64;
+            }
+        }
+        if !self.cursor.is_empty() {
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.cursor) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -4895,6 +4998,15 @@ impl<'a> ::buffa::ViewEncode<'a> for IntersectRequestView<'a> {
         }
         if self.limit != 0u32 {
             ::buffa::types::put_uint32_field(3u32, self.limit, buf);
+        }
+        {
+            let val = self.op.to_i32();
+            if val != 0 {
+                ::buffa::types::put_int32_field(4u32, val, buf);
+            }
+        }
+        if !self.cursor.is_empty() {
+            ::buffa::types::put_string_field(5u32, &self.cursor, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -4933,6 +5045,12 @@ impl<'__a> ::serde::Serialize for IntersectRequestView<'__a> {
                     "limit",
                     &::buffa::json_helpers::ProtoJson(&self.limit),
                 )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_default_enum_value(&self.op) {
+            __map.serialize_entry("op", &self.op)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.cursor) {
+            __map.serialize_entry("cursor", self.cursor)?;
         }
         __map.end()
     }
@@ -5048,6 +5166,18 @@ impl IntersectRequestOwnedView {
     pub fn limit(&self) -> u32 {
         self.0.reborrow().limit
     }
+    /// Field 4: `op`
+    #[must_use]
+    pub fn op(&self) -> ::buffa::EnumValue<super::super::SetOp> {
+        self.0.reborrow().op
+    }
+    /// The last response's cursor: the actors after it, in id order.
+    ///
+    /// Field 5: `cursor`
+    #[must_use]
+    pub fn cursor(&self) -> &'_ str {
+        self.0.reborrow().cursor
+    }
 }
 impl ::core::convert::From<::buffa::OwnedView<IntersectRequestView<'static>>>
 for IntersectRequestOwnedView {
@@ -5091,6 +5221,10 @@ pub struct IntersectResponseView<'a> {
     pub a_len: u64,
     /// Field 3: `b_len`
     pub b_len: u64,
+    /// Empty on the last page.
+    ///
+    /// Field 4: `cursor`
+    pub cursor: &'a str,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for IntersectResponseView<'a> {
@@ -5137,6 +5271,13 @@ impl<'a> ::buffa::MessageView<'a> for IntersectResponseView<'a> {
                 )?;
                 view.b_len = ::buffa::types::decode_uint64(&mut cur)?;
             }
+            4u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                view.cursor = ::buffa::types::borrow_str(&mut cur)?;
+            }
             1u32 => {
                 ::buffa::encoding::check_wire_type(
                     tag,
@@ -5173,6 +5314,7 @@ impl<'a> ::buffa::MessageView<'a> for IntersectResponseView<'a> {
             actors: self.actors.iter().map(|s| s.to_string()).collect(),
             a_len: self.a_len,
             b_len: self.b_len,
+            cursor: self.cursor.to_string(),
             __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
@@ -5193,6 +5335,9 @@ impl<'a> ::buffa::ViewEncode<'a> for IntersectResponseView<'a> {
         if self.b_len != 0u64 {
             size += 1u64 + ::buffa::types::uint64_encoded_len(self.b_len) as u64;
         }
+        if !self.cursor.is_empty() {
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.cursor) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -5212,6 +5357,9 @@ impl<'a> ::buffa::ViewEncode<'a> for IntersectResponseView<'a> {
         }
         if self.b_len != 0u64 {
             ::buffa::types::put_uint64_field(3u32, self.b_len, buf);
+        }
+        if !self.cursor.is_empty() {
+            ::buffa::types::put_string_field(4u32, &self.cursor, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -5250,6 +5398,9 @@ impl<'__a> ::serde::Serialize for IntersectResponseView<'__a> {
                     "bLen",
                     &::buffa::json_helpers::ProtoJson(&self.b_len),
                 )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.cursor) {
+            __map.serialize_entry("cursor", self.cursor)?;
         }
         __map.end()
     }
@@ -5365,6 +5516,13 @@ impl IntersectResponseOwnedView {
     pub fn b_len(&self) -> u64 {
         self.0.reborrow().b_len
     }
+    /// Empty on the last page.
+    ///
+    /// Field 4: `cursor`
+    #[must_use]
+    pub fn cursor(&self) -> &'_ str {
+        self.0.reborrow().cursor
+    }
 }
 impl ::core::convert::From<::buffa::OwnedView<IntersectResponseView<'static>>>
 for IntersectResponseOwnedView {
@@ -5405,6 +5563,13 @@ pub struct FilterDropView<'a> {
     ///
     /// Field 2: `dir`
     pub dir: ::buffa::EnumValue<super::super::Dir>,
+    /// Set instead of rel and dir: drops the actors in this side, whoever the
+    /// viewer is (a list's members: listitem, DIR_OUT, the list's URI).
+    ///
+    /// Field 3: `member_of`
+    pub member_of: ::buffa::MessageFieldView<
+        super::super::__buffa::view::ListSideView<'a>,
+    >,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for FilterDropView<'a> {
@@ -5453,6 +5618,27 @@ impl<'a> ::buffa::MessageView<'a> for FilterDropView<'a> {
                     ::buffa::types::decode_int32(&mut cur)?,
                 );
             }
+            3u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                let __sub_ctx = ctx.descend()?;
+                let sub = ::buffa::types::borrow_bytes(&mut cur)?;
+                match view.member_of.as_mut() {
+                    Some(existing) => {
+                        ::buffa::MessageView::merge_into_view(existing, sub, __sub_ctx)?
+                    }
+                    None => {
+                        view.member_of = ::buffa::MessageFieldView::set(
+                            <super::super::__buffa::view::ListSideView as ::buffa::MessageView>::decode_view_ctx(
+                                sub,
+                                __sub_ctx,
+                            )?,
+                        );
+                    }
+                }
+            }
             _ => {
                 ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
                 let span_len = before_tag.len() - cur.len();
@@ -5477,6 +5663,15 @@ impl<'a> ::buffa::MessageView<'a> for FilterDropView<'a> {
         ::core::result::Result::Ok(super::super::FilterDrop {
             rel: self.rel.to_string(),
             dir: self.dir,
+            member_of: match self.member_of.as_option() {
+                Some(v) => {
+                    ::buffa::MessageField::<
+                        super::super::ListSide,
+                        ::buffa::Inline<super::super::ListSide>,
+                    >::some(v.to_owned_from_source(__buffa_src)?)
+                }
+                None => ::buffa::MessageField::none(),
+            },
             __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
@@ -5484,7 +5679,7 @@ impl<'a> ::buffa::MessageView<'a> for FilterDropView<'a> {
 }
 impl<'a> ::buffa::ViewEncode<'a> for FilterDropView<'a> {
     #[allow(clippy::needless_borrow, clippy::let_and_return)]
-    fn compute_size(&self, _cache: &mut ::buffa::SizeCache) -> u32 {
+    fn compute_size(&self, __cache: &mut ::buffa::SizeCache) -> u32 {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
         let mut size = 0u64;
@@ -5497,13 +5692,21 @@ impl<'a> ::buffa::ViewEncode<'a> for FilterDropView<'a> {
                 size += 1u64 + ::buffa::types::int32_encoded_len(val) as u64;
             }
         }
+        if self.member_of.is_set() {
+            let __slot = __cache.reserve();
+            let inner_size = self.member_of.compute_size(__cache);
+            __cache.set(__slot, inner_size);
+            size
+                += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
+                    + inner_size as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
     #[allow(clippy::needless_borrow)]
     fn write_to(
         &self,
-        _cache: &mut ::buffa::SizeCache,
+        __cache: &mut ::buffa::SizeCache,
         buf: &mut impl ::buffa::EncodeSink,
     ) {
         #[allow(unused_imports)]
@@ -5516,6 +5719,14 @@ impl<'a> ::buffa::ViewEncode<'a> for FilterDropView<'a> {
             if val != 0 {
                 ::buffa::types::put_int32_field(2u32, val, buf);
             }
+        }
+        if self.member_of.is_set() {
+            ::buffa::types::put_len_delimited_header(
+                3u32,
+                u64::from(__cache.consume_next()),
+                buf,
+            );
+            self.member_of.write_to(__cache, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -5543,6 +5754,11 @@ impl<'__a> ::serde::Serialize for FilterDropView<'__a> {
         }
         if !::buffa::json_helpers::skip_if::is_default_enum_value(&self.dir) {
             __map.serialize_entry("dir", &self.dir)?;
+        }
+        {
+            if let ::core::option::Option::Some(__v) = self.member_of.as_option() {
+                __map.serialize_entry("memberOf", __v)?;
+            }
         }
         __map.end()
     }
@@ -5647,6 +5863,16 @@ impl FilterDropOwnedView {
     #[must_use]
     pub fn dir(&self) -> ::buffa::EnumValue<super::super::Dir> {
         self.0.reborrow().dir
+    }
+    /// Set instead of rel and dir: drops the actors in this side, whoever the
+    /// viewer is (a list's members: listitem, DIR_OUT, the list's URI).
+    ///
+    /// Field 3: `member_of`
+    #[must_use]
+    pub fn member_of(
+        &self,
+    ) -> &::buffa::MessageFieldView<super::super::__buffa::view::ListSideView<'_>> {
+        &self.0.reborrow().member_of
     }
 }
 impl ::core::convert::From<::buffa::OwnedView<FilterDropView<'static>>>
@@ -6986,8 +7212,13 @@ pub struct AddOpView<'a> {
     pub uri: &'a str,
     /// Field 2: `subject`
     pub subject: &'a str,
+    /// A list relation's record names its list, an AT URI in the same repo.
+    ///
+    /// Field 4: `list`
+    pub list: &'a str,
     /// When the source saw the create (µs since the epoch); 0: when marco applies it.
-    /// An add older than a delete of the same record stays deleted.
+    /// An add older than a delete of the same record stays deleted; one older
+    /// than the record's last change from another source changes nothing.
     ///
     /// Field 3: `time_us`
     pub time_us: i64,
@@ -7037,6 +7268,13 @@ impl<'a> ::buffa::MessageView<'a> for AddOpView<'a> {
                 )?;
                 view.subject = ::buffa::types::borrow_str(&mut cur)?;
             }
+            4u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                view.list = ::buffa::types::borrow_str(&mut cur)?;
+            }
             3u32 => {
                 ::buffa::encoding::check_wire_type(
                     tag,
@@ -7068,6 +7306,7 @@ impl<'a> ::buffa::MessageView<'a> for AddOpView<'a> {
         ::core::result::Result::Ok(super::super::AddOp {
             uri: self.uri.to_string(),
             subject: self.subject.to_string(),
+            list: self.list.to_string(),
             time_us: self.time_us,
             __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
@@ -7089,6 +7328,9 @@ impl<'a> ::buffa::ViewEncode<'a> for AddOpView<'a> {
         if self.time_us != 0i64 {
             size += 1u64 + ::buffa::types::int64_encoded_len(self.time_us) as u64;
         }
+        if !self.list.is_empty() {
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.list) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -7108,6 +7350,9 @@ impl<'a> ::buffa::ViewEncode<'a> for AddOpView<'a> {
         }
         if self.time_us != 0i64 {
             ::buffa::types::put_int64_field(3u32, self.time_us, buf);
+        }
+        if !self.list.is_empty() {
+            ::buffa::types::put_string_field(4u32, &self.list, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -7135,6 +7380,9 @@ impl<'__a> ::serde::Serialize for AddOpView<'__a> {
         }
         if !::buffa::json_helpers::skip_if::is_empty_str(self.subject) {
             __map.serialize_entry("subject", self.subject)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.list) {
+            __map.serialize_entry("list", self.list)?;
         }
         if !::buffa::json_helpers::skip_if::is_zero_i64(&self.time_us) {
             __map
@@ -7240,8 +7488,16 @@ impl AddOpOwnedView {
     pub fn subject(&self) -> &'_ str {
         self.0.reborrow().subject
     }
+    /// A list relation's record names its list, an AT URI in the same repo.
+    ///
+    /// Field 4: `list`
+    #[must_use]
+    pub fn list(&self) -> &'_ str {
+        self.0.reborrow().list
+    }
     /// When the source saw the create (µs since the epoch); 0: when marco applies it.
-    /// An add older than a delete of the same record stays deleted.
+    /// An add older than a delete of the same record stays deleted; one older
+    /// than the record's last change from another source changes nothing.
     ///
     /// Field 3: `time_us`
     #[must_use]

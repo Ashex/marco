@@ -6311,6 +6311,25 @@ pub struct RelationInfo {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
     )]
     pub non_tid: u64,
+    /// A list relation: the record's path to its list.
+    ///
+    /// Field 8: `list`
+    #[serde(
+        rename = "list",
+        with = "::buffa::json_helpers::proto_string",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    )]
+    pub list: ::buffa::alloc::string::String,
+    /// A companion: the list relation whose records it holds by owner.
+    ///
+    /// Field 9: `owner_of`
+    #[serde(
+        rename = "ownerOf",
+        alias = "owner_of",
+        with = "::buffa::json_helpers::proto_string",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    )]
+    pub owner_of: ::buffa::alloc::string::String,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -6325,6 +6344,8 @@ impl ::core::fmt::Debug for RelationInfo {
             .field("pairs", &self.pairs)
             .field("duplicates", &self.duplicates)
             .field("non_tid", &self.non_tid)
+            .field("list", &self.list)
+            .field("owner_of", &self.owner_of)
             .finish()
     }
 }
@@ -6376,6 +6397,12 @@ impl ::buffa::Message for RelationInfo {
         if self.non_tid != 0u64 {
             size += 1u64 + ::buffa::types::uint64_encoded_len(self.non_tid) as u64;
         }
+        if !self.list.is_empty() {
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.list) as u64;
+        }
+        if !self.owner_of.is_empty() {
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.owner_of) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -6406,6 +6433,12 @@ impl ::buffa::Message for RelationInfo {
         }
         if self.non_tid != 0u64 {
             ::buffa::types::put_uint64_field(7u32, self.non_tid, buf);
+        }
+        if !self.list.is_empty() {
+            ::buffa::types::put_string_field(8u32, &self.list, buf);
+        }
+        if !self.owner_of.is_empty() {
+            ::buffa::types::put_string_field(9u32, &self.owner_of, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -6469,6 +6502,20 @@ impl ::buffa::Message for RelationInfo {
                 )?;
                 self.non_tid = ::buffa::types::decode_uint64(buf)?;
             }
+            8u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.list, buf)?;
+            }
+            9u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.owner_of, buf)?;
+            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -6484,6 +6531,8 @@ impl ::buffa::Message for RelationInfo {
         self.pairs = 0u64;
         self.duplicates = 0u64;
         self.non_tid = 0u64;
+        self.list.clear();
+        self.owner_of.clear();
         self.__buffa_unknown_fields.clear();
     }
 }
@@ -8127,7 +8176,7 @@ pub const __SOURCE_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::typ
 #[derive(::serde::Serialize, ::serde::Deserialize)]
 #[serde(default)]
 pub struct GetActorRequest {
-    /// A DID.
+    /// A DID, or a list's AT URI.
     ///
     /// Field 1: `actor`
     #[serde(
@@ -8299,6 +8348,15 @@ pub struct GetActorResponse {
         deserialize_with = "::buffa::json_helpers::null_as_default"
     )]
     pub rels: ::buffa::alloc::vec::Vec<ActorRelation>,
+    /// A list node rather than a DID.
+    ///
+    /// Field 7: `list`
+    #[serde(
+        rename = "list",
+        with = "::buffa::json_helpers::proto_bool",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_false"
+    )]
+    pub list: bool,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -8312,6 +8370,7 @@ impl ::core::fmt::Debug for GetActorResponse {
             .field("shard", &self.shard)
             .field("status", &self.status)
             .field("rels", &self.rels)
+            .field("list", &self.list)
             .finish()
     }
 }
@@ -8365,6 +8424,9 @@ impl ::buffa::Message for GetActorResponse {
                 += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
                     + inner_size as u64;
         }
+        if self.list {
+            size += 1u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -8397,6 +8459,9 @@ impl ::buffa::Message for GetActorResponse {
                 buf,
             );
             v.write_to(__cache, buf);
+        }
+        if self.list {
+            ::buffa::types::put_bool_field(7u32, self.list, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -8458,6 +8523,13 @@ impl ::buffa::Message for GetActorResponse {
                 ::buffa::Message::merge_length_delimited(&mut elem, buf, ctx)?;
                 self.rels.push(elem);
             }
+            7u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.list = ::buffa::types::decode_bool(buf)?;
+            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -8472,6 +8544,7 @@ impl ::buffa::Message for GetActorResponse {
         self.shard = 0u32;
         self.status.clear();
         self.rels.clear();
+        self.list = false;
         self.__buffa_unknown_fields.clear();
     }
 }
@@ -8566,6 +8639,16 @@ pub struct ActorRelation {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
     )]
     pub in_stored: ::buffa::alloc::string::String,
+    /// Distinct subjects of the out records: a list's members.
+    ///
+    /// Field 8: `out_subjects`
+    #[serde(
+        rename = "outSubjects",
+        alias = "out_subjects",
+        with = "::buffa::json_helpers::uint64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
+    )]
+    pub out_subjects: u64,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -8580,6 +8663,7 @@ impl ::core::fmt::Debug for ActorRelation {
             .field("first_us", &self.first_us)
             .field("out_stored", &self.out_stored)
             .field("in_stored", &self.in_stored)
+            .field("out_subjects", &self.out_subjects)
             .finish()
     }
 }
@@ -8631,6 +8715,9 @@ impl ::buffa::Message for ActorRelation {
         if !self.in_stored.is_empty() {
             size += 1u64 + ::buffa::types::string_encoded_len(&self.in_stored) as u64;
         }
+        if self.out_subjects != 0u64 {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(self.out_subjects) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -8661,6 +8748,9 @@ impl ::buffa::Message for ActorRelation {
         }
         if !self.in_stored.is_empty() {
             ::buffa::types::put_string_field(7u32, &self.in_stored, buf);
+        }
+        if self.out_subjects != 0u64 {
+            ::buffa::types::put_uint64_field(8u32, self.out_subjects, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -8724,6 +8814,13 @@ impl ::buffa::Message for ActorRelation {
                 )?;
                 ::buffa::types::merge_string(&mut self.in_stored, buf)?;
             }
+            8u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.out_subjects = ::buffa::types::decode_uint64(buf)?;
+            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -8739,6 +8836,7 @@ impl ::buffa::Message for ActorRelation {
         self.first_us = 0i64;
         self.out_stored.clear();
         self.in_stored.clear();
+        self.out_subjects = 0u64;
         self.__buffa_unknown_fields.clear();
     }
 }
@@ -9701,6 +9799,15 @@ pub struct ResolveUriResponse {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
     )]
     pub subject_in_stored: ::buffa::alloc::string::String,
+    /// A list relation's record: its list, whose log holds the member edge.
+    ///
+    /// Field 20: `list`
+    #[serde(
+        rename = "list",
+        with = "::buffa::json_helpers::proto_string",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    )]
+    pub list: ::buffa::alloc::string::String,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -9727,6 +9834,7 @@ impl ::core::fmt::Debug for ResolveUriResponse {
             .field("subject_in_count", &self.subject_in_count)
             .field("subject_shard", &self.subject_shard)
             .field("subject_in_stored", &self.subject_in_stored)
+            .field("list", &self.list)
             .finish()
     }
 }
@@ -9818,6 +9926,9 @@ impl ::buffa::Message for ResolveUriResponse {
                 += 2u64
                     + ::buffa::types::string_encoded_len(&self.subject_in_stored) as u64;
         }
+        if !self.list.is_empty() {
+            size += 2u64 + ::buffa::types::string_encoded_len(&self.list) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -9884,6 +9995,9 @@ impl ::buffa::Message for ResolveUriResponse {
         }
         if !self.subject_in_stored.is_empty() {
             ::buffa::types::put_string_field(19u32, &self.subject_in_stored, buf);
+        }
+        if !self.list.is_empty() {
+            ::buffa::types::put_string_field(20u32, &self.list, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -10031,6 +10145,13 @@ impl ::buffa::Message for ResolveUriResponse {
                 )?;
                 ::buffa::types::merge_string(&mut self.subject_in_stored, buf)?;
             }
+            20u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.list, buf)?;
+            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -10058,6 +10179,7 @@ impl ::buffa::Message for ResolveUriResponse {
         self.subject_in_count = 0u64;
         self.subject_shard = 0u32;
         self.subject_in_stored.clear();
+        self.list.clear();
         self.__buffa_unknown_fields.clear();
     }
 }
