@@ -1,0 +1,19 @@
+[package]
+name = "marco-core"
+version = "0.1.0"
+edition = "2021"
+description = "marco's engine: the DID directory, relations, per-actor out logs, per-subject in sets and the snapshot file"
+license = "MIT"
+publish = false
+
+[dependencies]
+vlatproto = { workspace = true }
+anyhow = { workspace = true }
+memmap2 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+toml = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
