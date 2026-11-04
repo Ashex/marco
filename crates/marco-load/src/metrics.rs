@@ -42,7 +42,9 @@ pub fn rel(r: &RelReport) {
     g("in_lists", r.in_lists);
     g("in_bytes", r.in_bytes);
     g("non_tid", r.non_tid);
-    g("dup_keys", r.dup_keys);
+    g("superseded", r.superseded);
+    g("deleted_keys", r.deleted_keys);
+    g("recreated_keys", r.recreated_keys);
     g("bad_subject", r.bad_subject);
 }
 

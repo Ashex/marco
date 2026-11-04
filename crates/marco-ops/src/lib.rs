@@ -206,3 +206,29 @@ pub fn init_tracing(endpoint: &str, service: &str) -> Result<opentelemetry_sdk::
     tracing::subscriber::set_global_default(subscriber).context("a tracing subscriber is already set")?;
     Ok(provider)
 }
+
+#[cfg(all(test, feature = "cpu-profile"))]
+mod tests {
+    #[test]
+    fn cpu_profile_survives_busy_threads() {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    let mut x = 0u64;
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        x = std::hint::black_box(x.wrapping_mul(6364136223846793005).wrapping_add(1));
+                    }
+                })
+            })
+            .collect();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let pb = rt.block_on(super::cpu_profile(std::time::Duration::from_secs(1))).unwrap();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for w in workers {
+            w.join().unwrap();
+        }
+        assert!(pb.len() > 100, "{} bytes", pb.len());
+    }
+}

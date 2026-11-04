@@ -48,6 +48,7 @@ pub struct Opts {
     pub shards: usize,
     /// Spill files per shard and relation: each is sorted in memory alone.
     pub sub_buckets: usize,
+    pub deletes: Option<DeletesOut>,
 }
 
 #[derive(Serialize, Default, Clone)]
@@ -72,8 +73,12 @@ pub struct RelReport {
     pub export_bytes_raw: u64,
     pub bad_repo: u64,
     pub bad_subject: u64,
-    /// The same (actor, rkey) twice in the export; the first is kept.
-    pub dup_keys: u64,
+    /// Ops that a later op of the same key superseded.
+    pub superseded: u64,
+    /// Keys whose latest op is a delete.
+    pub deleted_keys: u64,
+    /// Live keys that were deleted and created again under the same rkey.
+    pub recreated_keys: u64,
     pub non_tid: u64,
     pub out_records: u64,
     pub out_lists: u64,
@@ -98,7 +103,9 @@ impl RelReport {
         self.export_bytes_zst += c.zst;
         self.bad_repo += c.bad_repo;
         self.bad_subject += c.bad_subject;
-        self.dup_keys += c.dup_keys;
+        self.superseded += c.superseded;
+        self.deleted_keys += c.deleted_keys;
+        self.recreated_keys += c.recreated_keys;
         self.out_records += c.records;
         self.out_lists += c.lists.len() as u64;
         self.out_bytes.add(&c.out_bytes);
@@ -127,7 +134,9 @@ impl RelReport {
         self.export_bytes_zst += o.export_bytes_zst;
         self.bad_repo += o.bad_repo;
         self.bad_subject += o.bad_subject;
-        self.dup_keys += o.dup_keys;
+        self.superseded += o.superseded;
+        self.deleted_keys += o.deleted_keys;
+        self.recreated_keys += o.recreated_keys;
         self.non_tid += o.non_tid;
         self.out_records += o.out_records;
         self.out_lists += o.out_lists;
@@ -252,10 +261,53 @@ impl Dir {
     fn len(&self) -> usize {
         self.plc.len() + self.other.len()
     }
+
+    /// Ids for packed did:plc values into `out[slot]` (u32::MAX if absent).
+    /// A counting partition by the top 12 bits first (one linear pass), so
+    /// the lookups go bucket by bucket and each bucket's slice of the
+    /// directory (~160 KB) stays in cache, instead of a miss per lookup in
+    /// the whole 645 MB array.
+    fn map_partitioned(&self, keys: &[(u128, u32)], out: &mut [u32]) {
+        const BITS: u32 = 12;
+        let bucket = |k: u128| (k >> (120 - BITS)) as usize;
+        let mut starts = vec![0usize; (1 << BITS) + 1];
+        for &(k, _) in keys {
+            starts[bucket(k) + 1] += 1;
+        }
+        for i in 1..starts.len() {
+            starts[i] += starts[i - 1];
+        }
+        let mut order = vec![(0u128, 0u32); keys.len()];
+        for &(k, slot) in keys {
+            let b = bucket(k);
+            order[starts[b]] = (k, slot);
+            starts[b] += 1;
+        }
+        for &(k, slot) in &order {
+            out[slot as usize] = self.radix.find(&self.plc, k).map_or(u32::MAX, |i| i as u32);
+        }
+    }
+
+    fn did(&self, id: u32) -> String {
+        let i = id as usize;
+        if i < self.plc.len() {
+            marco_core::did::unpack_plc(self.plc[i])
+        } else {
+            self.other[i - self.plc.len()].clone()
+        }
+    }
+
+    fn other_id(&self, s: &str) -> u32 {
+        self.other.binary_search_by(|x| x.as_str().cmp(s)).map_or(u32::MAX, |i| (self.plc.len() + i) as u32)
+    }
 }
 
-/// The first and last repo of a file that are DIDs.
-type RepoSpan = Option<(String, String)>;
+/// The lowest and highest repo of a file that are DIDs (bytes order, which
+/// is id order within did:plc and within the others).
+type RepoSpan = Option<(Vec<u8>, Vec<u8>)>;
+
+/// The op column: 1 create, 2 update, 3 delete (repo_records' enum; crawl rows are creates).
+const OP_DELETE: u8 = 3;
 
 fn build_dir(files: &[PathBuf], c: &Counters) -> Result<(Dir, Vec<RepoSpan>)> {
     let shards: Vec<Mutex<(Vec<u128>, usize)>> = (0..DIR_SHARDS).map(|_| Mutex::new((Vec::new(), 0))).collect();
@@ -305,12 +357,18 @@ fn build_dir(files: &[PathBuf], c: &Counters) -> Result<(Dir, Vec<RepoSpan>)> {
             };
             while rows.next(&mut cols)? {
                 n += 1;
+                let _us = rows.i64()?;
+                if rows.u8()? == OP_DELETE {
+                    continue;
+                }
                 if cols[0] != last_repo {
                     if add(&cols[0], &mut bufs) {
-                        let r = String::from_utf8_lossy(&cols[0]).into_owned();
-                        span = Some(match span {
-                            None => (r.clone(), r),
-                            Some((first, _)) => (first, r),
+                        span = Some(match span.take() {
+                            None => (cols[0].clone(), cols[0].clone()),
+                            Some((lo, hi)) => (
+                                if cols[0] < lo { cols[0].clone() } else { lo },
+                                if cols[0] > hi { cols[0].clone() } else { hi },
+                            ),
                         });
                     }
                     last_repo.clone_from(&cols[0]);
@@ -397,16 +455,30 @@ struct ChunkOut {
     zst: u64,
     bad_repo: u64,
     bad_subject: u64,
-    dup_keys: u64,
+    superseded: u64,
+    deleted_keys: u64,
+    recreated_keys: u64,
     out_bytes: OutBytes,
     out_max: u64,
     indexed: u64,
     len_log2: BTreeMap<u32, u64>,
 }
 
-/// One file's records for the actors in `lo..hi`.
-/// Rows whose repo isn't a DID count only in `count_bad`'s shard (the one
-/// holding the file's first actor), since a shared file is read twice.
+/// Where the keys whose latest op is a delete go, for the replay.
+pub struct DeletesOut {
+    pub dir: PathBuf,
+    pub since_us: i64,
+}
+
+fn put_str(out: &mut Vec<u8>, s: &[u8]) {
+    marco_core::varint::put(out, s.len() as u64);
+    out.extend_from_slice(s);
+}
+
+/// One file's ops for the actors in `lo..hi`, reduced to each key's latest
+/// op by time_us (a delete wins a tie). Rows whose repo isn't a DID count
+/// only in `count_bad`'s shard (the one holding the file's lowest actor),
+/// since a shared file is read twice.
 #[allow(clippy::too_many_arguments)]
 fn out_chunk(
     f: &Path,
@@ -416,64 +488,115 @@ fn out_chunk(
     count_bad: bool,
     subj_index: usize,
     spill: &Spill,
+    deletes: Option<(&DeletesOut, &str, usize)>,
     c: &Counters,
 ) -> Result<ChunkOut> {
     let t = Instant::now();
     let mut rows = Rows::open(f)?;
     let mut cols = [Vec::new(), Vec::new(), Vec::new()];
-    let mut edges: Vec<(u32, u64, u32)> = Vec::new();
-    let mut side = Vec::new();
-    let (mut n, mut bad_repo, mut bad_subject) = (0u64, 0u64, 0u64);
-    let mut last_repo: Vec<u8> = Vec::new();
-    let mut actor: Option<u32> = None;
-    let mut map_ns = 0u64;
+    // per row: rkey, time_us, op; and two id slots (repo, subject) filled below
+    let mut ops: Vec<(u64, i64, u8)> = Vec::new();
+    let mut plc_keys: Vec<(u128, u32)> = Vec::new();
+    let mut ids: Vec<u32> = Vec::new();
+    let mut side: Vec<(u32, String)> = Vec::new();
+    let (mut last_repo, mut repo_id, mut repo_ns) = (Vec::new(), u32::MAX, 0u64);
     let mut first = true;
     while rows.next(&mut cols)? {
-        if first || cols[0] != last_repo {
+        let us = rows.i64()?;
+        let op = rows.u8()?;
+        if first {
             first = false;
-            let tm = Instant::now();
-            actor = dir.lookup(&cols[0]);
-            map_ns += tm.elapsed().as_nanos() as u64;
-            last_repo.clone_from(&cols[0]);
+            last_repo = cols[0].clone();
+            repo_id = dir.lookup(&cols[0]).unwrap_or(u32::MAX);
         }
-        let a = match actor {
-            Some(a) if (lo..hi).contains(&a) => a,
-            Some(_) => continue,
-            None => {
-                bad_repo += count_bad as u64;
-                continue;
-            }
-        };
-        n += 1;
-        let tm = Instant::now();
-        let s = dir.lookup(&cols[2]);
-        map_ns += tm.elapsed().as_nanos() as u64;
-        let Some(s) = s else {
-            bad_subject += 1;
-            continue;
-        };
-        let Ok(rkey) = std::str::from_utf8(&cols[1]) else {
-            bad_subject += 1;
-            continue;
-        };
+        let row = ops.len() as u32;
+        let Ok(rkey) = std::str::from_utf8(&cols[1]) else { continue };
         let (key, nt) = key_of(rkey);
         if nt {
-            side.push((a, key, rkey.to_string()));
+            side.push((row, rkey.to_string()));
         }
-        edges.push((a, key, s));
+        ops.push((key, us, op));
+        // each table scans in (repo, rkey) order, so repos come in long runs
+        if cols[0] != last_repo {
+            let tm = Instant::now();
+            repo_id = dir.lookup(&cols[0]).unwrap_or(u32::MAX);
+            repo_ns += tm.elapsed().as_nanos() as u64;
+            last_repo.clone_from(&cols[0]);
+        }
+        ids.push(repo_id);
+        ids.push(u32::MAX);
+        if op != OP_DELETE {
+            match std::str::from_utf8(&cols[2]).ok().and_then(classify) {
+                Some(DidRef::Plc(v)) => plc_keys.push((v, 2 * row + 1)),
+                Some(DidRef::Other(o)) => *ids.last_mut().unwrap() = dir.other_id(o),
+                None => {}
+            }
+        }
     }
-    c.ns[1].fetch_add(map_ns, Relaxed);
+    c.ns[1].fetch_add(repo_ns, Relaxed);
     c.add(0, t);
     let t = Instant::now();
-    // stable, so a repeated (actor, rkey) keeps its first row
-    edges.sort_by_key(|e| (e.0, e.1));
-    let before = edges.len();
-    edges.dedup_by_key(|e| (e.0, e.1));
-    let dup_keys = (before - edges.len()) as u64;
-    side.sort_unstable();
-    side.dedup_by_key(|e| (e.0, e.1));
+    dir.map_partitioned(&plc_keys, &mut ids);
+    drop(plc_keys);
+    c.add(1, t);
+    let t = Instant::now();
+    let mut bad_repo = 0u64;
+    // (actor, rkey, time_us, op, row)
+    let mut recs: Vec<(u32, u64, i64, u8, u32)> = Vec::with_capacity(ops.len());
+    for (row, &(key, us, op)) in ops.iter().enumerate() {
+        match ids[2 * row] {
+            u32::MAX => bad_repo += count_bad as u64,
+            a if (lo..hi).contains(&a) => recs.push((a, key, us, op, row as u32)),
+            _ => {}
+        }
+    }
+    let n = recs.len() as u64;
+    recs.sort_unstable();
     c.add(2, t);
     let t = Instant::now();
+    let mut edges: Vec<(u32, u64, u32, u32)> = Vec::with_capacity(recs.len());
+    let (mut superseded, mut deleted_keys, mut recreated_keys, mut bad_subject) = (0u64, 0u64, 0u64, 0u64);
+    let mut del_rows: Vec<u8> = Vec::new();
+    let mut i = 0;
+    while i < recs.len() {
+        let (a, key) = (recs[i].0, recs[i].1);
+        let mut j = i;
+        while j < recs.len() && recs[j].0 == a && recs[j].1 == key {
+            j += 1;
+        }
+        let group = &recs[i..j];
+        superseded += (j - i - 1) as u64;
+        let last = group[j - i - 1];
+        if last.3 == OP_DELETE {
+            deleted_keys += 1;
+            if let Some((d, _, _)) = deletes {
+                if last.2 >= d.since_us {
+                    let subj = group.iter().rev().find(|r| r.3 != OP_DELETE).map(|r| ids[2 * r.4 as usize + 1]);
+                    let did = |id: u32| dir.did(id);
+                    put_str(&mut del_rows, did(a).as_bytes());
+                    let rk = rkey_text(key, last.4, &side);
+                    put_str(&mut del_rows, rk.as_bytes());
+                    put_str(&mut del_rows, subj.filter(|&s| s != u32::MAX).map(did).unwrap_or_default().as_bytes());
+                    del_rows.extend_from_slice(&last.2.to_le_bytes());
+                }
+            }
+        } else {
+            if group.iter().any(|r| r.3 == OP_DELETE) {
+                recreated_keys += 1;
+            }
+            match ids[2 * last.4 as usize + 1] {
+                u32::MAX => bad_subject += 1,
+                s => edges.push((a, key, s, last.4)),
+            }
+        }
+        i = j;
+    }
+    drop(recs);
+    let side: Vec<(u32, u64, String)> = edges
+        .iter()
+        .filter(|e| !marco_core::rkey::is_tid(e.1))
+        .map(|e| (e.0, e.1, rkey_text(e.1, e.3, &side)))
+        .collect();
     let mut buf = Vec::with_capacity(edges.len() * 9);
     let mut lists = Vec::new();
     let mut out_bytes = OutBytes::default();
@@ -500,12 +623,19 @@ fn out_chunk(
     c.add(3, t);
     let t = Instant::now();
     let mut by_bucket: Vec<Vec<u8>> = vec![Vec::new(); spill.files.len()];
-    for &(a, _, s) in &edges {
+    for &(a, _, s, _) in &edges {
         by_bucket[spill.bucket(s)].extend_from_slice(&(((s as u64) << 32) | a as u64).to_le_bytes());
     }
     for (b, bytes) in by_bucket.iter().enumerate() {
         if !bytes.is_empty() {
             spill.files[b].lock().unwrap().write_all(bytes)?;
+        }
+    }
+    if let Some((d, rel, k)) = deletes {
+        if !del_rows.is_empty() {
+            let stem = f.file_name().and_then(|x| x.to_str()).unwrap_or("x").trim_end_matches(".rb.zst");
+            let p = d.dir.join(rel).join(format!("{stem}-{k:03}.rb.zst"));
+            std::fs::write(&p, zstd::encode_all(&del_rows[..], 3)?)?;
         }
     }
     c.add(4, t);
@@ -520,12 +650,20 @@ fn out_chunk(
         zst: std::fs::metadata(f)?.len(),
         bad_repo,
         bad_subject,
-        dup_keys,
+        superseded,
+        deleted_keys,
+        recreated_keys,
         out_bytes,
         out_max,
         indexed,
         len_log2,
     })
+}
+
+/// The rkey string of a stored key: a TID's text, or the row's own string.
+fn rkey_text(key: u64, row: u32, side: &[(u32, String)]) -> String {
+    marco_core::rkey::tid_string(key)
+        .unwrap_or_else(|| side.binary_search_by_key(&row, |s| s.0).map(|i| side[i].1.clone()).unwrap_or_default())
 }
 
 struct BucketOut {
@@ -630,7 +768,9 @@ fn out_shard(
             if *fhi < lo || *flo >= hi {
                 continue;
             }
-            let co = out_chunk(f, dir, lo, hi, (lo..hi).contains(flo), o.subj_index, &spills[ri], c)?;
+            let k = (lo / spills[ri].width.max(1)) as usize;
+            let del = o.deletes.as_ref().map(|d| (d, o.rels.list[ri].name.as_str(), k));
+            let co = out_chunk(f, dir, lo, hi, (lo..hi).contains(flo), o.subj_index, &spills[ri], del, c)?;
             let t = Instant::now();
             p.place(&co.lists)?;
             w.write(&co.buf)?;
@@ -703,11 +843,16 @@ pub fn build(o: &Opts) -> Result<Report> {
             fs.iter()
                 .filter_map(|f| {
                     let (a, b) = span_iter.next().flatten()?;
-                    Some((f.clone(), dir.lookup(a.as_bytes())?, dir.lookup(b.as_bytes())?))
+                    Some((f.clone(), dir.lookup(&a)?, dir.lookup(&b)?))
                 })
                 .collect()
         })
         .collect();
+    if let Some(d) = &o.deletes {
+        for r in &o.rels.list {
+            std::fs::create_dir_all(d.dir.join(&r.name))?;
+        }
+    }
     let spills: Vec<Spill> = o
         .rels
         .list
@@ -832,10 +977,12 @@ mod tests {
         out.extend_from_slice(s.as_bytes());
     }
 
-    /// Rows split into files the way the export does: by the repo's first
-    /// identifier character, `z-other` for everything else, sorted.
-    fn write_export(dir: &Path, rel: &str, rows: &[(String, String, String)]) {
-        let mut files: BTreeMap<String, Vec<&(String, String, String)>> = BTreeMap::new();
+    /// Ops split into files the way the export does: by the repo's first
+    /// identifier character, `z-other` for everything else, in no order.
+    type Op = (String, String, String, i64, u8);
+
+    fn write_export(dir: &Path, rel: &str, rows: &[Op]) {
+        let mut files: BTreeMap<String, Vec<&Op>> = BTreeMap::new();
         for r in rows {
             let name = match r.0.strip_prefix("did:plc:") {
                 Some(rest) if r.0.len() == 32 => format!("p-{}", &rest[..1]),
@@ -845,12 +992,14 @@ mod tests {
         }
         std::fs::create_dir_all(dir.join(rel)).unwrap();
         for (name, mut rs) in files {
-            rs.sort_by(|a, b| (a.0.as_bytes(), a.1.as_bytes()).cmp(&(b.0.as_bytes(), b.1.as_bytes())));
+            rs.reverse();
             let mut raw = Vec::new();
-            for (a, k, s) in rs {
+            for (a, k, s, us, op) in rs {
                 put(&mut raw, a);
                 put(&mut raw, k);
                 put(&mut raw, s);
+                raw.extend_from_slice(&us.to_le_bytes());
+                raw.push(*op);
             }
             std::fs::write(dir.join(rel).join(format!("{name}.rb.zst")), zstd::encode_all(&raw[..], 3).unwrap())
                 .unwrap();
@@ -864,32 +1013,41 @@ mod tests {
         let mut rng = crate::stats::Rng::new(7);
         let mut g = Graph::new(Relations::bsky_default());
         for (rel, coll, n) in [("follow", "app.bsky.graph.follow", 20_000), ("block", "app.bsky.graph.block", 2_000)] {
-            let mut rows = Vec::new();
-            for _ in 0..n {
+            // ops in time order: creates, re-creates and deletes, some deletes of keys never created
+            let mut ops: Vec<Op> = Vec::new();
+            for t in 0..n as i64 {
                 let a = did(rng.below(300));
                 let rkey = match rng.below(40) {
                     0 => format!("m{}", rng.below(1000)),
                     _ => vlatproto::tid::Tid::from_parts(1_700_000_000_000_000 + rng.below(5000) * 997, 0).to_string(),
                 };
-                let s = match rng.below(500) {
-                    0 => "not a did".to_string(),
-                    _ => did(rng.below(400)),
+                let (s, op) = match rng.below(10) {
+                    0..=2 => (String::new(), OP_DELETE),
+                    _ if rng.below(500) == 0 => ("not a did".to_string(), 1),
+                    _ => (did(rng.below(400)), 1 + rng.below(2) as u8),
                 };
-                rows.push((a, rkey, s));
+                ops.push((a, rkey, s, 1000 + t, op));
             }
-            // the same subject twice under different rkeys, many times over
             for i in 0..200 {
                 let a = did(i);
-                rows.push((a.clone(), format!("dup{i}a"), did(i + 1)));
-                rows.push((a, format!("dup{i}b"), did(i + 1)));
+                ops.push((a.clone(), format!("dup{i}a"), did(i + 1), 50_000, 1));
+                ops.push((a, format!("dup{i}b"), did(i + 1), 50_001, 1));
             }
-            for (a, k, s) in &rows {
-                let uri = format!("at://{a}/{coll}/{k}");
-                if marco_core::did::classify(s).is_some() {
-                    let _ = g.add(&uri, s).map(|r| assert_ne!(r, Added::Deleted));
+            // the same records as the mutable path sees them: latest op per key
+            let mut latest: BTreeMap<(String, String), (i64, u8, String)> = BTreeMap::new();
+            for (a, k, s, us, op) in &ops {
+                let e = latest.entry((a.clone(), k.clone())).or_insert((*us, *op, s.clone()));
+                if (*us, *op) >= (e.0, e.1) {
+                    *e = (*us, *op, s.clone());
                 }
             }
-            write_export(&input, rel, &rows);
+            for ((a, k), (_, op, s)) in &latest {
+                if *op != OP_DELETE && marco_core::did::classify(s).is_some() {
+                    let r = g.add(&format!("at://{a}/{coll}/{k}"), s).unwrap();
+                    assert_eq!(r, Added::Added);
+                }
+            }
+            write_export(&input, rel, &ops);
         }
         let out = tmp.path().join("snap");
         let o = Opts {
@@ -900,9 +1058,23 @@ mod tests {
             subj_index: 8,
             shards: 5,
             sub_buckets: 3,
+            deletes: Some(DeletesOut { dir: tmp.path().join("deletes"), since_us: 0 }),
         };
         let rep = build(&o).unwrap();
-        assert!(rep.rels[0].dup_keys > 0 && rep.rels[0].bad_subject > 0 && rep.rels[0].non_tid > 0);
+        let f = &rep.rels[0];
+        assert!(f.superseded > 0 && f.deleted_keys > 0 && f.recreated_keys > 0 && f.bad_subject > 0 && f.non_tid > 0);
+        for (ri, r) in rep.rels.iter().enumerate() {
+            let mut n = 0;
+            for e in std::fs::read_dir(tmp.path().join("deletes").join(&r.name)).unwrap() {
+                let mut rows = Rows::open(&e.unwrap().path()).unwrap();
+                let mut cols = [Vec::new(), Vec::new(), Vec::new()];
+                while rows.next(&mut cols).unwrap() {
+                    rows.i64().unwrap();
+                    n += 1;
+                }
+            }
+            assert_eq!(n, r.deleted_keys, "deletes written for rel {ri}");
+        }
         let b = Graph::open(&out).unwrap();
         b.snapshot().unwrap().verify_checksums().unwrap();
         for rel in [0u8, 1] {

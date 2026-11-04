@@ -1,5 +1,5 @@
-//! Rows of an export file: zstd-compressed ClickHouse RowBinary, every
-//! column a String (LEB128 length, then bytes).
+//! Rows of an export file: zstd-compressed ClickHouse RowBinary. Strings
+//! are a LEB128 length, then bytes; the numbers are little-endian.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
@@ -58,6 +58,13 @@ impl Rows {
             self.bytes += n;
         }
         Ok(true)
+    }
+
+    pub fn u8(&mut self) -> Result<u8> {
+        let mut b = [0u8; 1];
+        self.r.read_exact(&mut b)?;
+        self.bytes += 1;
+        Ok(b[0])
     }
 
     /// A little-endian Int64 column (time_us).

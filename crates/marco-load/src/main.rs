@@ -8,9 +8,10 @@
 //! marco-load replay --snapshot FILE --deletes DIR   delete-by-URI replay through the mutable path
 //! ```
 //!
-//! Export files are zstd RowBinary with String columns (repo, rkey, subject),
-//! one directory per relation, each file one repo-prefix chunk; the files of a
-//! relation must sort in DID order (`p-<prefix>` names, then `z-other`).
+//! Export files are zstd RowBinary ops (repo, rkey, subject, Int64 time_us,
+//! UInt8 op: 1 create, 2 update, 3 delete), in any order, one directory per
+//! relation, each file one repo-prefix chunk; the files of a relation must
+//! sort in DID order (`p-<prefix>` names, then `z-other`).
 
 use std::path::PathBuf;
 
@@ -59,6 +60,13 @@ enum Cmd {
         /// Spill files per shard and relation for the in pass; each is sorted in memory alone.
         #[arg(long, default_value_t = 4)]
         sub_buckets: usize,
+        /// Write the keys whose latest op is a delete here (for `replay`), as
+        /// (repo, rkey, subject of the last create or "", Int64 time_us).
+        #[arg(long)]
+        deletes_out: Option<PathBuf>,
+        /// Only deletes at or after this time_us (default: the archive crawl's start).
+        #[arg(long, default_value_t = 1_771_484_880_000_000)]
+        deletes_since_us: i64,
     },
     Open {
         #[arg(long)]
@@ -76,13 +84,14 @@ fn main() -> Result<()> {
         eprintln!("ops on http://{a}");
     }
     let report: serde_json::Value = match cli.cmd {
-        Cmd::Build { input, out, tmp, relations, subj_index, shards, sub_buckets } => {
+        Cmd::Build { input, out, tmp, relations, subj_index, shards, sub_buckets, deletes_out, deletes_since_us } => {
             let rels = match relations {
                 Some(p) => marco_core::Relations::parse_toml(&std::fs::read_to_string(p)?)?,
                 None => marco_core::Relations::bsky_default(),
             };
             let tmp = tmp.unwrap_or_else(|| out.with_extension("spill"));
-            let o = build::Opts { input, out, tmp: tmp.clone(), rels, subj_index, shards, sub_buckets };
+            let deletes = deletes_out.map(|dir| build::DeletesOut { dir, since_us: deletes_since_us });
+            let o = build::Opts { input, out, tmp: tmp.clone(), rels, subj_index, shards, sub_buckets, deletes };
             let r = build::build(&o)?;
             let _ = std::fs::remove_dir(&tmp);
             serde_json::to_value(r)?

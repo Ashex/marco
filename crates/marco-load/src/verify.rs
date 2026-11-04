@@ -295,8 +295,10 @@ pub fn replay(a: &ReplayArgs) -> Result<Value> {
     }
     let del_secs = t.elapsed().as_secs_f64();
     let back = base.iter().filter(|&(&(rel, id), &n)| g.out_count(rel, id) == n).count();
-    let off: Vec<(RelId, u32)> = base.iter().filter(|&(&(rel, id), &n)| g.out_count(rel, id) != n).map(|(&k, _)| k).collect();
-    let off_existed = off.iter().filter(|&&(rel, id)| g.did_of(id).is_some_and(|d| existed.contains(&(rel, d)))).count();
+    let off: Vec<(RelId, u32)> =
+        base.iter().filter(|&(&(rel, id), &n)| g.out_count(rel, id) != n).map(|(&k, _)| k).collect();
+    let off_existed =
+        off.iter().filter(|&&(rel, id)| g.did_of(id).is_some_and(|d| existed.contains(&(rel, d)))).count();
     g.refresh_gauges();
     Ok(json!({
         "deletes": dels.len(),
