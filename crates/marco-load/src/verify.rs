@@ -110,7 +110,10 @@ pub fn verify(a: &VerifyArgs) -> Result<Value> {
             r["pairs_without_record"] = json!(no_out.load(Relaxed));
         }
         if let Some(dir) = &a.sample {
-            r["sample"] = sample(&g, rel, &dir.join(format!("sample-{name}.rb.zst")))?;
+            let p = dir.join(format!("sample-{name}.rb.zst"));
+            if p.exists() {
+                r["sample"] = sample(&g, rel, &p)?;
+            }
             let c = dir.join(format!("counts-{name}.rb.zst"));
             if c.exists() {
                 r["counts"] = counts(&g, rel, &c)?;
@@ -200,6 +203,11 @@ pub fn replay(a: &ReplayArgs) -> Result<Value> {
     let t = Instant::now();
     for rel in 0..g.relations().len() as RelId {
         let r = g.relations().get(rel).clone();
+        // a list relation's deletes are its companion's: (owner, rkey, list)
+        if r.list.is_some() {
+            continue;
+        }
+        let owner = r.owner_of.is_some();
         let dir = a.deletes.join(&r.name);
         let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
             .with_context(|| format!("read {}", dir.display()))?
@@ -218,7 +226,7 @@ pub fn replay(a: &ReplayArgs) -> Result<Value> {
                     us,
                     rel,
                     uri: format!("at://{repo}/{}/{rkey}", r.collection),
-                    subject: String::from_utf8_lossy(&cols[2]).into_owned(),
+                    subject: if owner { String::new() } else { String::from_utf8_lossy(&cols[2]).into_owned() },
                 });
             }
         }

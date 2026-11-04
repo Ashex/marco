@@ -12,6 +12,11 @@
 //!    the subject's shard and sub-bucket.
 //! 3. in pass: shards in parallel again. Each sorts its spill files,
 //!    deduplicates them (the pair view) and writes its in sets.
+//!
+//! A list relation's files carry a fourth string column, the record's list
+//! URI. They're read twice: by owner for the companion (owner -> list) and
+//! by list for the relation (list -> member). A list's URI starts with its
+//! owner's DID, so a repo-prefix file's lists are one id range too.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
@@ -251,6 +256,9 @@ impl Dir {
     #[inline]
     fn lookup(&self, b: &[u8]) -> Option<u32> {
         let s = std::str::from_utf8(b).ok()?;
+        if s.starts_with("at://") {
+            return self.other.binary_search_by(|x| x.as_str().cmp(s)).ok().map(|i| (self.plc.len() + i) as u32);
+        }
         match classify(s)? {
             DidRef::Plc(v) => self.radix.find(&self.plc, v).map(|i| i as u32),
             DidRef::Other(s) => {
@@ -307,10 +315,38 @@ impl Dir {
 /// is id order within did:plc and within the others).
 type RepoSpan = Option<(Vec<u8>, Vec<u8>)>;
 
+/// How a relation reads its files.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Mode {
+    /// (repo, rkey, subject): edges repo -> subject.
+    Plain,
+    /// (repo, rkey, subject, list): edges list -> subject.
+    ByList,
+    /// The same files: the records, repo -> list.
+    ByOwner,
+}
+
+fn widen(span: &mut RepoSpan, v: &[u8]) {
+    *span = Some(match span.take() {
+        None => (v.to_vec(), v.to_vec()),
+        Some((lo, hi)) => (if v < &lo[..] { v.to_vec() } else { lo }, if v > &hi[..] { v.to_vec() } else { hi }),
+    });
+}
+
+/// A relation's mode and its files with their actor id ranges.
+type RelFiles = (Mode, Vec<(PathBuf, u32, u32)>);
+
+/// A list column's URI if it names a record in `repo`'s own repo.
+fn own_list<'a>(repo: &[u8], list: &'a [u8]) -> Option<&'a str> {
+    let l = std::str::from_utf8(list).ok()?;
+    let (owner, _, _) = marco_core::relation::parse_uri(l)?;
+    (owner.as_bytes() == repo).then_some(l)
+}
+
 /// The op column: 1 create, 2 update, 3 delete (repo_records' enum; crawl rows are creates).
 const OP_DELETE: u8 = 3;
 
-fn build_dir(files: &[PathBuf], c: &Counters) -> Result<(Dir, Vec<RepoSpan>)> {
+fn build_dir(files: &[(PathBuf, bool)], c: &Counters) -> Result<(Dir, Vec<(RepoSpan, RepoSpan)>)> {
     let shards: Vec<Mutex<(Vec<u128>, usize)>> = (0..DIR_SHARDS).map(|_| Mutex::new((Vec::new(), 0))).collect();
     let others: Mutex<HashSet<String>> = Mutex::new(HashSet::new());
     let flush = |shard: usize, buf: &mut Vec<u128>| {
@@ -325,10 +361,13 @@ fn build_dir(files: &[PathBuf], c: &Counters) -> Result<(Dir, Vec<RepoSpan>)> {
     };
     let spans = files
         .par_iter()
-        .map(|f| -> Result<RepoSpan> {
+        .map(|(f, has_list)| -> Result<(RepoSpan, RepoSpan)> {
             let t = Instant::now();
             let mut rows = Rows::open(f)?;
-            let mut cols = [Vec::new(), Vec::new(), Vec::new()];
+            let mut cols = vec![Vec::new(); if *has_list { 4 } else { 3 }];
+            let mut list_span: RepoSpan = None;
+            let mut local_lists: HashSet<String> = HashSet::new();
+            let mut bad_list = 0u64;
             let mut bufs: Vec<Vec<u128>> = (0..DIR_SHARDS).map(|_| Vec::with_capacity(4096)).collect();
             let mut local_other: HashSet<String> = HashSet::new();
             let mut last_repo: Vec<u8> = Vec::new();
@@ -364,28 +403,33 @@ fn build_dir(files: &[PathBuf], c: &Counters) -> Result<(Dir, Vec<RepoSpan>)> {
                 }
                 if cols[0] != last_repo {
                     if add(&cols[0], &mut bufs) {
-                        span = Some(match span.take() {
-                            None => (cols[0].clone(), cols[0].clone()),
-                            Some((lo, hi)) => (
-                                if cols[0] < lo { cols[0].clone() } else { lo },
-                                if cols[0] > hi { cols[0].clone() } else { hi },
-                            ),
-                        });
+                        widen(&mut span, &cols[0]);
                     }
                     last_repo.clone_from(&cols[0]);
                 }
                 add(&cols[2], &mut bufs);
+                if *has_list {
+                    match own_list(&cols[0], &cols[3]) {
+                        Some(l) => {
+                            if !local_lists.contains(l) {
+                                local_lists.insert(l.to_string());
+                            }
+                            widen(&mut list_span, l.as_bytes());
+                        }
+                        None => bad_list += 1,
+                    }
+                }
             }
             for (s, b) in bufs.iter_mut().enumerate() {
                 if !b.is_empty() {
                     flush(s, b);
                 }
             }
-            others.lock().unwrap().extend(local_other);
+            others.lock().unwrap().extend(local_other.into_iter().chain(local_lists));
             c.rows.fetch_add(n, Relaxed);
-            c.bad.fetch_add(bad, Relaxed);
+            c.bad.fetch_add(bad + bad_list, Relaxed);
             c.add(0, t);
-            Ok(span)
+            Ok((span, list_span))
         })
         .collect::<Result<Vec<_>>>()?;
     let t = Instant::now();
@@ -479,10 +523,13 @@ fn put_str(out: &mut Vec<u8>, s: &[u8]) {
 /// One file's ops for the actors in `lo..hi`, reduced to each key's latest
 /// op by time_us (a delete wins a tie). Rows whose repo isn't a DID count
 /// only in `count_bad`'s shard (the one holding the file's lowest actor),
-/// since a shared file is read twice.
+/// since a shared file is read twice. In `Mode::ByList` the actor is the
+/// record's list, but a record is still its (repo, rkey): the latest op is
+/// found by repo, since a delete row has no list, and then placed by list.
 #[allow(clippy::too_many_arguments)]
 fn out_chunk(
     f: &Path,
+    mode: Mode,
     dir: &Dir,
     lo: u32,
     hi: u32,
@@ -494,8 +541,10 @@ fn out_chunk(
 ) -> Result<ChunkOut> {
     let t = Instant::now();
     let mut rows = Rows::open(f)?;
-    let mut cols = [Vec::new(), Vec::new(), Vec::new()];
-    // per row: rkey, time_us, op; and two id slots (repo, subject) filled below
+    let listed = mode != Mode::Plain;
+    let mut cols = vec![Vec::new(); if listed { 4 } else { 3 }];
+    // per row: rkey, time_us, op; and id slots (repo, subject[, list]) filled below
+    let w = if listed { 3 } else { 2 };
     let mut ops: Vec<(u64, i64, u8)> = Vec::new();
     let mut plc_keys: Vec<(u128, u32)> = Vec::new();
     let mut ids: Vec<u32> = Vec::new();
@@ -526,11 +575,19 @@ fn out_chunk(
         }
         ids.push(repo_id);
         ids.push(u32::MAX);
+        if listed {
+            ids.push(u32::MAX);
+        }
         if op != OP_DELETE {
             match std::str::from_utf8(&cols[2]).ok().and_then(classify) {
-                Some(DidRef::Plc(v)) => plc_keys.push((v, 2 * row + 1)),
-                Some(DidRef::Other(o)) => *ids.last_mut().unwrap() = dir.other_id(o),
+                Some(DidRef::Plc(v)) => plc_keys.push((v, w * row + 1)),
+                Some(DidRef::Other(o)) => ids[(w * row + 1) as usize] = dir.other_id(o),
                 None => {}
+            }
+            if listed {
+                if let Some(l) = own_list(&cols[0], &cols[3]) {
+                    ids[(w * row + 2) as usize] = dir.other_id(l);
+                }
             }
         }
     }
@@ -542,12 +599,13 @@ fn out_chunk(
     c.add(1, t);
     let t = Instant::now();
     let mut bad_repo = 0u64;
-    // (actor, rkey, time_us, op, row)
+    let by_list = mode == Mode::ByList;
+    // (repo, rkey, time_us, op, row)
     let mut recs: Vec<(u32, u64, i64, u8, u32)> = Vec::with_capacity(ops.len());
     for (row, &(key, us, op)) in ops.iter().enumerate() {
-        match ids[2 * row] {
+        match ids[w as usize * row] {
             u32::MAX => bad_repo += count_bad as u64,
-            a if (lo..hi).contains(&a) => recs.push((a, key, us, op, row as u32)),
+            a if by_list || (lo..hi).contains(&a) => recs.push((a, key, us, op, row as u32)),
             _ => {}
         }
     }
@@ -555,6 +613,7 @@ fn out_chunk(
     recs.sort_unstable();
     c.add(2, t);
     let t = Instant::now();
+    let slot = |row: u32, i: u32| ids[(w * row + i) as usize];
     let mut edges: Vec<(u32, u64, u32, u32)> = Vec::with_capacity(recs.len());
     let (mut superseded, mut deleted_keys, mut recreated_keys, mut bad_subject) = (0u64, 0u64, 0u64, 0u64);
     let mut del_rows: Vec<u8> = Vec::new();
@@ -570,9 +629,10 @@ fn out_chunk(
         let last = group[j - i - 1];
         if last.3 == OP_DELETE {
             deleted_keys += 1;
-            if let Some((d, _, _)) = deletes {
+            if let Some((d, _, _)) = deletes.filter(|_| !by_list) {
                 if last.2 >= d.since_us {
-                    let subj = group.iter().rev().find(|r| r.3 != OP_DELETE).map(|r| ids[2 * r.4 as usize + 1]);
+                    let target = if listed { 2 } else { 1 };
+                    let subj = group.iter().rev().find(|r| r.3 != OP_DELETE).map(|r| slot(r.4, target));
                     let did = |id: u32| dir.did(id);
                     put_str(&mut del_rows, did(a).as_bytes());
                     let rk = rkey_text(key, last.4, &side);
@@ -585,14 +645,21 @@ fn out_chunk(
             if group.iter().any(|r| r.3 == OP_DELETE) {
                 recreated_keys += 1;
             }
-            match ids[2 * last.4 as usize + 1] {
-                u32::MAX => bad_subject += 1,
-                s => edges.push((a, key, s, last.4)),
+            let (subject, list) = (slot(last.4, 1), if listed { slot(last.4, 2) } else { 0 });
+            match mode {
+                _ if subject == u32::MAX || list == u32::MAX => bad_subject += 1,
+                Mode::Plain => edges.push((a, key, subject, last.4)),
+                Mode::ByOwner => edges.push((a, key, list, last.4)),
+                Mode::ByList if (lo..hi).contains(&list) => edges.push((list, key, subject, last.4)),
+                Mode::ByList => {}
             }
         }
         i = j;
     }
     drop(recs);
+    if by_list {
+        edges.sort_unstable();
+    }
     let side: Vec<(u32, u64, String)> = edges
         .iter()
         .filter(|e| !marco_core::rkey::is_tid(e.1))
@@ -640,20 +707,23 @@ fn out_chunk(
         }
     }
     c.add(4, t);
-    c.rows.fetch_add(n, Relaxed);
+    // a list file's rows are counted by the shard holding its first list, so
+    // once; its deletes are the companion's, which counts and writes them
+    let once = |x: u64| if !by_list || count_bad { x } else { 0 };
+    c.rows.fetch_add(once(n), Relaxed);
     Ok(ChunkOut {
         buf,
         lists,
         side,
-        rows: n,
+        rows: once(n),
         records: edges.len() as u64,
         raw: rows.bytes,
         zst: std::fs::metadata(f)?.len(),
         bad_repo,
-        bad_subject,
-        superseded,
-        deleted_keys,
-        recreated_keys,
+        bad_subject: once(bad_subject),
+        superseded: once(superseded),
+        deleted_keys: if by_list { 0 } else { deleted_keys },
+        recreated_keys: once(recreated_keys),
         out_bytes,
         out_max,
         indexed,
@@ -751,7 +821,7 @@ impl Placer {
 #[allow(clippy::too_many_arguments)]
 fn out_shard(
     w: &mut Writer,
-    files: &[Vec<(PathBuf, u32, u32)>],
+    files: &[RelFiles],
     dir: &Dir,
     lo: u32,
     hi: u32,
@@ -760,28 +830,53 @@ fn out_shard(
     c: &Counters,
 ) -> Result<Vec<RelReport>> {
     let mut reps = Vec::new();
-    for (ri, rel_files) in files.iter().enumerate() {
+    for (ri, (mode, rel_files)) in files.iter().enumerate() {
         let mut rr = RelReport::default();
         let mut p = Placer::new(hi - lo);
         let mut side: Vec<(u32, u64, String)> = Vec::new();
         w.begin(&rel_section(ri, "out.dat"));
+        // list ids follow their URIs' order, which isn't the files' order
+        // (did:key and other repos sort among the did:plc ones), so a list
+        // relation's chunks are merged by id before they're written
+        let mut held: Vec<ChunkOut> = Vec::new();
         for (f, flo, fhi) in rel_files {
             if *fhi < lo || *flo >= hi {
                 continue;
             }
             let k = (lo / spills[ri].width.max(1)) as usize;
             let del = o.deletes.as_ref().map(|d| (d, o.rels.list[ri].name.as_str(), k));
-            let co = out_chunk(f, dir, lo, hi, (lo..hi).contains(flo), o.subj_index, &spills[ri], del, c)?;
-            let t = Instant::now();
-            p.place(&co.lists)?;
-            w.write(&co.buf)?;
-            c.add(5, t);
-            rr.add_out(&co);
+            let mut co = out_chunk(f, *mode, dir, lo, hi, (lo..hi).contains(flo), o.subj_index, &spills[ri], del, c)?;
             if !(lo..hi).contains(flo) || !(lo..hi).contains(fhi) {
                 rr.files_shared += 1;
             }
             rr.files += 1;
-            side.extend(co.side);
+            rr.add_out(&co);
+            side.append(&mut co.side);
+            if *mode == Mode::ByList {
+                held.push(co);
+            } else {
+                let t = Instant::now();
+                p.place(&co.lists)?;
+                w.write(&co.buf)?;
+                c.add(5, t);
+            }
+        }
+        if !held.is_empty() {
+            let t = Instant::now();
+            let mut at: Vec<(u32, usize, usize, usize)> = Vec::new();
+            for (ci, co) in held.iter().enumerate() {
+                let mut off = 0usize;
+                for &(id, len) in &co.lists {
+                    at.push((id, ci, off, len as usize));
+                    off += len as usize;
+                }
+            }
+            at.sort_unstable();
+            for (id, ci, off, len) in at {
+                p.place(&[(id, len as u32)])?;
+                w.write(&held[ci].buf[off..off + len])?;
+            }
+            c.add(5, t);
         }
         w.end()?;
         w.section(&rel_section(ri, "out.idx"), &p.index(hi - lo)?)?;
@@ -818,11 +913,30 @@ fn in_shard(w: &mut Writer, k: usize, lo: u32, hi: u32, spills: &[Spill], c: &Co
 pub fn build(o: &Opts) -> Result<Report> {
     let wall = Instant::now();
     let mut rep = Report { threads: rayon::current_num_threads(), shards: o.shards, ..Default::default() };
-    if let Some(r) = o.rels.list.iter().find(|r| r.list.is_some()) {
-        bail!("relation {}: the bulk build doesn't take list relations yet", r.name);
+    // a companion reads its list relation's files
+    let modes: Vec<(Mode, &str)> = o
+        .rels
+        .list
+        .iter()
+        .map(|r| match (&r.list, &r.owner_of) {
+            (Some(_), _) => (Mode::ByList, r.name.as_str()),
+            (_, Some(p)) => (Mode::ByOwner, p.as_str()),
+            _ => (Mode::Plain, r.name.as_str()),
+        })
+        .collect();
+    let mut all: Vec<(PathBuf, bool)> = Vec::new();
+    let mut per_rel: Vec<Vec<usize>> = Vec::new();
+    for &(mode, dir) in &modes {
+        let mut v = Vec::new();
+        for f in files_of(&o.input, dir)? {
+            let i = all.iter().position(|x| x.0 == f).unwrap_or_else(|| {
+                all.push((f, mode != Mode::Plain));
+                all.len() - 1
+            });
+            v.push(i);
+        }
+        per_rel.push(v);
     }
-    let per_rel: Vec<Vec<PathBuf>> = o.rels.list.iter().map(|r| files_of(&o.input, &r.name)).collect::<Result<_>>()?;
-    let all: Vec<PathBuf> = per_rel.iter().flatten().cloned().collect();
     eprintln!("{} files, {} threads, {} shards", all.len(), rep.threads, o.shards);
 
     sys::reset_peak_rss();
@@ -839,17 +953,20 @@ pub fn build(o: &Opts) -> Result<Report> {
     rep.phases.push(c.phase("directory", t));
     metrics::set("dids", n as f64);
 
-    // each file's actor id range, from its first and last repo
-    let mut span_iter = spans.into_iter();
-    let files: Vec<Vec<(PathBuf, u32, u32)>> = per_rel
+    // each file's actor id range, from its first and last repo (or list)
+    let files: Vec<RelFiles> = per_rel
         .iter()
-        .map(|fs| {
-            fs.iter()
-                .filter_map(|f| {
-                    let (a, b) = span_iter.next().flatten()?;
-                    Some((f.clone(), dir.lookup(&a)?, dir.lookup(&b)?))
+        .zip(&modes)
+        .map(|(fs, &(mode, _))| {
+            let v = fs
+                .iter()
+                .filter_map(|&i| {
+                    let span = if mode == Mode::ByList { &spans[i].1 } else { &spans[i].0 };
+                    let (a, b) = span.as_ref()?;
+                    Some((all[i].0.clone(), dir.lookup(a)?, dir.lookup(b)?))
                 })
-                .collect()
+                .collect();
+            (mode, v)
         })
         .collect();
     if let Some(d) = &o.deletes {
@@ -961,7 +1078,7 @@ pub fn build(o: &Opts) -> Result<Report> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use marco_core::{Added, Graph};
+    use marco_core::Graph;
     use std::collections::BTreeMap;
 
     fn did(i: u64) -> String {
@@ -988,24 +1105,68 @@ mod tests {
     /// Ops split into files the way the export does: by the repo's first
     /// identifier character, `z-other` for everything else, in no order.
     type Op = (String, String, String, i64, u8);
+    /// A listitem op: (repo, rkey, subject, list, time_us, op).
+    type ListOp = (String, String, String, String, i64, u8);
+
+    fn list_uri(a: &str, l: u64) -> String {
+        format!("at://{a}/app.bsky.graph.list/l{l}")
+    }
+
+    fn write_list_export(dir: &Path, rows: &[ListOp]) {
+        let ops: Vec<Op> = rows.iter().map(|r| (r.0.clone(), r.1.clone(), r.2.clone(), r.4, r.5)).collect();
+        write_export_cols(dir, "listitem", &ops, Some(rows));
+    }
 
     fn write_export(dir: &Path, rel: &str, rows: &[Op]) {
-        let mut files: BTreeMap<String, Vec<&Op>> = BTreeMap::new();
-        for r in rows {
+        write_export_cols(dir, rel, rows, None)
+    }
+
+    /// The live path: every op in time order (a delete last on a tie), as
+    /// ingest hands them over. A create or update that isn't an edge (a bad
+    /// subject, a list in another repo) empties its key.
+    /// (repo, rkey, subject, list, time_us, op)
+    type LiveOp<'a> = (&'a str, &'a str, &'a str, Option<&'a str>, i64, u8);
+
+    fn live(g: &mut Graph, coll: &str, mut ops: Vec<LiveOp>) {
+        ops.sort_by_key(|r| (r.4, r.5));
+        for (a, k, s, l, us, op) in ops {
+            let uri = format!("at://{a}/{coll}/{k}");
+            let edge = op != OP_DELETE
+                && classify(s).is_some()
+                && l.is_none_or(|l| own_list(a.as_bytes(), l.as_bytes()).is_some());
+            if edge {
+                g.add_rec(&uri, s, l, us).unwrap();
+            } else {
+                g.delete_at(&uri, us).unwrap();
+            }
+        }
+    }
+
+    fn live_lists(g: &mut Graph, lops: &[ListOp]) {
+        let v = lops.iter().map(|r| (r.0.as_str(), r.1.as_str(), r.2.as_str(), Some(r.3.as_str()), r.4, r.5)).collect();
+        live(g, "app.bsky.graph.listitem", v)
+    }
+
+    fn write_export_cols(dir: &Path, rel: &str, rows: &[Op], lists: Option<&[ListOp]>) {
+        let mut files: BTreeMap<String, Vec<(usize, &Op)>> = BTreeMap::new();
+        for (i, r) in rows.iter().enumerate() {
             let name = match r.0.strip_prefix("did:plc:") {
                 Some(rest) if r.0.len() == 32 => format!("p-{}", &rest[..1]),
                 _ => "z-other".into(),
             };
-            files.entry(name).or_default().push(r);
+            files.entry(name).or_default().push((i, r));
         }
         std::fs::create_dir_all(dir.join(rel)).unwrap();
         for (name, mut rs) in files {
             rs.reverse();
             let mut raw = Vec::new();
-            for (a, k, s, us, op) in rs {
+            for (i, (a, k, s, us, op)) in rs {
                 put(&mut raw, a);
                 put(&mut raw, k);
                 put(&mut raw, s);
+                if let Some(l) = lists {
+                    put(&mut raw, &l[i].3);
+                }
                 raw.extend_from_slice(&us.to_le_bytes());
                 raw.push(*op);
             }
@@ -1019,7 +1180,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let input = tmp.path().join("in");
         let mut rng = crate::stats::Rng::new(7);
-        let rels = Relations::new(Relations::bsky_default().list[..2].to_vec()).unwrap();
+        let rels = Relations::bsky_default();
         let mut g = Graph::new(rels.clone());
         for (rel, coll, n) in [("follow", "app.bsky.graph.follow", 20_000), ("block", "app.bsky.graph.block", 2_000)] {
             // ops in time order: creates, re-creates and deletes, some deletes of keys never created
@@ -1042,22 +1203,30 @@ mod tests {
                 ops.push((a.clone(), format!("dup{i}a"), did(i + 1), 50_000, 1));
                 ops.push((a, format!("dup{i}b"), did(i + 1), 50_001, 1));
             }
-            // the same records as the mutable path sees them: latest op per key
-            let mut latest: BTreeMap<(String, String), (i64, u8, String)> = BTreeMap::new();
-            for (a, k, s, us, op) in &ops {
-                let e = latest.entry((a.clone(), k.clone())).or_insert((*us, *op, s.clone()));
-                if (*us, *op) >= (e.0, e.1) {
-                    *e = (*us, *op, s.clone());
-                }
-            }
-            for ((a, k), (_, op, s)) in &latest {
-                if *op != OP_DELETE && marco_core::did::classify(s).is_some() {
-                    let r = g.add(&format!("at://{a}/{coll}/{k}"), s).unwrap();
-                    assert_eq!(r, Added::Added);
-                }
-            }
+            live(
+                &mut g,
+                coll,
+                ops.iter().map(|r| (r.0.as_str(), r.1.as_str(), r.2.as_str(), None, r.3, r.4)).collect(),
+            );
             write_export(&input, rel, &ops);
         }
+        // listitems: owners' lists, repeat members, deletes with no list, lists in other repos
+        let mut lops: Vec<ListOp> = Vec::new();
+        for t in 0..6_000i64 {
+            let a = did(rng.below(120));
+            let rkey = match rng.below(40) {
+                0 => format!("m{}", rng.below(300)),
+                _ => vlatproto::tid::Tid::from_parts(1_700_000_000_000_000 + rng.below(2000) * 997, 0).to_string(),
+            };
+            let row = match rng.below(10) {
+                0..=2 => (String::new(), String::new(), OP_DELETE),
+                3 if rng.below(20) == 0 => (did(rng.below(60)), list_uri(&did(rng.below(120)), 0), 1),
+                _ => (did(rng.below(60)), list_uri(&a, rng.below(4)), 1 + rng.below(2) as u8),
+            };
+            lops.push((a, rkey, row.0, row.1, 1000 + t, row.2));
+        }
+        live_lists(&mut g, &lops);
+        write_list_export(&input, &lops);
         let out = tmp.path().join("snap");
         let o = Opts {
             input: input.clone(),
@@ -1102,5 +1271,119 @@ mod tests {
                 assert_eq!(b.has(rel, &d, &e), g.has(rel, &d, &e));
             }
         }
+        let (li, lo) = (2u8, 3u8);
+        for rel in [li, lo] {
+            let st = &b.snapshot().unwrap().stats()[rel as usize];
+            assert_eq!(st.out_records, g.records(rel).0, "rel {rel}");
+            assert_eq!(st.in_pairs, g.records(rel).1, "rel {rel}");
+        }
+        for i in 0..120 {
+            let d = did(i);
+            assert_eq!(b.counts(lo, &d), g.counts(lo, &d), "owner {d}");
+            assert_eq!(b.out_list(lo, &d, 100_000, None).0, g.out_list(lo, &d, 100_000, None).0, "owner {d}");
+            let mut x = b.in_list(li, &d, 100_000, None).0;
+            let mut y = g.in_list(li, &d, 100_000, None).0;
+            x.sort();
+            y.sort();
+            assert_eq!(x, y, "lists {d} is on");
+            for l in 0..4 {
+                let lu = list_uri(&d, l);
+                assert_eq!(b.counts(li, &lu), g.counts(li, &lu), "{lu}");
+                assert_eq!(b.out_list(li, &lu, 100_000, None).0, g.out_list(li, &lu, 100_000, None).0, "{lu}");
+                let ids = (b.id_of(&lu), g.id_of(&lu));
+                assert_eq!(
+                    ids.0.map_or(0, |x| b.out_distinct(li, x)),
+                    ids.1.map_or(0, |x| g.out_distinct(li, x)),
+                    "{lu}"
+                );
+            }
+        }
+        assert!(rep.rels[3].bad_subject > 0, "lists in other repos are refused");
+    }
+
+    fn build_lists(tmp: &Path, lops: &[ListOp], shards: usize) -> (Report, Graph) {
+        let input = tmp.join("in");
+        write_export(&input, "follow", &[]);
+        write_export(&input, "block", &[]);
+        write_list_export(&input, lops);
+        let out = tmp.join("snap");
+        let o = Opts {
+            input,
+            out: out.clone(),
+            tmp: tmp.join("spill"),
+            rels: Relations::bsky_default(),
+            subj_index: 8,
+            shards,
+            sub_buckets: 1,
+            deletes: None,
+        };
+        let rep = build(&o).unwrap();
+        (rep, Graph::open(&out).unwrap())
+    }
+
+    fn live_graph(lops: &[ListOp]) -> Graph {
+        let mut g = Graph::new(Relations::bsky_default());
+        live_lists(&mut g, lops);
+        g
+    }
+
+    #[test]
+    fn a_listitem_moved_under_one_rkey_lands_on_its_new_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (o, x) = (did(1), did(2));
+        let (l1, l2) = (list_uri(&o, 1), list_uri(&o, 2));
+        let rk = "3kaaaaaaaaa22".to_string();
+        let lops: Vec<ListOp> =
+            vec![(o.clone(), rk.clone(), x.clone(), l1.clone(), 1, 1), (o.clone(), rk, x.clone(), l2.clone(), 2, 2)];
+        let (_, b) = build_lists(tmp.path(), &lops, 1);
+        let g = live_graph(&lops);
+        let on = |g: &Graph| (g.has(2, &l1, &x).is_some(), g.has(2, &l2, &x).is_some());
+        assert_eq!((on(&b), on(&g)), ((false, true), (false, true)), "bulk, live");
+    }
+
+    #[test]
+    fn an_update_to_a_list_in_another_repo_drops_the_item() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (o, x) = (did(1), did(2));
+        let rk = "3kaaaaaaaaa22".to_string();
+        let lops: Vec<ListOp> = vec![
+            (o.clone(), rk.clone(), x.clone(), list_uri(&o, 1), 1, 1),
+            (o.clone(), rk, x.clone(), list_uri(&did(3), 1), 2, 2),
+        ];
+        let (_, b) = build_lists(tmp.path(), &lops, 1);
+        let g = live_graph(&lops);
+        let n = |g: &Graph| (g.counts(3, &o).0, g.counts(2, &list_uri(&o, 1)).0);
+        assert_eq!((n(&b), n(&g)), ((0, 0), (0, 0)), "bulk, live");
+    }
+
+    /// A did:key repo's lists sort among the did:plc ones but come in the
+    /// z-other file, read last.
+    #[test]
+    fn lists_of_a_repo_outside_did_plc_build() {
+        let tmp = tempfile::tempdir().unwrap();
+        let k = "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".to_string();
+        let lops: Vec<ListOp> = vec![
+            (did(1), "3kaaaaaaaaa22".into(), did(2), list_uri(&did(1), 1), 1, 1),
+            (k.clone(), "3kaaaaaaaaa22".into(), did(2), list_uri(&k, 1), 1, 1),
+        ];
+        let (_, b) = build_lists(tmp.path(), &lops, 1);
+        let g = live_graph(&lops);
+        for l in [list_uri(&k, 1), list_uri(&did(1), 1)] {
+            assert_eq!((b.counts(2, &l).0, g.counts(2, &l).0), (1, 1), "{l}");
+        }
+    }
+
+    #[test]
+    fn list_rows_are_counted_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lops: Vec<ListOp> = (0..200u64)
+            .map(|i| {
+                let a = did(i % 40);
+                let rk = vlatproto::tid::Tid::from_parts(1_700_000_000_000_000 + i * 997, 0).to_string();
+                (a.clone(), rk, did(100 + i % 7), list_uri(&a, i % 3), 1 + i as i64, 1)
+            })
+            .collect();
+        let (rep, _) = build_lists(tmp.path(), &lops, 5);
+        assert_eq!((rep.rels[2].rows, rep.rels[3].rows), (200, 200));
     }
 }

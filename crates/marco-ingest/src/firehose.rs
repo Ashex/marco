@@ -300,4 +300,70 @@ mod tests {
         assert_eq!(decode(&info, &rels), Ok(Frame::Info("OutdatedCursor".into())));
         assert!(decode(b"\xff", &rels).is_err());
     }
+
+    /// A listitem's list comes along with the subject; one from another repo
+    /// isn't an edge, so its key empties.
+    #[test]
+    fn listitems_carry_their_list() {
+        use vlatproto::cbor::Value;
+        use vlatproto::events;
+        let item = |list: &str| {
+            Value::Map(vec![
+                ("list".into(), Value::Text(list.into())),
+                ("$type".into(), Value::Text("app.bsky.graph.listitem".into())),
+                ("subject".into(), Value::Text("did:plc:bbbbbbbbbbbbbbbbbbbbbbbb".into())),
+            ])
+            .to_cbor()
+        };
+        let own = "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.graph.list/3kaaaaaaaaa2a";
+        let (r1, r2) = (item(own), item("at://did:plc:cccccccccccccccccccccccc/app.bsky.graph.list/3kaaaaaaaaa2a"));
+        let (c1, c2) = (Cid::dag_cbor(&r1), Cid::dag_cbor(&r2));
+        let mut car = Vec::new();
+        vlatproto::car::write_header(&mut car, &c1);
+        vlatproto::car::write_block(&mut car, &c1, &r1);
+        vlatproto::car::write_block(&mut car, &c2, &r2);
+        let ops = [
+            events::RepoOp {
+                action: "create",
+                path: "app.bsky.graph.listitem/3kaaaaaaaaa22",
+                cid: Some(c1),
+                prev: None,
+            },
+            events::RepoOp {
+                action: "create",
+                path: "app.bsky.graph.listitem/3kaaaaaaaaa23",
+                cid: Some(c2),
+                prev: None,
+            },
+        ];
+        let f = events::commit_frame(&events::CommitFrame {
+            repo: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+            rev: "3kabc",
+            since: None,
+            commit: c1,
+            prev_data: None,
+            blocks: &car,
+            ops: &ops,
+            time: "2026-01-01T00:00:00Z",
+        });
+        let mut b = Vec::new();
+        f.finish(43, &mut b);
+        let Frame::Event(ev) = decode(&b, &Relations::bsky_default()).unwrap() else { panic!() };
+        assert_eq!(ev.skipped, vec!["bad_list"]);
+        assert_eq!(
+            ev.change,
+            Change::Ops(vec![
+                Op::Add {
+                    uri: "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.graph.listitem/3kaaaaaaaaa22".into(),
+                    subject: "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                    list: Some(own.into()),
+                    time_us: 1_767_225_600_000_000,
+                },
+                Op::Delete {
+                    uri: "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.graph.listitem/3kaaaaaaaaa23".into(),
+                    time_us: 1_767_225_600_000_000,
+                },
+            ])
+        );
+    }
 }

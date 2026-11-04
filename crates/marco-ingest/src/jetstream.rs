@@ -197,4 +197,32 @@ mod tests {
         .unwrap();
         assert_eq!((ev.cursor, ev.change), (8, Change::None));
     }
+
+    #[test]
+    fn listitems_carry_their_list() {
+        let rels = Relations::bsky_default();
+        let line = |list: &str| {
+            format!(
+                r#"{{"did":"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa","time_us":9,"kind":"commit","commit":{{"operation":"create","collection":"app.bsky.graph.listitem","rkey":"3kaaaaaaaaa22","record":{{"list":"{list}","subject":"did:plc:bbbbbbbbbbbbbbbbbbbbbbbb"}}}}}}"#
+            )
+        };
+        let own = "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.graph.list/3kaaaaaaaaa2a";
+        let ev = decode(line(own).as_bytes(), &rels).unwrap();
+        assert_eq!(
+            ev.change,
+            Change::Ops(vec![Op::Add {
+                uri: "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.graph.listitem/3kaaaaaaaaa22".into(),
+                subject: "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                list: Some(own.into()),
+                time_us: 9,
+            }])
+        );
+        let other = "at://did:plc:cccccccccccccccccccccccc/app.bsky.graph.list/3kaaaaaaaaa2a";
+        let ev = decode(line(other).as_bytes(), &rels).unwrap();
+        let gone = Change::Ops(vec![Op::Delete {
+            uri: "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.graph.listitem/3kaaaaaaaaa22".into(),
+            time_us: 9,
+        }]);
+        assert_eq!((ev.change, ev.skipped), (gone, vec!["bad_list"]), "not an edge: its key empties");
+    }
 }

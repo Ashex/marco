@@ -50,7 +50,7 @@ enum Cmd {
         /// Spill directory for the in pass (default: beside the output).
         #[arg(long)]
         tmp: Option<PathBuf>,
-        /// Relations config (TOML); default follow + block.
+        /// Relations config (TOML); default follow, block and listitem.
         #[arg(long)]
         relations: Option<PathBuf>,
         #[arg(long, default_value_t = marco_core::graph::DEFAULT_SUBJ_INDEX)]
