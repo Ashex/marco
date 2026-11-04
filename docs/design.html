@@ -248,21 +248,27 @@ subject = "subject"</pre>
 <p>Blocks have the same mix: 2,010 of them, mostly <code>m9i94nup-niiane1z</code>-style keys from 27 repos. They're all valid record keys, so dropping them would make 370 accounts' counts disagree with every other appview. They don't get to shape the core either. A TID's top bit is always 0, so a non-TID rkey becomes <code>1 ‖ hash63(rkey)</code> in the same u64 column, and one function at the edge of the API does the mapping. A small side table keeps the strings so URIs come back exact. These sort as newest in lists, which is the one place they behave differently.</p>
 
 <h2>API</h2>
-<p>HTTP with JSON (and a binary batch encoding for bulk ingest), plus a Rust client crate. Every write takes an optional source cursor, so a pipeline can resume and replay without double-applying.</p>
+<p>One ConnectRPC service, defined in protobuf and served by connectrpc + buffa. A Connect server answers three protocols on the same port: gRPC, gRPC-Web, and Connect's own HTTP POST with JSON or binary bodies. So <code>curl</code> with JSON works, hydration paths get protobuf, and every language gets generated clients from one <code>.proto</code>. Ingest is a client stream, so a pipeline pushes ops without a round trip per batch. Every write carries an optional source cursor, so a pipeline can resume and replay without double-applying.</p>
 <div class="tw"><table>
-<tr><th>Call</th><th>Body / params</th><th>Returns</th></tr>
-<tr><td><code>POST /v1/edges</code></td><td><code>{edges: [{uri, subject}], cursor?}</code>. The relation comes from the URI's collection.</td><td>per edge: added | exists</td></tr>
-<tr><td><code>POST /v1/edges/delete</code></td><td><code>{uris: [...], cursor?}</code></td><td>per URI: the subject it removed, or not-found</td></tr>
-<tr><td><code>GET /v1/has</code></td><td><code>rel, from, to</code></td><td>the edge's URI or null</td></tr>
-<tr><td><code>POST /v1/relationships</code></td><td><code>{actor, others: [≤100], rels: [follow, block]}</code></td><td>per other and relation: out URI, in URI (getRelationships)</td></tr>
-<tr><td><code>GET /v1/out</code>, <code>/v1/in</code></td><td><code>rel, actor, limit, cursor</code></td><td>DIDs + URIs. Out: newest first, cursor an rkey. In: id order, cursor a DID</td></tr>
-<tr><td><code>POST /v1/counts</code></td><td><code>{actors: [...], rels}</code></td><td>out and in counts</td></tr>
-<tr><td><code>POST /v1/intersect</code></td><td><code>{a: {rel, dir, actor}, b: {...}, limit}</code></td><td>mutuals, "followed by people you follow"</td></tr>
-<tr><td><code>POST /v1/filter</code></td><td><code>{viewer, actors: [...], drop: [block.out, block.in]}</code></td><td>the actors left (feed and thread block filtering)</td></tr>
-<tr><td><code>DELETE /v1/actors/{did}</code></td><td>account deleted or taken down</td><td>drops its out edges and hides it as a subject</td></tr>
+<tr><th>Option</th><th>curl-able</th><th>Typed clients</th><th>Batch hydration cost</th><th>Streaming ingest</th></tr>
+<tr><td>HTTP + JSON</td><td>yes</td><td>hand-written</td><td>JSON parse of every DID and URI</td><td>no</td></tr>
+<tr><td>gRPC only</td><td>no (grpcurl)</td><td>generated</td><td>protobuf</td><td>yes</td></tr>
+<tr class="pick"><td><b>ConnectRPC</b></td><td>yes, JSON over POST</td><td>generated (Go, TS, Rust, Swift…)</td><td>protobuf, or JSON when asked</td><td>yes</td></tr>
 </table></div>
-<pre>curl -X POST localhost:7300/v1/edges/delete \
-  -d '{"uris":["at://did:plc:a/app.bsky.graph.follow/3lab2xyz7qk2c"]}'
+<div class="tw"><table>
+<tr><th>RPC (<code>marco.v1.Graph</code>)</th><th>Request</th><th>Response</th></tr>
+<tr><td><code>Write</code> (client stream) / <code>WriteBatch</code></td><td>ops: add <code>{uri, subject}</code> or delete <code>{uri}</code>, cursor?. The relation comes from the URI's collection.</td><td>per op: added | exists | removed subject | not-found; the applied cursor</td></tr>
+<tr><td><code>Has</code></td><td>rel, from, to</td><td>the edge's URI or empty</td></tr>
+<tr><td><code>Relationships</code></td><td>actor, others (≤100), rels</td><td>per other and relation: out URI, in URI (getRelationships)</td></tr>
+<tr><td><code>ListOut</code>, <code>ListIn</code></td><td>rel, actor, limit, cursor</td><td>DIDs + URIs. Out: newest first, cursor an rkey. In: id order, cursor a DID</td></tr>
+<tr><td><code>Counts</code></td><td>actors, rels</td><td>out and in counts</td></tr>
+<tr><td><code>Intersect</code></td><td>two (rel, dir, actor) sides, limit</td><td>mutuals, "followed by people you follow"</td></tr>
+<tr><td><code>Filter</code></td><td>viewer, actors, drop: block.out, block.in…</td><td>the actors left (feed and thread block filtering)</td></tr>
+<tr><td><code>SetActorStatus</code></td><td>did, deleted | takendown | active</td><td>drops or hides its out edges and hides it as a subject</td></tr>
+</table></div>
+<pre>curl -X POST localhost:7300/marco.v1.Graph/WriteBatch \
+  -H 'content-type: application/json' \
+  -d '{"ops":[{"delete":{"uri":"at://did:plc:a/app.bsky.graph.follow/3lab2xyz7qk2c"}}]}'
 {"results":[{"removed":"did:plc:b"}]}</pre>
 
 <h2>Writes, durability and ingest</h2>
@@ -342,6 +348,7 @@ subject = "subject"</pre>
 <tr><td>Followers in time order</td><td>Not needed. In lists stay id-sorted sets.</td></tr>
 <tr><td>Public?</td><td>Yes, once it's built. No private names in the package from the start, so the export is a copy.</td></tr>
 <tr><td>vlDB integration</td><td>Ignored for now.</td></tr>
+<tr><td>API protocol</td><td>ConnectRPC: gRPC and JSON over HTTP from one proto.</td></tr>
 </table></div>
 </main>
 </body>
