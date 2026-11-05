@@ -144,8 +144,9 @@ back to its owner shard after.
 set. With replication factor 3, ranges spread over all three replicas.
 
 **Relations.** The snapshot holds exactly the relations the config's
-tables name, in that order: a relation left out would start empty and then
-fill only from the catch-up. `--relations` is where their definitions come
+tables name, in that order. A relation left out of the scan is absent from
+the snapshot, and Jetstream never fills it: the server follows only the
+snapshot's relations. `--relations` is where their definitions come
 from. The scan writes them to `DIR/relations.toml`, so a build of a kept
 scan is `marco-load build --input DIR --relations DIR/relations.toml`.
 

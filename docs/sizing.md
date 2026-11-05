@@ -55,9 +55,10 @@ Plan for twice the snapshot on disk. A checkpoint writes new shard files for eve
 changed before it deletes the old ones, and 3M ops touch nearly all 64 shards. Change segments
 between checkpoints are ~109 B an op, so a day of follows and blocks (~2.4-2.7M ops) is ~300 MB.
 
-A rebuild from Scylla needs more for a while: about 128 GB at its peak on the whole network, the
-scan output (66.4 GB), the build's own spill beside the snapshot (~23.7 GB) and the snapshot
-(38.5 GB) at once ([Rebuilding from Scylla](scylla.md#memory-and-disk)).
+A rebuild from Scylla needs more for a while: about 128 GB at its peak for the whole network's
+follows and blocks, the scan output (66.4 GB), the build's own spill beside the snapshot (~23.7 GB)
+and the snapshot (38.5 GB) at once ([Rebuilding from Scylla](scylla.md#memory-and-disk)). List
+items weren't part of that run. Their scan output is ~27 B a row on synthetic data.
 
 ## Memory
 
@@ -123,8 +124,8 @@ API at that rate should size for it.
 |---|---|
 | Export from a ClickHouse archive | 12.6 min (the network's ~1 Gb/s was the limit) |
 | Bulk build from the export | 115 s, 25.9M edges/s |
-| Scylla scan, one 16-shard node | 4.4 min at 11.2M rows/s |
-| Scylla to `/readyz` 200, end to end | 6.8 min |
+| Scylla scan of follows and blocks, one 16-shard node | 4.4 min at 11.2M rows/s |
+| Scylla to `/readyz` 200, end to end, follows and blocks | 6.8 min |
 | Open a snapshot, caches dropped | 11 ms |
 | kill -9 to `/readyz` 200, p50 by run | 381-595 ms |
 | Restart with a day of segments | 10.9-11.7 s warm, 13.3 s of replay alone with the page cache dropped |

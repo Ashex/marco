@@ -36,12 +36,12 @@ of these 50 accounts block the viewer? Who are the mutuals? Which of these actor
 list? It's one binary on local disk. The whole network's follows and blocks are a 38.5 GB snapshot,
 served from a 32-thread box with 61 GiB of RAM.
 
-You can run it next to an appview and rebuild it from the appview's own follows and blocks tables
-in Scylla in about 7 minutes ([Rebuilding from Scylla](scylla.md)). After that it keeps itself
-current from Jetstream. A Scylla rebuild holds only the relations its tables cover, follows and
-blocks, so it has no lists: the scan doesn't read `listitem`, and Jetstream fills only the
-relations the snapshot has. The [Quickstart](quickstart.md) runs the whole path on a four-account
-example.
+You can run it next to an appview and rebuild it from the appview's own follows, blocks and list
+items tables in Scylla. Follows and blocks for the whole network took about 7 minutes
+([Rebuilding from Scylla](scylla.md)). After that marco keeps itself current from Jetstream. A
+rebuild holds only the relations its tables cover, so leave out the list items table and it has no
+lists, since Jetstream fills only the relations the snapshot has. The [Quickstart](quickstart.md)
+runs the whole path on a four-account example.
 
 ## What marco holds
 

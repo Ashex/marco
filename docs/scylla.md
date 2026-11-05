@@ -2,14 +2,14 @@
 title: Rebuilding from Scylla
 section: marco
 order: 7
-summary: "scan-scylla reads an appview's follows and blocks tables with a parallel full scan, builds a snapshot, and marco catches up from Jetstream: 6.8 min for the whole network."
+summary: "scan-scylla reads an appview's follows, blocks and list items tables with a parallel full scan, builds a snapshot, and marco catches up from Jetstream: 6.8 min for the whole network's follows and blocks."
 ---
 
 ```hero
 diagram:
   caption: "scan → spill → build → catch-up. The scan writes the same build input any exporter writes, and the build doesn't know where it came from. Catch-up is Jetstream-only."
   nodes:
-    - { id: sc, label: Scylla, sub: "follows · blocks", at: [0, 0], size: [8, 3], shape: store, tone: muted }
+    - { id: sc, label: Scylla, sub: "follows · blocks · lists", at: [0, 0], size: [8, 3], shape: store, tone: muted }
     - { id: scan, label: scan-scylla, sub: "per-shard ranges", at: [12, 0], size: [9, 3], tone: accent }
     - { id: spill, label: build input, sub: "1,025 files a table", at: [25, 0], size: [9, 3], shape: store, tone: amber }
     - { id: snap, label: snapshot, sub: "time_us = start − 5 m", at: [25, 5.5], size: [9, 3], shape: store, tone: amber }
@@ -22,18 +22,19 @@ diagram:
     - "snap -> srv: mmap"
     - "js -> srv: since time_us"
 facts:
-  - { value: "4.4", unit: min, label: to scan 2.97B rows, note: "11.2M rows/s · one 16-shard node", tone: accent }
+  - { value: "4.4", unit: min, label: to scan 2.97B rows, note: "follows + blocks · 11.2M rows/s · one node", tone: accent }
   - { value: "114", unit: s, label: to build, note: "38.5 GB snapshot", tone: amber }
   - { value: "6.8", unit: min, label: empty directory to ready, note: "scan · build · catch up", tone: cyan }
   - { value: "0", label: records differ, note: "against the archive build", tone: ok }
 ```
 
 If you run an appview, you already have the graph in Scylla. `marco-load scan-scylla` reads the
-follows and blocks tables, writes [build input](quickstart.md#the-input-format), and with
-`--snapshot` builds it. Then `marco serve --jetstream` replays what changed since the scan began.
-On one ScyllaDB node holding the whole network (2.97B rows), that took 6.8 minutes from an empty
-directory to `/readyz` 200, and the snapshot matched the archive build record for record
-([the Scylla run](scylla-results.html)).
+follows, blocks and list items tables, writes [build input](quickstart.md#the-input-format), and
+with `--snapshot` builds it. Then `marco serve --jetstream` replays what changed since the scan
+began. On one ScyllaDB node holding the whole network's follows and blocks (2.97B rows), that took
+6.8 minutes from an empty directory to `/readyz` 200, and the snapshot matched the archive build
+record for record ([the Scylla run](scylla-results.html)). List items weren't part of that run, so
+every whole-network number on this page is follows and blocks only.
 
 ## Run it
 
@@ -71,6 +72,12 @@ subject = "target_did"         # the subject DID (default target_did)
 [[table]]
 relation = "block"
 name = "blocks"
+
+[[table]]
+relation = "listitem"          # a list relation: the table needs a list column
+name = "list_items"
+subject = "subject"
+list = "list"                  # the column with the list's AT URI (default list)
 ```
 
 The scan needs `SELECT` on the tables, `system_schema` and `system.tablets`. Column and table
@@ -83,16 +90,20 @@ or more. For anything else, scan with `--keep-spill` (or without `--snapshot`) a
 
 ## What it assumes about the tables
 
-- One row per record: the record's repo DID, its rkey and its subject DID, as text.
+- One row per record: the record's repo DID, its rkey and its subject DID, as text. A list
+  relation's table also has the list's AT URI (the `list` column), and only a list relation's
+  table may have one.
 - The partition key comes from the schema, and the token bounds use all of its columns, so any
   partition key works.
 - The snapshot holds exactly the relations the config's tables name. A relation left out isn't in
   the snapshot at all, and since marco follows Jetstream only for the snapshot's relations, it
-  never fills. List relations (`listitem`) aren't scanned, since their tables would need the list
-  column, and the scan refuses them. So a marco rebuilt from Scylla has follows and blocks and no
-  lists, and list queries find nothing.
+  never fills. So name the list items table too, or the rebuilt marco has no lists.
+- A `listitem` table gives the snapshot `listitem` and its companion `listitem.owner`: a list's
+  members, an owner's items and the lists a DID is on. An item whose list is in another repo is
+  dropped, as on the live path, and counted as `cross_repo_rows` in the report's table
+  ([the owner rule](relations.md#the-owner-rule)).
 - Rows whose repo or subject isn't a DID are counted and skipped. The whole-network run had 13
-  (3 follows, 10 blocks).
+  (3 follows, 10 blocks). A row with a null column is skipped and counted as `null_rows`.
 
 ### The primary key
 
@@ -129,7 +140,7 @@ arrive, 1,025 files per table, which is the order the build needs.
 | | |
 |---|---|
 | Client memory | `--memory-gb` (4) caps what all ranges in flight buffer, by lowering `--chunk-rows` (262,144). 20 nodes of 64 shards is 2,560 ranges at once, about 5,000 rows a chunk in 4 GB. A partition is held whole until it ends, so a very long list adds its size on top. The budget counts the chunks only. The whole-network run peaked at 9.0 GB RSS at 2 ranges in flight per shard and 11.5 GB at 8, both under the default 4 GB. |
-| Scan output | About the rows compressed with zstd: 66.4 GB for the whole network, 22 B a row, in `--out`. Put it on local NVMe. |
+| Scan output | About the rows compressed with zstd: 66.4 GB for the whole network's follows and blocks, 22 B a row, in `--out`. A list item's row also carries its list's URI (~70 B raw), and the tests' synthetic items took 27 B a row. Put it on local NVMe. |
 | Build spill | The build's own in-pass spill, about 23.7 GB for the whole network, goes beside the snapshot in `<snapshot>.spill`. scan-scylla has no `--tmp` to move it (task 973). |
 | Peak | About 128 GB at once: the scan output, the build spill and the snapshot being written. |
 | Open files | One per bucket per table (1,025 each), plus a connection per shard per node. The scan raises its soft limit to the hard one and stops with a message if that's still too few. |

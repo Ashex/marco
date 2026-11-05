@@ -89,7 +89,8 @@ snapshot before the live tail can keep it current. So:
 
 A relation left out of a build isn't in the snapshot at all. marco doesn't ask Jetstream for its
 collection and the write API refuses its URIs, so it stays absent until a rebuild that includes it.
-A Scylla rebuild has no `listitem` for this reason ([Rebuilding from Scylla](scylla.md)).
+So a Scylla rebuild needs a table for every relation you want, the list items table included
+([Rebuilding from Scylla](scylla.md)).
 
 ## Lists
 
@@ -132,6 +133,7 @@ isn't an edge, and the appview ignores those too. Every path into marco applies 
 | Write API | The whole batch is refused (`invalid_argument`, "needs a list in the record's own repo"), so a bad batch changes nothing. |
 | Jetstream or firehose | Not an edge, so the key is emptied like a delete, and counted in `marco_ingest_skipped_ops_total{reason="bad_list"}`. |
 | Bulk build | Left out and counted with the bad rows. |
+| `scan-scylla` | Dropped and counted as `cross_repo_rows` in the report's table. |
 
 A create or update whose subject isn't a DID gets the same treatment (`reason="bad_subject"`).
 Emptying the key keeps the live graph where a rebuild would end: a record updated into something
