@@ -774,10 +774,10 @@ impl App {
         tokio::task::spawn_blocking(move || {
             let mut failed = 0;
             for (i, p) in paths.iter().enumerate() {
-                let r = marco_core::snapshot::Snapshot::open(p).and_then(|s| {
-                    let b = s.meta.get("build").and_then(|v| v.as_u64());
+                let r = marco_core::store::MappedFile::open(p).and_then(|f| {
+                    let b = f.footer.meta.get("build").and_then(|v| v.as_u64());
                     anyhow::ensure!(b == Some(build), "{} is from another snapshot", p.display());
-                    s.verify_checksums()
+                    f.verify_checksums()
                 });
                 let v = match r {
                     Ok(()) => Verify::Ok,

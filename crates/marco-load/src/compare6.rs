@@ -12,12 +12,13 @@ use anyhow::{bail, Context, Result};
 use rayon::prelude::*;
 use serde::Serialize;
 
-use marco_core::format6::{read_footer, read_manifest, Pinned, ShardView};
+use marco_core::format6::{read_footer, Pinned, ShardView};
 use marco_core::inset::InList;
 use marco_core::outlog::OutList;
 use marco_core::read::{Engine, ReadCx};
 use marco_core::snapshot::{rel_section, Index, Meta};
-use marco_core::store::{ShardFile, Store, DIR_FILE};
+use marco_core::store::v5::{ShardFile, Store};
+use marco_core::store::{Manifest, DIR_FILE};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -56,7 +57,7 @@ pub fn run(a: &Args) -> Result<serde_json::Value> {
 pub fn compare(a: &Path, b: &Path) -> Result<Report> {
     let t = Instant::now();
     let five = Store::open(a)?;
-    let m6 = read_manifest(b)?;
+    let m6 = Manifest::read(b)?;
     let dir6 = read_footer(&b.join(DIR_FILE))?;
     let meta6: Meta = serde_json::from_value(dir6.meta.clone()).context("directory meta")?;
     let d5 = &five.dir.meta;

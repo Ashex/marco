@@ -432,6 +432,12 @@ impl Engine {
         Ok((id, footer))
     }
 
+    /// Registers the FORMAT 6 file its caller mapped whole and reads its
+    /// pinned sections from. It is never evicted or freed.
+    pub fn add_mapped(&self, name: impl Into<String>, map: Arc<memmap2::Mmap>, footer: PagedFooter) -> FileId {
+        self.add_resident(name.into(), Bytes::Shared(map), Some(footer))
+    }
+
     /// A registered file's name.
     pub fn name(&self, f: FileId) -> Option<&str> {
         self.inner.table.name(f)
@@ -896,6 +902,17 @@ impl Engine {
                 }
             })
             .collect()
+    }
+
+    /// `f` in one pass that pins nothing, then, if it missed, in passes
+    /// that fetch between them ([`Engine::read_blocking`]): for readers that
+    /// may wait on disk and mostly don't have to. Never call it on a tokio
+    /// worker over an engine that may miss.
+    pub fn read<T>(&self, f: impl Fn(&ReadCx<'_>) -> R<T>) -> Result<T, StorageError> {
+        match self.pass(&mut Hold::none(), &f) {
+            Ok(t) => Ok(t),
+            Err(_) => self.read_blocking(&mut Hold::new(), f),
+        }
     }
 
     /// Runs passes of `f` until one is clean, fetching what each missed in

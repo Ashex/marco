@@ -382,7 +382,7 @@ impl svc::Admin for AdminApi {
                     shard: k as u32,
                     lo,
                     hi: f.map_or(lo, |f| f.meta.hi),
-                    size_bytes: f.map_or(0, |f| f.snap.len() as u64),
+                    size_bytes: f.map_or(0, |f| f.file.len() as u64),
                     written_ms: f.map_or(0, |f| f.meta.written_ms),
                     file: f.map_or_else(String::new, |f| f.name.clone()),
                     checkpoint: f.map_or(0, |f| f.meta.checkpoint),
@@ -406,7 +406,7 @@ impl svc::Admin for AdminApi {
             shards,
             merge_ratio: g.merge_ratio,
             job: job_pb(&app.job()).into(),
-            directory_bytes: snap.dir.snap.len() as u64,
+            directory_bytes: snap.dir.file.len() as u64,
             directory_verify: vword(0).word().into(),
             ..Default::default()
         })
@@ -426,9 +426,9 @@ impl svc::Admin for AdminApi {
         let snap = g.snapshot().ok_or_else(|| ConnectError::unavailable("no snapshot"))?;
         let mut secs: std::collections::BTreeMap<String, (u64, u32)> = Default::default();
         for (_, f) in snap.files() {
-            for s in &f.sections {
+            for s in f.sections() {
                 let e = secs.entry(s.name.clone()).or_default();
-                e.0 += s.len;
+                e.0 += s.len();
                 e.1 += 1;
             }
         }

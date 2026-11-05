@@ -1033,7 +1033,7 @@ export const GetStorageResponseSchema: GenMessage<GetStorageResponse> = /*@__PUR
  */
 export type Section = Message<"marco.v1.Section"> & {
   /**
-   * As in the files: r0.out.dat, dir.plc …
+   * As in the files: r0.out.small, dir.plc …
    *
    * @generated from field: string name = 1;
    */

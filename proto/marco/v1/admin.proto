@@ -315,7 +315,7 @@ message GetStorageResponse {
 }
 
 message Section {
-  // As in the files: r0.out.dat, dir.plc …
+  // As in the files: r0.out.small, dir.plc …
   string name = 1;
   // The relation's name, or "directory".
   string rel = 2;

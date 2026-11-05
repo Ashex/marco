@@ -81,8 +81,8 @@ enum Cmd {
         /// Build even if a cursor is past the retention.
         #[arg(long)]
         allow_gap: bool,
-        /// Snapshot format: 5, which the server reads, or 6 (paged, written with O_DIRECT).
-        #[arg(long, default_value_t = marco_core::snapshot::FORMAT)]
+        /// Snapshot format: 6, which the server reads (paged, written with O_DIRECT), or 5, for compare6.
+        #[arg(long, default_value_t = marco_core::snapshot::PAGED_FORMAT)]
         format: u32,
     },
     Open {

@@ -10,11 +10,21 @@ import { dirOf, shardName, windowLabel } from './common'
 import type { Durability, GetOverviewResponse, ListShardsResponse, Section } from '../gen/marco/v1/admin_pb'
 
 const PART: Record<string, [string, string]> = {
-  'out.dat': ['out log', 'out'],
+  'out.small': ['small out logs', 'out'],
+  'out.subj': ['out subjects', 'out'],
+  'out.rkey': ['out rkeys', 'out'],
+  'out.bysubj': ['out by subject', 'out'],
+  'out.head': ['out heads', 'c4'],
   'out.idx': ['out index', 'c4'],
-  'in.dat': ['in set', 'in'],
+  'in.small': ['small in sets', 'in'],
+  'in.blocks': ['in set blocks', 'in'],
+  'in.head': ['in heads', 'c4'],
   'in.idx': ['in index', 'c4'],
   side: ['non-TID rkeys', 'c3'],
+}
+
+function partOf(part: string): [string, string] | undefined {
+  return part.endsWith('.sums') ? ['page sums', 'c4'] : PART[part]
 }
 
 function sectionRows(secs: Section[], o: GetOverviewResponse) {
@@ -25,7 +35,8 @@ function sectionRows(secs: Section[], o: GetOverviewResponse) {
     const part = s.name.split('.').slice(1).join('.')
     const r = o.relations.find((x) => x.name === s.rel)
     const per = part.startsWith('in') ? n(r?.snapshotPairs) : n(r?.snapshotRecords)
-    return { name: s.name, rel: s.rel, part: PART[part]?.[0] ?? part, color: PART[part]?.[1] ?? 'c6', b: n(s.sizeBytes), per: per ? n(s.sizeBytes) / per : NaN, unit: 'B/edge' }
+    const p = partOf(part)
+    return { name: s.name, rel: s.rel, part: p?.[0] ?? part, color: p?.[1] ?? 'c6', b: n(s.sizeBytes), per: per ? n(s.sizeBytes) / per : NaN, unit: 'B/edge' }
   })
   rows.push({ name: 'dir.*', rel: 'directory', part: `${si(o.directory?.base)} DIDs`, color: 'c6', b: dirBytes, per: dirBytes / Math.max(1, n(o.directory?.base)), unit: 'B/DID' })
   return { rows, dir }
@@ -55,7 +66,7 @@ export function verifyDialog(sh: ListShardsResponse) {
   return confirmAction({
     tone: 'info',
     title: `Verify ${sh.shards.length + 1} files?`,
-    items: [`xxh3 of every section · ${bytes(size)} read`, 'reads and writes continue'],
+    items: [`every section and page sum · ${bytes(size)} read`, 'reads and writes continue'],
     action: 'Verify checksums',
     call: 'POST /marco.v1.Admin/VerifyShards\n{}',
     run: () => verifyShards(),
@@ -275,7 +286,7 @@ function BytesPanel({ secs, o }: { secs: Section[]; o: GetOverviewResponse }) {
       right={<span className="mono">{o.snapshot?.files} files · {bytes(o.snapshot?.sizeBytes)}</span>}
       foot={
         <>
-          <span>xxh3 per section · 64-byte aligned</span>
+          <span>xxh3 per pinned section · a sum per 4 KiB page</span>
           <div className="r">
             <span className="mono">{dir.map((d) => `${d.name} ${bytes(d.sizeBytes)}`).join(' · ')}</span>
           </div>

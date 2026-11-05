@@ -624,13 +624,23 @@ fn checksums_catch_a_flipped_byte() {
     let store = marco_core::store::Store::open(&p).unwrap();
     let k = (id / store.dir.meta.shard_width) as usize;
     let f = p.join(marco_core::store::shard_file(k, 0));
-    let sec = store.shards[k].as_ref().unwrap().snap.sections.iter().find(|s| s.name == "r0.out.dat").unwrap().clone();
+    let sections = store.shards[k].as_ref().unwrap().file.sections().to_vec();
     drop(store);
-    let mut b = std::fs::read(&f).unwrap();
-    b[sec.off as usize] ^= 1;
-    std::fs::write(&f, b).unwrap();
+    let flip = |name: &str| {
+        let sec = sections.iter().find(|s| s.name == name).unwrap();
+        let mut b = std::fs::read(&f).unwrap();
+        b[sec.off as usize] ^= 1;
+        std::fs::write(&f, &b).unwrap();
+        b[sec.off as usize] ^= 1;
+        b
+    };
+    let good = flip("r0.out.small");
     let err = marco_core::store::Store::open(&p).unwrap().verify_checksums().unwrap_err();
-    assert!(format!("{err:#}").contains("r0.out.dat"), "{err:#}");
+    assert!(format!("{err:#}").contains("r0.out.small page"), "{err:#}");
+    std::fs::write(&f, good).unwrap();
+    flip("r0.out.idx");
+    let err = marco_core::store::Store::open(&p).unwrap().verify_checksums().unwrap_err();
+    assert!(format!("{err:#}").contains("section r0.out.idx checksum"), "{err:#}");
 }
 
 #[test]
@@ -1127,7 +1137,8 @@ fn the_stamp_section_is_checksummed() {
     let mut b = std::fs::read(&fp).unwrap();
     b[r.start] ^= 1;
     std::fs::write(&fp, &b).unwrap();
-    assert!(Graph::open(&p).unwrap().snapshot().unwrap().verify_checksums().is_err());
+    let err = Graph::open(&p).unwrap().snapshot().unwrap().verify_checksums().unwrap_err();
+    assert!(format!("{err:#}").contains("r0.stamp checksum"), "{err:#}");
 }
 
 /// Stamps past the TTL go at a snapshot or checkpoint; newer ones stay. A

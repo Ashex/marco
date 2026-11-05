@@ -227,6 +227,9 @@ fn commit(f: BufWriter<File>, tmp: &Path, path: &Path) -> Result<()> {
 
 pub enum Bytes {
     Map(memmap2::Mmap),
+    /// A mapping other owners read too: a FORMAT 6 file's pinned sections
+    /// are read from the same mapping the engine serves its pages from.
+    Shared(std::sync::Arc<memmap2::Mmap>),
     Owned(Vec<u8>),
 }
 
@@ -235,6 +238,7 @@ impl std::ops::Deref for Bytes {
     fn deref(&self) -> &[u8] {
         match self {
             Bytes::Map(m) => m,
+            Bytes::Shared(m) => m,
             Bytes::Owned(v) => v,
         }
     }
@@ -688,14 +692,19 @@ pub struct DirRanges {
 
 impl DirRanges {
     pub fn new(s: &Snapshot) -> DirRanges {
+        DirRanges::by(|name| s.range(name))
+    }
+
+    /// The sections where `range` says they are in the file.
+    pub fn by(range: impl Fn(&str) -> Option<Range<usize>>) -> DirRanges {
         DirRanges {
-            plc: s.range("dir.plc").unwrap_or(0..0),
-            plc_ids: s.range("dir.plc.ids"),
-            radix: s.range("dir.plc.radix"),
-            oth_off: s.range("dir.oth.off").unwrap_or(0..0),
-            oth_str: s.range("dir.oth.str").unwrap_or(0..0),
-            oth_ids: s.range("dir.oth.ids"),
-            byid: s.range("dir.byid"),
+            plc: range("dir.plc").unwrap_or(0..0),
+            plc_ids: range("dir.plc.ids"),
+            radix: range("dir.plc.radix"),
+            oth_off: range("dir.oth.off").unwrap_or(0..0),
+            oth_str: range("dir.oth.str").unwrap_or(0..0),
+            oth_ids: range("dir.oth.ids"),
+            byid: range("dir.byid"),
         }
     }
 }
@@ -724,7 +733,11 @@ impl<'a> BaseDir<'a> {
     }
 
     pub fn with(s: &'a Snapshot, r: &DirRanges) -> BaseDir<'a> {
-        let b = s.bytes();
+        BaseDir::over(s.bytes(), r)
+    }
+
+    /// The directory in the file `b`, its sections at `r`.
+    pub fn over(b: &'a [u8], r: &DirRanges) -> BaseDir<'a> {
         let opt = |r: &Option<Range<usize>>| r.clone().map(|r| &b[r]);
         let plc = &b[r.plc.clone()];
         let oth_off = &b[r.oth_off.clone()];
@@ -982,8 +995,9 @@ pub fn decode_live(b: &[u8]) -> Result<Vec<crate::did::DidKey>> {
 
 // ---------------------------------------------------------------- FORMAT 6 files
 
-/// The format of paged files ([`PagedFooter`]). [`FORMAT`] stays the one the
-/// server reads and writes until FORMAT 6 has readers.
+/// The format of paged files ([`PagedFooter`]): what marco serves and writes.
+/// [`FORMAT`] is the one before it, which only `marco-load build --format 5`
+/// writes and `compare6` reads.
 pub const PAGED_FORMAT: u32 = 6;
 
 /// Pinned sections start on a multiple of this, as FORMAT 5's sections do.

@@ -39,7 +39,7 @@ use marco_core::snapshot::{
     encode_index, encode_side, rel_section, write_directory, DirParts, Meta, RelStats, ShardMeta, Writer, FORMAT,
 };
 use marco_core::snapshot::{PagedFooter, PagedWriter, PAGED_FORMAT};
-use marco_core::store::SetWriter;
+use marco_core::store::v5::SetWriter;
 use marco_core::Relations;
 
 use crate::metrics;
@@ -1367,7 +1367,7 @@ pub fn build(o: &Opts) -> Result<Report> {
             shard_bytes.push(b);
         }
     } else {
-        let store = marco_core::store::Store::open(&o.out)?;
+        let store = marco_core::store::v5::Store::open(&o.out)?;
         rep.sections = store.section_bytes();
         rep.snapshot_bytes = store.bytes();
         for s in store.shards.iter().flatten() {
@@ -1547,7 +1547,7 @@ mod tests {
             sub_buckets: 3,
             deletes: Some(DeletesOut { dir: tmp.path().join("deletes"), since_us: 0 }),
             cursors: [("time_us".to_string(), "1730000000000000".to_string())].into(),
-            format: FORMAT,
+            format: PAGED_FORMAT,
         };
         let rep = build(&o).unwrap();
         let f = &rep.rels[0];
@@ -1706,7 +1706,18 @@ mod tests {
             let c = crate::compare6::compare(&a, &b).unwrap();
             assert_eq!(c.out_lists, r5.rels.iter().map(|r| r.out_lists).sum::<u64>());
             assert_eq!(c.in_members, r5.rels.iter().map(|r| r.in_pairs).sum::<u64>());
-            assert!(Graph::open(&b).is_err(), "the server doesn't read FORMAT 6 yet");
+            let g = Graph::open(&b).unwrap();
+            for (ri, r) in r5.rels.iter().enumerate() {
+                let rel = ri as u8;
+                let n: u64 = (0..g.n_ids()).map(|id| g.read(|cx| g.out_count(cx, rel, id)).unwrap()).sum();
+                let m: u64 = (0..g.n_ids()).map(|id| g.read(|cx| g.in_count(cx, rel, id)).unwrap()).sum();
+                assert_eq!((n, m), (r.out_records, r.in_pairs), "{}", r.name);
+            }
+            // the graph's own writer, which checkpoints use, against the builder
+            let w = tmp.path().join(format!("rewritten-{subj_index}"));
+            g.write_snapshot(&w).unwrap();
+            let c = crate::compare6::compare(&a, &w).unwrap();
+            assert_eq!(c.out_records, r5.rels.iter().map(|r| r.out_records).sum::<u64>());
         }
     }
 
@@ -1726,7 +1737,7 @@ mod tests {
             sub_buckets: 1,
             deletes: None,
             cursors: BTreeMap::new(),
-            format: FORMAT,
+            format: PAGED_FORMAT,
         };
         let rep = build(&o).unwrap();
         (rep, Graph::open(&out).unwrap())

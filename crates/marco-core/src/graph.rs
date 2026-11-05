@@ -36,6 +36,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::did::{classify, unpack_plc, DidKey, DidRef};
+use crate::format6::{InSections, OutSections, SetWriter6};
 use crate::inset::{self, InList, PagedIn};
 use crate::obs::{self, Applied, Op};
 use crate::outlog::{self, OutBytes, OutList, PagedOut};
@@ -44,11 +45,11 @@ use crate::relation::{parse_uri, RelId, Relations};
 use crate::rkey::{self, is_tid, key_of};
 use crate::segment::Status;
 use crate::snapshot::{
-    decode_live, decode_stamps, decode_statuses, decode_tombs, encode_index, encode_live, encode_side, encode_stamps,
-    encode_statuses, encode_tombs, rel_section, write_directory, BaseDir, DidAt, DirParts, Index, Meta, RelStats,
-    ShardMeta, Side, Writer, FORMAT,
+    decode_live, decode_stamps, decode_statuses, decode_tombs, encode_live, encode_side, encode_stamps,
+    encode_statuses, encode_tombs, rel_section, write_directory, BaseDir, DidAt, DirParts, FileKind, Meta, PagedWriter,
+    RelStats, ShardMeta, Side, PAGED_FORMAT,
 };
-use crate::store::{now_ms, shard_file, Manifest, SetWriter, ShardFile, ShardFiles, Store, DEFAULT_SHARDS};
+use crate::store::{now_ms, shard_file, Manifest, ShardFile, ShardFiles, Store, DEFAULT_SHARDS};
 use crate::varint::u32_at;
 
 /// Out logs at least this long get a by-subject index in a snapshot.
@@ -284,11 +285,12 @@ impl Graph {
         let meta = store.dir.meta.clone();
         let rels = Relations::new(meta.relations.clone())?;
         let mut g = Graph::new(rels);
+        g.engine = store.engine.clone();
         g.subj_index = meta.subj_index as usize;
         g.base_n = meta.n_ids;
         g.width = meta.shard_width.max(1);
         g.shards = store.shards.len();
-        let n = BaseDir::new(&store.dir.snap).len();
+        let n = store.dir.dir().len();
         if n != g.base_n as usize {
             bail!("directory holds {n} DIDs, meta says {}", g.base_n);
         }
@@ -303,20 +305,20 @@ impl Graph {
                 g.pairs[i] += st.in_pairs as i64;
             }
             if f.meta.live_lo < f.meta.hi {
-                let v = decode_live(&f.bytes()[f.live.clone()]).with_context(|| f.name.clone())?;
+                let v = decode_live(f.pinned(&f.live)).with_context(|| f.name.clone())?;
                 if v.len() != (f.meta.hi - f.meta.live_lo) as usize {
                     bail!("{} holds {} live DIDs, its range {}", f.name, v.len(), f.meta.hi - f.meta.live_lo);
                 }
                 live.push((f.meta.live_lo, v));
             }
-            decode_statuses(&f.bytes()[f.status.clone()], |id, _| bits.push((id, true)));
+            decode_statuses(f.pinned(&f.status), |id, _| bits.push((id, true)));
             for (i, m) in tombs.iter_mut().enumerate() {
-                decode_tombs(&f.bytes()[f.rels[i].tomb.clone()], |a, k, t| {
+                decode_tombs(f.pinned(&f.rels[i].tomb), |a, k, t| {
                     m.insert((a, k), t);
                 });
             }
             for (i, m) in stamps.iter_mut().enumerate() {
-                decode_stamps(&f.bytes()[f.rels[i].stamp.clone()], |a, k, t, src| {
+                decode_stamps(f.pinned(&f.rels[i].stamp), |a, k, t, src| {
                     m.insert((a, k), (t, src));
                 });
             }
@@ -351,13 +353,10 @@ impl Graph {
         &self.engine
     }
 
-    /// Runs passes of `f` until one is clean, waiting on disk between them:
-    /// for tools, tests, admin jobs and checkpoints, never a tokio worker.
+    /// Runs `f` over the snapshot ([`Engine::read`]): for tools, tests, admin
+    /// jobs and checkpoints.
     pub fn read<T>(&self, f: impl Fn(&ReadCx<'_>) -> R<T>) -> Result<T, StorageError> {
-        match self.engine.pass(&mut Hold::none(), &f) {
-            Ok(t) => Ok(t),
-            Err(_) => self.engine.read_blocking(&mut Hold::new(), f),
-        }
+        self.engine.read(f)
     }
 
     pub fn snapshot(&self) -> Option<&Store> {
@@ -403,7 +402,7 @@ impl Graph {
     // ------------------------------------------------------------ directory
 
     fn base_dir(&self) -> Option<BaseDir<'_>> {
-        self.snapshot().map(|s| BaseDir::with(&s.dir.snap, &s.dir.ranges))
+        self.snapshot().map(|s| s.dir.dir())
     }
 
     #[inline]
@@ -411,15 +410,14 @@ impl Graph {
         self.snapshot()?.shards.get((id / self.width) as usize)?.as_deref()
     }
 
-    /// The shard file holding `id`'s lists, the relation's sections, the
-    /// shard-local id and the ids the file covers.
+    /// The shard file holding `id`'s lists and the shard-local id.
     #[inline]
-    fn shard(&self, rel: RelId, id: u32) -> Option<(&ShardFile, &crate::store::RelRanges, u32, usize)> {
+    fn shard(&self, id: u32) -> Option<(&ShardFile, u32)> {
         let f = self.file(id)?;
         if id >= f.meta.hi {
             return None;
         }
-        Some((f, &f.rels[rel as usize], id - f.meta.lo, (f.meta.hi - f.meta.lo) as usize))
+        Some((f, id - f.meta.lo))
     }
 
     /// A DID's id, or a node's (a list) by its AT URI.
@@ -503,7 +501,7 @@ impl Graph {
             return None;
         }
         let f = self.file(id)?;
-        let s = &f.bytes()[f.status.clone()];
+        let s = f.pinned(&f.status);
         let (mut lo, mut hi) = (0, s.len() / 5);
         while lo < hi {
             let mid = (lo + hi) / 2;
@@ -594,7 +592,7 @@ impl Graph {
         }
         if let Some(st) = self.snapshot() {
             for f in st.shards.iter().flatten() {
-                decode_statuses(&f.bytes()[f.status.clone()], |id, c| {
+                decode_statuses(f.pinned(&f.status), |id, c| {
                     if !seen.contains(&id) {
                         if let (Some(Some(s)), Some(d)) = (Status::from_code(c), self.did_of(id)) {
                             v.push((d, s));
@@ -693,46 +691,38 @@ impl Graph {
 
     // ------------------------------------------------------------ base lists
 
-    fn base_out<'a>(&'a self, _cx: &ReadCx<'a>, rel: RelId, id: u32) -> R<Option<PagedOut<'a>>> {
+    fn base_out<'a>(&'a self, cx: &ReadCx<'a>, rel: RelId, id: u32) -> R<Option<PagedOut<'a>>> {
         let st = &self.state[rel as usize];
         if !st.out_over.is_empty() {
             if let Some(b) = st.out_over.get(&id) {
                 return Ok(Some(PagedOut::Whole(OutList::parse(b, self.subj_index))));
             }
         }
-        let Some((f, r, local, n)) = self.shard(rel, id) else { return Ok(None) };
-        if r.out_idx.is_empty() {
-            return Ok(None);
+        let Some((f, local)) = self.shard(id) else { return Ok(None) };
+        match f.out(rel as usize, self.subj_index) {
+            Some(side) => side.list(cx, local),
+            None => Ok(None),
         }
-        let b = f.bytes();
-        let Some(range) = Index::parse(&b[r.out_idx.clone()], n).and_then(|ix| ix.range(local)) else {
-            return Ok(None);
-        };
-        let l = OutList::parse(&b[r.out_dat.start + range.start..r.out_dat.start + range.end], self.subj_index);
-        Ok(Some(PagedOut::Whole(l)))
     }
 
-    fn base_in<'a>(&'a self, _cx: &ReadCx<'a>, rel: RelId, id: u32) -> R<Option<PagedIn<'a>>> {
+    fn base_in<'a>(&'a self, cx: &ReadCx<'a>, rel: RelId, id: u32) -> R<Option<PagedIn<'a>>> {
         let st = &self.state[rel as usize];
         if !st.in_over.is_empty() {
             if let Some(b) = st.in_over.get(&id) {
                 return Ok(Some(PagedIn::Whole(InList::parse(b))));
             }
         }
-        let Some((f, r, local, n)) = self.shard(rel, id) else { return Ok(None) };
-        if r.in_idx.is_empty() {
-            return Ok(None);
+        let Some((f, local)) = self.shard(id) else { return Ok(None) };
+        match f.inn(rel as usize) {
+            Some(side) => side.set(cx, local),
+            None => Ok(None),
         }
-        let b = f.bytes();
-        let Some(range) = Index::parse(&b[r.in_idx.clone()], n).and_then(|ix| ix.range(local)) else {
-            return Ok(None);
-        };
-        Ok(Some(PagedIn::Whole(InList::parse(&b[r.in_dat.start + range.start..r.in_dat.start + range.end]))))
     }
 
     fn base_side(&self, rel: RelId, actor: u32) -> Option<Side<'_>> {
-        let (f, r, _, _) = self.shard(rel, actor)?;
-        (!r.side.is_empty()).then(|| Side::parse(&f.bytes()[r.side.clone()]))
+        let (f, _) = self.shard(actor)?;
+        let r = &f.rels[rel as usize].side;
+        (!r.is_empty()).then(|| Side::parse(f.pinned(r)))
     }
 
     pub fn rkey_string(&self, rel: RelId, actor: u32, key: u64) -> Option<String> {
@@ -2044,7 +2034,7 @@ impl Graph {
         let oth_v: Vec<&str> = oth.iter().map(|p| p.0.as_str()).collect();
         let plc_ids: Vec<u32> = plc.iter().map(|p| p.1).collect();
         let oth_ids: Vec<u32> = oth.iter().map(|p| p.1).collect();
-        let mut set = SetWriter::create(path, n, self.shards)?;
+        let mut set = SetWriter6::create(path, n, self.shards)?;
         let w = set.dir.as_mut().unwrap();
         write_directory(
             w,
@@ -2056,10 +2046,10 @@ impl Graph {
             let body = self.write_shard_body(&mut w, lo, hi, None, false)?;
             let mut m = set.shard_meta(k, body.stats);
             m.statuses = body.statuses;
-            SetWriter::finish_shard(w, &m)?;
+            w.finish("shard", &m)?;
         }
         let meta = Meta {
-            format: FORMAT,
+            format: PAGED_FORMAT,
             build: set.build,
             shard_width: set.width,
             n_ids: n,
@@ -2068,7 +2058,8 @@ impl Graph {
             subj_index: self.subj_index as u32,
             relations: self.rels.list.clone(),
         };
-        set.finish(&meta)
+        set.finish(&meta, BTreeMap::new())?;
+        Ok(())
     }
 
     /// Which shards have changed since the snapshot.
@@ -2124,7 +2115,7 @@ impl Graph {
         let dirty = self.dirty_shards();
         let w = self.width;
         let mut m = Manifest {
-            format: FORMAT,
+            format: PAGED_FORMAT,
             build: store.dir.meta.build,
             checkpoint,
             written_ms: now_ms(),
@@ -2146,10 +2137,10 @@ impl Graph {
             if store.manifest.shards.values().flat_map(ShardFiles::files).any(|n| n == name) {
                 bail!("{name} is in the committed manifest: checkpoint {checkpoint} was used before");
             }
-            let mut wr = Writer::create(&path.join(&name))?;
+            let mut wr = PagedWriter::create(&path.join(&name), FileKind::Base)?;
             let body = self.write_shard_body(&mut wr, lo, hi, old, true)?;
             let meta = ShardMeta {
-                format: FORMAT,
+                format: PAGED_FORMAT,
                 build: store.dir.meta.build,
                 shard: k as u32,
                 lo,
@@ -2169,12 +2160,13 @@ impl Graph {
         Ok(m)
     }
 
-    /// A shard's sections for ids lo..hi. With `old` (the shard's file in
-    /// this graph's snapshot), lists without a delta are copied as bytes.
+    /// A shard's sections for ids lo..hi, every list re-encoded from what
+    /// the graph reads. `old` is the shard's file in this graph's snapshot,
+    /// where its statuses, tombstones and stamps come from.
     /// `live`: the shard's ids past the directory keep their DIDs in it.
     fn write_shard_body(
         &self,
-        w: &mut Writer,
+        w: &mut PagedWriter,
         lo: u32,
         hi: u32,
         old: Option<&ShardFile>,
@@ -2186,14 +2178,14 @@ impl Graph {
         }
         let mut sts: Vec<(u32, u8)> = Vec::new();
         if let Some(f) = old {
-            decode_statuses(&f.bytes()[f.status.clone()], |id, c| {
+            decode_statuses(f.pinned(&f.status), |id, c| {
                 if !self.status.contains_key(&id) {
                     sts.push((id, c));
                 }
             });
         } else if let Some(s) = self.snapshot() {
             for f in s.shards.iter().flatten() {
-                decode_statuses(&f.bytes()[f.status.clone()], |id, c| {
+                decode_statuses(f.pinned(&f.status), |id, c| {
                     if (lo..hi).contains(&id) && !self.status.contains_key(&id) {
                         sts.push((id, c));
                     }
@@ -2207,19 +2199,19 @@ impl Graph {
                 .map(|(&id, &s)| (id, Status::code(s))),
         );
         sts.sort_unstable();
-        w.section("status", &encode_statuses(&sts))?;
+        w.pinned("status", &encode_statuses(&sts))?;
         let dids = if live && hi > self.base_n {
             &self.live_dids[(lo.max(self.base_n) - self.base_n) as usize..(hi - self.base_n) as usize]
         } else {
             &[][..]
         };
-        w.section("live", &encode_live(dids))?;
+        w.pinned("live", &encode_live(dids))?;
         Ok(ShardBody { stats, statuses: sts.len() as u64 })
     }
 
     fn write_shard_rel(
         &self,
-        w: &mut Writer,
+        w: &mut PagedWriter,
         rel: RelId,
         lo: u32,
         hi: u32,
@@ -2228,55 +2220,10 @@ impl Graph {
         let r = rel as usize;
         let st = &self.state[r];
         let mut stats = RelStats::default();
-        let mut offsets = Vec::with_capacity((hi - lo) as usize + 1);
-        let mut buf = Vec::new();
-        let old_rel = old.map(|f| (f, &f.rels[r], (f.meta.hi - f.meta.lo) as usize));
-        // byte runs of unchanged lists, flushed when a changed list breaks them
-        let mut run: Option<(usize, usize)> = None;
-        let flush = |w: &mut Writer, run: &mut Option<(usize, usize)>, b: &[u8]| -> Result<()> {
-            if let Some((a, z)) = run.take() {
-                w.write(&b[a..z])?;
-            }
-            Ok(())
-        };
-        let old_list = |id: u32, dat: bool| -> Option<std::ops::Range<usize>> {
-            let (f, rr, n) = old_rel?;
-            if id >= f.meta.hi {
-                return None;
-            }
-            let (idx, d) = if dat { (&rr.out_idx, &rr.out_dat) } else { (&rr.in_idx, &rr.in_dat) };
-            if idx.is_empty() {
-                return None;
-            }
-            let x = Index::parse(&f.bytes()[idx.clone()], n)?.range(id - f.meta.lo)?;
-            Some(d.start + x.start..d.start + x.end)
-        };
-        let ob = old.map_or(&[][..], |f| f.bytes());
         let mut side: Vec<(u32, u64, String)> = Vec::new();
-        let mut changed_actors: FxHashSet<u32> = FxHashSet::default();
-        w.begin(&rel_section(r, "out.dat"));
+        let mut out = OutSections::new(r, self.subj_index);
+        out.begin(w)?;
         for id in lo..hi {
-            let unchanged = old.is_some() && !st.out.contains_key(&id) && !st.out_over.contains_key(&id);
-            if unchanged {
-                offsets.push(w.section_len() + run.map_or(0, |(a, z)| (z - a) as u64));
-                if let Some(x) = old_list(id, true) {
-                    let (n, bytes) = outlog::bytes_of(&ob[x.clone()], self.subj_index);
-                    stats.out_records += n as u64;
-                    stats.out_lists += (n > 0) as u64;
-                    stats.out_bytes.add(&bytes);
-                    run = match run {
-                        Some((a, z)) if z == x.start => Some((a, x.end)),
-                        _ => {
-                            flush(w, &mut run, ob)?;
-                            Some((x.start, x.end))
-                        }
-                    };
-                }
-                continue;
-            }
-            flush(w, &mut run, ob)?;
-            offsets.push(w.section_len());
-            changed_actors.insert(id);
             let v = self.blocking(|cx| self.out_all(cx, rel, id))?;
             if v.is_empty() {
                 continue;
@@ -2286,70 +2233,31 @@ impl Graph {
                     side.push((id, k, self.rkey_string(rel, id, k).unwrap_or_default()));
                 }
             }
-            buf.clear();
-            outlog::encode(&v, self.subj_index, &mut buf, &mut stats.out_bytes);
-            w.write(&buf)?;
+            out.push(id - lo, &v)?;
+            out.drain(w)?;
             stats.out_records += v.len() as u64;
             stats.out_lists += 1;
         }
-        flush(w, &mut run, ob)?;
-        offsets.push(w.section_len());
-        w.end()?;
-        w.section(&rel_section(r, "out.idx"), &encode_index(&offsets)?)?;
-        if let Some((f, rr, _)) = old_rel {
-            if !rr.side.is_empty() {
-                Side::parse(&f.bytes()[rr.side.clone()]).for_each(|a, k, s| {
-                    if (lo..hi).contains(&a) && !changed_actors.contains(&a) {
-                        side.push((a, k, s.to_string()));
-                    }
-                });
-            }
-        }
-        side.sort_unstable_by_key(|e| (e.0, e.1));
+        stats.out_bytes = out.finish(w, hi - lo)?.0;
         stats.non_tid = side.len() as u64;
         let side_ref: Vec<(u32, u64, &str)> = side.iter().map(|(a, k, s)| (*a, *k, s.as_str())).collect();
-        w.section(&rel_section(r, "side"), &encode_side(&side_ref))?;
+        w.pinned(&rel_section(r, "side"), &encode_side(&side_ref))?;
 
-        offsets.clear();
-        w.begin(&rel_section(r, "in.dat"));
+        let mut inn = InSections::new(r);
         for id in lo..hi {
-            let unchanged = old.is_some() && !st.inn.contains_key(&id) && !st.in_over.contains_key(&id);
-            if unchanged {
-                offsets.push(w.section_len() + run.map_or(0, |(a, z)| (z - a) as u64));
-                if let Some(x) = old_list(id, false) {
-                    let n = InList::parse(&ob[x.clone()]).len();
-                    stats.in_pairs += n as u64;
-                    stats.in_lists += (n > 0) as u64;
-                    run = match run {
-                        Some((a, z)) if z == x.start => Some((a, x.end)),
-                        _ => {
-                            flush(w, &mut run, ob)?;
-                            Some((x.start, x.end))
-                        }
-                    };
-                }
-                continue;
-            }
-            flush(w, &mut run, ob)?;
-            offsets.push(w.section_len());
             let v = self.blocking(|cx| self.in_set(cx, rel, id))?;
             if v.is_empty() {
                 continue;
             }
-            buf.clear();
-            inset::encode(&v, &mut buf);
-            w.write(&buf)?;
+            inn.push(id - lo, &v)?;
             stats.in_pairs += v.len() as u64;
             stats.in_lists += 1;
         }
-        flush(w, &mut run, ob)?;
-        offsets.push(w.section_len());
-        w.end()?;
-        w.section(&rel_section(r, "in.idx"), &encode_index(&offsets)?)?;
+        inn.finish(w, hi - lo)?;
 
         let mut tombs: Vec<(u32, u64, i64)> = Vec::new();
         let base_tombs = |f: &ShardFile, tombs: &mut Vec<(u32, u64, i64)>| {
-            decode_tombs(&f.bytes()[f.rels[r].tomb.clone()], |a, key, t| {
+            decode_tombs(f.pinned(&f.rels[r].tomb), |a, key, t| {
                 if (lo..hi).contains(&a) && !st.untomb.contains(&(a, key)) && !st.tomb.contains_key(&(a, key)) {
                     tombs.push((a, key, t));
                 }
@@ -2367,11 +2275,11 @@ impl Graph {
         }
         tombs.sort_unstable();
         stats.tombstones = tombs.len() as u64;
-        w.section(&rel_section(r, "tomb"), &encode_tombs(&tombs))?;
+        w.pinned(&rel_section(r, "tomb"), &encode_tombs(&tombs))?;
 
         let mut stamps: Vec<(u32, u64, i64, u32)> = Vec::new();
         let base_stamps = |f: &ShardFile, stamps: &mut Vec<(u32, u64, i64, u32)>| {
-            decode_stamps(&f.bytes()[f.rels[r].stamp.clone()], |a, key, t, src| {
+            decode_stamps(f.pinned(&f.rels[r].stamp), |a, key, t, src| {
                 if (lo..hi).contains(&a) && !st.stamp.contains_key(&(a, key)) {
                     stamps.push((a, key, t, src));
                 }
@@ -2393,7 +2301,7 @@ impl Graph {
             stamps.retain(|t| t.2 >= cutoff);
         }
         stamps.sort_unstable();
-        w.section(&rel_section(r, "stamp"), &encode_stamps(&stamps))?;
+        w.pinned(&rel_section(r, "stamp"), &encode_stamps(&stamps))?;
         Ok(stats)
     }
 

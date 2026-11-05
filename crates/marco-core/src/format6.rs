@@ -721,7 +721,8 @@ struct RelView {
 /// One FORMAT 6 shard base with no patches, for tools and tests: the
 /// builder's checks and the format comparison. Its pinned sections are in
 /// memory; its pages are read through an engine that has the file as `file`.
-/// The engine-backed store builds the same [`OutSide`] and [`InSide`].
+/// The served store ([`crate::store::ShardFile`]) builds the same
+/// [`OutSide`] and [`InSide`].
 pub struct ShardView {
     pub meta: ShardMeta,
     pub pinned: Pinned,
@@ -877,18 +878,6 @@ impl SetWriter6 {
         sync_dir(parent)?;
         Ok(footer)
     }
-}
-
-/// A FORMAT 6 snapshot's manifest, which [`Manifest::read`] refuses until
-/// the server reads FORMAT 6.
-pub fn read_manifest(dir: &Path) -> Result<Manifest> {
-    let p = dir.join(crate::store::MANIFEST);
-    let b = std::fs::read(&p).with_context(|| format!("read {}", p.display()))?;
-    let m: Manifest = serde_json::from_slice(&b).with_context(|| format!("parse {}", p.display()))?;
-    if m.format != crate::snapshot::PAGED_FORMAT {
-        bail!("{}: format {}, not {}", p.display(), m.format, crate::snapshot::PAGED_FORMAT);
-    }
-    Ok(m)
 }
 
 #[cfg(test)]

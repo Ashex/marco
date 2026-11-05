@@ -3,18 +3,45 @@
 //! cached per snapshot build.
 
 use std::collections::{BTreeMap, BinaryHeap};
+use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use marco_core::did::unpack_plc;
-use marco_core::inset::InList;
-use marco_core::snapshot::{rel_section, BaseDir, DidAt, Index};
-use marco_core::store::Store;
-use marco_core::varint;
+use marco_core::read::{ReadCx, StorageError, R};
+use marco_core::snapshot::{BaseDir, DidAt};
+use marco_core::store::{ShardFile, Store};
 
 const TOP: usize = 20;
+
+/// Shard-local ids a pass reads the lengths of.
+const CHUNK: u32 = 4096;
+
+/// (local id, length) of relation `r`'s lists of `ids` in one direction: a
+/// big list's from its pinned head, a small one's from its page.
+fn lens(cx: &ReadCx<'_>, f: &ShardFile, r: usize, subj: usize, out: bool, ids: Range<u32>) -> R<Vec<(u32, u64)>> {
+    let mut v = Vec::new();
+    match (out, f.out(r, subj), f.inn(r)) {
+        (true, Some(side), _) => {
+            for local in ids {
+                if let Some(l) = side.list(cx, local)?.filter(|l| !l.is_empty()) {
+                    v.push((local, l.len() as u64));
+                }
+            }
+        }
+        (false, _, Some(side)) => {
+            for local in ids {
+                if let Some(l) = side.set(cx, local)?.filter(|l| !l.is_empty()) {
+                    v.push((local, l.len() as u64));
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(v)
+}
 
 #[derive(Default, Clone)]
 pub struct Dist {
@@ -165,38 +192,21 @@ fn compute(path: &std::path::Path, done: &AtomicUsize, total: &AtomicUsize) -> R
                         let k = next.fetch_add(1, Ordering::Relaxed);
                         let Some(f) = store.shards.get(k) else { break };
                         let Some(f) = f else { continue };
-                        let (s, m) = (&f.snap, &f.meta);
-                        let n = (m.hi - m.lo) as usize;
-                        let b = s.bytes();
+                        let m = &f.meta;
+                        let n = m.hi - m.lo;
                         for (r, (out, inn, big)) in acc.iter_mut().enumerate() {
-                            for (part, dist, is_out) in [("out", &mut *out, true), ("in", &mut *inn, false)] {
-                                let (Some(idx), Some(dat)) = (
-                                    s.range(&rel_section(r, &format!("{part}.idx"))),
-                                    s.range(&rel_section(r, &format!("{part}.dat"))),
-                                ) else {
-                                    continue;
-                                };
-                                if idx.is_empty() {
-                                    continue;
-                                }
-                                let Some(ix) = Index::parse(&b[idx], n) else { continue };
-                                for local in 0..n as u32 {
-                                    let Some(rg) = ix.range(local) else { continue };
-                                    let list = &b[dat.start + rg.start..dat.start + rg.end];
-                                    let len = if is_out {
-                                        varint::get(list, &mut 0)
-                                    } else {
-                                        InList::parse(list).len() as u64
-                                    };
-                                    if len == 0 {
-                                        continue;
-                                    }
-                                    *dist.by_len.entry(len).or_default() += 1;
-                                    if len >= subj as u64 {
-                                        let h = &mut big[is_out as usize];
-                                        h.push(std::cmp::Reverse((len, m.lo + local)));
-                                        if h.len() > TOP {
-                                            h.pop();
+                            for (dist, is_out) in [(&mut *out, true), (&mut *inn, false)] {
+                                for lo in (0..n).step_by(CHUNK as usize) {
+                                    let ids = lo..(lo + CHUNK).min(n);
+                                    let lens = store.engine.read(|cx| lens(cx, f, r, subj, is_out, ids.clone()))?;
+                                    for (local, len) in lens {
+                                        *dist.by_len.entry(len).or_default() += 1;
+                                        if len >= subj as u64 {
+                                            let h = &mut big[is_out as usize];
+                                            h.push(std::cmp::Reverse((len, m.lo + local)));
+                                            if h.len() > TOP {
+                                                h.pop();
+                                            }
                                         }
                                     }
                                 }
@@ -204,13 +214,13 @@ fn compute(path: &std::path::Path, done: &AtomicUsize, total: &AtomicUsize) -> R
                         }
                         done.fetch_add(1, Ordering::Relaxed);
                     }
-                    acc
+                    Ok(acc)
                 })
             })
             .collect();
-        hs.into_iter().map(|h| h.join().expect("list stats thread")).collect()
-    });
-    let dir = BaseDir::new(&store.dir.snap);
+        hs.into_iter().map(|h| h.join().expect("list stats thread")).collect::<Result<_, StorageError>>()
+    })?;
+    let dir = store.dir.dir();
     let mut rels = Vec::with_capacity(nrel);
     for r in 0..nrel {
         let (mut out, mut inn) = (Dist::default(), Dist::default());

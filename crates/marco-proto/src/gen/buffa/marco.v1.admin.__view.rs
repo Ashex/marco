@@ -8844,7 +8844,7 @@ impl ::serde::Serialize for GetStorageResponseOwnedView {
 }
 #[derive(Clone, Debug, Default)]
 pub struct SectionView<'a> {
-    /// As in the files: r0.out.dat, dir.plc …
+    /// As in the files: r0.out.small, dir.plc …
     ///
     /// Field 1: `name`
     pub name: &'a str,
@@ -9118,7 +9118,7 @@ impl SectionOwnedView {
     pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
         self.0.into_bytes()
     }
-    /// As in the files: r0.out.dat, dir.plc …
+    /// As in the files: r0.out.small, dir.plc …
     ///
     /// Field 1: `name`
     #[must_use]

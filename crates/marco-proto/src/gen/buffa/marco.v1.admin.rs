@@ -5552,7 +5552,7 @@ pub const __GET_STORAGE_RESPONSE_JSON_ANY: ::buffa::type_registry::JsonAnyEntry 
 #[derive(::serde::Serialize, ::serde::Deserialize)]
 #[serde(default)]
 pub struct Section {
-    /// As in the files: r0.out.dat, dir.plc …
+    /// As in the files: r0.out.small, dir.plc …
     ///
     /// Field 1: `name`
     #[serde(

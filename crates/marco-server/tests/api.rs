@@ -831,7 +831,7 @@ async fn admin_rpcs() {
     assert!(sh.shards.iter().all(|x| x.verify == "unverified"));
 
     let st = a.get_storage(GetStorageRequest::default()).await.unwrap().into_owned();
-    assert!(st.sections.iter().any(|x| x.name == "r0.out.dat" && x.rel == "follow" && x.files == 4));
+    assert!(st.sections.iter().any(|x| x.name == "r0.out.small" && x.rel == "follow" && x.files == 4));
     assert!(st.sections.iter().any(|x| x.rel == "directory"));
     assert_eq!(st.delta_lists, 2);
     assert_eq!(st.deltas.len(), 2);
