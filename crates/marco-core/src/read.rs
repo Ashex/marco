@@ -16,19 +16,19 @@
 //! guard that could have seen it is gone. Passes never wait on I/O while
 //! holding a guard.
 //!
-//! The [`Engine`] here keeps whole files in memory, owned or mapped, and
-//! never misses a page its files have. The paged engine keeps this API.
+//! The [`Engine`] lives in [`crate::store::engine`]: it keeps whole files in
+//! memory, or reads FORMAT 6 files a page at a time through its cache.
 
 use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::ops::Range;
-use std::path::Path;
+use std::sync::Arc;
 
-use anyhow::{Context, Result};
 pub use crossbeam_epoch::Guard;
 
-use crate::snapshot::{Bytes, PagedFooter};
-use crate::store::page::{FileId, Page, PageId, PAGE};
+use crate::store::cache::{Cache, NO_FRAME};
+pub use crate::store::engine::Engine;
+use crate::store::page::{Page, PageId, PAGE};
 
 /// A pass can't finish: a page it needs isn't in memory. The [`ReadCx`] that
 /// returned it has already recorded the page, so callers propagate it with
@@ -66,17 +66,19 @@ impl PageSet {
         self.0.iter().copied()
     }
 
+    /// Whether `p` is in the set; it must be sorted ([`PageSet::normalize`]).
+    pub fn contains(&self, p: PageId) -> bool {
+        !self.0.is_empty() && self.0.binary_search(&p).is_ok()
+    }
+
     /// Sorted, repeats removed.
     pub fn normalize(&mut self) {
         self.0.sort_unstable();
         self.0.dedup();
     }
-
-    fn extend(&mut self, o: PageSet) {
-        self.0.extend(o.0);
-        self.normalize();
-    }
 }
+
+static NO_PAGES: PageSet = PageSet(Vec::new());
 
 /// What one pass read.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -100,7 +102,7 @@ pub struct ReadStats {
 /// # use marco_core::read::{BlockAt, Blocks, Engine, PageBlocks, ReadCx};
 /// # use marco_core::snapshot::Bytes;
 /// # use marco_core::store::page::{PageId, PAGE};
-/// # let mut engine = Engine::new();
+/// # let engine = Engine::new();
 /// # let file = engine.add("f", Bytes::Owned(vec![7u8; PAGE]));
 /// # let at = [BlockAt::new(PageId::new(file, 0), 0, 16)];
 /// # let blocks = PageBlocks::new(&at);
@@ -116,7 +118,7 @@ pub struct ReadStats {
 /// # use marco_core::read::{BlockAt, Blocks, Engine, PageBlocks, ReadCx};
 /// # use marco_core::snapshot::Bytes;
 /// # use marco_core::store::page::{PageId, PAGE};
-/// # let mut engine = Engine::new();
+/// # let engine = Engine::new();
 /// # let file = engine.add("f", Bytes::Owned(vec![7u8; PAGE]));
 /// # let at = [BlockAt::new(PageId::new(file, 0), 0, 16)];
 /// # let blocks = PageBlocks::new(&at);
@@ -134,7 +136,7 @@ pub struct ReadStats {
 /// # use marco_core::read::{BlockAt, Blocks, Engine, Hold, PageBlocks};
 /// # use marco_core::snapshot::Bytes;
 /// # use marco_core::store::page::{PageId, PAGE};
-/// # let mut engine = Engine::new();
+/// # let engine = Engine::new();
 /// # let file = engine.add("f", Bytes::Owned(vec![7u8; PAGE]));
 /// # let at = [BlockAt::new(PageId::new(file, 0), 0, 16)];
 /// # let blocks = PageBlocks::new(&at);
@@ -146,7 +148,7 @@ pub struct ReadStats {
 /// # use marco_core::read::{BlockAt, Blocks, Engine, Hold, PageBlocks};
 /// # use marco_core::snapshot::Bytes;
 /// # use marco_core::store::page::{PageId, PAGE};
-/// # let mut engine = Engine::new();
+/// # let engine = Engine::new();
 /// # let file = engine.add("f", Bytes::Owned(vec![7u8; PAGE]));
 /// # let at = [BlockAt::new(PageId::new(file, 0), 0, 16)];
 /// # let blocks = PageBlocks::new(&at);
@@ -158,6 +160,12 @@ pub struct ReadCx<'g> {
     engine: &'g Engine,
     /// Record pages served, for the pass to pin if it misses.
     keep_touched: bool,
+    /// Pages the request already holds: reading them again isn't a new use
+    /// for the eviction policy, so a page a request fetched and then reads
+    /// doesn't look reused, and one big scan stays in the small queue.
+    held: &'g PageSet,
+    /// The last page served, so a run of blocks in one page counts once.
+    last: Cell<Option<PageId>>,
     missing: RefCell<PageSet>,
     touched: RefCell<PageSet>,
     stats: Cell<ReadStats>,
@@ -168,14 +176,16 @@ impl<'g> ReadCx<'g> {
     /// [`Engine::pin`] on the same engine. It keeps no record of the pages it
     /// serves (as [`Hold::none`]).
     pub fn new(engine: &'g Engine, guard: &'g Guard) -> ReadCx<'g> {
-        ReadCx::with(engine, guard, false)
+        ReadCx::with(engine, guard, false, &NO_PAGES)
     }
 
-    fn with(engine: &'g Engine, guard: &'g Guard, keep_touched: bool) -> ReadCx<'g> {
+    pub(crate) fn with(engine: &'g Engine, guard: &'g Guard, keep_touched: bool, held: &'g PageSet) -> ReadCx<'g> {
         ReadCx {
             guard,
             engine,
             keep_touched,
+            held,
+            last: Cell::new(None),
             missing: RefCell::new(PageSet::default()),
             touched: RefCell::new(PageSet::default()),
             stats: Cell::new(ReadStats::default()),
@@ -189,7 +199,9 @@ impl<'g> ReadCx<'g> {
     pub fn page(&self, p: PageId) -> R<&'g Page> {
         let mut st = self.stats.get();
         st.pages += 1;
-        let r = match self.engine.resident(p) {
+        let bump = self.last.get() != Some(p) && !self.held.contains(p);
+        self.last.set(Some(p));
+        let r = match self.engine.lookup(p, self.guard, bump) {
             Some(page) => {
                 if self.keep_touched {
                     self.touched.borrow_mut().insert(p);
@@ -229,7 +241,7 @@ impl<'g> ReadCx<'g> {
         self.engine
     }
 
-    fn into_sets(self) -> (PageSet, PageSet) {
+    pub(crate) fn into_sets(self) -> (PageSet, PageSet) {
         let mut missing = self.missing.into_inner();
         missing.normalize();
         let mut touched = self.touched.into_inner();
@@ -318,21 +330,25 @@ impl<'g> Blocks<'g> for PageBlocks<'g> {
 /// other blocking readers make one with [`Hold::new`] per request and drop it
 /// when the request is done; the first pass on a tokio worker uses
 /// [`Hold::none`], since a request that misses there starts over on the pool.
-#[derive(Debug)]
+/// Dropping it unpins everything.
 pub struct Hold {
-    keep: bool,
-    pins: PageSet,
+    pub(crate) keep: bool,
+    pub(crate) pins: PageSet,
+    /// The frame behind each pin, in the order of `pins` ([`NO_FRAME`] for a
+    /// page of a file kept whole, which needs no pin).
+    frames: Vec<u32>,
+    cache: Option<Arc<Cache>>,
 }
 
 impl Hold {
     /// A hold that pins what a missing pass touched.
     pub fn new() -> Hold {
-        Hold { keep: true, pins: PageSet::default() }
+        Hold { keep: true, pins: PageSet::default(), frames: Vec::new(), cache: None }
     }
 
     /// A hold that pins nothing.
     pub fn none() -> Hold {
-        Hold { keep: false, pins: PageSet::default() }
+        Hold { keep: false, pins: PageSet::default(), frames: Vec::new(), cache: None }
     }
 
     /// Pages pinned.
@@ -342,14 +358,34 @@ impl Hold {
 
     /// Unpins everything.
     pub fn release(&mut self) {
+        if let Some(c) = &self.cache {
+            if self.frames.iter().any(|&f| f != NO_FRAME) {
+                let guard = crossbeam_epoch::pin();
+                for &f in &self.frames {
+                    if f != NO_FRAME {
+                        c.unpin(f, &guard);
+                    }
+                }
+            }
+        }
         self.pins = PageSet::default();
+        self.frames.clear();
     }
 
-    // The resident engine never evicts, so a pin is only bookkeeping here.
-    fn pin(&mut self, touched: PageSet) {
-        if self.keep {
-            self.pins.extend(touched);
+    /// Takes pins already made on `(page, frame)`s that aren't held yet.
+    pub(crate) fn add(&mut self, mut add: Vec<(PageId, u32)>, cache: Option<&Arc<Cache>>) {
+        if add.is_empty() {
+            return;
         }
+        match (&self.cache, cache) {
+            (None, Some(c)) => self.cache = Some(c.clone()),
+            (Some(a), Some(b)) => assert!(Arc::ptr_eq(a, b), "a Hold is used on two engines"),
+            _ => {}
+        }
+        add.extend(self.pins.0.iter().copied().zip(self.frames.iter().copied()));
+        add.sort_unstable_by_key(|x| x.0);
+        self.pins.0 = add.iter().map(|x| x.0).collect();
+        self.frames = add.into_iter().map(|x| x.1).collect();
     }
 }
 
@@ -359,10 +395,22 @@ impl Default for Hold {
     }
 }
 
+impl Drop for Hold {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+impl fmt::Debug for Hold {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Hold").field("keep", &self.keep).field("pins", &self.pins).finish()
+    }
+}
+
 /// What a pass missed: hand it to [`Engine::fetch_blocking`].
 #[derive(Debug)]
 pub struct Misses {
-    pages: PageSet,
+    pub(crate) pages: PageSet,
 }
 
 impl Misses {
@@ -434,118 +482,15 @@ impl fmt::Display for StorageError {
 
 impl std::error::Error for StorageError {}
 
-struct ResidentFile {
-    name: String,
-    bytes: Bytes,
-    footer: Option<PagedFooter>,
-}
-
-/// The page store, one per process, shared by every reader. This one keeps
-/// each file whole in memory, so a page is missing only if its file doesn't
-/// have it.
-#[derive(Default)]
-pub struct Engine {
-    files: Vec<ResidentFile>,
-}
-
-impl Engine {
-    pub fn new() -> Engine {
-        Engine::default()
-    }
-
-    /// Registers a file's bytes under `name`. Its pages are `bytes` in 4 KiB
-    /// steps; a partial last page is past the end.
-    pub fn add(&mut self, name: impl Into<String>, bytes: Bytes) -> FileId {
-        self.push(ResidentFile { name: name.into(), bytes, footer: None })
-    }
-
-    /// Maps the FORMAT 6 file at `path`, checks its footer and registers it
-    /// under its file name.
-    pub fn open(&mut self, path: &Path) -> Result<(FileId, PagedFooter)> {
-        let f = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-        // SAFETY: snapshot files are written once and renamed into place; nothing
-        // writes to one after that.
-        let map = unsafe { memmap2::Mmap::map(&f)? };
-        let footer = PagedFooter::read(&map).with_context(|| path.display().to_string())?;
-        let name = path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
-        let id = self.push(ResidentFile { name, bytes: Bytes::Map(map), footer: Some(footer.clone()) });
-        Ok((id, footer))
-    }
-
-    fn push(&mut self, f: ResidentFile) -> FileId {
-        self.files.push(f);
-        FileId((self.files.len() - 1) as u32)
-    }
-
-    /// A registered file's name.
-    pub fn name(&self, f: FileId) -> Option<&str> {
-        self.files.get(f.0 as usize).map(|f| f.name.as_str())
-    }
-
-    /// A guard for a pass. Only guards from here may build a [`ReadCx`] on
-    /// this engine.
-    pub fn pin(&self) -> Guard {
-        crossbeam_epoch::pin()
-    }
-
-    #[inline]
-    fn resident(&self, p: PageId) -> Option<&Page> {
-        let off = p.offset() as usize;
-        self.files.get(p.file.0 as usize)?.bytes.get(off..off + PAGE)?.try_into().ok()
-    }
-
-    /// One pass of `f`. Never waits. Ok if `f` succeeded and nothing was
-    /// missing; otherwise the pages that were, after pinning the pages the
-    /// pass touched into `hold` (before the guard drops).
-    pub fn pass<T>(&self, hold: &mut Hold, f: impl FnOnce(&ReadCx<'_>) -> R<T>) -> Result<T, Misses> {
-        let guard = self.pin();
-        let cx = ReadCx::with(self, &guard, hold.keep);
-        match f(&cx) {
-            Ok(t) if cx.clean() => Ok(t),
-            _ => {
-                let (pages, touched) = cx.into_sets();
-                hold.pin(touched);
-                Err(Misses { pages })
-            }
-        }
-    }
-
-    /// Reads what a pass missed into memory, pinned into `hold`, waiting on
-    /// disk. Never call it on a tokio worker. Here every page a file has is
-    /// already in memory, so whatever was missing is an error.
-    pub fn fetch_blocking(&self, m: Misses, _hold: &mut Hold) -> Result<(), StorageError> {
-        let Some(p) = m.pages.iter().next() else {
-            return Err(StorageError::NoPage);
-        };
-        let f = self.files.get(p.file.0 as usize);
-        Err(StorageError::Short(BadPage {
-            file: f.map_or_else(|| format!("file {}", p.file.0), |f| f.name.clone()),
-            section: f.and_then(|f| f.footer.as_ref()?.page_at(p.page)).map(|s| s.name.clone()),
-            page: p.page,
-        }))
-    }
-
-    /// Runs passes of `f` until one is clean, fetching what each missed in
-    /// between: the loop every reader that may wait on disk runs. Never call
-    /// it on a tokio worker.
-    pub fn read_blocking<T>(&self, hold: &mut Hold, f: impl Fn(&ReadCx<'_>) -> R<T>) -> Result<T, StorageError> {
-        loop {
-            match self.pass(hold, &f) {
-                Ok(t) => return Ok(t),
-                Err(m) => self.fetch_blocking(m, hold)?,
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::snapshot::{FileKind, PagedWriter};
+    use crate::snapshot::{Bytes, FileKind, PagedWriter};
+    use crate::store::page::FileId;
 
     /// Three pages, every byte of page i equal to i + 1.
     fn engine() -> (Engine, FileId) {
-        let mut e = Engine::new();
+        let e = Engine::new();
         let bytes = (0..3u8).flat_map(|i| [i + 1; PAGE]).collect();
         let f = e.add("shard-000-00000000.marco", Bytes::Owned(bytes));
         (e, f)
@@ -616,7 +561,7 @@ mod tests {
         w.pinned("r0.out.idx", &[1, 2, 3]).unwrap();
         w.paged("r0.out.small", 0, &[5u8; PAGE + 1]).unwrap();
         w.finish("shard", &()).unwrap();
-        let mut e = Engine::new();
+        let e = Engine::new();
         let (f, footer) = e.open(&p).unwrap();
         assert_eq!(e.name(f), Some("shard-001-00000000.marco"));
         let small = footer.section("r0.out.small").unwrap().clone();

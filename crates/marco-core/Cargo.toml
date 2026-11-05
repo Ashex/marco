@@ -23,7 +23,13 @@ tracing = { workspace = true }
 xxhash-rust = { workspace = true }
 rustc-hash = { workspace = true }
 crossbeam-epoch = { workspace = true }
+libc = { workspace = true }
 prometheus = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "hit_path"
+harness = false

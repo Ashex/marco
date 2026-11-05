@@ -21,6 +21,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::snapshot::{rel_section, DirRanges, Meta, ShardMeta, Snapshot, Writer, FORMAT};
 
+pub mod cache;
+pub mod engine;
+pub mod io;
 pub mod page;
 
 pub const DIR_FILE: &str = "directory.marco";
