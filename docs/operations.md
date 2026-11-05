@@ -62,6 +62,15 @@ ignored), and `--admin-operators` the logins allowed. A proxy login's writes wor
 console's own page (same-origin), so a link or another site can't use it to change anything.
 Reads through the proxy (Admin reads, Graph reads, `/metrics`) also work from curl, on purpose.
 
+When the proxy's address also carries other callers' streams (a service mesh whose proxy delivers
+every caller's connections from its own address), the address can't say which caller set the
+header. `--proxy-protocol-from` names the addresses whose connections, on both listeners, start
+with a PROXY protocol v2 header naming the caller in TLV `0xE0` (a SPIFFE ID, say), and
+`--admin-proxy-peers` the callers whose header login is believed. A login from any other caller is
+refused with 403, and a connection from those addresses without a good header is closed before
+any HTTP is read (`marco_proxy_header_refused_total`). Only the proxy may be able to reach the
+listeners from those addresses, or the header proves nothing.
+
 ## Flags
 
 Every flag has an environment variable. A flag on the command line wins over the env. The
@@ -77,6 +86,8 @@ console's Settings page shows each one's value and where it came from.
 | `--admin-proxy-header` | `MARCO_ADMIN_PROXY_HEADER` | | A header a proxy sets to the operator's login. |
 | `--admin-proxy-from` | `MARCO_ADMIN_PROXY_FROM` | | The proxy's addresses, comma-separated CIDRs. |
 | `--admin-operators` | `MARCO_ADMIN_OPERATORS` | | The logins the header may name, comma-separated. |
+| `--proxy-protocol-from` | `MARCO_PROXY_PROTOCOL_FROM` | | Addresses (CIDRs) whose connections start with a PROXY v2 header naming the caller. |
+| `--admin-proxy-peers` | `MARCO_ADMIN_PROXY_PEERS` | | The callers (TLV `0xE0`) whose header login is believed, comma-separated. |
 | `--jetstream URL` | `MARCO_JETSTREAM` | | Follow a Jetstream instance. |
 | `--firehose URL` | `MARCO_FIREHOSE` | | Follow a relay's `subscribeRepos`. Conflicts with `--jetstream`. |
 | `--source-retention-hours` | `MARCO_SOURCE_RETENTION_HOURS` | 36 | How far back the Jetstream instance replays. An older bulk-built snapshot is refused. |
@@ -114,6 +125,7 @@ A scraper that can't send the token reads the same text from `--ops-listen`, whi
 |---|---|---|
 | `marco_rpc_seconds` | `rpc` | RPC time in the server, request decoded to response encoded |
 | `marco_rpc_errors_total` | `rpc`, `status` | RPCs that failed |
+| `marco_proxy_header_refused_total` | | Connections from `--proxy-protocol-from` closed for a missing or bad PROXY v2 header |
 | `marco_op_seconds` | `op`, `rel` | API op latency: `has`, `relationships`, `out_list`, `in_list`, `counts`, `intersect`, `filter`, `add`, `delete` |
 | `marco_op_results_total` | `op`, `rel` | Items API ops returned |
 | `marco_applied_total` | `rel`, `outcome` | Writes applied, by outcome (`added`, `exists`, `removed`…) |

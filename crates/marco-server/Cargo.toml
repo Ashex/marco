@@ -37,7 +37,7 @@ prometheus = { workspace = true, features = ["process"] }
 rust-embed = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "signal", "io-util"] }
 toml = { workspace = true }
 tracing = { workspace = true }
 vlatproto = { workspace = true }

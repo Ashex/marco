@@ -31,15 +31,20 @@ async fn start(read_only: bool, proxy: bool) -> Srv {
 }
 
 async fn start_with(read_only: bool, proxy: bool, api_read_only: bool) -> Srv {
-    let dir = tempfile::tempdir().unwrap();
-    let snap = dir.path().join("snap");
-    marco_server::synth::write(&snap, N, 4).unwrap();
     let auth = AuthConfig {
         token: Some(TOKEN.into()),
         proxy_header: proxy.then(|| http::HeaderName::from_static("x-operator")),
         proxy_from: if proxy { vec!["127.0.0.1/32".parse::<Cidr>().unwrap()] } else { vec![] },
         operators: if proxy { vec!["alice@example.com".into()] } else { vec![] },
+        ..Default::default()
     };
+    start_auth(read_only, api_read_only, auth).await
+}
+
+async fn start_auth(read_only: bool, api_read_only: bool, auth: AuthConfig) -> Srv {
+    let dir = tempfile::tempdir().unwrap();
+    let snap = dir.path().join("snap");
+    marco_server::synth::write(&snap, N, 4).unwrap();
     let cfg = Config { read_only, api_read_only, auth, ops_listen: Some("127.0.0.1:0".into()), ..Config::new(snap) };
     let app = App::open(cfg).unwrap();
     let ui = Arc::new(marco_server::ui::Ui::load(None).unwrap());
@@ -69,6 +74,19 @@ fn admin(addr: SocketAddr, token: Option<&str>) -> AdminClient<HttpClient> {
 
 /// One HTTP/1.1 request the way curl sends it: (status, body).
 fn http(addr: SocketAddr, method: &str, path: &str, body: &str, headers: &[(&str, &str)]) -> (u16, String) {
+    http_after(addr, &[], method, path, body, headers).unwrap()
+}
+
+/// [`http`] with `first` sent ahead of the request (a PROXY v2 header), or
+/// None when the server closed the connection without an answer.
+fn http_after(
+    addr: SocketAddr,
+    first: &[u8],
+    method: &str,
+    path: &str,
+    body: &str,
+    headers: &[(&str, &str)],
+) -> Option<(u16, String)> {
     let mut s = std::net::TcpStream::connect(addr).unwrap();
     let mut req =
         format!("{method} {path} HTTP/1.1\r\nhost: {addr}\r\nconnection: close\r\ncontent-length: {}\r\n", body.len());
@@ -77,9 +95,14 @@ fn http(addr: SocketAddr, method: &str, path: &str, body: &str, headers: &[(&str
     }
     req.push_str("\r\n");
     req.push_str(body);
-    s.write_all(req.as_bytes()).unwrap();
+    let mut out = first.to_vec();
+    out.extend_from_slice(req.as_bytes());
+    // a write into a connection the server already closed may fail
+    let _ = s.write_all(&out);
     let mut out = String::new();
-    s.read_to_string(&mut out).unwrap();
+    if s.read_to_string(&mut out).is_err() || out.is_empty() {
+        return None;
+    }
     let status = out[9..12].parse().unwrap();
     let (head, mut body) = out.split_once("\r\n\r\n").map(|(h, b)| (h.to_lowercase(), b.to_string())).unwrap();
     if head.contains("transfer-encoding: chunked") {
@@ -95,7 +118,7 @@ fn http(addr: SocketAddr, method: &str, path: &str, body: &str, headers: &[(&str
         }
         body = plain;
     }
-    (status, body)
+    Some((status, body))
 }
 
 fn add(u: &str, s: &str) -> WriteOp {
@@ -648,6 +671,93 @@ async fn admin_auth() {
     let (st, _) =
         http(s.api, "POST", "/marco.v1.Graph/WriteBatch", r#"{"ops":[]}"#, &op("alice@example.com", "same-origin"));
     assert_eq!(st, 401);
+}
+
+/// One proxy delivers every caller's streams from its own address (loopback
+/// here), each behind a PROXY v2 header naming that caller: only the console's
+/// proxy may sign an operator in, wherever the other callers' streams go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admin_auth_behind_a_shared_proxy() {
+    const CONSOLE: &str = "spiffe://mesh/console-proxy/proxy";
+    const TUNNEL: &str = "spiffe://mesh/tunnel/tunnel";
+    let auth = AuthConfig {
+        proxy_header: Some(http::HeaderName::from_static("x-operator")),
+        proxy_from: vec!["127.0.0.1/32".parse::<Cidr>().unwrap()],
+        operators: vec!["alice@example.com".into()],
+        proxy_protocol_from: vec!["127.0.0.1/32".parse::<Cidr>().unwrap()],
+        proxy_peers: vec![CONSOLE.into()],
+        ..Default::default()
+    };
+    let s = start_auth(false, true, auth).await;
+    let hdr = |caller: &str, to: SocketAddr| marco_server::peer::encode("127.0.0.1:40000".parse().unwrap(), to, caller);
+    let op = |site: &'static str| {
+        vec![("content-type", "application/json"), ("x-operator", "alice@example.com"), ("sec-fetch-site", site)]
+    };
+
+    // the console's proxy: the login is believed, reads and writes work
+    let console = hdr(CONSOLE, s.admin);
+    let (st, b) =
+        http_after(s.admin, &console, "POST", "/marco.v1.Admin/GetSession", "{}", &op("same-origin")).unwrap();
+    assert_eq!((st, b.as_str()), (200, r#"{"auth":"proxy","operator":"alice@example.com"}"#));
+    let st = |first: &[u8], path: &str, body: &str| {
+        http_after(s.admin, first, "POST", path, body, &op("same-origin")).map(|(st, _)| st)
+    };
+    assert_eq!(st(&console, "/marco.v1.Admin/GetOverview", "{}"), Some(200));
+    assert_eq!(st(&console, "/marco.v1.Admin/SetTraceRatio", r#"{"ratio":0}"#), Some(200));
+    assert_eq!(st(&console, "/marco.v1.Admin/Checkpoint", "{}"), Some(200));
+
+    // the tunnel, through the same proxy address, with a forged login: refused
+    let tunnel = hdr(TUNNEL, s.admin);
+    let (code, b) =
+        http_after(s.admin, &tunnel, "POST", "/marco.v1.Admin/GetSession", "{}", &op("same-origin")).unwrap();
+    assert_eq!(code, 403, "{b}");
+    assert!(b.contains("may not sign operators in"), "{b}");
+    assert_eq!(st(&tunnel, "/marco.v1.Admin/GetOverview", "{}"), Some(403));
+    assert_eq!(st(&tunnel, "/marco.v1.Admin/SetTraceRatio", r#"{"ratio":0}"#), Some(403));
+    assert_eq!(st(&tunnel, "/marco.v1.Admin/Checkpoint", "{}"), Some(403));
+    // and with no login, nothing past the open routes
+    let (code, _) = http_after(s.admin, &tunnel, "POST", "/marco.v1.Admin/GetOverview", "{}", &[]).unwrap();
+    assert_eq!(code, 401);
+
+    // from the proxy's address with no header, or a header that isn't one:
+    // closed before a byte of HTTP is read
+    assert_eq!(st(&[], "/marco.v1.Admin/GetSession", "{}"), None);
+    let mut bad = console.clone();
+    bad[12] = 0x20;
+    assert_eq!(st(&bad, "/marco.v1.Admin/GetSession", "{}"), None);
+
+    // the API listener takes the same header from the proxy and serves reads
+    let (code, _) = http_after(
+        s.api,
+        &hdr(TUNNEL, s.api),
+        "POST",
+        "/marco.v1.Graph/Counts",
+        r#"{"actors":[]}"#,
+        &[("content-type", "application/json")],
+    )
+    .unwrap();
+    assert_eq!(code, 200);
+}
+
+/// Without --proxy-protocol-from, a PROXY v2 header is just bytes: the server
+/// never reads a caller it wasn't told a proxy writes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn proxy_peers_need_a_header() {
+    let auth = AuthConfig {
+        proxy_header: Some(http::HeaderName::from_static("x-operator")),
+        proxy_from: vec!["127.0.0.1/32".parse::<Cidr>().unwrap()],
+        operators: vec!["alice@example.com".into()],
+        proxy_peers: vec!["spiffe://mesh/console-proxy/proxy".into()],
+        ..Default::default()
+    };
+    let s = start_auth(false, true, auth).await;
+    let op =
+        [("content-type", "application/json"), ("x-operator", "alice@example.com"), ("sec-fetch-site", "same-origin")];
+    let (code, b) = http(s.admin, "POST", "/marco.v1.Admin/GetSession", "{}", &op);
+    assert_eq!(code, 403, "{b}");
+    let h = marco_server::peer::encode("127.0.0.1:1".parse().unwrap(), s.admin, "spiffe://mesh/console-proxy/proxy");
+    let r = http_after(s.admin, &h, "POST", "/marco.v1.Admin/GetSession", "{}", &op);
+    assert_ne!(r.map(|(c, _)| c), Some(200));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

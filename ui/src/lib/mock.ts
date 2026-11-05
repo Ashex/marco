@@ -410,6 +410,8 @@ const FLAGS: [string, string, string][] = [
   ['--admin-proxy-header', '—', 'unset'],
   ['--admin-proxy-from', '—', 'unset'],
   ['--admin-operators', '—', 'unset'],
+  ['--proxy-protocol-from', '—', 'unset'],
+  ['--admin-proxy-peers', '—', 'unset'],
   ['--merge-ratio', '0.125', 'default'],
   ['--compact-min', '64', 'default'],
   ['--trace-ratio', '0', 'default'],

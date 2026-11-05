@@ -740,7 +740,7 @@ impl Caller for Raw {
 pub type Stack = ServiceTransport<axum::Router>;
 
 fn stack_client(app: &Arc<App>) -> GraphClient<Stack> {
-    let peer = axum::extract::ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1)));
+    let peer = axum::extract::ConnectInfo(marco_server::peer::Peer::from(SocketAddr::from(([127, 0, 0, 1], 1))));
     let router = marco_server::api_router(app).layer(axum::Extension(peer));
     GraphClient::new(ServiceTransport::new(router), ClientConfig::new("http://marco.local".parse().unwrap()))
 }

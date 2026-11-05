@@ -10,6 +10,7 @@ pub mod graph_svc;
 pub mod ingest;
 pub mod liststats;
 pub mod metrics;
+pub mod peer;
 pub mod series;
 pub mod synth;
 pub mod sys;
@@ -20,11 +21,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use axum::serve::ListenerExt;
 use marco_proto::connect::marco::v1::{AdminExt, GraphExt};
 
 use crate::app::App;
 use crate::auth::Listener;
+use crate::peer::{Peer, PeerListener};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const COMMIT: &str = match option_env!("MARCO_COMMIT") {
@@ -107,15 +108,10 @@ pub async fn serve(app: Arc<App>, ui: Arc<ui::Ui>) -> Result<(SocketAddr, Socket
         .await
         .with_context(|| format!("bind --admin-listen {}", app.cfg.admin_listen))?;
     let (a1, a2) = (api.local_addr()?, admin.local_addr()?);
-    let r1 =
-        api_router(&app).merge(ui::docs_routes(ui.clone(), false)).into_make_service_with_connect_info::<SocketAddr>();
-    let r2 = admin_router(&app, ui).into_make_service_with_connect_info::<SocketAddr>();
-    // Without TCP_NODELAY, an HTTP/2 response written as two frames waits
-    // on the client's delayed ACK: 40 ms for a page of edges.
-    let nodelay = |s: &mut tokio::net::TcpStream| {
-        let _ = s.set_nodelay(true);
-    };
-    let (api, admin) = (api.tap_io(nodelay), admin.tap_io(nodelay));
+    let r1 = api_router(&app).merge(ui::docs_routes(ui.clone(), false)).into_make_service_with_connect_info::<Peer>();
+    let r2 = admin_router(&app, ui).into_make_service_with_connect_info::<Peer>();
+    let from = &app.cfg.auth.proxy_protocol_from;
+    let (api, admin) = (PeerListener::new(api, from.clone())?, PeerListener::new(admin, from.clone())?);
     tokio::spawn(async move { axum::serve(api, r1).await });
     tokio::spawn(async move { axum::serve(admin, r2).await });
     series::spawn(app);

@@ -2,9 +2,11 @@
 //! writes need the admin token. On the admin listener everything but the
 //! console's files and GetSession needs the token, or a login from the
 //! trusted proxy header (off unless configured, and believed only from the
-//! proxy's own addresses, as vlRelay's console gate does).
+//! proxy's own addresses, as vlRelay's console gate does, and with
+//! `--admin-proxy-peers` only on a connection whose PROXY v2 header names
+//! one of them).
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use axum::extract::{ConnectInfo, Request, State};
@@ -14,6 +16,7 @@ use connectrpc::ConnectError;
 use http::{header, HeaderMap, StatusCode};
 
 use crate::app::App;
+use crate::peer::Peer;
 
 #[derive(Clone, Default)]
 pub struct AuthConfig {
@@ -21,6 +24,10 @@ pub struct AuthConfig {
     pub proxy_header: Option<http::HeaderName>,
     pub proxy_from: Vec<Cidr>,
     pub operators: Vec<String>,
+    /// Connections from here start with a PROXY v2 header (crate::peer).
+    pub proxy_protocol_from: Vec<Cidr>,
+    /// When set, the header login is believed only from these callers.
+    pub proxy_peers: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -86,6 +93,7 @@ pub fn identify(
     kind: Listener,
     headers: &HeaderMap,
     peer: IpAddr,
+    caller: Option<&str>,
 ) -> Result<Option<Caller>, Refusal> {
     if let Some(v) = headers.get(header::AUTHORIZATION) {
         let Some(want) = &cfg.token else {
@@ -105,6 +113,12 @@ pub fn identify(
     let vals: Vec<_> = headers.get_all(h).iter().collect();
     if vals.is_empty() {
         return Ok(None);
+    }
+    // The proxy may deliver other callers' streams from the same address:
+    // only the ones named here may sign an operator in.
+    if !cfg.proxy_peers.is_empty() && !caller.is_some_and(|c| cfg.proxy_peers.iter().any(|p| p == c)) {
+        let who = caller.unwrap_or("a connection with no PROXY v2 header");
+        return Err(Refusal::denied(&format!("{who} may not sign operators in")));
     }
     let login = match vals.as_slice() {
         [v] => v.to_str().unwrap_or("").trim(),
@@ -167,7 +181,7 @@ fn same_origin(headers: &HeaderMap, write: bool) -> bool {
 
 pub async fn gate(
     State((app, kind)): State<(Arc<App>, Listener)>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    ConnectInfo(peer): ConnectInfo<Peer>,
     mut req: Request,
     next: Next,
 ) -> Response {
@@ -183,7 +197,7 @@ pub async fn gate(
                 || path.starts_with("/debug/")
         }
     };
-    let caller = match identify(&app.cfg.auth, kind, req.headers(), peer.ip()) {
+    let caller = match identify(&app.cfg.auth, kind, req.headers(), peer.addr.ip(), peer.caller.as_deref()) {
         Ok(c) => c,
         Err(r) if needs || path == "/marco.v1.Admin/GetSession" => return r.into_response(connect),
         Err(_) => None,

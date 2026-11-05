@@ -65,6 +65,19 @@ struct Serve {
     /// The logins the proxy header may name.
     #[arg(long, env = "MARCO_ADMIN_OPERATORS", value_delimiter = ',', requires = "admin_proxy_header")]
     admin_operators: Vec<String>,
+    /// Addresses (CIDRs) whose connections, on --listen and --admin-listen, start with a PROXY v2
+    /// header naming the caller in TLV 0xE0. One without a good header is closed.
+    #[arg(long, env = "MARCO_PROXY_PROTOCOL_FROM", value_delimiter = ',')]
+    proxy_protocol_from: Vec<String>,
+    /// Believe the proxy header only on a connection whose PROXY v2 header names one of these callers.
+    #[arg(
+        long,
+        env = "MARCO_ADMIN_PROXY_PEERS",
+        value_delimiter = ',',
+        requires = "admin_proxy_header",
+        requires = "proxy_protocol_from"
+    )]
+    admin_proxy_peers: Vec<String>,
     /// With --compact-min, a list's delta merges past this share of its base.
     #[arg(long, env = "MARCO_MERGE_RATIO", default_value_t = 0.125)]
     merge_ratio: f64,
@@ -134,6 +147,8 @@ fn flags(m: &ArgMatches, s: &Serve) -> Vec<FlagInfo> {
         ("admin_proxy_header", s.admin_proxy_header.clone().unwrap_or_else(|| "—".into())),
         ("admin_proxy_from", list(&s.admin_proxy_from)),
         ("admin_operators", list(&s.admin_operators)),
+        ("proxy_protocol_from", list(&s.proxy_protocol_from)),
+        ("admin_proxy_peers", list(&s.admin_proxy_peers)),
         ("merge_ratio", s.merge_ratio.to_string()),
         ("compact_min", s.compact_min.to_string()),
         ("trace_ratio", s.trace_ratio.to_string()),
@@ -186,9 +201,15 @@ fn auth(s: &Serve) -> Result<AuthConfig> {
         }
         None => None,
     };
-    let proxy_from =
-        s.admin_proxy_from.iter().map(|c| c.parse::<Cidr>().map_err(anyhow::Error::msg)).collect::<Result<_>>()?;
-    Ok(AuthConfig { token, proxy_header, proxy_from, operators: s.admin_operators.clone() })
+    let cidrs = |v: &[String]| v.iter().map(|c| c.parse::<Cidr>().map_err(anyhow::Error::msg)).collect::<Result<_>>();
+    Ok(AuthConfig {
+        token,
+        proxy_header,
+        proxy_from: cidrs(&s.admin_proxy_from)?,
+        operators: s.admin_operators.clone(),
+        proxy_protocol_from: cidrs(&s.proxy_protocol_from)?,
+        proxy_peers: s.admin_proxy_peers.clone(),
+    })
 }
 
 async fn shutdown_signal() {

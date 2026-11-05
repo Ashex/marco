@@ -300,7 +300,7 @@ pub fn free_port() -> Result<SocketAddr> {
 /// An App on `snapshot` with the harness's admin token, listening on free ports.
 pub fn open_app(snapshot: &Path) -> Result<Arc<App>> {
     App::open(Config {
-        auth: AuthConfig { token: Some(TOKEN.into()), proxy_header: None, proxy_from: vec![], operators: vec![] },
+        auth: AuthConfig { token: Some(TOKEN.into()), ..Default::default() },
         ..Config::new(snapshot.to_path_buf())
     })
 }

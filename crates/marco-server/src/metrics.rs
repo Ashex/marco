@@ -91,6 +91,7 @@ pub fn init(version: &str, commit: &str) {
     LazyLock::force(&RPC_ERRORS);
     LazyLock::force(&CACHED);
     LazyLock::force(&READY);
+    LazyLock::force(&crate::peer::REFUSED);
     LazyLock::force(&READS_BEFORE_READY);
     LazyLock::force(&SEGMENT_SECONDS);
     LazyLock::force(&SEGMENT_BYTES);
