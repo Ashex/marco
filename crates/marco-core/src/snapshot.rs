@@ -38,7 +38,7 @@ use crate::relation::Relation;
 use crate::varint::{self, u32_at, u64_at};
 
 pub const MAGIC: &[u8; 8] = b"MARCOSN1";
-pub const FORMAT: u32 = 4;
+pub const FORMAT: u32 = 5;
 const ALIGN: u64 = 64;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -316,91 +316,149 @@ impl Snapshot {
 
 // ---------------------------------------------------------------- offsets
 
-/// Offsets for ids 0..=n. Dense: a u64 base per 128 ids, then a u32 per id
-/// from its base, half the bytes of plain u64s. Sparse, when it's smaller
-/// (a relation most ids have no list in, like a list relation, whose lists
-/// are 3% of the ids): u32 c, the c ids with a list (u32, ascending), their
-/// c + 1 starts (u64). The lengths tell them apart: a sparse index is only
-/// written when it's shorter than the dense one.
+/// Offsets for ids 0..=n, in one of two forms whose lengths tell them apart.
+/// Dense: the offsets [`Packed`]. Sparse, when it's at most half of dense (a
+/// relation most ids have no list in, like blocks or lists): a bitmap of the
+/// ids with a list (u64 words), a u32 rank per 512 ids (the set bits before
+/// them), the c + 1 starts of those lists [`Packed`], then u32 c. Either way
+/// a lookup is a few loads, no search.
 pub fn encode_index(offsets: &[u64]) -> Result<Vec<u8>> {
-    let groups = offsets.len().div_ceil(128);
-    let dense = groups * 8 + offsets.len() * 4;
-    let present: Vec<u32> =
-        (0..offsets.len().saturating_sub(1)).filter(|&i| offsets[i + 1] > offsets[i]).map(|i| i as u32).collect();
+    let Some(n) = offsets.len().checked_sub(1) else {
+        return Ok(Vec::new());
+    };
+    let present: Vec<usize> = (0..n).filter(|&i| offsets[i + 1] > offsets[i]).collect();
     let c = present.len();
-    if 4 + 4 * c + 8 * (c + 1) < dense {
-        let mut out = Vec::with_capacity(4 + 12 * c + 8);
-        out.extend_from_slice(&(c as u32).to_le_bytes());
-        for &i in &present {
-            out.extend_from_slice(&i.to_le_bytes());
+    // the bitmap costs a load per lookup, worth it only where it saves most of dense's bytes
+    if 2 * sparse_len(n, c) <= packed_len(n + 1) {
+        // packed starts span 128 lists, not 128 ids: when they can't, dense may still fit
+        if let Some(out) = encode_sparse(offsets, &present) {
+            return Ok(out);
         }
-        for &i in &present {
-            out.extend_from_slice(&offsets[i as usize].to_le_bytes());
-        }
-        out.extend_from_slice(&offsets[offsets.len() - 1].to_le_bytes());
-        return Ok(out);
     }
-    let mut out = Vec::with_capacity(dense);
-    for g in 0..groups {
+    let mut out = Vec::with_capacity(packed_len(n + 1));
+    if let Err(i) = encode_packed(offsets, &mut out) {
+        bail!("the lists of ids {}..={i} are over 4 GiB", i / 128 * 128);
+    }
+    Ok(out)
+}
+
+fn encode_sparse(offsets: &[u64], present: &[usize]) -> Option<Vec<u8>> {
+    let (n, c) = (offsets.len() - 1, present.len());
+    let mut bits = vec![0u64; n.div_ceil(64)];
+    for &i in present {
+        bits[i / 64] |= 1 << (i % 64);
+    }
+    let mut out = Vec::with_capacity(sparse_len(n, c));
+    for w in &bits {
+        out.extend_from_slice(&w.to_le_bytes());
+    }
+    let mut rank = 0u32;
+    for block in bits.chunks(8) {
+        out.extend_from_slice(&rank.to_le_bytes());
+        rank += block.iter().map(|w| w.count_ones()).sum::<u32>();
+    }
+    let starts: Vec<u64> = present.iter().map(|&i| offsets[i]).chain([offsets[n]]).collect();
+    encode_packed(&starts, &mut out).ok()?;
+    out.extend_from_slice(&(c as u32).to_le_bytes());
+    Some(out)
+}
+
+fn packed_len(m: usize) -> usize {
+    8 * m.div_ceil(128) + 4 * m
+}
+
+fn sparse_len(n: usize, c: usize) -> usize {
+    8 * n.div_ceil(64) + 4 * n.div_ceil(512) + packed_len(c + 1) + 4
+}
+
+/// Ascending offsets as a u64 base per 128, then a u32 each from its base:
+/// half the bytes of plain u64s. Err(i): offset i is over 4 GiB past its base.
+fn encode_packed(offsets: &[u64], out: &mut Vec<u8>) -> std::result::Result<(), usize> {
+    for g in 0..offsets.len().div_ceil(128) {
         out.extend_from_slice(&offsets[g * 128].to_le_bytes());
     }
     for (i, &o) in offsets.iter().enumerate() {
         let rel = o - offsets[i / 128 * 128];
         if rel > u32::MAX as u64 {
-            bail!("128 consecutive lists over 4 GiB at id {i}");
+            return Err(i);
         }
         out.extend_from_slice(&(rel as u32).to_le_bytes());
     }
-    Ok(out)
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+pub struct Packed<'a> {
+    bases: &'a [u8],
+    rels: &'a [u8],
+}
+
+impl<'a> Packed<'a> {
+    fn parse(b: &'a [u8], m: usize) -> Option<Packed<'a>> {
+        let (bases, rels) = b.split_at_checked(8 * m.div_ceil(128))?;
+        (rels.len() == 4 * m).then_some(Packed { bases, rels })
+    }
+
+    #[inline]
+    fn at(&self, i: usize) -> usize {
+        u64_at(self.bases, 8 * (i / 128)).wrapping_add(u32_at(self.rels, 4 * i) as u64) as usize
+    }
 }
 
 #[derive(Clone, Copy)]
 pub enum Index<'a> {
-    Dense { bases: &'a [u8], rels: &'a [u8], n: usize },
-    Sparse { ids: &'a [u8], starts: &'a [u8], c: usize },
+    Dense { offsets: Packed<'a>, n: usize },
+    Sparse { bits: &'a [u8], ranks: &'a [u8], starts: Packed<'a>, n: usize, c: usize },
 }
 
 impl<'a> Index<'a> {
     /// An index over ids 0..n, None if its length is neither form's.
     pub fn parse(bytes: &'a [u8], n: usize) -> Option<Index<'a>> {
-        let g = (n + 1).div_ceil(128);
-        if bytes.len() == 8 * g + 4 * (n + 1) {
-            return Some(Index::Dense { bases: &bytes[..8 * g], rels: &bytes[8 * g..], n });
+        if let Some(offsets) = Packed::parse(bytes, n + 1) {
+            return Some(Index::Dense { offsets, n });
         }
-        let c = u32_at(bytes.get(..4)?, 0) as usize;
-        (bytes.len() == 12 + 12 * c).then(|| Index::Sparse {
-            ids: &bytes[4..4 + 4 * c],
-            starts: &bytes[4 + 4 * c..],
-            c,
-        })
+        let (rest, c) = bytes.split_last_chunk::<4>()?;
+        let c = u32::from_le_bytes(*c) as usize;
+        if c > n || bytes.len() != sparse_len(n, c) {
+            return None;
+        }
+        let (bits, rest) = rest.split_at(8 * n.div_ceil(64));
+        let (ranks, rest) = rest.split_at(4 * n.div_ceil(512));
+        Some(Index::Sparse { bits, ranks, starts: Packed::parse(rest, c + 1)?, n, c })
     }
 
     /// The byte range of `id`'s list, None if it has none.
     #[inline]
     pub fn range(&self, id: u32) -> Option<Range<usize>> {
+        let i = id as usize;
         match *self {
-            Index::Dense { bases, rels, n } => {
-                let i = id as usize;
+            Index::Dense { offsets, n } => {
                 if i >= n {
                     return None;
                 }
-                let at = |i: usize| (u64_at(bases, 8 * (i / 128)) + u32_at(rels, 4 * i) as u64) as usize;
-                let (a, b) = (at(i), at(i + 1));
+                let (a, b) = (offsets.at(i), offsets.at(i + 1));
                 (b > a).then_some(a..b)
             }
-            Index::Sparse { ids, starts, c } => {
-                let (mut lo, mut hi) = (0, c);
-                while lo < hi {
-                    let mid = (lo + hi) / 2;
-                    match u32_at(ids, 4 * mid).cmp(&id) {
-                        std::cmp::Ordering::Equal => {
-                            return Some(u64_at(starts, 8 * mid) as usize..u64_at(starts, 8 * mid + 8) as usize)
-                        }
-                        std::cmp::Ordering::Less => lo = mid + 1,
-                        std::cmp::Ordering::Greater => hi = mid,
-                    }
+            Index::Sparse { bits, ranks, starts, n, c } => {
+                if i >= n {
+                    return None;
                 }
-                None
+                let w = u64_at(bits, 8 * (i / 64));
+                if w >> (i % 64) & 1 == 0 {
+                    return None;
+                }
+                // sections are 64-byte aligned, so a rank's 8 words are one cache line
+                let mut r = u32_at(ranks, 4 * (i / 512)) as usize + (w & ((1 << (i % 64)) - 1)).count_ones() as usize;
+                for k in i / 512 * 8..i / 64 {
+                    r += u64_at(bits, 8 * k).count_ones() as usize;
+                }
+                // a bitmap with more bits than c, or starts out of order, is malformed:
+                // no list, not a panic
+                if r >= c {
+                    return None;
+                }
+                let (a, b) = (starts.at(r), starts.at(r + 1));
+                (b > a).then_some(a..b)
             }
         }
     }
@@ -410,25 +468,86 @@ impl<'a> Index<'a> {
 mod index_tests {
     use super::*;
 
+    fn offsets(n: usize, has: impl Fn(u64) -> bool) -> Vec<u64> {
+        offsets_with(n, |i| if has(i) { 1 + i % 7 } else { 0 })
+    }
+
+    fn offsets_with(n: usize, len: impl Fn(u64) -> u64) -> Vec<u64> {
+        let mut o = vec![0u64];
+        for i in 0..n as u64 {
+            o.push(o.last().unwrap() + len(i));
+        }
+        o
+    }
+
+    fn check(o: &[u64], ix: &Index) {
+        let n = o.len() - 1;
+        for i in 0..n + 2 {
+            let want = (i < n && o[i + 1] > o[i]).then(|| o[i] as usize..o[i + 1] as usize);
+            assert_eq!(ix.range(i as u32), want, "id {i}");
+        }
+    }
+
     #[test]
     fn dense_and_sparse_find_the_same_lists() {
-        for every in [1u64, 3, 40, 1000] {
-            let n = 5000usize;
-            let mut offsets = vec![0u64];
-            for i in 0..n as u64 {
-                let len = if i % every == 0 { 1 + i % 7 } else { 0 };
-                offsets.push(offsets.last().unwrap() + len);
+        for every in [1u64, 2, 3, 40, 1000] {
+            for n in [0usize, 1, 63, 64, 65, 511, 512, 513, 5000] {
+                let o = offsets(n, |i| i % every == 0);
+                let b = encode_index(&o).unwrap();
+                let ix = Index::parse(&b, n).unwrap();
+                if n >= 512 {
+                    assert_eq!(matches!(ix, Index::Sparse { .. }), every >= 3, "every {every} n {n}");
+                }
+                check(&o, &ix);
+                assert!(Index::parse(&b[..b.len() - 1], n).is_none(), "a short index is refused");
             }
-            let b = encode_index(&offsets).unwrap();
-            let ix = Index::parse(&b, n).unwrap();
-            assert_eq!(matches!(ix, Index::Sparse { .. }), every >= 3, "every {every}");
-            for i in 0..n + 2 {
-                let want = (i < n && offsets[i + 1] > offsets[i]).then(|| offsets[i] as usize..offsets[i + 1] as usize);
-                assert_eq!(ix.range(i as u32), want, "every {every} id {i}");
-            }
-            assert!(Index::parse(&b[..b.len() - 1], n).is_none(), "a short index is refused");
         }
+        // runs that fill whole words and blocks, and ids on their edges
+        let o = offsets(5000, |i| (600..1700).contains(&i) || i % 512 == 511 || i % 64 == 0);
+        let b = encode_index(&o).unwrap();
+        let ix = Index::parse(&b, 5000).unwrap();
+        assert!(matches!(ix, Index::Sparse { .. }));
+        check(&o, &ix);
         assert!(Index::parse(&[1, 0], 10).is_none());
+        assert!(Index::parse(&[], 10).is_none());
+    }
+
+    #[test]
+    fn sparse_falls_back_to_dense_when_its_starts_cannot_pack() {
+        // a 40 MB list every 128 ids: dense's 128 ids hold one list, sparse's 128 starts 5 GB
+        let n = 25_600;
+        let o = offsets_with(n, |i| if i % 128 == 0 { 40 << 20 } else { 0 });
+        assert!(2 * sparse_len(n, n / 128) <= packed_len(n + 1));
+        let b = encode_index(&o).unwrap();
+        let ix = Index::parse(&b, n).unwrap();
+        assert!(matches!(ix, Index::Dense { .. }));
+        check(&o, &ix);
+        let o = offsets_with(300, |i| if i == 5 { 5 << 30 } else { 1 });
+        let e = encode_index(&o).unwrap_err().to_string();
+        assert!(e.contains("ids 0..=6"), "{e}");
+    }
+
+    #[test]
+    fn a_bad_sparse_index_finds_nothing_rather_than_panic() {
+        let n = 5000;
+        let o = offsets(n, |i| i % 40 == 0);
+        let mut b = encode_index(&o).unwrap();
+        let c = u32::from_le_bytes(b[b.len() - 4..].try_into().unwrap());
+        assert_eq!(c, 125);
+        let mut reversed = b.clone();
+        let rels = 8 * n.div_ceil(64) + 4 * n.div_ceil(512) + 8 * (c as usize + 1).div_ceil(128);
+        reversed[rels..rels + 8].copy_from_slice(&[0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0]);
+        let ix = Index::parse(&reversed, n).unwrap();
+        assert_eq!(ix.range(0), None, "starts out of order");
+        assert_eq!(ix.range(80), Some(o[80] as usize..o[81] as usize));
+        let mut longer = b.clone();
+        longer.splice(longer.len() - 4.., (c + 1).to_le_bytes());
+        assert!(Index::parse(&longer, n).is_none(), "a c the length doesn't fit");
+        b[..8 * n.div_ceil(64)].fill(0xff);
+        b[8 * n.div_ceil(64)..8 * n.div_ceil(64) + 4 * n.div_ceil(512)].fill(0);
+        let ix = Index::parse(&b, n).unwrap();
+        let found = (0..n as u32 + 2).filter(|&i| ix.range(i).is_some()).count();
+        assert!(found > 0 && found < n, "{found}");
     }
 }
 
