@@ -17,27 +17,48 @@
 //! never land on names a committed manifest uses, and anything that goes
 //! wrong after the manifest's rename is cleanup, not a failed checkpoint.
 //!
+//! After open and after each checkpoint, a compaction thread rewrites the
+//! shards whose patches have left too much garbage, one at a time, each as
+//! a new base with the same lists, committed by a manifest of its own. The
+//! writer swaps each into both copies as it does a write. A checkpoint that
+//! comes due, or a verify job, stops the compaction after its current
+//! shard; the checkpoint waits for it. A failed checkpoint is retried after
+//! a backoff, a minute doubling to an hour.
+//!
 //! If the writer or segment thread panics, the process aborts: a writer
 //! that answers writes no segment will hold must not keep running.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use marco_core::store::{remove_unlisted, Manifest};
-use marco_core::{segment, Graph, Rec};
+use marco_core::{segment, Compacted, Graph, Rec};
 
 use marco_core::read::Hold;
 
 use crate::app::{apply_planned, apply_rec, now_ms, open_replayed, App, Applied};
 
 pub enum Req {
-    Apply { rec: Rec, durable: bool, reply: tokio::sync::oneshot::Sender<Result<Applied>> },
-    Flush { reply: tokio::sync::oneshot::Sender<Result<()>> },
+    Apply {
+        rec: Rec,
+        durable: bool,
+        reply: tokio::sync::oneshot::Sender<Result<Applied>>,
+    },
+    Flush {
+        reply: tokio::sync::oneshot::Sender<Result<()>>,
+    },
     Checkpoint,
-    Shutdown { reply: tokio::sync::oneshot::Sender<Result<()>> },
+    Shutdown {
+        reply: tokio::sync::oneshot::Sender<Result<()>>,
+    },
     Rewritten(Box<Result<Rewritten>>),
+    /// A shard compacted, or why it failed.
+    Compacted(Box<Result<Compacted>>),
+    /// The compaction thread ended.
+    CompactionDone,
 }
 
 /// A committed checkpoint.
@@ -46,6 +67,9 @@ pub struct Rewritten {
     seconds: f64,
     bytes: u64,
     shards: u32,
+    patch_bytes: u64,
+    pinned_bytes: u64,
+    base_bytes: u64,
     /// The new copies to serve, or why opening them failed after the commit.
     switch: Result<Switch, String>,
     /// What failed in the cleanup after the commit.
@@ -127,6 +151,9 @@ pub fn spawn(app: Arc<App>, spare: Graph, init: Init) -> mpsc::Sender<Req> {
         ckpt_at: Instant::now().checked_sub(age).unwrap_or_else(Instant::now),
         ckpt_running: false,
         next_ckpt: m.checkpoint + 1,
+        compaction: None,
+        ckpt_wanted: None,
+        ckpt_retry: None,
     };
     std::thread::Builder::new().name("marco-writer".into()).spawn(move || w.run(rx)).unwrap();
     tx
@@ -185,6 +212,15 @@ fn exclusive(g: &mut Arc<Graph>) -> &mut Graph {
     Arc::get_mut(g).unwrap()
 }
 
+/// A running compaction thread.
+struct Compaction {
+    /// Stop after the shard being compacted.
+    stop: Arc<AtomicBool>,
+    /// Give up the shard being compacted too.
+    abort: Arc<AtomicBool>,
+    thread: std::thread::JoinHandle<()>,
+}
+
 struct Writer {
     app: Arc<App>,
     tx: mpsc::Sender<Req>,
@@ -202,6 +238,11 @@ struct Writer {
     ckpt_at: Instant,
     ckpt_running: bool,
     next_ckpt: u64,
+    compaction: Option<Compaction>,
+    /// A checkpoint waiting for the compaction to stop: whether it was asked for.
+    ckpt_wanted: Option<bool>,
+    /// After a failed checkpoint: when the next automatic one may start, and the backoff.
+    ckpt_retry: Option<(Instant, Duration)>,
     interval: Duration,
     deadline: Instant,
 }
@@ -209,6 +250,7 @@ struct Writer {
 impl Writer {
     fn run(mut self, rx: mpsc::Receiver<Req>) {
         let _guard = AbortOnPanic("writer");
+        self.start_compaction();
         loop {
             let wait = self.deadline.saturating_duration_since(Instant::now());
             let mut batch = Vec::new();
@@ -217,6 +259,7 @@ impl Writer {
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     self.cut(Vec::new());
+                    self.stop_compaction();
                     return;
                 }
             }
@@ -240,6 +283,15 @@ impl Writer {
                         shutdown = true;
                     }
                     Req::Rewritten(r) => self.rewritten(*r),
+                    Req::Compacted(r) => self.compacted(*r),
+                    Req::CompactionDone => {
+                        if let Some(c) = self.compaction.take() {
+                            let _ = c.thread.join();
+                        }
+                        if let Some(asked) = self.ckpt_wanted.take() {
+                            self.start_checkpoint(asked);
+                        }
+                    }
                 }
             }
             if !applies.is_empty() {
@@ -252,6 +304,7 @@ impl Writer {
             }
             self.app.durability.lock().unwrap().pending_ops = self.buf_ops;
             if shutdown {
+                self.stop_compaction();
                 return;
             }
             let due = self.ops_since_ckpt + self.buf_ops >= self.app.cfg.checkpoint_ops
@@ -380,6 +433,14 @@ impl Writer {
         if self.ckpt_running {
             return;
         }
+        if !asked && self.ckpt_retry.is_some_and(|(at, _)| Instant::now() < at) {
+            return;
+        }
+        if let Some(c) = &self.compaction {
+            c.stop.store(true, Ordering::Relaxed);
+            self.ckpt_wanted = Some(asked || self.ckpt_wanted.unwrap_or(false));
+            return;
+        }
         self.cut(Vec::new());
         if !asked {
             // the operator's call took the slot already; with a verify in it, this one runs unlisted
@@ -426,9 +487,13 @@ impl Writer {
             Err(e) => {
                 self.note_error("failed", format!("{e:#}"));
                 self.finish_job(Err(e));
+                let wait =
+                    self.ckpt_retry.map_or(Duration::from_secs(60), |(_, w)| (w * 2).min(Duration::from_secs(3600)));
+                self.ckpt_retry = Some((Instant::now() + wait, wait));
                 return;
             }
         };
+        self.ckpt_retry = None;
         self.ckpt_at = Instant::now();
         let ops: u64 = since.iter().map(|(_, recs)| recs.iter().map(|r| r.ops() as u64).sum::<u64>()).sum();
         self.ops_since_ckpt = ops;
@@ -439,10 +504,19 @@ impl Writer {
             d.checkpoint_seconds = r.seconds;
             d.checkpoint_bytes = r.bytes;
             d.checkpoint_shards = r.shards;
+            d.checkpoint_patch_bytes = r.patch_bytes;
+            d.checkpoint_pinned_bytes = r.pinned_bytes;
             d.segment_ops = ops;
             d.checkpoint_error.clear();
         }
         crate::metrics::CHECKPOINT_SECONDS.observe(r.seconds);
+        for (part, b) in [("patch", r.patch_bytes), ("pinned", r.pinned_bytes), ("base", r.base_bytes)] {
+            crate::metrics::CHECKPOINT_BYTES.with_label_values(&[part]).set(b as i64);
+        }
+        eprintln!(
+            "marco: checkpoint {} committed in {:.1} s: {} shards, R {} B patch, P_new {} B pinned, {} B new bases",
+            r.manifest.checkpoint, r.seconds, r.shards, r.patch_bytes, r.pinned_bytes, r.base_bytes
+        );
         if let Some(e) = r.cleanup {
             self.note_error("cleanup after commit", e);
         }
@@ -475,7 +549,140 @@ impl Writer {
         *self.app.verify.lock().unwrap() = vec![Default::default(); self.app.snapshot_files()];
         self.app.list_stats.clear();
         self.finish_job(Ok(()));
+        self.start_compaction();
     }
+
+    /// Starts compacting the shards that are due, if any are and nothing
+    /// else is rewriting the snapshot.
+    fn start_compaction(&mut self) {
+        if self.ckpt_running || self.compaction.is_some() || self.app.cfg.read_only {
+            return;
+        }
+        let Some(snap) = self.spare.as_ref().and_then(|g| g.shared_snapshot()) else { return };
+        let policy = self.app.cfg.compaction;
+        let due = snap.compaction_due(&policy);
+        if due.is_empty() || self.verifying() {
+            return;
+        }
+        let (stop, abort) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let (s, ab, tx, app) = (stop.clone(), abort.clone(), self.tx.clone(), self.app.clone());
+        let thread = std::thread::Builder::new()
+            .name("marco-compaction".into())
+            .spawn(move || {
+                let path = &app.cfg.snapshot;
+                for (k, _) in due {
+                    // a verify reads the files by name, and a compaction removes some
+                    if s.load(Ordering::Relaxed) || ab.load(Ordering::Relaxed) || verifying(&app) {
+                        break;
+                    }
+                    let r =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| snap.compact(path, k, &policy, &ab)))
+                            .unwrap_or_else(|_| Err(anyhow!("the compaction thread panicked")));
+                    // another shard's compaction may still go: a shard that keeps failing
+                    // mustn't hold up the rest. One that found the snapshot moved stops it.
+                    let stale = r.as_ref().err().is_some_and(|e| {
+                        let m = e.to_string();
+                        m == marco_core::COMPACTION_STOPPED
+                            || m.contains("changed since")
+                            || m.contains("changed during")
+                    });
+                    if let Ok(c) = &r {
+                        if let Err(e) = remove_unlisted(path, &c.manifest, false) {
+                            eprintln!("marco: removing shard {k}'s old files after its compaction: {e:#}");
+                        }
+                    }
+                    if tx.send(Req::Compacted(Box::new(r))).is_err() || stale {
+                        break;
+                    }
+                }
+                let _ = tx.send(Req::CompactionDone);
+            })
+            .expect("spawn the compaction thread");
+        self.compaction = Some(Compaction { stop, abort, thread });
+    }
+
+    fn verifying(&self) -> bool {
+        verifying(&self.app)
+    }
+
+    /// Stops the compaction, if one runs, and waits for its thread: nothing
+    /// may write the snapshot once the writer has gone.
+    fn stop_compaction(&mut self) {
+        if let Some(c) = self.compaction.take() {
+            c.abort.store(true, Ordering::Relaxed);
+            let _ = c.thread.join();
+        }
+    }
+
+    /// Swaps a compacted shard into both copies, as a write goes in.
+    fn compacted(&mut self, r: Result<Compacted>) {
+        let c = match r {
+            Ok(c) => c,
+            Err(e) if e.to_string() == marco_core::COMPACTION_STOPPED => return,
+            Err(e) => {
+                self.note_compaction_error(format!("{e:#}"));
+                return;
+            }
+        };
+        let k = c.shard;
+        let swapped = c.file.clone();
+        let swap = match self.spare.as_ref().expect("the spare copy").compacted(k, &c.was, c.file, c.manifest) {
+            Ok(s) => s,
+            Err(e) => {
+                // committed: a restart opens the compacted shard, which reads the same
+                self.note_compaction_error(format!("{e:#}"));
+                return;
+            }
+        };
+        let mut g = self.spare.take().expect("the spare copy");
+        exclusive(&mut g).swap_base(&swap);
+        let mut old = self.app.publish(g);
+        exclusive(&mut old).swap_base(&swap);
+        self.spare = Some(old);
+        crate::metrics::COMPACTION_SHARDS.inc();
+        crate::metrics::COMPACTION_BYTES.inc_by(c.bytes);
+        crate::metrics::COMPACTION_GARBAGE.inc_by(c.before.bytes());
+        crate::metrics::COMPACTION_SECONDS.observe(c.seconds);
+        eprintln!(
+            "marco: compacted shard {k} in {:.1} s: {} B of files, {} B live, into a {} B base",
+            c.seconds, c.before.disk, c.before.live, c.bytes
+        );
+        {
+            let mut d = self.app.durability.lock().unwrap();
+            d.compactions += 1;
+            d.compaction_bytes += c.bytes;
+            d.compaction_error.clear();
+        }
+        if !self.verifying() {
+            *self.app.verify.lock().unwrap() = vec![Default::default(); self.app.snapshot_files()];
+        }
+        if self.app.cfg.prefault {
+            // before its first reads would fault (or miss) every page
+            let (f, engine) = (swapped, self.app.engine.clone());
+            std::thread::Builder::new()
+                .name("marco-prefault".into())
+                .spawn(move || {
+                    let file = &f.base().file;
+                    file.populate();
+                    if let marco_core::store::StoreFile::Paged(p) = file {
+                        engine.load(&[&**p]);
+                    }
+                })
+                .ok();
+        }
+    }
+
+    fn note_compaction_error(&self, msg: String) {
+        eprintln!("marco: compaction: {msg}");
+        crate::metrics::CHECKPOINT_ERRORS.with_label_values(&["compaction"]).inc();
+        self.app.durability.lock().unwrap().compaction_error = msg;
+    }
+}
+
+/// Whether a verify job is running.
+fn verifying(app: &App) -> bool {
+    let j = app.job();
+    j.running && j.kind == "verify"
 }
 
 fn source_cursor(r: &Rec) -> (&str, &str) {
@@ -496,12 +703,10 @@ fn rewrite(app: &App, id: u64, upto: u64, cursors: BTreeMap<String, String>) -> 
         std::thread::sleep(Duration::from_millis(5));
     }
     let g = open_replayed(cfg, &app.engine, Some(upto))?.graph;
-    let manifest = g.write_checkpoint(&cfg.snapshot, id, upto, cursors)?;
+    let rep = g.write_checkpoint(&cfg.snapshot, id, upto, cursors)?;
     drop(g);
-    let new: Vec<&String> =
-        manifest.shards.values().map(|f| &f.base).filter(|n| n.ends_with(&format!("-{id:08}.marco"))).collect();
-    let bytes = new.iter().map(|n| std::fs::metadata(cfg.snapshot.join(n)).map_or(0, |x| x.len())).sum();
-    let shards = new.len() as u32;
+    let manifest = rep.manifest;
+    let (bytes, shards) = (rep.file_bytes, rep.patches + rep.bases);
     let cleanup = remove_unlisted(&cfg.snapshot, &manifest, false).err().map(|e| format!("{e:#}"));
     let switch = (|| -> Result<Switch> {
         let r = open_replayed(cfg, &app.engine, None)?;
@@ -521,5 +726,15 @@ fn rewrite(app: &App, id: u64, upto: u64, cursors: BTreeMap<String, String>) -> 
         Ok(Switch { g: r.graph, twin, last: r.last, segments_after: (r.segments, seg_bytes) })
     })()
     .map_err(|e| format!("{e:#}"));
-    Ok(Rewritten { manifest, seconds: t.elapsed().as_secs_f64(), bytes, shards, switch, cleanup })
+    Ok(Rewritten {
+        manifest,
+        seconds: t.elapsed().as_secs_f64(),
+        bytes,
+        shards,
+        patch_bytes: rep.patch_bytes,
+        pinned_bytes: rep.pinned_bytes,
+        base_bytes: rep.base_bytes,
+        switch,
+        cleanup,
+    })
 }

@@ -224,10 +224,15 @@ async fn a_crash_on_either_side_of_a_checkpoints_commit() {
     }
     let ccfg = cfg(&copy);
     let r = marco_server::app::open_replayed(&ccfg, &ccfg.storage.engine().unwrap(), None).unwrap();
-    let m = r.graph.write_checkpoint(&copy, 1, r.last, r.cursors.clone()).unwrap();
+    let m = r.graph.write_checkpoint(&copy, 1, r.last, r.cursors.clone()).unwrap().manifest;
     drop(r);
-    let new_files: Vec<String> =
-        m.shards.values().map(|f| f.base.clone()).filter(|n| n.ends_with("-00000001.marco")).collect();
+    let new_files: Vec<String> = m
+        .shards
+        .values()
+        .flat_map(|f| f.files())
+        .filter(|n| n.ends_with("-00000001.marco"))
+        .map(str::to_string)
+        .collect();
     assert!(!new_files.is_empty());
 
     // 1: the shard files were written, the manifest wasn't renamed
@@ -284,6 +289,40 @@ async fn checkpoints_keep_up_with_writes_and_fold_the_segments() {
     let app = App::open(cfg(&snap)).unwrap();
     assert_eq!(dump(&app.graph()), want);
     app.graph().snapshot().unwrap().verify_checksums().unwrap();
+}
+
+/// Compaction after every checkpoint: each shard with patches is rewritten
+/// as one base and swapped into the served copies while writes go on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn compactions_swap_shards_in_under_writes() {
+    let s = stream(900);
+    let want = uninterrupted(&s).await;
+    let (_d, snap) = snapshot();
+    let mut c = cfg(&snap);
+    c.segment_interval = Duration::from_millis(20);
+    c.checkpoint_ops = 150;
+    c.compaction = marco_core::CompactPolicy { ratio: 1.0, min_garbage: 0, rate: 0 };
+    let app = App::open(c).unwrap();
+    feed(&app, &s, 0, s.len()).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while app.job().running || app.durability.lock().unwrap().compactions == 0 {
+        assert!(std::time::Instant::now() < deadline, "no compaction");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(dump(&app.graph()), want, "a compacted shard reads as its base and patches did");
+    let d = app.durability.lock().unwrap().clone();
+    assert!(d.checkpoint >= 2 && d.compaction_error.is_empty(), "{d:?}");
+    app.shutdown().await.unwrap();
+    let m = Manifest::read(&snap).unwrap();
+    let app = App::open(cfg(&snap)).unwrap();
+    assert_eq!(dump(&app.graph()), want);
+    app.graph().snapshot().unwrap().verify_checksums().unwrap();
+    let listed: std::collections::HashSet<String> =
+        m.shards.values().flat_map(|f| f.files()).map(str::to_string).collect();
+    for e in std::fs::read_dir(&snap).unwrap() {
+        let n = e.unwrap().file_name().to_string_lossy().to_string();
+        assert!(!n.starts_with("shard-") || listed.contains(&n), "{n} is left over");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

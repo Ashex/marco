@@ -86,13 +86,20 @@ hand.
 ```steps
 - title: Cut
   body: "A thread of its own opens the snapshot and replays the segments up to a new cut."
-- title: Write the dirty shards
-  body: "Only shards whose lists changed are rewritten, and unchanged lists inside them are copied byte for byte. Every checkpoint takes a new id, so its files never land on a name the committed manifest uses."
+- title: Write a patch per changed shard
+  body: "A patch holds the lists that changed, after the pages the shard's files already hold, and the shard's index and side tables whole. A long list keeps every block whose records didn't change, so an append writes its tail. Unchanged lists stay where they are. A shard with no file yet gets a base. Every checkpoint takes a new id, so its files never land on a name the committed manifest uses."
 - title: Commit
   body: "Rename the new `manifest.json` into place. A crash anywhere before that leaves the old snapshot whole."
 - title: Switch
   body: "Open the new snapshot, replay the segments written since the cut, and swap it in. Reads and writes never wait on the checkpoint."
 ```
+
+Old versions of changed lists stay in the shard's files as garbage. Once a shard's files hold
+1.43× what its index still names and at least 64 MiB of garbage (`--compaction-ratio`,
+`--compaction-min-garbage-mb`), a compaction rewrites its base and patches as one base with the same
+lists, at most `--compaction-rate-mb` (200 MB/s), one shard at a time after each checkpoint. Its
+manifest rename is its commit, and the served copies swap the shard in place. A checkpoint that
+comes due stops it, and a crash leaves either the old files or the new base, never a mix.
 
 On the whole network a checkpoint took 29 s and wrote 37.71 GB (63 of 64 shards, since 3M ops
 touch nearly every shard). Reads stay up, but `Relationships` p99 roughly triples for those 30 s

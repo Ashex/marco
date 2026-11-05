@@ -43,6 +43,15 @@ impl OutBytes {
         self.rkeys += o.rkeys;
     }
 
+    /// Takes `o` away, as when a list it counted is replaced.
+    pub fn sub(&mut self, o: &OutBytes) {
+        self.header = self.header.saturating_sub(o.header);
+        self.skip = self.skip.saturating_sub(o.skip);
+        self.bysubj = self.bysubj.saturating_sub(o.bysubj);
+        self.subjects = self.subjects.saturating_sub(o.subjects);
+        self.rkeys = self.rkeys.saturating_sub(o.rkeys);
+    }
+
     pub fn total(&self) -> u64 {
         self.header + self.skip + self.bysubj + self.subjects + self.rkeys
     }
@@ -417,17 +426,99 @@ pub fn encode_split(
     head: &mut Vec<u8>,
     bytes: &mut OutBytes,
 ) -> Result<()> {
+    encode_split_over(edges, subj_index, cols, head, bytes, None).map(|_| ())
+}
+
+/// The version of a big list a patch replaces: its records and its head as
+/// the shard's pinned head section holds it.
+#[derive(Clone, Copy)]
+pub struct OldSplit<'a> {
+    pub edges: &'a [(u64, u32)],
+    pub head: &'a [u8],
+}
+
+/// Blocks an encoder took from the old version instead of writing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Reused {
+    pub blocks: u64,
+    pub bysubj: u64,
+}
+
+/// The bytes of a big list's head that starts `head`: None if it's cut short.
+pub fn split_head_len(head: &[u8]) -> Option<usize> {
+    let h = head.get(..HEAD_FIXED)?;
+    let n = u32_at(h, 0) as usize;
+    let len = HEAD_FIXED + HEAD_BLOCK * n.div_ceil(BLOCK) + HEAD_FENCE * u32_at(h, 8) as usize;
+    (head.len() >= len).then_some(len)
+}
+
+/// Where the blocks of the big list whose head starts `head` are: `f(col,
+/// at)` for each block that takes bytes, col 0 the subject column, 1 rkeys,
+/// 2 by-subject. False if the head is cut short.
+pub fn split_blocks(head: &[u8], mut f: impl FnMut(usize, u64)) -> bool {
+    if split_head_len(head).is_none() {
+        return false;
+    }
+    let n = u32_at(head, 0) as usize;
+    let nbs = u32_at(head, 8) as usize;
+    let nb = n.div_ceil(BLOCK);
+    for b in 0..nb {
+        let e = HEAD_FIXED + HEAD_BLOCK * b;
+        f(0, u32_at(head, e + 8) as u64);
+        if (n - b * BLOCK).min(BLOCK) > 1 {
+            f(1, u32_at(head, e + 12) as u64);
+        }
+    }
+    for j in 0..nbs {
+        f(2, u32_at(head, HEAD_FIXED + HEAD_BLOCK * nb + HEAD_FENCE * j + 4) as u64);
+    }
+    true
+}
+
+/// (subject, position) for every record, sorted: the by-subject order.
+fn by_subject(edges: &[(u64, u32)]) -> Vec<(u32, u32)> {
+    let mut v: Vec<(u32, u32)> = edges.iter().enumerate().map(|(p, e)| (e.1, p as u32)).collect();
+    v.sort_unstable();
+    v
+}
+
+/// [`encode_split`] over `old`, the list's version in the shard's spaces:
+/// a block whose records are the old block's at the same index keeps the old
+/// block, and only its head entry is written. A block's bytes depend only on
+/// its records (a subject or rkey block on its 128 records, a by-subject
+/// block on its 128 (subject, position) pairs), so equal records mean equal
+/// bytes. `bytes` counts every block, kept or not, as a full write would.
+pub fn encode_split_over(
+    edges: &[(u64, u32)],
+    subj_index: usize,
+    cols: SplitCols,
+    head: &mut Vec<u8>,
+    bytes: &mut OutBytes,
+    old: Option<OldSplit>,
+) -> Result<Reused> {
     let n = edges.len();
     debug_assert!(n > crate::format6::WHOLE && edges.windows(2).all(|w| w[0].0 < w[1].0));
+    let old = match old {
+        Some(o) => {
+            let len = split_head_len(o.head).ok_or_else(|| anyhow::anyhow!("an old head cut short"))?;
+            if u32_at(o.head, 0) as usize != o.edges.len() {
+                anyhow::bail!("an old head of {} records over {} edges", u32_at(o.head, 0), o.edges.len());
+            }
+            Some((o, &o.head[..len]))
+        }
+        None => None,
+    };
     let nb = n.div_ceil(BLOCK);
     let nbs = if n >= subj_index { nb } else { 0 };
+    let mut reused = Reused::default();
     let h0 = head.len();
     head.extend_from_slice(&(n as u32).to_le_bytes());
     head.extend_from_slice(&((n - distinct(edges)) as u32).to_le_bytes());
     head.extend_from_slice(&(nbs as u32).to_le_bytes());
     let mut blk = Vec::with_capacity(4 * BLOCK);
     let mut keys = Vec::with_capacity(10 * BLOCK);
-    for chunk in edges.chunks(BLOCK) {
+    let old_chunks: Vec<&[(u64, u32)]> = old.map_or_else(Vec::new, |(o, _)| o.edges.chunks(BLOCK).collect());
+    for (b, chunk) in edges.chunks(BLOCK).enumerate() {
         blk.clear();
         for &(_, s) in chunk {
             blk.extend_from_slice(&s.to_le_bytes());
@@ -436,34 +527,82 @@ pub fn encode_split(
         for w in chunk.windows(2) {
             varint::put(&mut keys, w[1].0 - w[0].0);
         }
+        bytes.subjects += blk.len() as u64;
+        bytes.rkeys += keys.len() as u64;
+        if let Some((_, oh)) = old.filter(|_| old_chunks.get(b) == Some(&chunk)) {
+            head.extend_from_slice(&oh[HEAD_FIXED + HEAD_BLOCK * b..HEAD_FIXED + HEAD_BLOCK * (b + 1)]);
+            reused.blocks += 1;
+            continue;
+        }
         let sat = col_at(cols.subj.put(&blk), "subj")?;
         let rat = col_at(cols.rkey.put(&keys), "rkey")?;
         head.extend_from_slice(&chunk[0].0.to_le_bytes());
         head.extend_from_slice(&sat.to_le_bytes());
         head.extend_from_slice(&rat.to_le_bytes());
-        bytes.subjects += blk.len() as u64;
-        bytes.rkeys += keys.len() as u64;
     }
     if nbs > 0 {
-        let mut pos: Vec<u32> = (0..n as u32).collect();
-        pos.sort_unstable_by_key(|&p| (edges[p as usize].1, p));
+        let pairs = by_subject(edges);
+        let (old_pairs, old_fences) = match old {
+            Some((o, oh)) if u32_at(oh, 8) > 0 => {
+                (by_subject(o.edges), &oh[HEAD_FIXED + HEAD_BLOCK * o.edges.len().div_ceil(BLOCK)..])
+            }
+            _ => (Vec::new(), &[][..]),
+        };
+        let old_chunks: Vec<&[(u32, u32)]> = old_pairs.chunks(BLOCK).collect();
         let mut subj = Vec::with_capacity(BLOCK);
-        for chunk in pos.chunks(BLOCK) {
+        for (j, chunk) in pairs.chunks(BLOCK).enumerate() {
             blk.clear();
             subj.clear();
-            for &p in chunk {
+            for &(s, p) in chunk {
                 blk.extend_from_slice(&p.to_le_bytes());
-                subj.push(edges[p as usize].1);
+                subj.push(s);
             }
             crate::inset::encode_block(&subj, &mut blk);
+            bytes.bysubj += blk.len() as u64;
+            if old_chunks.get(j) == Some(&chunk) {
+                head.extend_from_slice(&old_fences[HEAD_FENCE * j..HEAD_FENCE * (j + 1)]);
+                reused.bysubj += 1;
+                continue;
+            }
             let at = col_at(cols.bysubj.put(&blk), "bysubj")?;
             head.extend_from_slice(&subj[0].to_le_bytes());
             head.extend_from_slice(&at.to_le_bytes());
-            bytes.bysubj += blk.len() as u64;
         }
     }
     bytes.header += (head.len() - h0) as u64;
-    Ok(())
+    Ok(reused)
+}
+
+/// What [`encode_split`] counts in `bytes` for `edges`, without writing.
+pub fn split_bytes(edges: &[(u64, u32)], subj_index: usize) -> OutBytes {
+    let n = edges.len();
+    let nb = n.div_ceil(BLOCK);
+    let nbs = if n >= subj_index { nb } else { 0 };
+    let mut o = OutBytes {
+        header: (HEAD_FIXED + HEAD_BLOCK * nb + HEAD_FENCE * nbs) as u64,
+        subjects: 4 * n as u64,
+        ..Default::default()
+    };
+    let mut keys = Vec::with_capacity(10 * BLOCK);
+    for chunk in edges.chunks(BLOCK) {
+        keys.clear();
+        for w in chunk.windows(2) {
+            varint::put(&mut keys, w[1].0 - w[0].0);
+        }
+        o.rkeys += keys.len() as u64;
+    }
+    if nbs > 0 {
+        let mut blk = Vec::with_capacity(4 * BLOCK);
+        let mut subj = Vec::with_capacity(BLOCK);
+        for chunk in by_subject(edges).chunks(BLOCK) {
+            blk.clear();
+            subj.clear();
+            subj.extend(chunk.iter().map(|&(s, _)| s));
+            crate::inset::encode_block(&subj, &mut blk);
+            o.bysubj += (4 * chunk.len() + blk.len()) as u64;
+        }
+    }
+    o
 }
 
 /// A big list read through the page store: its head is pinned, its blocks

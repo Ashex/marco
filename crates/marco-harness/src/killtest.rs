@@ -38,6 +38,8 @@ pub struct Args {
     pub segment_metric: Option<String>,
     /// Also kill during shard rewrites.
     pub rewrite: bool,
+    /// Also kill during the compaction after a checkpoint.
+    pub compaction: bool,
 }
 
 /// The URIs and DIDs a capture touches.
@@ -194,6 +196,8 @@ enum When {
     BeforeSegment,
     /// Within 300 ms of starting a checkpoint (Admin.Checkpoint).
     DuringRewrite,
+    /// Within 500 ms of a checkpoint's commit, when the compaction it starts runs.
+    DuringCompaction,
 }
 
 /// A metric's value from /metrics text: `name` with no labels, or `name{labels}` as written.
@@ -250,6 +254,9 @@ pub async fn run(a: Args) -> Result<bool> {
     if a.rewrite {
         modes.push(When::DuringRewrite);
     }
+    if a.compaction {
+        modes.push(When::DuringCompaction);
+    }
     for i in 0..=a.kills {
         let last_run = i == a.kills;
         let mode = modes[i as usize % modes.len()];
@@ -266,6 +273,7 @@ pub async fn run(a: Args) -> Result<bool> {
         let (mut ready, mut readyz, mut cursor) = (None, None, None);
         let (mut segs, mut seg_times): (Option<f64>, Vec<Instant>) = (None, Vec::new());
         let mut rewrite_at: Option<Instant> = None;
+        let mut ckpts: Option<f64> = None;
         let mut kill_at: Option<Instant> = None;
         while started.elapsed() < limit && kill_at.is_none_or(|k| Instant::now() < k) {
             if let Some(st) = m.child.try_wait()? {
@@ -308,6 +316,16 @@ pub async fn run(a: Args) -> Result<bool> {
                             admin(m.admin).checkpoint(CheckpointRequest::default()).await.context("Checkpoint")?;
                             rewrite_at = Some(Instant::now());
                             kill_at = Some(Instant::now() + Duration::from_millis(rng.below(300)));
+                        }
+                    }
+                    When::DuringCompaction => {
+                        let done = metric(&body, "marco_checkpoint_seconds_count");
+                        if rewrite_at.is_none() && started.elapsed() >= random.min(Duration::from_millis(1500)) {
+                            admin(m.admin).checkpoint(CheckpointRequest::default()).await.context("Checkpoint")?;
+                            rewrite_at = Some(Instant::now());
+                            ckpts = done;
+                        } else if rewrite_at.is_some() && kill_at.is_none() && done > ckpts {
+                            kill_at = Some(Instant::now() + Duration::from_millis(rng.below(500)));
                         }
                     }
                 }

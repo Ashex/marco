@@ -123,6 +123,16 @@ struct Serve {
     /// Checkpoints drop tombstones older than this many days: past what any source still replays.
     #[arg(long, env = "MARCO_TOMBSTONE_DAYS", default_value_t = 7.0)]
     tombstone_days: f64,
+    /// Compact a shard once its files are this many times what its index still names (0: only when a
+    /// space nears its cap).
+    #[arg(long, env = "MARCO_COMPACTION_RATIO", default_value_t = 1.43)]
+    compaction_ratio: f64,
+    /// …and its garbage is at least this many MiB.
+    #[arg(long, env = "MARCO_COMPACTION_MIN_GARBAGE_MB", default_value_t = 64)]
+    compaction_min_garbage_mb: u64,
+    /// MB a second a compaction writes at most (0: unpaced).
+    #[arg(long, env = "MARCO_COMPACTION_RATE_MB", default_value_t = 200)]
+    compaction_rate_mb: u64,
     /// Don't map the snapshot's pages in after open (they then fault in as reads touch them). On
     /// --storage engine: don't load every page at open when --memory holds them all.
     #[arg(long, env = "MARCO_NO_PREFAULT")]
@@ -187,6 +197,9 @@ fn flags(m: &ArgMatches, s: &Serve) -> Vec<FlagInfo> {
         ("checkpoint_age", s.checkpoint_age.to_string()),
         ("serve_before_ready", s.serve_before_ready.to_string()),
         ("tombstone_days", s.tombstone_days.to_string()),
+        ("compaction_ratio", s.compaction_ratio.to_string()),
+        ("compaction_min_garbage_mb", s.compaction_min_garbage_mb.to_string()),
+        ("compaction_rate_mb", s.compaction_rate_mb.to_string()),
         ("no_prefault", s.no_prefault.to_string()),
         ("storage", s.storage.clone()),
         ("memory", s.memory.clone().unwrap_or_else(|| "—".into())),
@@ -318,6 +331,11 @@ fn main() -> Result<()> {
                 checkpoint_age: std::time::Duration::from_secs_f64(s.checkpoint_age),
                 serve_before_ready: s.serve_before_ready,
                 prefault: !s.no_prefault,
+                compaction: marco_core::CompactPolicy {
+                    ratio: s.compaction_ratio.max(0.0),
+                    min_garbage: s.compaction_min_garbage_mb << 20,
+                    rate: s.compaction_rate_mb * 1_000_000,
+                },
                 tombstone_ttl: std::time::Duration::from_secs_f64(s.tombstone_days.max(0.0) * 86_400.0),
                 expected_sources: source.iter().map(|s| s.name.clone()).collect(),
                 storage,

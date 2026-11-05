@@ -83,6 +83,8 @@ pub struct Config {
     pub storage: Storage,
     /// Threads a request that misses moves to (`--miss-threads`).
     pub miss_threads: usize,
+    /// When shards are compacted, after open and after each checkpoint.
+    pub compaction: marco_core::CompactPolicy,
 }
 
 /// Memory a store budget must leave the cache beyond the pinned tier.
@@ -110,6 +112,7 @@ impl Config {
             prefault: true,
             storage: Storage::from_env().unwrap_or_else(|e| panic!("{e:#}")),
             miss_threads: 64,
+            compaction: marco_core::CompactPolicy::default(),
         }
     }
 }
@@ -256,6 +259,13 @@ pub struct Durability {
     pub checkpoint_seconds: f64,
     pub checkpoint_bytes: u64,
     pub checkpoint_shards: u32,
+    /// The last checkpoint's patch bytes (R) and their pinned bytes (P_new).
+    pub checkpoint_patch_bytes: u64,
+    pub checkpoint_pinned_bytes: u64,
+    pub compactions: u64,
+    pub compaction_bytes: u64,
+    /// The last compaction's error, cleared by the next that commits.
+    pub compaction_error: String,
     pub replayed_segments: u32,
     pub replayed_ops: u64,
     pub replay_seconds: f64,
@@ -406,8 +416,8 @@ impl App {
         }
         let Replayed { graph: g, cursors, segments: segs, ops, last } = open_replayed(&cfg, &engine, None)?;
         if let (Storage::Engine { memory, max_frames: None }, Some(s)) = (&cfg.storage, g.snapshot()) {
-            // twice the pinned tier: a checkpoint registers each dirty shard's whole
-            // new file beside the old until the switch
+            // twice the pinned tier: a checkpoint registers each dirty shard's patch,
+            // whose index and heads are the shard's whole, beside the old until the switch
             let pinned = engine.bytes().borrowed;
             let min = 2 * pinned + MIN_CACHE;
             if min > *memory {

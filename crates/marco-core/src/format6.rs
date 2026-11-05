@@ -361,6 +361,7 @@ impl<'a> Entries<'a> {
 pub struct OutSections {
     rel: usize,
     subj_index: usize,
+    first: OutFirsts,
     small: Packer,
     subj: Packer,
     rkey: Packer,
@@ -433,15 +434,31 @@ fn head_offset(at: usize, rel: usize, part: &str) -> Result<u32> {
     Ok(at as u32)
 }
 
+/// Where a patch's pages start in each of a relation's out spaces: the
+/// pages the base and earlier patches hold. A base starts them all at 0.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OutFirsts {
+    pub small: u32,
+    pub subj: u32,
+    pub rkey: u32,
+    pub bysubj: u32,
+}
+
 impl OutSections {
     pub fn new(rel: usize, subj_index: usize) -> OutSections {
+        OutSections::after(rel, subj_index, OutFirsts::default())
+    }
+
+    /// A patch's out sections, its pages after `first` in each space.
+    pub fn after(rel: usize, subj_index: usize, first: OutFirsts) -> OutSections {
         OutSections {
             rel,
             subj_index,
-            small: Packer::new(0),
-            subj: Packer::new(0),
-            rkey: Packer::new(0),
-            bysubj: Packer::new(0),
+            first,
+            small: Packer::new(first.small),
+            subj: Packer::new(first.subj),
+            rkey: Packer::new(first.rkey),
+            bysubj: Packer::new(first.bysubj),
             head: Vec::new(),
             entries: Vec::new(),
             buf: Vec::new(),
@@ -452,12 +469,23 @@ impl OutSections {
 
     /// Opens the streamed rkey section.
     pub fn begin(&self, w: &mut PagedWriter) -> Result<()> {
-        w.begin_paged(&rel_section(self.rel, "out.rkey"), 0)
+        w.begin_paged(&rel_section(self.rel, "out.rkey"), self.first.rkey)
     }
 
     /// The list of shard-local id `local`, after every id before it: `edges`
     /// sorted by rkey, rkeys unique, at least one.
     pub fn push(&mut self, local: u32, edges: &[(u64, u32)]) -> Result<()> {
+        self.push_over(local, edges, None).map(|_| ())
+    }
+
+    /// [`Self::push`] for a patch: a big list keeps the blocks it shares with
+    /// `old`, its version in the spaces ([`crate::outlog::encode_split_over`]).
+    pub fn push_over(
+        &mut self,
+        local: u32,
+        edges: &[(u64, u32)],
+        old: Option<crate::outlog::OldSplit>,
+    ) -> Result<crate::outlog::Reused> {
         check_order(&self.entries, local)?;
         if edges.len() <= WHOLE {
             self.buf.clear();
@@ -465,13 +493,33 @@ impl OutSections {
             let at = small_offset(self.small.put(&self.buf), self.rel, "out.small")?;
             self.layout.small_lists += 1;
             put_entry(&mut self.entries, local, Entry::Small(at));
-            return Ok(());
+            return Ok(Default::default());
         }
         let at = head_offset(self.head.len(), self.rel, "out.head")?;
         let cols = crate::outlog::SplitCols { subj: &mut self.subj, rkey: &mut self.rkey, bysubj: &mut self.bysubj };
-        crate::outlog::encode_split(edges, self.subj_index, cols, &mut self.head, &mut self.bytes)?;
+        let r = crate::outlog::encode_split_over(edges, self.subj_index, cols, &mut self.head, &mut self.bytes, old)?;
         self.layout.big_lists += 1;
         self.layout.bysubj_lists += (edges.len() >= self.subj_index) as u64;
+        put_entry(&mut self.entries, local, Entry::Head(at));
+        Ok(r)
+    }
+
+    /// A small list a patch leaves where it is, at `at` in the small space.
+    pub fn keep_small(&mut self, local: u32, at: u32) -> Result<()> {
+        check_order(&self.entries, local)?;
+        self.layout.small_lists += 1;
+        put_entry(&mut self.entries, local, Entry::Small(at));
+        Ok(())
+    }
+
+    /// A big list a patch leaves as it is: its head, copied into the new
+    /// head section, still names its blocks in the spaces.
+    pub fn keep_head(&mut self, local: u32, head: &[u8]) -> Result<()> {
+        check_order(&self.entries, local)?;
+        let at = head_offset(self.head.len(), self.rel, "out.head")?;
+        self.head.extend_from_slice(head);
+        self.layout.big_lists += 1;
+        self.layout.bysubj_lists += (crate::varint::u32_at(head, 8) > 0) as u64;
         put_entry(&mut self.entries, local, Entry::Head(at));
         Ok(())
     }
@@ -490,12 +538,13 @@ impl OutSections {
         w.end_paged()?;
         let r = self.rel;
         let l = &mut self.layout;
-        for (part, p, pages) in [
-            ("out.small", &mut self.small, &mut l.small_pages),
-            ("out.subj", &mut self.subj, &mut l.subj_pages),
-            ("out.bysubj", &mut self.bysubj, &mut l.bysubj_pages),
+        let f = self.first;
+        for (part, p, pages, first) in [
+            ("out.small", &mut self.small, &mut l.small_pages, f.small),
+            ("out.subj", &mut self.subj, &mut l.subj_pages, f.subj),
+            ("out.bysubj", &mut self.bysubj, &mut l.bysubj_pages, f.bysubj),
         ] {
-            w.begin_paged(&rel_section(r, part), 0)?;
+            w.begin_paged(&rel_section(r, part), first)?;
             w.write_pages(&p.take_all())?;
             *pages = w.end_paged()? as u64;
             l.paged_used += p.bytes;
@@ -515,6 +564,7 @@ impl OutSections {
 /// One relation's in side of one shard, built set by set in id order.
 pub struct InSections {
     rel: usize,
+    first: [u32; 2],
     small: Packer,
     blocks: Packer,
     head: Vec<u8>,
@@ -552,10 +602,17 @@ impl InLayout {
 
 impl InSections {
     pub fn new(rel: usize) -> InSections {
+        InSections::after(rel, 0, 0)
+    }
+
+    /// A patch's in sections, its pages after the spaces' `small` and
+    /// `blocks` pages.
+    pub fn after(rel: usize, small: u32, blocks: u32) -> InSections {
         InSections {
             rel,
-            small: Packer::new(0),
-            blocks: Packer::new(0),
+            first: [small, blocks],
+            small: Packer::new(small),
+            blocks: Packer::new(blocks),
             head: Vec::new(),
             entries: Vec::new(),
             buf: Vec::new(),
@@ -566,6 +623,12 @@ impl InSections {
     /// The set of shard-local id `local`, after every id before it: `ids`
     /// sorted, unique, at least one.
     pub fn push(&mut self, local: u32, ids: &[u32]) -> Result<()> {
+        self.push_over(local, ids, None).map(|_| ())
+    }
+
+    /// [`Self::push`] for a patch: a big set keeps the blocks it shares with
+    /// `old`, (its ids, its head) in the space. Returns the blocks kept.
+    pub fn push_over(&mut self, local: u32, ids: &[u32], old: Option<(&[u32], &[u8])>) -> Result<u64> {
         check_order(&self.entries, local)?;
         if ids.len() <= WHOLE {
             self.buf.clear();
@@ -573,10 +636,28 @@ impl InSections {
             let at = small_offset(self.small.put(&self.buf), self.rel, "in.small")?;
             self.layout.small_sets += 1;
             put_entry(&mut self.entries, local, Entry::Small(at));
-            return Ok(());
+            return Ok(0);
         }
         let at = head_offset(self.head.len(), self.rel, "in.head")?;
-        crate::inset::encode_split(ids, &mut self.blocks, &mut self.head)?;
+        let kept = crate::inset::encode_split_over(ids, &mut self.blocks, &mut self.head, old)?;
+        self.layout.big_sets += 1;
+        put_entry(&mut self.entries, local, Entry::Head(at));
+        Ok(kept)
+    }
+
+    /// A small set a patch leaves where it is.
+    pub fn keep_small(&mut self, local: u32, at: u32) -> Result<()> {
+        check_order(&self.entries, local)?;
+        self.layout.small_sets += 1;
+        put_entry(&mut self.entries, local, Entry::Small(at));
+        Ok(())
+    }
+
+    /// A big set a patch leaves as it is: its head copied.
+    pub fn keep_head(&mut self, local: u32, head: &[u8]) -> Result<()> {
+        check_order(&self.entries, local)?;
+        let at = head_offset(self.head.len(), self.rel, "in.head")?;
+        self.head.extend_from_slice(head);
         self.layout.big_sets += 1;
         put_entry(&mut self.entries, local, Entry::Head(at));
         Ok(())
@@ -588,10 +669,12 @@ impl InSections {
         }
         let r = self.rel;
         let l = &mut self.layout;
-        for (part, p, pages) in
-            [("in.small", &mut self.small, &mut l.small_pages), ("in.blocks", &mut self.blocks, &mut l.block_pages)]
-        {
-            w.begin_paged(&rel_section(r, part), 0)?;
+        let [fs, fb] = self.first;
+        for (part, p, pages, first) in [
+            ("in.small", &mut self.small, &mut l.small_pages, fs),
+            ("in.blocks", &mut self.blocks, &mut l.block_pages, fb),
+        ] {
+            w.begin_paged(&rel_section(r, part), first)?;
             w.write_pages(&p.take_all())?;
             *pages = w.end_paged()? as u64;
             l.paged_used += p.bytes;

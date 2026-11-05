@@ -28,8 +28,9 @@ facts:
 
 `marco serve` is one process with two listeners. Bind the admin listener to loopback or a private
 network, and put the API listener wherever your appview can reach it. The process needs its
-snapshot directory on local disk with room for a second copy (a checkpoint writes new shard files
-before it deletes the old ones), and RAM for the hot part of the snapshot in page cache
+snapshot directory on local disk with room for half again its size (checkpoints add patches, and
+compaction lets a shard's files reach `--compaction-ratio` of what it holds, plus the one shard it
+rewrites), and RAM for the hot part of the snapshot in page cache
 ([Sizing](sizing.md)).
 
 > [!WARNING]
@@ -107,6 +108,9 @@ console's Settings page shows each one's value and where it came from.
 | `--checkpoint-ops` | `MARCO_CHECKPOINT_OPS` | 3000000 | Checkpoint once the segments since the last hold this many ops. |
 | `--checkpoint-age` | `MARCO_CHECKPOINT_AGE` | 86400 | …or the last is this many seconds old. |
 | `--tombstone-days` | `MARCO_TOMBSTONE_DAYS` | 7 | Checkpoints drop tombstones older than this. |
+| `--compaction-ratio` | `MARCO_COMPACTION_RATIO` | 1.43 | Compact a shard once its files are this many times what its index still names. 0: only when a space nears its cap. |
+| `--compaction-min-garbage-mb` | `MARCO_COMPACTION_MIN_GARBAGE_MB` | 64 | …and it holds at least this much garbage. |
+| `--compaction-rate-mb` | `MARCO_COMPACTION_RATE_MB` | 200 | MB a second a compaction writes at most. 0: unpaced. |
 | `--merge-ratio` | `MARCO_MERGE_RATIO` | 0.125 | With `--compact-min`, a list's delta merges past this share of its base. |
 | `--compact-min` | `MARCO_COMPACT_MIN` | 0 | Merge a list's delta inside the write past this many entries. 0 leaves it to checkpoints. |
 | `--no-prefault` | `MARCO_NO_PREFAULT` | off | Don't map the snapshot's pages in after open. With `--storage engine`, don't load every page at open when `--memory` holds them all. |
@@ -159,7 +163,10 @@ A scraper that can't send the token reads the same text from `--ops-listen`, whi
 | `marco_segment_write_seconds` | | One change segment: encode, write, fsync, rename |
 | `marco_segment_bytes_total`, `marco_segment_errors_total` | | Segment bytes, and failed writes (each retried) |
 | `marco_checkpoint_seconds` | | A checkpoint, cut to new copies serving |
-| `marco_checkpoint_errors_total` | `stage` | Checkpoint failures |
+| `marco_checkpoint_errors_total` | `stage` | Checkpoint failures, and compactions' (`stage="compaction"`) |
+| `marco_store_checkpoint_bytes` | `part` | The last checkpoint's bytes: `patch` (changed lists), `pinned` (the patches' indexes and tables), `base` (new bases) |
+| `marco_store_compaction_shards_total`, `marco_store_compaction_bytes_total`, `marco_store_compaction_garbage_bytes_total` | | Shards compacted, the bytes they wrote, the garbage they cleared |
+| `marco_store_compaction_seconds` | | One shard's compaction |
 | `marco_delta_entries`, `marco_delta_lists` | `rel`, `dir` | Unmerged delta entries, and lists with a delta |
 | `marco_merges_total`, `marco_merge_bytes_total` | `rel`, `dir` | List deltas merged, and the bytes they wrote |
 | `marco_merge_seconds` | `dir` | Time to merge one list's delta |

@@ -479,11 +479,23 @@ pub struct RelFile {
     pub in_blocks: Space,
 }
 
-/// One shard's base file, registered with the snapshot's engine.
-pub struct ShardFile {
+/// One of a shard's files, registered with the snapshot's engine.
+pub struct ShardPart {
     pub name: String,
     pub file: StoreFile,
     pub id: FileId,
+}
+
+/// One shard: its base and its patches, registered with the snapshot's
+/// engine. The newest file's pinned sections and meta describe the whole
+/// shard; its spaces run over every file's pages. Dropping the last handle
+/// on a file takes it out of the engine, so a compacted shard's old files
+/// go once nothing reads them.
+pub struct ShardFile {
+    /// The newest file's name.
+    pub name: String,
+    /// The base, then the patches in the order they were written.
+    pub parts: Vec<ShardPart>,
     pub meta: ShardMeta,
     pub rels: Vec<RelFile>,
     pub status: Pin,
@@ -491,27 +503,54 @@ pub struct ShardFile {
 }
 
 impl ShardFile {
-    pub fn open(dir: &Path, name: &str, d: &Meta, engine: &Engine) -> Result<ShardFile> {
-        let p = dir.join(name);
-        let file = StoreFile::open(&p, engine, true)?;
-        let footer = file.footer();
-        let meta: ShardMeta =
-            serde_json::from_value(footer.meta.clone()).with_context(|| format!("{} meta", p.display()))?;
-        let k = meta.shard as u64;
-        // a fresh write clamps empty shards' ranges to the directory's ids;
-        // checkpoints write shards for live ids past them
-        let lo = k * d.shard_width as u64;
-        let lo_ok = meta.lo as u64 == lo || meta.lo as u64 == lo.min(d.n_ids as u64);
-        if footer.kind != "shard" || footer.file != FileKind::Base || meta.build != d.build || !lo_ok {
-            bail!("{} isn't a shard of this snapshot", p.display());
+    /// Shard `k`'s `files` in `dir`.
+    pub fn open(dir: &Path, k: u32, files: &ShardFiles, d: &Meta, engine: &Engine) -> Result<ShardFile> {
+        let mut parts: Vec<ShardPart> = Vec::with_capacity(1 + files.patches.len());
+        let mut metas: Vec<ShardMeta> = Vec::with_capacity(parts.capacity());
+        for name in files.files() {
+            let p = dir.join(name);
+            let file = StoreFile::open(&p, engine, true)?;
+            let footer = file.footer();
+            let meta: ShardMeta =
+                serde_json::from_value(footer.meta.clone()).with_context(|| format!("{} meta", p.display()))?;
+            let ours = footer.kind == "shard" && meta.build == d.build && meta.shard == k;
+            let fits = match (metas.first(), metas.last()) {
+                (None, _) => {
+                    // a fresh write clamps empty shards' ranges to the directory's ids;
+                    // checkpoints write shards for live ids past them
+                    let lo = k as u64 * d.shard_width as u64;
+                    let lo_ok = meta.lo as u64 == lo || meta.lo as u64 == lo.min(d.n_ids as u64);
+                    footer.file == FileKind::Base && lo_ok
+                }
+                (Some(base), Some(prev)) => {
+                    footer.file == FileKind::Patch { base: parts[0].file.footer().salt }
+                        && meta.lo == base.lo
+                        && meta.hi >= prev.hi
+                        && meta.checkpoint > prev.checkpoint
+                }
+                _ => unreachable!(),
+            };
+            if !ours || !fits {
+                bail!(
+                    "{} isn't {} of shard {k} of this snapshot",
+                    p.display(),
+                    ["a patch", "the base"][parts.is_empty() as usize]
+                );
+            }
+            let id = file.id().expect("a shard file is registered");
+            parts.push(ShardPart { name: name.to_string(), file, id });
+            metas.push(meta);
         }
-        let id = file.id().expect("a shard file is registered");
-        let files = [(id, footer)];
+        let meta = metas.pop().context("a shard with no files")?;
+        let newest = &parts.last().unwrap().file;
+        let p = dir.join(&parts.last().unwrap().name);
+        let footers: Vec<(FileId, &PagedFooter)> = parts.iter().map(|x| (x.id, x.file.footer())).collect();
         let n = (meta.hi - meta.lo) as usize;
         let mut rels = Vec::with_capacity(d.relations.len());
         for i in 0..d.relations.len() {
-            let pin = |part: &str| file.pin(&rel_section(i, part)).unwrap_or_default();
-            let space = |part: &str| Space::of(&files, &rel_section(i, part)).with_context(|| p.display().to_string());
+            let pin = |part: &str| newest.pin(&rel_section(i, part)).unwrap_or_default();
+            let space =
+                |part: &str| Space::of(&footers, &rel_section(i, part)).with_context(|| p.display().to_string());
             let r = RelFile {
                 out_idx: pin("out.idx"),
                 out_head: pin("out.head"),
@@ -528,21 +567,49 @@ impl ShardFile {
                 in_blocks: space("in.blocks")?,
             };
             for idx in [&r.out_idx, &r.in_idx] {
-                if !idx.is_empty() && Entries::parse(file.pinned(idx), n).is_none() {
+                if !idx.is_empty() && Entries::parse(newest.pinned(idx), n).is_none() {
                     bail!("{}: relation {i}'s index isn't {n} ids long", p.display());
                 }
             }
             rels.push(r);
         }
-        let status = file.pin("status").unwrap_or_default();
-        let live = file.pin("live").unwrap_or_default();
-        Ok(ShardFile { name: name.to_string(), file, id, meta, rels, status, live })
+        let status = newest.pin("status").unwrap_or_default();
+        let live = newest.pin("live").unwrap_or_default();
+        let name = parts.last().unwrap().name.clone();
+        Ok(ShardFile { name, parts, meta, rels, status, live })
+    }
+
+    /// The newest file: the one whose pinned sections are the shard's.
+    pub fn newest(&self) -> &StoreFile {
+        &self.parts.last().expect("a shard has a base").file
+    }
+
+    /// The base's file.
+    pub fn base(&self) -> &ShardPart {
+        &self.parts[0]
+    }
+
+    /// Bytes of the shard's files.
+    pub fn len(&self) -> u64 {
+        self.parts.iter().map(|p| p.file.len()).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The manifest entry naming these files.
+    pub fn files(&self) -> ShardFiles {
+        ShardFiles {
+            base: self.parts[0].name.clone(),
+            patches: self.parts[1..].iter().map(|p| p.name.clone()).collect(),
+        }
     }
 
     /// A pinned section's bytes.
     #[inline]
     pub fn pinned(&self, p: &Pin) -> &[u8] {
-        self.file.pinned(p)
+        self.newest().pinned(p)
     }
 
     /// Relation `rel`'s out side, None if the shard has no index for it.
@@ -575,9 +642,11 @@ impl ShardFile {
     }
 }
 
-/// A FORMAT 6 snapshot opened for serving: the directory and a base per
-/// shard, read through `engine`. Stores that share an engine share its
-/// files, their pinned sections and their cached pages.
+/// A FORMAT 6 snapshot opened for serving: the directory and each shard's
+/// base and patches, read through `engine`. Stores that share an engine
+/// share its files, their pinned sections and their cached pages; clones
+/// share the files.
+#[derive(Clone)]
 pub struct Store {
     pub path: PathBuf,
     pub engine: Arc<Engine>,
@@ -607,20 +676,24 @@ impl Store {
         let n = manifest.shards.keys().next_back().map_or(0, |&k| k as usize + 1).max(base_shards);
         let mut shards: Vec<Option<Arc<ShardFile>>> = (0..n).map(|_| None).collect();
         for (&k, files) in &manifest.shards {
-            if !files.patches.is_empty() {
-                bail!("shard {k} has patches, which this build doesn't read yet");
-            }
-            let name = &files.base;
-            let f = ShardFile::open(path, name, &dir.meta, engine)?;
-            if f.meta.shard != k {
-                bail!("{name} is shard {}, the manifest says {k}", f.meta.shard);
-            }
-            shards[k as usize] = Some(Arc::new(f));
+            shards[k as usize] = Some(Arc::new(ShardFile::open(path, k, files, &dir.meta, engine)?));
         }
         if let Some(k) = (0..base_shards).find(|&k| shards[k].is_none()) {
             bail!("the manifest has no file for shard {k}");
         }
         Ok(Store { path: path.to_path_buf(), engine: engine.clone(), dir: Arc::new(dir), manifest, shards })
+    }
+
+    /// This store with shard `k`'s files replaced by `f`, under `manifest`:
+    /// what a compaction swaps in. `f` must be open on this store's engine.
+    pub fn with_shard(&self, k: usize, f: Arc<ShardFile>, manifest: Manifest) -> Store {
+        let mut s = self.clone();
+        if s.shards.len() <= k {
+            s.shards.resize(k + 1, None);
+        }
+        s.shards[k] = Some(f);
+        s.manifest = manifest;
+        s
     }
 
     /// Per relation, summed over the shard files.
@@ -634,9 +707,10 @@ impl Store {
         v
     }
 
+    /// The directory, then each shard's files, base first.
     pub fn files(&self) -> impl Iterator<Item = (&str, &StoreFile)> {
         std::iter::once((DIR_FILE, &self.dir.file))
-            .chain(self.shards.iter().flatten().map(|s| (s.name.as_str(), &s.file)))
+            .chain(self.shards.iter().flatten().flat_map(|s| s.parts.iter().map(|p| (p.name.as_str(), &p.file))))
     }
 
     pub fn bytes(&self) -> u64 {

@@ -177,7 +177,7 @@ fn checkpoints_drop_tombstones_past_their_ttl() {
     g.delete_at(&follow(&did(3), &tid(1)), now - 10 * day).unwrap();
     g.delete_at(&follow(&did(3), &tid(2)), now - day).unwrap();
     g.tombstone_ttl_us = 7 * day;
-    let m = g.write_checkpoint(&p, 1, 0, Default::default()).unwrap();
+    let m = g.write_checkpoint(&p, 1, 0, Default::default()).unwrap().manifest;
     marco_core::store::remove_unlisted(&p, &m, true).unwrap();
     assert_eq!(Graph::open(&p).unwrap().tombstones(FOLLOW), 1);
 }
@@ -507,7 +507,7 @@ fn run_model(subj_index: usize) {
                 Graph::open(&snap).unwrap()
             } else {
                 ckpt += 1;
-                let m = g.write_checkpoint(&snap, ckpt, 0, Default::default()).unwrap();
+                let m = g.write_checkpoint(&snap, ckpt, 0, Default::default()).unwrap().manifest;
                 marco_core::store::remove_unlisted(&snap, &m, true).unwrap();
                 let g2 = Graph::open(&snap).unwrap();
                 g2.snapshot().unwrap().verify_checksums().unwrap();
@@ -624,7 +624,7 @@ fn checksums_catch_a_flipped_byte() {
     let store = marco_core::store::Store::open(&p).unwrap();
     let k = (id / store.dir.meta.shard_width) as usize;
     let f = p.join(marco_core::store::shard_file(k, 0));
-    let sections = store.shards[k].as_ref().unwrap().file.sections().to_vec();
+    let sections = store.shards[k].as_ref().unwrap().newest().sections().to_vec();
     drop(store);
     let flip = |name: &str| {
         let sec = sections.iter().find(|s| s.name == name).unwrap();
@@ -671,14 +671,16 @@ fn a_checkpoint_id_is_never_written_twice() {
     g.write_snapshot(&p).unwrap();
     let mut g = Graph::open(&p).unwrap();
     g.add(&follow(&did(1), &tid(2)), &did(3)).unwrap();
-    let m = g.write_checkpoint(&p, 1, 0, Default::default()).unwrap();
+    let m = g.write_checkpoint(&p, 1, 0, Default::default()).unwrap().manifest;
     let mut g = Graph::open(&p).unwrap();
     g.add(&follow(&did(1), &tid(3)), &did(4)).unwrap();
-    let before: Vec<Vec<u8>> = m.shards.values().map(|f| std::fs::read(p.join(&f.base)).unwrap()).collect();
+    let before: Vec<Vec<u8>> =
+        m.shards.values().flat_map(|f| f.files()).map(|f| std::fs::read(p.join(f)).unwrap()).collect();
     for id in [0, 1] {
         assert!(g.write_checkpoint(&p, id, 0, Default::default()).is_err(), "id {id}");
     }
-    let after: Vec<Vec<u8>> = m.shards.values().map(|f| std::fs::read(p.join(&f.base)).unwrap()).collect();
+    let after: Vec<Vec<u8>> =
+        m.shards.values().flat_map(|f| f.files()).map(|f| std::fs::read(p.join(f)).unwrap()).collect();
     assert!(before == after, "the committed files are untouched");
     g.write_checkpoint(&p, 2, 0, Default::default()).unwrap();
 }
@@ -825,7 +827,7 @@ fn lists_match_a_model() {
                 Graph::open(&snap).unwrap()
             } else {
                 ckpt += 1;
-                let m = g.write_checkpoint(&snap, ckpt, 0, Default::default()).unwrap();
+                let m = g.write_checkpoint(&snap, ckpt, 0, Default::default()).unwrap().manifest;
                 marco_core::store::remove_unlisted(&snap, &m, true).unwrap();
                 Graph::open(&snap).unwrap()
             };

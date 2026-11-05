@@ -371,18 +371,21 @@ impl svc::Admin for AdminApi {
             .map(|(k, a)| {
                 let f = snap.shards.get(k).and_then(|f| f.as_deref());
                 let base: u64 = f.map_or(0, |f| f.meta.stats.iter().map(|s| s.out_records + s.in_pairs).sum());
-                let v = if f.is_some() {
-                    file_slot += 1;
-                    vword(file_slot)
-                } else {
-                    Verify::Unverified
+                // a shard's verdict is its first file's that isn't ok
+                let v = match f {
+                    Some(f) => {
+                        let vs: Vec<Verify> = (0..f.parts.len()).map(|i| vword(file_slot + 1 + i)).collect();
+                        file_slot += f.parts.len();
+                        vs.iter().find(|v| !matches!(v, Verify::Ok)).cloned().unwrap_or(Verify::Ok)
+                    }
+                    None => Verify::Unverified,
                 };
                 let lo = k as u32 * w;
                 Shard {
                     shard: k as u32,
                     lo,
                     hi: f.map_or(lo, |f| f.meta.hi),
-                    size_bytes: f.map_or(0, |f| f.file.len()),
+                    size_bytes: f.map_or(0, |f| f.len()),
                     written_ms: f.map_or(0, |f| f.meta.written_ms),
                     file: f.map_or_else(String::new, |f| f.name.clone()),
                     checkpoint: f.map_or(0, |f| f.meta.checkpoint),

@@ -10,9 +10,11 @@
 //! marco-harness retention --jetstream URL | --firehose URL                     how far back a source replays
 //! marco-harness perf-inputs --snapshot DIR --out F.json                        read inputs for perf, as DIDs
 //! marco-harness perf --inputs F --target engine|stack|h2 --out F.json          Graph read throughput and latency
+//! marco-harness checkpoint-day --snapshot DIR --ops F.jsonl.zst --work DIR     a recorded day's checkpoint: R, P_new, garbage
 //! ```
 
 mod capture;
+mod day;
 mod fake;
 mod hist;
 mod killtest;
@@ -138,6 +140,27 @@ enum Cmd {
         /// Adds kills during a checkpoint, the shard rewrite (Admin.Checkpoint).
         #[arg(long)]
         rewrite: bool,
+        /// Adds kills during the compaction after a checkpoint (Admin.Checkpoint,
+        /// then a kill shortly after it commits): serve with compaction forced
+        /// (--compaction-ratio=1 --compaction-min-garbage-mb=0) and slowed.
+        #[arg(long)]
+        compaction: bool,
+    },
+    /// Replay a recorded day of record ops into an in-process App over a
+    /// hard-linked copy of a snapshot, checkpoint once, and report what the
+    /// checkpoint wrote and the garbage it left (JSON on stdout).
+    CheckpointDay {
+        #[arg(long)]
+        snapshot: PathBuf,
+        /// JSON lines of ops ([`day`]), zstd if .zst.
+        #[arg(long)]
+        ops: PathBuf,
+        /// On the snapshot's filesystem: the copy is hard links.
+        #[arg(long)]
+        work: PathBuf,
+        /// Then compact this many shards, most garbage first, unpaced.
+        #[arg(long, default_value_t = 1)]
+        compact: usize,
     },
     /// Replay a capture as fast as it goes into an in-process App.
     Bench {
@@ -224,6 +247,7 @@ fn main() -> Result<()> {
                 serve_args,
                 segment_metric,
                 rewrite,
+                compaction,
             } => {
                 let ok = killtest::run(killtest::Args {
                     snapshot,
@@ -239,6 +263,7 @@ fn main() -> Result<()> {
                     serve_args,
                     segment_metric,
                     rewrite,
+                    compaction,
                 })
                 .await?;
                 if !ok {
@@ -247,6 +272,11 @@ fn main() -> Result<()> {
                 Ok(())
             }
             Cmd::Bench { snapshot, capture, work } => bench(&snapshot, &capture, &work).await,
+            Cmd::CheckpointDay { snapshot, ops, work, compact } => {
+                let r = day::run(day::Args { snapshot, ops, work, compact }).await?;
+                println!("{}", serde_json::to_string_pretty(&r)?);
+                Ok(())
+            }
             Cmd::Lag { snapshot, jetstream, work, seconds, null_sink, events_out } => {
                 let d = Duration::from_secs(seconds);
                 if null_sink {

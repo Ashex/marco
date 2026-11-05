@@ -309,10 +309,56 @@ impl<'a> InList<'a> {
 /// blocks: FORMAT 5's: per block, Elias-Fano of the ids after its first
 /// ```
 pub fn encode_split(ids: &[u32], blocks: &mut Packer, head: &mut Vec<u8>) -> Result<()> {
+    encode_split_over(ids, blocks, head, None).map(|_| ())
+}
+
+/// The bytes of a big set's head that starts `head`: None if it's cut short.
+pub fn split_head_len(head: &[u8]) -> Option<usize> {
+    let n = u32_at(head.get(..4)?, 0) as usize;
+    let len = 4 + 8 * n.div_ceil(BLOCK);
+    (head.len() >= len).then_some(len)
+}
+
+/// Where the blocks of the big set whose head starts `head` are: `f(at)` for
+/// each block that takes bytes. False if the head is cut short.
+pub fn split_blocks(head: &[u8], mut f: impl FnMut(u64)) -> bool {
+    if split_head_len(head).is_none() {
+        return false;
+    }
+    let n = u32_at(head, 0) as usize;
+    for b in 0..n.div_ceil(BLOCK) {
+        if (n - b * BLOCK).min(BLOCK) > 1 {
+            f(u32_at(head, 4 + 8 * b + 4) as u64);
+        }
+    }
+    true
+}
+
+/// [`encode_split`] over `old`, the set's version in the shard's space, as
+/// (its ids, its head): a block whose ids are the old block's at the same
+/// index keeps the old block. Returns the blocks kept.
+pub fn encode_split_over(
+    ids: &[u32],
+    blocks: &mut Packer,
+    head: &mut Vec<u8>,
+    old: Option<(&[u32], &[u8])>,
+) -> Result<u64> {
     debug_assert!(ids.len() > crate::format6::WHOLE && ids.windows(2).all(|w| w[0] < w[1]));
+    if let Some((oi, oh)) = old {
+        if split_head_len(oh).is_none() || u32_at(oh, 0) as usize != oi.len() {
+            anyhow::bail!("an old set head that isn't {} ids", oi.len());
+        }
+    }
+    let old_chunks: Vec<&[u32]> = old.map_or_else(Vec::new, |(oi, _)| oi.chunks(BLOCK).collect());
     head.extend_from_slice(&(ids.len() as u32).to_le_bytes());
     let mut buf = Vec::with_capacity(4 * BLOCK);
-    for chunk in ids.chunks(BLOCK) {
+    let mut kept = 0;
+    for (b, chunk) in ids.chunks(BLOCK).enumerate() {
+        if let Some((_, oh)) = old.filter(|_| old_chunks.get(b) == Some(&chunk)) {
+            head.extend_from_slice(&oh[4 + 8 * b..4 + 8 * (b + 1)]);
+            kept += 1;
+            continue;
+        }
         buf.clear();
         encode_block(chunk, &mut buf);
         let at = u32::try_from(blocks.put(&buf))
@@ -320,7 +366,7 @@ pub fn encode_split(ids: &[u32], blocks: &mut Packer, head: &mut Vec<u8>) -> Res
         head.extend_from_slice(&chunk[0].to_le_bytes());
         head.extend_from_slice(&at.to_le_bytes());
     }
-    Ok(())
+    Ok(kept)
 }
 
 /// A big set read through the page store: firsts pinned, blocks paged.

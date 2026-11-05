@@ -136,6 +136,36 @@ pub static CHECKPOINT_ERRORS: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .unwrap()
 });
 
+pub static CHECKPOINT_BYTES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "marco_store_checkpoint_bytes",
+        "The last checkpoint's bytes: patch (R, changed lists and blocks), pinned (P_new, the patches' index, heads and tables), base (new bases)",
+        &["part"]
+    )
+    .unwrap()
+});
+
+pub static COMPACTION_SHARDS: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!("marco_store_compaction_shards_total", "Shards compacted into a new base").unwrap()
+});
+
+pub static COMPACTION_BYTES: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!("marco_store_compaction_bytes_total", "Bytes of the bases compactions wrote").unwrap()
+});
+
+pub static COMPACTION_GARBAGE: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!("marco_store_compaction_garbage_bytes_total", "Bytes of garbage compactions cleared").unwrap()
+});
+
+pub static COMPACTION_SECONDS: LazyLock<Histogram> = LazyLock::new(|| {
+    register_histogram!(
+        "marco_store_compaction_seconds",
+        "One shard's compaction, paced writes included",
+        exponential_buckets(0.01, 2.0, 18).unwrap()
+    )
+    .unwrap()
+});
+
 pub fn init(version: &str, commit: &str) {
     BUILD.with_label_values(&[version, commit]).set(1);
     let _ = prometheus::register(Box::new(prometheus::process_collector::ProcessCollector::for_self()));
@@ -155,6 +185,11 @@ pub fn init(version: &str, commit: &str) {
     LazyLock::force(&SEGMENT_ERRORS);
     LazyLock::force(&CHECKPOINT_SECONDS);
     LazyLock::force(&CHECKPOINT_ERRORS);
+    LazyLock::force(&CHECKPOINT_BYTES);
+    LazyLock::force(&COMPACTION_SHARDS);
+    LazyLock::force(&COMPACTION_BYTES);
+    LazyLock::force(&COMPACTION_GARBAGE);
+    LazyLock::force(&COMPACTION_SECONDS);
 }
 
 /// `Graph/Has` from `/marco.v1.Graph/Has`.

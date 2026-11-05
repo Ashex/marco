@@ -36,7 +36,7 @@ use anyhow::{bail, Context, Result};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::did::{classify, unpack_plc, DidKey, DidRef};
-use crate::format6::{InSections, OutSections, SetWriter6};
+use crate::format6::SetWriter6;
 use crate::inset::{self, InList, PagedIn};
 use crate::obs::{self, Applied, Op};
 use crate::outlog::{self, OutBytes, OutList, PagedOut};
@@ -45,12 +45,14 @@ use crate::relation::{parse_uri, RelId, Relations};
 use crate::rkey::{self, is_tid, key_of};
 use crate::segment::{Rec, Status};
 use crate::snapshot::{
-    decode_live, decode_stamps, decode_statuses, decode_tombs, encode_live, encode_side, encode_stamps,
-    encode_statuses, encode_tombs, rel_section, write_directory, BaseDir, DidAt, DirParts, FileKind, Meta, PagedWriter,
-    RelStats, ShardMeta, Side, PAGED_FORMAT,
+    decode_live, decode_stamps, decode_statuses, decode_tombs, write_directory, BaseDir, DidAt, DirParts, Meta, Side,
+    PAGED_FORMAT,
 };
-use crate::store::{now_ms, shard_file, Manifest, ShardFile, ShardFiles, Store, DEFAULT_SHARDS};
+use crate::store::{Manifest, ShardFile, Store, DEFAULT_SHARDS};
 use crate::varint::u32_at;
+
+mod checkpoint;
+pub use checkpoint::{BaseSwap, CheckpointReport, CompactPolicy, Compacted, Garbage, COMPACTION_STOPPED, SPACE_FILL};
 
 /// Out logs at least this long get a by-subject index in a snapshot.
 pub const DEFAULT_SUBJ_INDEX: usize = 4096;
@@ -187,19 +189,24 @@ struct RelState {
     stamp: FxHashMap<(u32, u64), (i64, u32, bool)>,
 }
 
+/// (actor, key) to a tombstone's time.
+type TombMap = FxHashMap<(u32, u64), i64>;
+/// (actor, key) to a stamp's (time, source).
+type StampMap = FxHashMap<(u32, u64), (i64, u32)>;
+
 /// What a snapshot holds that the graph reads as its base, shared by every
 /// copy of the graph.
 struct Base {
     store: Store,
     /// Ids with a status in a shard file.
-    status_bits: Vec<u64>,
+    status_bits: Arc<Vec<u64>>,
     /// Whether any bit of `status_bits` is set: reads ask on every DID, and
     /// scanning the bits for it costs ~150 µs on the whole network.
     any_status: bool,
     /// Per relation, the shard files' tombstones: a lookup on every add.
-    tombs: Vec<FxHashMap<(u32, u64), i64>>,
+    tombs: Arc<Vec<TombMap>>,
     /// Per relation, the shard files' stamps: (time, source).
-    stamps: Vec<FxHashMap<(u32, u64), (i64, u32)>>,
+    stamps: Arc<Vec<StampMap>>,
 }
 
 #[derive(Clone)]
@@ -347,7 +354,13 @@ impl Graph {
             }
         }
         let any_status = status_bits.iter().any(|&w| w != 0);
-        g.base = Some(Arc::new(Base { store, status_bits, any_status, tombs, stamps }));
+        g.base = Some(Arc::new(Base {
+            store,
+            status_bits: Arc::new(status_bits),
+            any_status,
+            tombs: Arc::new(tombs),
+            stamps: Arc::new(stamps),
+        }));
         Ok(g)
     }
 
@@ -2129,260 +2142,12 @@ impl Graph {
         Ok(())
     }
 
-    /// Which shards have changed since the snapshot.
-    pub fn dirty_shards(&self) -> Vec<bool> {
-        let n = self.n_shards();
-        let w = self.width;
-        let mut d = vec![false; n];
-        let mut mark = |id: u32| {
-            if let Some(x) = d.get_mut((id / w) as usize) {
-                *x = true;
-            }
-        };
-        for st in &self.state {
-            st.out
-                .keys()
-                .chain(st.inn.keys())
-                .chain(st.out_over.keys())
-                .chain(st.in_over.keys())
-                .for_each(|&id| mark(id));
-            st.tomb.keys().chain(st.untomb.iter()).for_each(|&(a, _)| mark(a));
-            st.stamp.iter().filter(|(_, v)| v.2).for_each(|(&(a, _), _)| mark(a));
-        }
-        self.status.keys().for_each(|&id| mark(id));
-        if let Some(s) = self.snapshot() {
-            for (k, x) in d.iter_mut().enumerate() {
-                let hi = ((k as u64 + 1) * w as u64).min(self.n_ids() as u64) as u32;
-                match s.shards.get(k).and_then(|f| f.as_ref()) {
-                    Some(f) if f.meta.hi >= hi => {}
-                    _ => *x = true,
-                }
-            }
-        } else {
-            d.iter_mut().for_each(|x| *x = true);
-        }
-        d
-    }
-
-    /// Writes the shards that changed under `checkpoint`'s names, then the
-    /// manifest naming them and the unchanged ones. The manifest's rename
-    /// is the commit; the caller deletes the files it no longer names.
-    pub fn write_checkpoint(
-        &self,
-        path: &Path,
-        checkpoint: u64,
-        segment: u64,
-        cursors: BTreeMap<String, String>,
-    ) -> Result<Manifest> {
-        let t = std::time::Instant::now();
-        let Some(store) = self.snapshot() else { bail!("no snapshot to checkpoint over") };
-        if checkpoint <= store.manifest.checkpoint {
-            bail!("checkpoint {checkpoint} isn't past the committed {}", store.manifest.checkpoint);
-        }
-        let dirty = self.dirty_shards();
-        let w = self.width;
-        let mut m = Manifest {
-            format: PAGED_FORMAT,
-            build: store.dir.meta.build,
-            checkpoint,
-            written_ms: now_ms(),
-            segment,
-            shards: BTreeMap::new(),
-            cursors,
-        };
-        for (k, &is_dirty) in dirty.iter().enumerate() {
-            let old = store.shards.get(k).and_then(|f| f.as_deref());
-            if !is_dirty {
-                if let Some(f) = old {
-                    m.shards.insert(k as u32, ShardFiles::base(f.name.clone()));
-                }
-                continue;
-            }
-            let lo = k as u32 * w;
-            let hi = ((k as u64 + 1) * w as u64).min(self.n_ids() as u64) as u32;
-            let name = shard_file(k, checkpoint);
-            if store.manifest.shards.values().flat_map(ShardFiles::files).any(|n| n == name) {
-                bail!("{name} is in the committed manifest: checkpoint {checkpoint} was used before");
-            }
-            let mut wr = PagedWriter::create(&path.join(&name), FileKind::Base)?;
-            let body = self.write_shard_body(&mut wr, lo, hi, old, true)?;
-            let meta = ShardMeta {
-                format: PAGED_FORMAT,
-                build: store.dir.meta.build,
-                shard: k as u32,
-                lo,
-                hi,
-                live_lo: lo.max(self.base_n).min(hi),
-                checkpoint,
-                written_ms: now_ms(),
-                statuses: body.statuses,
-                stats: body.stats,
-            };
-            wr.finish("shard", &meta)?;
-            m.shards.insert(k as u32, ShardFiles::base(name));
-        }
-        crate::store::sync_dir(path)?;
-        m.write(path)?;
-        obs::snapshot_timed("checkpoint", t.elapsed().as_secs_f64());
-        Ok(m)
-    }
-
-    /// A shard's sections for ids lo..hi, every list re-encoded from what
-    /// the graph reads. `old` is the shard's file in this graph's snapshot,
-    /// where its statuses, tombstones and stamps come from.
-    /// `live`: the shard's ids past the directory keep their DIDs in it.
-    fn write_shard_body(
-        &self,
-        w: &mut PagedWriter,
-        lo: u32,
-        hi: u32,
-        old: Option<&ShardFile>,
-        live: bool,
-    ) -> Result<ShardBody> {
-        let mut stats = Vec::with_capacity(self.rels.len());
-        for rel in 0..self.rels.len() as RelId {
-            stats.push(self.write_shard_rel(w, rel, lo, hi, old)?);
-        }
-        let mut sts: Vec<(u32, u8)> = Vec::new();
-        if let Some(f) = old {
-            decode_statuses(f.pinned(&f.status), |id, c| {
-                if !self.status.contains_key(&id) {
-                    sts.push((id, c));
-                }
-            });
-        } else if let Some(s) = self.snapshot() {
-            for f in s.shards.iter().flatten() {
-                decode_statuses(f.pinned(&f.status), |id, c| {
-                    if (lo..hi).contains(&id) && !self.status.contains_key(&id) {
-                        sts.push((id, c));
-                    }
-                });
-            }
-        }
-        sts.extend(
-            self.status
-                .iter()
-                .filter(|(id, s)| (lo..hi).contains(*id) && s.is_some())
-                .map(|(&id, &s)| (id, Status::code(s))),
-        );
-        sts.sort_unstable();
-        w.pinned("status", &encode_statuses(&sts))?;
-        let dids = if live && hi > self.base_n {
-            &self.live_dids[(lo.max(self.base_n) - self.base_n) as usize..(hi - self.base_n) as usize]
-        } else {
-            &[][..]
-        };
-        w.pinned("live", &encode_live(dids))?;
-        Ok(ShardBody { stats, statuses: sts.len() as u64 })
-    }
-
-    fn write_shard_rel(
-        &self,
-        w: &mut PagedWriter,
-        rel: RelId,
-        lo: u32,
-        hi: u32,
-        old: Option<&ShardFile>,
-    ) -> Result<RelStats> {
-        let r = rel as usize;
-        let st = &self.state[r];
-        let mut stats = RelStats::default();
-        let mut side: Vec<(u32, u64, String)> = Vec::new();
-        let mut out = OutSections::new(r, self.subj_index);
-        out.begin(w)?;
-        for id in lo..hi {
-            let v = self.blocking(|cx| self.out_all(cx, rel, id))?;
-            if v.is_empty() {
-                continue;
-            }
-            for &(k, _) in &v {
-                if !is_tid(k) {
-                    side.push((id, k, self.rkey_string(rel, id, k).unwrap_or_default()));
-                }
-            }
-            out.push(id - lo, &v)?;
-            out.drain(w)?;
-            stats.out_records += v.len() as u64;
-            stats.out_lists += 1;
-        }
-        stats.out_bytes = out.finish(w, hi - lo)?.0;
-        stats.non_tid = side.len() as u64;
-        let side_ref: Vec<(u32, u64, &str)> = side.iter().map(|(a, k, s)| (*a, *k, s.as_str())).collect();
-        w.pinned(&rel_section(r, "side"), &encode_side(&side_ref))?;
-
-        let mut inn = InSections::new(r);
-        for id in lo..hi {
-            let v = self.blocking(|cx| self.in_set(cx, rel, id))?;
-            if v.is_empty() {
-                continue;
-            }
-            inn.push(id - lo, &v)?;
-            stats.in_pairs += v.len() as u64;
-            stats.in_lists += 1;
-        }
-        inn.finish(w, hi - lo)?;
-
-        let mut tombs: Vec<(u32, u64, i64)> = Vec::new();
-        let base_tombs = |f: &ShardFile, tombs: &mut Vec<(u32, u64, i64)>| {
-            decode_tombs(f.pinned(&f.rels[r].tomb), |a, key, t| {
-                if (lo..hi).contains(&a) && !st.untomb.contains(&(a, key)) && !st.tomb.contains_key(&(a, key)) {
-                    tombs.push((a, key, t));
-                }
-            });
-        };
-        match (old, self.snapshot()) {
-            (Some(f), _) => base_tombs(f, &mut tombs),
-            (None, Some(s)) => s.shards.iter().flatten().for_each(|f| base_tombs(f, &mut tombs)),
-            (None, None) => {}
-        }
-        tombs.extend(st.tomb.iter().filter(|((a, _), _)| (lo..hi).contains(a)).map(|(&(a, k), &t)| (a, k, t)));
-        if self.tombstone_ttl_us > 0 {
-            let cutoff = now_ms() * 1000 - self.tombstone_ttl_us;
-            tombs.retain(|t| t.2 >= cutoff);
-        }
-        tombs.sort_unstable();
-        stats.tombstones = tombs.len() as u64;
-        w.pinned(&rel_section(r, "tomb"), &encode_tombs(&tombs))?;
-
-        let mut stamps: Vec<(u32, u64, i64, u32)> = Vec::new();
-        let base_stamps = |f: &ShardFile, stamps: &mut Vec<(u32, u64, i64, u32)>| {
-            decode_stamps(f.pinned(&f.rels[r].stamp), |a, key, t, src| {
-                if (lo..hi).contains(&a) && !st.stamp.contains_key(&(a, key)) {
-                    stamps.push((a, key, t, src));
-                }
-            });
-        };
-        match (old, self.snapshot()) {
-            (Some(f), _) => base_stamps(f, &mut stamps),
-            (None, Some(s)) => s.shards.iter().flatten().for_each(|f| base_stamps(f, &mut stamps)),
-            (None, None) => {}
-        }
-        stamps.extend(
-            st.stamp
-                .iter()
-                .filter(|((a, _), v)| v.2 && (lo..hi).contains(a))
-                .map(|(&(a, k), &(t, src, _))| (a, k, t, src)),
-        );
-        if self.tombstone_ttl_us > 0 {
-            let cutoff = now_ms() * 1000 - self.tombstone_ttl_us;
-            stamps.retain(|t| t.2 >= cutoff);
-        }
-        stamps.sort_unstable();
-        w.pinned(&rel_section(r, "stamp"), &encode_stamps(&stamps))?;
-        Ok(stats)
-    }
-
     /// Sets the by-subject index threshold for snapshots this graph writes.
     pub fn set_subj_index(&mut self, n: usize) {
         if self.base.is_none() && self.state.iter().all(|s| s.out_over.is_empty()) {
             self.subj_index = n;
         }
     }
-}
-
-struct ShardBody {
-    stats: Vec<RelStats>,
-    statuses: u64,
 }
 
 /// A source's name as a stamp holds it.

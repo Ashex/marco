@@ -1566,6 +1566,13 @@ impl PagedWriter {
         Ok(pages)
     }
 
+    /// Gives the file up: closes and deletes it.
+    pub fn abandon(self) {
+        let tmp = self.tmp.clone();
+        drop(self);
+        let _ = std::fs::remove_file(tmp);
+    }
+
     /// Writes the sums sections and the footer, fsyncs and renames the file
     /// into place. Returns the footer as written.
     pub fn finish(mut self, kind: &str, meta: &impl Serialize) -> Result<PagedFooter> {

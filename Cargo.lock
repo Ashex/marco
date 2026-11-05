@@ -1745,6 +1745,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tracing",
+ "zstd",
 ]
 
 [[package]]
