@@ -169,6 +169,8 @@ fn same_origin(headers: &HeaderMap, write: bool) -> bool {
     let site = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok());
     match site {
         Some("same-origin") => true,
+        // a page the operator opened by typing it or from a bookmark
+        Some("none") => !write,
         Some(_) => false,
         None if !write => true,
         None => {
@@ -202,7 +204,10 @@ pub async fn gate(
         Err(r) if needs || path == "/marco.v1.Admin/GetSession" => return r.into_response(connect),
         Err(_) => None,
     };
-    if let Some(Caller::Proxy(_)) = &caller {
+    // The console's page and assets carry no data, so a link to them is fine;
+    // the RPCs and ops routes it then calls are what a login must guard.
+    let guarded = connect || path.starts_with("/metrics") || path.starts_with("/debug/");
+    if let (Some(Caller::Proxy(_)), true) = (&caller, guarded) {
         let write = !is_read(&path) && !(path.starts_with("/metrics") || req.method() == http::Method::GET);
         if !same_origin(req.headers(), write) {
             return Refusal::denied("a proxy login works only from the console's own page").into_response(connect);

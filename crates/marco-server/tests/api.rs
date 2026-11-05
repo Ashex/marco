@@ -667,6 +667,26 @@ async fn admin_auth() {
         http(s.admin, "POST", "/marco.v1.Admin/GetOverview", "{}", &op("mallory@example.com", "same-origin")).0,
         403
     );
+    // opening the console signed in: typed, bookmarked or from a link
+    for site in ["none", "cross-site", "same-site", ""] {
+        assert_eq!(http(s.admin, "GET", "/admin/", "", &op("alice@example.com", site)).0, 200, "page, {site:?}");
+        assert_eq!(
+            http(s.admin, "GET", "/admin/storage", "", &op("alice@example.com", site)).0,
+            200,
+            "route, {site:?}"
+        );
+    }
+    assert_eq!(
+        http(s.admin, "POST", "/marco.v1.Admin/GetOverview", "{}", &op("alice@example.com", "none")).0,
+        200,
+        "a read the operator started"
+    );
+    assert_eq!(
+        http(s.admin, "POST", "/marco.v1.Admin/SetTraceRatio", r#"{"ratio":0}"#, &op("alice@example.com", "none")).0,
+        403,
+        "a write still needs the console's page"
+    );
+    assert_eq!(http(s.admin, "GET", "/metrics", "", &op("alice@example.com", "cross-site")).0, 403);
     // the header means nothing on the API listener
     let (st, _) =
         http(s.api, "POST", "/marco.v1.Graph/WriteBatch", r#"{"ops":[]}"#, &op("alice@example.com", "same-origin"));
