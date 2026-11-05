@@ -116,6 +116,58 @@ message GetOverviewResponse {
   // Why not ready, empty when ready.
   string ready_reason = 25;
   uint64 reads_before_ready = 26;
+  // The storage engine's budget and reads; unset on --storage mmap.
+  Cache cache = 27;
+}
+
+// Where the store's budget is, and what its reads did since start. Rates,
+// ratios and quantiles over time are GetSeries' store_* series.
+message Cache {
+  // --memory.
+  uint64 budget_bytes = 1;
+  // The pinned tier: the directory, the shards' indexes and heads, and the
+  // tables (page sums, slots, side tables, statuses, the engine's own).
+  uint64 pinned_dir_bytes = 2;
+  uint64 pinned_index_bytes = 3;
+  uint64 pinned_heads_bytes = 4;
+  uint64 pinned_tables_bytes = 5;
+  uint64 main_bytes = 6;
+  uint64 small_bytes = 7;
+  // Frames waiting on the epoch before reuse.
+  uint64 retired_bytes = 8;
+  // Cached pages a request holds (inside main and small).
+  uint64 pins_bytes = 9;
+  uint64 free_bytes = 10;
+  // Borrowed by anything but the served snapshot (a checkpoint's new files
+  // before their switch).
+  uint64 borrowed_bytes = 11;
+  // Paged bytes no index names, as of the last checkpoint or compaction.
+  uint64 garbage_bytes = 12;
+  // Lookups and misses since start, by structure (out_small, out_subj,
+  // out_rkey, out_bysubj, in_small, in_blocks).
+  repeated CacheStructure structures = 13;
+  uint64 bad_pages = 14;
+  // Failed page reads since start: checksum, eio, short; and EIO a retry fixed.
+  uint64 checksum_errors = 15;
+  uint64 eio_errors = 16;
+  uint64 short_errors = 17;
+  uint64 eio_retried = 18;
+  // Distinct pages failing on the device in the last 60 s; 64 is a storm.
+  uint32 failing_pages = 19;
+  uint32 miss_threads = 20;
+  // Compactions in the last 24 h.
+  uint32 compactions_24h = 21;
+  // The whole snapshot was loaded at open.
+  bool resident = 22;
+  // Pages checkpoints and compactions wrote into the cache, and let go.
+  uint64 written_through = 23;
+  uint64 write_through_skipped = 24;
+}
+
+message CacheStructure {
+  string name = 1;
+  uint64 lookups = 2;
+  uint64 misses = 3;
 }
 
 // Writes are applied in memory, then written every few seconds as a change
@@ -153,6 +205,10 @@ message Durability {
   // cleared by the next that commits.
   string checkpoint_error = 20;
   uint64 checkpoint_failures = 21;
+  // The last checkpoint's patch bytes (R, the changed lists and blocks) and
+  // their pinned sections (P_new).
+  uint64 checkpoint_patch_bytes = 22;
+  uint64 checkpoint_pinned_bytes = 23;
 }
 
 message SnapshotInfo {

@@ -122,6 +122,7 @@ impl Ring {
             let dt = now.duration_since(*t0).as_secs_f64().max(1e-3);
             let rate = |id: &str, v: f64| (v - pc.get(id).copied().unwrap_or(0.0)).max(0.0) / dt;
             let mut rpc_err: HashMap<String, f64> = HashMap::new();
+            let mut lookups: HashMap<String, (f64, f64)> = HashMap::new();
             let mut seen = std::collections::HashSet::new();
             for f in fams {
                 for m in f.get_metric() {
@@ -173,6 +174,44 @@ impl Ring {
                         "marco_rpc_errors_total" => {
                             *rpc_err.entry(label(m, "rpc")).or_default() += rate(&i, ctrs[&i]);
                         }
+                        "marco_store_io_seconds"
+                        | "marco_store_miss_pool_wait_seconds"
+                        | "marco_store_request_pages"
+                        | "marco_store_request_rounds" => {
+                            let h = &hists[&i];
+                            let b = ph.get(&i);
+                            let n = h.count - b.map_or(0, |b| b.count).min(h.count);
+                            let k = |metric| Key {
+                                metric,
+                                rpc: label(m, "rpc"),
+                                dir: label(m, "queue"),
+                                ..Default::default()
+                            };
+                            match f.name() {
+                                "marco_store_io_seconds" => {
+                                    vals.push((k("store_reads"), n as f64 / dt));
+                                    vals.push((k("store_read_p50"), quantile(h, b, 0.5)));
+                                    vals.push((k("store_read_p99"), quantile(h, b, 0.99)));
+                                }
+                                "marco_store_miss_pool_wait_seconds" => {
+                                    vals.push((k("store_pool_wait_p99"), quantile(h, b, 0.99)))
+                                }
+                                "marco_store_request_pages" => vals.push((k("store_pages_p99"), quantile(h, b, 0.99))),
+                                _ => vals.push((k("store_rounds_p99"), quantile(h, b, 0.99))),
+                            }
+                        }
+                        "marco_store_io_bytes_total" => vals.push((
+                            Key { metric: "store_io_bytes", dir: label(m, "queue"), ..Default::default() },
+                            rate(&i, ctrs[&i]),
+                        )),
+                        "marco_store_lookups_total" => {
+                            let r = rate(&i, ctrs[&i]);
+                            let e = lookups.entry(label(m, "structure")).or_default();
+                            e.0 += r;
+                            if label(m, "result") == "miss" {
+                                e.1 += r;
+                            }
+                        }
                         "process_cpu_seconds_total" => {
                             vals.push((Key { metric: "cpu_cores", ..Default::default() }, rate(&i, ctrs[&i])))
                         }
@@ -182,6 +221,10 @@ impl Ring {
             }
             for (rpc, r) in rpc_err {
                 vals.push((Key { metric: "rpc_errors", rpc, ..Default::default() }, r));
+            }
+            for (structure, (all, miss)) in lookups {
+                vals.push((Key { metric: "store_lookups", op: structure.clone(), ..Default::default() }, all));
+                vals.push((Key { metric: "store_misses", op: structure, ..Default::default() }, miss));
             }
         }
         let first = self.prev.is_none();
@@ -268,7 +311,10 @@ fn sample(app: &App, cache: bool) {
         crate::metrics::CACHED.set(b as i64);
     }
     let p = crate::sys::proc_self();
+    let (depth, _) = app.engine.io_depth();
     let extra = [
+        (Key { metric: "store_io_queue", ..Default::default() }, depth as f64),
+        (Key { metric: "store_pool_busy", ..Default::default() }, crate::metrics::POOL_BUSY.get() as f64),
         (Key { metric: "rss_bytes", ..Default::default() }, p.rss_bytes as f64),
         (Key { metric: "delta_entries", ..Default::default() }, delta as f64),
         (Key { metric: "tombstones", ..Default::default() }, tombs as f64),

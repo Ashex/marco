@@ -12,7 +12,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file marco/v1/admin.proto.
  */
 export const file_marco_v1_admin: GenFile = /*@__PURE__*/
-  fileDesc("ChRtYXJjby92MS9hZG1pbi5wcm90bxIIbWFyY28udjEiEwoRR2V0U2Vzc2lvblJlcXVlc3QiNAoSR2V0U2Vzc2lvblJlc3BvbnNlEgwKBGF1dGgYASABKAkSEAoIb3BlcmF0b3IYAiABKAkiFAoSR2V0T3ZlcnZpZXdSZXF1ZXN0IqQFChNHZXRPdmVydmlld1Jlc3BvbnNlEg8KB3ZlcnNpb24YASABKAkSDgoGY29tbWl0GAIgASgJEhIKCnN0YXJ0ZWRfbXMYAyABKAMSEQoJcmVhZF9vbmx5GAQgASgIEigKCHNuYXBzaG90GAUgASgLMhYubWFyY28udjEuU25hcHNob3RJbmZvEioKCWRpcmVjdG9yeRgGIAEoCzIXLm1hcmNvLnYxLkRpcmVjdG9yeUluZm8SKwoJcmVsYXRpb25zGAcgAygLMhgubWFyY28udjEuUmVsYXRpb25Ub3RhbHMSJgoHcHJvY2VzcxgIIAEoCzIVLm1hcmNvLnYxLlByb2Nlc3NJbmZvEhMKC3RyYWNlX3JhdGlvGAkgASgBEhoKA2pvYhgKIAEoCzINLm1hcmNvLnYxLkpvYhITCgttZXJnZV9yYXRpbxgLIAEoARIUCgxkaXJ0eV9zaGFyZHMYDCABKA0SEwoLb3Zlcl9zaGFyZHMYDSABKA0SFQoNZGVsdGFfZW50cmllcxgOIAEoBBIUCgxiYXNlX2VudHJpZXMYDyABKAQSEgoKdG9tYnN0b25lcxgQIAEoBBIUCgxtZXJnZWRfYnl0ZXMYESABKAQSFAoMbWVyZ2VkX2xpc3RzGBIgASgNEhQKDHdyaXRlX2N1cnNvchgTIAEoCRIRCgl3cml0ZV9zZXEYFCABKAQSEgoKYXBpX2xpc3RlbhgVIAEoCRIUCgxhZG1pbl9saXN0ZW4YFiABKAkSKAoKZHVyYWJpbGl0eRgXIAEoCzIULm1hcmNvLnYxLkR1cmFiaWxpdHkSDQoFcmVhZHkYGCABKAgSFAoMcmVhZHlfcmVhc29uGBkgASgJEhoKEnJlYWRzX2JlZm9yZV9yZWFkeRgaIAEoBCKQBAoKRHVyYWJpbGl0eRIgChhzZWdtZW50X2ludGVydmFsX3NlY29uZHMYASABKAESDwoHc2VnbWVudBgCIAEoBBISCgpzZWdtZW50X21zGAMgASgDEh0KFXNlZ21lbnRfd3JpdGVfc2Vjb25kcxgEIAEoARIQCghzZWdtZW50cxgFIAEoDRIVCg1zZWdtZW50X2J5dGVzGAYgASgEEhMKC3NlZ21lbnRfb3BzGAcgASgEEhMKC3BlbmRpbmdfb3BzGAggASgEEhIKCmNoZWNrcG9pbnQYCSABKAQSFQoNY2hlY2twb2ludF9tcxgKIAEoAxIWCg5jaGVja3BvaW50X29wcxgLIAEoBBIeChZjaGVja3BvaW50X2FnZV9zZWNvbmRzGAwgASgBEhoKEmNoZWNrcG9pbnRfc2Vjb25kcxgNIAEoARIYChBjaGVja3BvaW50X2J5dGVzGA4gASgEEhkKEWNoZWNrcG9pbnRfc2hhcmRzGA8gASgNEhkKEXJlcGxheWVkX3NlZ21lbnRzGBAgASgNEhQKDHJlcGxheWVkX29wcxgRIAEoBBIWCg5yZXBsYXlfc2Vjb25kcxgSIAEoARIVCg1zZWdtZW50X2Vycm9yGBMgASgJEhgKEGNoZWNrcG9pbnRfZXJyb3IYFCABKAkSGwoTY2hlY2twb2ludF9mYWlsdXJlcxgVIAEoBCKsAQoMU25hcHNob3RJbmZvEgwKBHBhdGgYASABKAkSDQoFYnVpbGQYAiABKAkSDgoGZm9ybWF0GAMgASgNEg4KBnNoYXJkcxgEIAEoDRISCgpzaXplX2J5dGVzGAUgASgEEhIKCndyaXR0ZW5fbXMYBiABKAMSFAoMb3Blbl9zZWNvbmRzGAcgASgBEhIKCnN1YmpfaW5kZXgYCCABKA0SDQoFZmlsZXMYCSABKA0iKwoNRGlyZWN0b3J5SW5mbxIMCgRiYXNlGAEgASgEEgwKBGxpdmUYAiABKAQiiwIKDlJlbGF0aW9uVG90YWxzEgwKBG5hbWUYASABKAkSEgoKY29sbGVjdGlvbhgCIAEoCRIPCgdzdWJqZWN0GAMgASgJEg8KB3JlY29yZHMYBCABKAQSGAoQc25hcHNob3RfcmVjb3JkcxgFIAEoBBIWCg5zbmFwc2hvdF9wYWlycxgGIAEoBBIRCglvdXRfbGlzdHMYByABKAQSEAoIaW5fbGlzdHMYCCABKAQSDwoHbm9uX3RpZBgJIAEoBBIRCglkZWx0YV9vdXQYCiABKAQSEAoIZGVsdGFfaW4YCyABKAQSEgoKdG9tYnN0b25l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EwoLaW5fY29udGFpbnMYECABKAgSGAoQc3ViamVjdF9pbl9jb3VudBgRIAEoBBIVCg1zdWJqZWN0X3NoYXJkGBIgASgNEhkKEXN1YmplY3RfaW5fc3RvcmVkGBMgASgJEgwKBGxpc3QYFCABKAkiFAoSR2V0U2V0dGluZ3NSZXF1ZXN0IlgKE0dldFNldHRpbmdzUmVzcG9uc2USHQoFZmxhZ3MYASADKAsyDi5tYXJjby52MS5GbGFnEiIKBWJ1aWxkGAIgASgLMhMubWFyY28udjEuQnVpbGRJbmZvIjMKBEZsYWcSDAoEbmFtZRgBIAEoCRINCgV2YWx1ZRgCIAEoCRIOCgZzb3VyY2UYAyABKAkiTgoJQnVpbGRJbmZvEg8KB3ZlcnNpb24YASABKAkSDgoGY29tbWl0GAIgASgJEg4KBmZvcm1hdBgDIAEoDRIQCghmZWF0dXJlcxgEIAMoCSITChFDaGVja3BvaW50UmVxdWVzdCIwChJDaGVja3BvaW50UmVzcG9uc2USGgoDam9iGAEgASgLMg0ubWFyY28udjEuSm9iIhUKE1ZlcmlmeVNoYXJkc1JlcXVlc3QiMgoUVmVyaWZ5U2hhcmRzUmVzcG9uc2USGgoDam9iGAEgASgLMg0ubWFyY28udjEuSm9iIiUKFFNldFRyYWNlUmF0aW9SZXF1ZXN0Eg0KBXJhdGlvGAEgASgBIiYKFVNldFRyYWNlUmF0aW9SZXNwb25zZRINCgVyYXRpbxgBIAEoASI0ChVTZXRBY3RvclN0YXR1c1JlcXVlc3QSCwoDZGlkGAEgASgJEg4KBnN0YXR1cxgCIAEoCSJGChZTZXRBY3RvclN0YXR1c1Jlc3BvbnNlEgsKA2RpZBgBIAEoCRIOCgZzdGF0dXMYAiABKAkSDwoHcmVtb3ZlZBgDIAEoBDLaCgoFQWRtaW4STAoKR2V0U2Vzc2lvbhIbLm1hcmNvLnYxLkdldFNlc3Npb25SZXF1ZXN0GhwubWFyY28udjEuR2V0U2Vzc2lvblJlc3BvbnNlIgOQAgESTwoLR2V0T3ZlcnZpZXcSHC5tYXJjby52MS5HZXRPdmVydmlld1JlcXVlc3QaHS5tYXJjby52MS5HZXRPdmVydmlld1Jlc3BvbnNlIgOQAgESSQoJR2V0U2VyaWVzEhoubWFyY28udjEuR2V0U2VyaWVzUmVxdWVzdBobLm1hcmNvLnYxLkdldFNlcmllc1Jlc3BvbnNlIgOQAgESXgoQTGlzdFJlY2VudFdyaXRlcxIhLm1hcmNvLnYxLkxpc3RSZWNlbnRXcml0ZXNSZXF1ZXN0GiIubWFyY28udjEuTGlzdFJlY2VudFdyaXRlc1Jlc3BvbnNlIgOQAgESTAoKTGlzdFNoYXJkcxIbLm1hcmNvLnYxLkxpc3RTaGFyZHNSZXF1ZXN0GhwubWFyY28udjEuTGlzdFNoYXJkc1Jlc3BvbnNlIgOQAgESTAoKR2V0U3RvcmFnZRIbLm1hcmNvLnYxLkdldFN0b3JhZ2VSZXF1ZXN0GhwubWFyY28udjEuR2V0U3RvcmFnZVJlc3BvbnNlIgOQAgESVQoNTGlzdFJlbGF0aW9ucxIeLm1hcmNvLnYxLkxpc3RSZWxhdGlvbnNSZXF1ZXN0Gh8ubWFyY28udjEuTGlzdFJlbGF0aW9uc1Jlc3BvbnNlIgOQAgESUgoMR2V0TGlzdFN0YXRzEh0ubWFyY28udjEuR2V0TGlzdFN0YXRzUmVxdWVzdBoeLm1hcmNvLnYxLkdldExpc3RTdGF0c1Jlc3BvbnNlIgOQAgESTwoLTGlzdFNvdXJjZXMSHC5tYXJjby52MS5MaXN0U291cmNlc1JlcXVlc3QaHS5tYXJjby52MS5MaXN0U291cmNlc1Jlc3BvbnNlIgOQAgESRgoIR2V0QWN0b3ISGS5tYXJjby52MS5HZXRBY3RvclJlcXVlc3QaGi5tYXJjby52MS5HZXRBY3RvclJlc3BvbnNlIgOQAgESSQoJTGlzdEVkZ2VzEhoubWFyY28udjEuTGlzdEVkZ2VzUmVxdWVzdBobLm1hcmNvLnYxLkxpc3RFZGdlc1Jlc3BvbnNlIgOQAgESTAoKUmVzb2x2ZVVyaRIbLm1hcmNvLnYxLlJlc29sdmVVcmlSZXF1ZXN0GhwubWFyY28udjEuUmVzb2x2ZVVyaVJlc3BvbnNlIgOQAgESTwoLR2V0U2V0dGluZ3MSHC5tYXJjby52MS5HZXRTZXR0aW5nc1JlcXVlc3QaHS5tYXJjby52MS5HZXRTZXR0aW5nc1Jlc3BvbnNlIgOQAgESRwoKQ2hlY2twb2ludBIbLm1hcmNvLnYxLkNoZWNrcG9pbnRSZXF1ZXN0GhwubWFyY28udjEuQ2hlY2twb2ludFJlc3BvbnNlEk0KDFZlcmlmeVNoYXJkcxIdLm1hcmNvLnYxLlZlcmlmeVNoYXJkc1JlcXVlc3QaHi5tYXJjby52MS5WZXJpZnlTaGFyZHNSZXNwb25zZRJQCg1TZXRUcmFjZVJhdGlvEh4ubWFyY28udjEuU2V0VHJhY2VSYXRpb1JlcXVlc3QaHy5tYXJjby52MS5TZXRUcmFjZVJhdGlvUmVzcG9uc2USUwoOU2V0QWN0b3JTdGF0dXMSHy5tYXJjby52MS5TZXRBY3RvclN0YXR1c1JlcXVlc3QaIC5tYXJjby52MS5TZXRBY3RvclN0YXR1c1Jlc3BvbnNlYgZwcm90bzM", [file_marco_v1_graph]);
+  fileDesc("ChRtYXJjby92MS9hZG1pbi5wcm90bxIIbWFyY28udjEiEwoRR2V0U2Vzc2lvblJlcXVlc3QiNAoSR2V0U2Vzc2lvblJlc3BvbnNlEgwKBGF1dGgYASABKAkSEAoIb3BlcmF0b3IYAiABKAkiFAoSR2V0T3ZlcnZpZXdSZXF1ZXN0IsQFChNHZXRPdmVydmlld1Jlc3BvbnNlEg8KB3ZlcnNpb24YASABKAkSDgoGY29tbWl0GAIgASgJEhIKCnN0YXJ0ZWRfbXMYAyABKAMSEQoJcmVhZF9vbmx5GAQgASgIEigKCHNuYXBzaG90GAUgASgLMhYubWFyY28udjEuU25hcHNob3RJbmZvEioKCWRpcmVjdG9yeRgGIAEoCzIXLm1hcmNvLnYxLkRpcmVjdG9yeUluZm8SKwoJcmVsYXRpb25zGAcgAygLMhgubWFyY28udjEuUmVsYXRpb25Ub3RhbHMSJgoHcHJvY2VzcxgIIAEoCzIVLm1hcmNvLnYxLlByb2Nlc3NJbmZvEhMKC3RyYWNlX3JhdGlvGAkgASgBEhoKA2pvYhgKIAEoCzINLm1hcmNvLnYxLkpvYhITCgttZXJnZV9yYXRpbxgLIAEoARIUCgxkaXJ0eV9zaGFyZHMYDCABKA0SEwoLb3Zlcl9zaGFyZHMYDSABKA0SFQoNZGVsdGFfZW50cmllcxgOIAEoBBIUCgxiYXNlX2VudHJpZXMYDyABKAQSEgoKdG9tYnN0b25lcxgQIAEoBBIUCgxtZXJnZWRfYnl0ZXMYESABKAQSFAoMbWVyZ2VkX2xpc3RzGBIgASgNEhQKDHdyaXRlX2N1cnNvchgTIAEoCRIRCgl3cml0ZV9zZXEYFCABKAQSEgoKYXBpX2xpc3RlbhgVIAEoCRIUCgxhZG1pbl9saXN0ZW4YFiABKAkSKAoKZHVyYWJpbGl0eRgXIAEoCzIULm1hcmNvLnYxLkR1cmFiaWxpdHkSDQoFcmVhZHkYGCABKAgSFAoMcmVhZHlfcmVhc29uGBkgASgJEhoKEnJlYWRzX2JlZm9yZV9yZWFkeRgaIAEoBBIeCgVjYWNoZRgbIAEoCzIPLm1hcmNvLnYxLkNhY2hlIswECgVDYWNoZRIUCgxidWRnZXRfYnl0ZXMYASABKAQSGAoQcGlubmVkX2Rpcl9ieXRlcxgCIAEoBBIaChJwaW5uZWRfaW5kZXhfYnl0ZXMYAyABKAQSGgoScGlubmVkX2hlYWRzX2J5dGVzGAQgASgEEhsKE3Bpbm5lZF90YWJsZXNfYnl0ZXMYBSABKAQSEgoKbWFpbl9ieXRlcxgGIAEoBBITCgtzbWFsbF9ieXRlcxgHIAEoBBIVCg1yZXRpcmVkX2J5dGVzGAggASgEEhIKCnBpbnNfYnl0ZXMYCSABKAQSEgoKZnJlZV9ieXRlcxgKIAEoBBIWCg5ib3Jyb3dlZF9ieXRlcxgLIAEoBBIVCg1nYXJiYWdlX2J5dGVzGAwgASgEEiwKCnN0cnVjdHVyZXMYDSADKAsyGC5tYXJjby52MS5DYWNoZVN0cnVjdHVyZRIRCgliYWRfcGFnZXMYDiABKAQSFwoPY2hlY2tzdW1fZXJyb3JzGA8gASgEEhIKCmVpb19lcnJvcnMYECABKAQSFAoMc2hvcnRfZXJyb3JzGBEgASgEEhMKC2Vpb19yZXRyaWVkGBIgASgEEhUKDWZhaWxpbmdfcGFnZXMYEyABKA0SFAoMbWlzc190aHJlYWRzGBQgASgNEhcKD2NvbXBhY3Rpb25zXzI0aBgVIAEoDRIQCghyZXNpZGVudBgWIAEoCBIXCg93cml0dGVuX3Rocm91Z2gYFyABKAQSHQoVd3JpdGVfdGhyb3VnaF9za2lwcGVkGBggASgEIj8KDkNhY2hlU3RydWN0dXJlEgwKBG5hbWUYASABKAkSDwoHbG9va3VwcxgCIAEoBBIOCgZtaXNzZXMYAyABKAQi0QQKCkR1cmFiaWxpdHkSIAoYc2VnbWVudF9pbnRlcnZhbF9zZWNvbmRzGAEgASgBEg8KB3NlZ21lbnQYAiABKAQSEgoKc2VnbWVudF9tcxgDIAEoAxIdChVzZWdtZW50X3dyaXRlX3NlY29uZHMYBCABKAESEAoIc2VnbWVudHMYBSABKA0SFQoNc2VnbWVudF9ieXRlcxgGIAEoBBITCgtzZWdtZW50X29wcxgHIAEoBBITCgtwZW5kaW5nX29wcxgIIAEoBBISCgpjaGVja3BvaW50GAkgASgEEhUKDWNoZWNrcG9pbnRfbXMYCiABKAMSFgoOY2hlY2twb2ludF9vcHMYCyABKAQSHgoWY2hlY2twb2ludF9hZ2Vfc2Vjb25kcxgMIAEoARIaChJjaGVja3BvaW50X3NlY29uZHMYDSABKAESGAoQY2hlY2twb2ludF9ieXRlcxgOIAEoBBIZChFjaGVja3BvaW50X3NoYXJkcxgPIAEoDRIZChFyZXBsYXllZF9zZWdtZW50cxgQIAEoDRIUCgxyZXBsYXllZF9vcHMYESABKAQSFgoOcmVwbGF5X3NlY29uZHMYEiABKAESFQoNc2VnbWVudF9lcnJvchgTIAEoCRIYChBjaGVja3BvaW50X2Vycm9yGBQgASgJEhsKE2NoZWNrcG9pbnRfZmFpbHVyZXMYFSABKAQSHgoWY2hlY2twb2ludF9wYXRjaF9ieXRlcxgWIAEoBBIfChdjaGVja3BvaW50X3Bpbm5lZF9ieXRlcxgXIAEoBCKsAQoMU25hcHNob3RJbmZvEgwKBHBhdGgYASABKAkSDQoFYnVpbGQYAiABKAkSDgoGZm9ybWF0GAMgASgNEg4KBnNoYXJkcxgEIAEoDRISCgpzaXplX2J5dGVzGAUgASgEEhIKCndyaXR0ZW5fbXMYBiABKAMSFAoMb3Blbl9zZWNvbmRzGAcgASgBEhIKCnN1YmpfaW5kZXgYCCABKA0SDQoFZmlsZXMYCSABKA0iKwoNRGlyZWN0b3J5SW5mbxIMCgRiYXNlGAEgASgEEgwKBGxpdmUYAiABKAQiiwIKDlJlbGF0aW9uVG90YWxzEgwKBG5hbWUYASABKAkSEgoKY29sbGVjdGlvbhgCIAEoCRIPCgdzdWJqZWN0GAMgASgJEg8KB3JlY29yZHMYBCABKAQSGAoQc25hcHNob3RfcmVjb3JkcxgFIAEoBBIWCg5zbmFwc2hvdF9wYWlycxgGIAEoBBIRCglvdXRfbGlzdHMYByABKAQSEAoIaW5fbGlzdHMYCCABKAQSDwoHbm9uX3RpZBgJIAEoBBIRCglkZWx0YV9vdXQYCiABKAQSEAoIZGVsdGFfaW4YCyABKAQSEgoKdG9tYnN0b25lcxgMIAEoBBIUCgxtZXJnZWRfYnl0ZXMYDSABKAQifgoLUHJvY2Vzc0luZm8SEQoJcnNzX2J5dGVzGAEgASgEEhcKD21lbV90b3RhbF9ieXRlcxgCIAEoBBITCgtjcHVfc2Vjb25kcxgDIAEoARIPCgd0aHJlYWRzGAQgASgNEh0KFXNuYXBzaG90X2NhY2hlZF9ieXRlcxgFIAEoBCJ5CgNKb2ISDAoEa2luZBgBIAEoCRIPCgdydW5uaW5nGAIgASgIEhIKCnN0YXJ0ZWRfbXMYAyABKAMSEwoLZmluaXNoZWRfbXMYBCABKAMSDQoFZXJyb3IYBSABKAkSDAoEZG9uZRgGIAEoDRINCgV0b3RhbBgHIAEoDSIqChBHZXRTZXJpZXNSZXF1ZXN0EhYKDndpbmRvd19zZWNvbmRzGAEgASgNIlQKEUdldFNlcmllc1Jlc3BvbnNlEg8KB3N0ZXBfbXMYASABKAMSDAoEdF9tcxgCIAMoAxIgCgZzZXJpZXMYAyADKAsyEC5tYXJjby52MS5TZXJpZXMibAoGU2VyaWVzEg4KBm1ldHJpYxgBIAEoCRIKCgJvcBgCIAEoCRILCgNyZWwYAyABKAkSDwoHb3V0Y29tZRgEIAEoCRILCgNkaXIYBSABKAkSCwoDcnBjGAYgASgJEg4KBnZhbHVlcxgHIAMoASI3ChdMaXN0UmVjZW50V3JpdGVzUmVxdWVzdBINCgVhZnRlchgBIAEoBBINCgVsaW1pdBgCIAEoDSJTChhMaXN0UmVjZW50V3JpdGVzUmVzcG9uc2USJQoGd3JpdGVzGAEgAygLMhUubWFyY28udjEuUmVjZW50V3JpdGUSEAoIbGFzdF9zZXEYAiABKAQigQEKC1JlY2VudFdyaXRlEgsKA3NlcRgBIAEoBBINCgVhdF9tcxgCIAEoAxILCgNyZWwYAyABKAkSCwoDYWRkGAQgASgIEg0KBWFjdG9yGAUgASgJEg8KB3N1YmplY3QYBiABKAkSDwoHb3V0Y29tZRgHIAEoCRILCgN1cmkYCCABKAkiEwoRTGlzdFNoYXJkc1JlcXVlc3QimQEKEkxpc3RTaGFyZHNSZXNwb25zZRIfCgZzaGFyZHMYASADKAsyDy5tYXJjby52MS5TaGFyZBITCgttZXJnZV9yYXRpbxgCIAEoARIaCgNqb2IYAyABKAsyDS5tYXJjby52MS5Kb2ISFwoPZGlyZWN0b3J5X2J5dGVzGAQgASgEEhgKEGRpcmVjdG9yeV92ZXJpZnkYBSABKAkirwIKBVNoYXJkEg0KBXNoYXJkGAEgASgNEgoKAmxvGAIgASgNEgoKAmhpGAMgASgNEhIKCnNpemVfYnl0ZXMYBCABKAQSEgoKd3JpdHRlbl9tcxgFIAEoAxIUCgxiYXNlX2VudHJpZXMYBiABKAQSFQoNZGVsdGFfZW50cmllcxgHIAEoBBITCgtkZWx0YV9saXN0cxgIIAEoDRIUCgxtZXJnZWRfbGlzdHMYCSABKA0SFAoMbWVyZ2VkX2J5dGVzGAogASgEEhIKCnRvbWJzdG9uZXMYCyABKA0SDQoFc3RhdGUYDCABKAkSDgoGdmVyaWZ5GA0gASgJEhQKDHZlcmlmeV9lcnJvchgOIAEoCRIMCgRmaWxlGA8gASgJEhIKCmNoZWNrcG9pbnQYECABKAQiHwoRR2V0U3RvcmFnZVJlcXVlc3QSCgoCYnkYASABKAkicwoSR2V0U3RvcmFnZVJlc3BvbnNlEiMKCHNlY3Rpb25zGAEgAygLMhEubWFyY28udjEuU2VjdGlvbhIjCgZkZWx0YXMYAiADKAsyEy5tYXJjby52MS5EZWx0YUxpc3QSEwoLZGVsdGFfbGlzdHMYAyABKA0iRwoHU2VjdGlvbhIMCgRuYW1lGAEgASgJEgsKA3JlbBgCIAEoCRISCgpzaXplX2J5dGVzGAMgASgEEg0KBWZpbGVzGAQgASgNImsKCURlbHRhTGlzdBILCgNkaWQYASABKAkSCwoDcmVsGAIgASgJEhoKA2RpchgDIAEoDjINLm1hcmNvLnYxLkRpchIMCgRiYXNlGAQgASgEEgwKBGFkZHMYBSABKAQSDAoEZGVscxgGIAEoBCIWChRMaXN0UmVsYXRpb25zUmVxdWVzdCJSChVMaXN0UmVsYXRpb25zUmVzcG9uc2USKQoJcmVsYXRpb25zGAEgAygLMhYubWFyY28udjEuUmVsYXRpb25JbmZvEg4KBmNvbmZpZxgCIAEoCSKmAQoMUmVsYXRpb25JbmZvEgwKBG5hbWUYASABKAkSEgoKY29sbGVjdGlvbhgCIAEoCRIPCgdzdWJqZWN0GAMgASgJEg8KB3JlY29yZHMYBCABKAQSDQoFcGFpcnMYBSABKAQSEgoKZHVwbGljYXRlcxgGIAEoBBIPCgdub25fdGlkGAcgASgEEgwKBGxpc3QYCCABKAkSEAoIb3duZXJfb2YYCSABKAkiIgoTR2V0TGlzdFN0YXRzUmVxdWVzdBILCgNyZWwYASABKAkiwAEKFEdldExpc3RTdGF0c1Jlc3BvbnNl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UmVzcG9uc2USHQoFZmxhZ3MYASADKAsyDi5tYXJjby52MS5GbGFnEiIKBWJ1aWxkGAIgASgLMhMubWFyY28udjEuQnVpbGRJbmZvIjMKBEZsYWcSDAoEbmFtZRgBIAEoCRINCgV2YWx1ZRgCIAEoCRIOCgZzb3VyY2UYAyABKAkiTgoJQnVpbGRJbmZvEg8KB3ZlcnNpb24YASABKAkSDgoGY29tbWl0GAIgASgJEg4KBmZvcm1hdBgDIAEoDRIQCghmZWF0dXJlcxgEIAMoCSITChFDaGVja3BvaW50UmVxdWVzdCIwChJDaGVja3BvaW50UmVzcG9uc2USGgoDam9iGAEgASgLMg0ubWFyY28udjEuSm9iIhUKE1ZlcmlmeVNoYXJkc1JlcXVlc3QiMgoUVmVyaWZ5U2hhcmRzUmVzcG9uc2USGgoDam9iGAEgASgLMg0ubWFyY28udjEuSm9iIiUKFFNldFRyYWNlUmF0aW9SZXF1ZXN0Eg0KBXJhdGlvGAEgASgBIiYKFVNldFRyYWNlUmF0aW9SZXNwb25zZRINCgVyYXRpbxgBIAEoASI0ChVTZXRBY3RvclN0YXR1c1JlcXVlc3QSCwoDZGlkGAEgASgJEg4KBnN0YXR1cxgCIAEoCSJGChZTZXRBY3RvclN0YXR1c1Jlc3BvbnNlEgsKA2RpZBgBIAEoCRIOCgZzdGF0dXMYAiABKAkSDwoHcmVtb3ZlZBgDIAEoBDLaCgoFQWRtaW4STAoKR2V0U2Vzc2lvbhIbLm1hcmNvLnYxLkdldFNlc3Npb25SZXF1ZXN0GhwubWFyY28udjEuR2V0U2Vzc2lvblJlc3BvbnNlIgOQAgESTwoLR2V0T3ZlcnZpZXcSHC5tYXJjby52MS5HZXRPdmVydmlld1JlcXVlc3QaHS5tYXJjby52MS5HZXRPdmVydmlld1Jlc3BvbnNlIgOQAgESSQoJR2V0U2VyaWVzEhoubWFyY28udjEuR2V0U2VyaWVzUmVxdWVzdBobLm1hcmNvLnYxLkdldFNlcmllc1Jlc3BvbnNlIgOQAgESXgoQTGlzdFJlY2VudFdyaXRlcxIhLm1hcmNvLnYxLkxpc3RSZWNlbnRXcml0ZXNSZXF1ZXN0GiIubWFyY28udjEuTGlzdFJlY2VudFdyaXRlc1Jlc3BvbnNlIgOQAgESTAoKTGlzdFNoYXJkcxIbLm1hcmNvLnYxLkxpc3RTaGFyZHNSZXF1ZXN0GhwubWFyY28udjEuTGlzdFNoYXJkc1Jlc3BvbnNlIgOQAgESTAoKR2V0U3RvcmFnZRIbLm1hcmNvLnYxLkdldFN0b3JhZ2VSZXF1ZXN0GhwubWFyY28udjEuR2V0U3RvcmFnZVJlc3BvbnNlIgOQAgESVQoNTGlzdFJlbGF0aW9ucxIeLm1hcmNvLnYxLkxpc3RSZWxhdGlvbnNSZXF1ZXN0Gh8ubWFyY28udjEuTGlzdFJlbGF0aW9uc1Jlc3BvbnNlIgOQAgESUgoMR2V0TGlzdFN0YXRzEh0ubWFyY28udjEuR2V0TGlzdFN0YXRzUmVxdWVzdBoeLm1hcmNvLnYxLkdldExpc3RTdGF0c1Jlc3BvbnNlIgOQAgESTwoLTGlzdFNvdXJjZXMSHC5tYXJjby52MS5MaXN0U291cmNlc1JlcXVlc3QaHS5tYXJjby52MS5MaXN0U291cmNlc1Jlc3BvbnNlIgOQAgESRgoIR2V0QWN0b3ISGS5tYXJjby52MS5HZXRBY3RvclJlcXVlc3QaGi5tYXJjby52MS5HZXRBY3RvclJlc3BvbnNlIgOQAgESSQoJTGlzdEVkZ2VzEhoubWFyY28udjEuTGlzdEVkZ2VzUmVxdWVzdBobLm1hcmNvLnYxLkxpc3RFZGdlc1Jlc3BvbnNlIgOQAgESTAoKUmVzb2x2ZVVyaRIbLm1hcmNvLnYxLlJlc29sdmVVcmlSZXF1ZXN0GhwubWFyY28udjEuUmVzb2x2ZVVyaVJlc3BvbnNlIgOQAgESTwoLR2V0U2V0dGluZ3MSHC5tYXJjby52MS5HZXRTZXR0aW5nc1JlcXVlc3QaHS5tYXJjby52MS5HZXRTZXR0aW5nc1Jlc3BvbnNlIgOQAgESRwoKQ2hlY2twb2ludBIbLm1hcmNvLnYxLkNoZWNrcG9pbnRSZXF1ZXN0GhwubWFyY28udjEuQ2hlY2twb2ludFJlc3BvbnNlEk0KDFZlcmlmeVNoYXJkcxIdLm1hcmNvLnYxLlZlcmlmeVNoYXJkc1JlcXVlc3QaHi5tYXJjby52MS5WZXJpZnlTaGFyZHNSZXNwb25zZRJQCg1TZXRUcmFjZVJhdGlvEh4ubWFyY28udjEuU2V0VHJhY2VSYXRpb1JlcXVlc3QaHy5tYXJjby52MS5TZXRUcmFjZVJhdGlvUmVzcG9uc2USUwoOU2V0QWN0b3JTdGF0dXMSHy5tYXJjby52MS5TZXRBY3RvclN0YXR1c1JlcXVlc3QaIC5tYXJjby52MS5TZXRBY3RvclN0YXR1c1Jlc3BvbnNlYgZwcm90bzM", [file_marco_v1_graph]);
 
 /**
  * @generated from message marco.v1.GetSessionRequest
@@ -216,6 +216,13 @@ export type GetOverviewResponse = Message<"marco.v1.GetOverviewResponse"> & {
    * @generated from field: uint64 reads_before_ready = 26;
    */
   readsBeforeReady: bigint;
+
+  /**
+   * The storage engine's budget and reads; unset on --storage mmap.
+   *
+   * @generated from field: marco.v1.Cache cache = 27;
+   */
+  cache?: Cache | undefined;
 };
 
 /**
@@ -224,6 +231,195 @@ export type GetOverviewResponse = Message<"marco.v1.GetOverviewResponse"> & {
  */
 export const GetOverviewResponseSchema: GenMessage<GetOverviewResponse> = /*@__PURE__*/
   messageDesc(file_marco_v1_admin, 3);
+
+/**
+ * Where the store's budget is, and what its reads did since start. Rates,
+ * ratios and quantiles over time are GetSeries' store_* series.
+ *
+ * @generated from message marco.v1.Cache
+ */
+export type Cache = Message<"marco.v1.Cache"> & {
+  /**
+   * --memory.
+   *
+   * @generated from field: uint64 budget_bytes = 1;
+   */
+  budgetBytes: bigint;
+
+  /**
+   * The pinned tier: the directory, the shards' indexes and heads, and the
+   * tables (page sums, slots, side tables, statuses, the engine's own).
+   *
+   * @generated from field: uint64 pinned_dir_bytes = 2;
+   */
+  pinnedDirBytes: bigint;
+
+  /**
+   * @generated from field: uint64 pinned_index_bytes = 3;
+   */
+  pinnedIndexBytes: bigint;
+
+  /**
+   * @generated from field: uint64 pinned_heads_bytes = 4;
+   */
+  pinnedHeadsBytes: bigint;
+
+  /**
+   * @generated from field: uint64 pinned_tables_bytes = 5;
+   */
+  pinnedTablesBytes: bigint;
+
+  /**
+   * @generated from field: uint64 main_bytes = 6;
+   */
+  mainBytes: bigint;
+
+  /**
+   * @generated from field: uint64 small_bytes = 7;
+   */
+  smallBytes: bigint;
+
+  /**
+   * Frames waiting on the epoch before reuse.
+   *
+   * @generated from field: uint64 retired_bytes = 8;
+   */
+  retiredBytes: bigint;
+
+  /**
+   * Cached pages a request holds (inside main and small).
+   *
+   * @generated from field: uint64 pins_bytes = 9;
+   */
+  pinsBytes: bigint;
+
+  /**
+   * @generated from field: uint64 free_bytes = 10;
+   */
+  freeBytes: bigint;
+
+  /**
+   * Borrowed by anything but the served snapshot (a checkpoint's new files
+   * before their switch).
+   *
+   * @generated from field: uint64 borrowed_bytes = 11;
+   */
+  borrowedBytes: bigint;
+
+  /**
+   * Paged bytes no index names, as of the last checkpoint or compaction.
+   *
+   * @generated from field: uint64 garbage_bytes = 12;
+   */
+  garbageBytes: bigint;
+
+  /**
+   * Lookups and misses since start, by structure (out_small, out_subj,
+   * out_rkey, out_bysubj, in_small, in_blocks).
+   *
+   * @generated from field: repeated marco.v1.CacheStructure structures = 13;
+   */
+  structures: CacheStructure[];
+
+  /**
+   * @generated from field: uint64 bad_pages = 14;
+   */
+  badPages: bigint;
+
+  /**
+   * Failed page reads since start: checksum, eio, short; and EIO a retry fixed.
+   *
+   * @generated from field: uint64 checksum_errors = 15;
+   */
+  checksumErrors: bigint;
+
+  /**
+   * @generated from field: uint64 eio_errors = 16;
+   */
+  eioErrors: bigint;
+
+  /**
+   * @generated from field: uint64 short_errors = 17;
+   */
+  shortErrors: bigint;
+
+  /**
+   * @generated from field: uint64 eio_retried = 18;
+   */
+  eioRetried: bigint;
+
+  /**
+   * Distinct pages failing on the device in the last 60 s; 64 is a storm.
+   *
+   * @generated from field: uint32 failing_pages = 19;
+   */
+  failingPages: number;
+
+  /**
+   * @generated from field: uint32 miss_threads = 20;
+   */
+  missThreads: number;
+
+  /**
+   * Compactions in the last 24 h.
+   *
+   * @generated from field: uint32 compactions_24h = 21;
+   */
+  compactions24h: number;
+
+  /**
+   * The whole snapshot was loaded at open.
+   *
+   * @generated from field: bool resident = 22;
+   */
+  resident: boolean;
+
+  /**
+   * Pages checkpoints and compactions wrote into the cache, and let go.
+   *
+   * @generated from field: uint64 written_through = 23;
+   */
+  writtenThrough: bigint;
+
+  /**
+   * @generated from field: uint64 write_through_skipped = 24;
+   */
+  writeThroughSkipped: bigint;
+};
+
+/**
+ * Describes the message marco.v1.Cache.
+ * Use `create(CacheSchema)` to create a new message.
+ */
+export const CacheSchema: GenMessage<Cache> = /*@__PURE__*/
+  messageDesc(file_marco_v1_admin, 4);
+
+/**
+ * @generated from message marco.v1.CacheStructure
+ */
+export type CacheStructure = Message<"marco.v1.CacheStructure"> & {
+  /**
+   * @generated from field: string name = 1;
+   */
+  name: string;
+
+  /**
+   * @generated from field: uint64 lookups = 2;
+   */
+  lookups: bigint;
+
+  /**
+   * @generated from field: uint64 misses = 3;
+   */
+  misses: bigint;
+};
+
+/**
+ * Describes the message marco.v1.CacheStructure.
+ * Use `create(CacheStructureSchema)` to create a new message.
+ */
+export const CacheStructureSchema: GenMessage<CacheStructure> = /*@__PURE__*/
+  messageDesc(file_marco_v1_admin, 5);
 
 /**
  * Writes are applied in memory, then written every few seconds as a change
@@ -355,6 +551,19 @@ export type Durability = Message<"marco.v1.Durability"> & {
    * @generated from field: uint64 checkpoint_failures = 21;
    */
   checkpointFailures: bigint;
+
+  /**
+   * The last checkpoint's patch bytes (R, the changed lists and blocks) and
+   * their pinned sections (P_new).
+   *
+   * @generated from field: uint64 checkpoint_patch_bytes = 22;
+   */
+  checkpointPatchBytes: bigint;
+
+  /**
+   * @generated from field: uint64 checkpoint_pinned_bytes = 23;
+   */
+  checkpointPinnedBytes: bigint;
 };
 
 /**
@@ -362,7 +571,7 @@ export type Durability = Message<"marco.v1.Durability"> & {
  * Use `create(DurabilitySchema)` to create a new message.
  */
 export const DurabilitySchema: GenMessage<Durability> = /*@__PURE__*/
-  messageDesc(file_marco_v1_admin, 4);
+  messageDesc(file_marco_v1_admin, 6);
 
 /**
  * @generated from message marco.v1.SnapshotInfo
@@ -425,7 +634,7 @@ export type SnapshotInfo = Message<"marco.v1.SnapshotInfo"> & {
  * Use `create(SnapshotInfoSchema)` to create a new message.
  */
 export const SnapshotInfoSchema: GenMessage<SnapshotInfo> = /*@__PURE__*/
-  messageDesc(file_marco_v1_admin, 5);
+  messageDesc(file_marco_v1_admin, 7);
 
 /**
  * @generated from message marco.v1.DirectoryInfo
@@ -451,7 +660,7 @@ export type DirectoryInfo = Message<"marco.v1.DirectoryInfo"> & {
  * Use `create(DirectoryInfoSchema)` to create a new message.
  */
 export const DirectoryInfoSchema: GenMessage<DirectoryInfo> = /*@__PURE__*/
-  messageDesc(file_marco_v1_admin, 6);
+  messageDesc(file_marco_v1_admin, 8);
 
 /**
  * @generated from message marco.v1.RelationTotals
@@ -530,7 +739,7 @@ export type RelationTotals = Message<"marco.v1.RelationTotals"> & {
  * Use `create(RelationTotalsSchema)` to create a new message.
  */
 export const RelationTotalsSchema: GenMessage<RelationTotals> = /*@__PURE__*/
-  messageDesc(file_marco_v1_admin, 7);
+  messageDesc(file_marco_v1_admin, 9);
 
 /**
  * @generated from message marco.v1.ProcessInfo
@@ -569,7 +778,7 @@ export type ProcessInfo = Message<"marco.v1.ProcessInfo"> & {
  * Use `create(ProcessInfoSchema)` to create a new message.
  */
 export const ProcessInfoSchema: GenMessage<ProcessInfo> = /*@__PURE__*/
-  messageDesc(file_marco_v1_admin, 8);
+  messageDesc(file_marco_v1_admin, 10);
 
 /**
  * @generated from message marco.v1.Job
@@ -620,7 +829,7 @@ export type Job = Message<"marco.v1.Job"> & {
  * Use `create(JobSchema)` to create a new message.
  */
 export const JobSchema: GenMessage<Job> = /*@__PURE__*/
-  messageDesc(file_marco_v1_admin, 9);
+  messageDesc(file_marco_v1_admin, 11);
 
 /**
  * @generated from message marco.v1.GetSeriesRequest
@@ -639,7 +848,7 @@ export type GetSeriesRequest = Message<"marco.v1.GetSeriesRequest"> & {
  * Use `create(GetSeriesRequestSchema)` to create a new message.
  */
 export const GetSeriesRequestSchema: GenMessage<GetSeriesRequest> = /*@__PURE__*/
-  messageDesc(file_marco_v1_admin, 10);
+  messageDesc(file_marco_v1_admin, 12);
 
 /**
  * @generated from message marco.v1.GetSeriesResponse
@@ -666,7 +875,7 @@ export type GetSeriesResponse = Message<"marco.v1.GetSeriesResponse"> & {
  * Use `create(GetSeriesResponseSchema)` to create a new message.
  */
 export const GetSeriesResponseSchema: GenMessage<GetSeriesResponse> = /*@__PURE__*/
-  messageDesc(file_marco_v1_admin, 11);
+  messageDesc(file_marco_v1_admin, 13);
 
 /**
  * One sampled value over time. `metric` names it; the other fields are its
@@ -719,7 +928,7 @@ export type Series = Message<"marco.v1.Series"> & {
  * Use `create(SeriesSchema)` to create a new message.
  */
 export const SeriesSchema: GenMessage<Series> = /*@__PURE__*/
-  messageDesc(file_marco_v1_admin, 12);
+  messageDesc(file_marco_v1_admin, 14);
 
 /**
  * @generated from message marco.v1.ListRecentWritesRequest
@@ -743,7 +952,7 @@ export type ListRecentWritesRequest = Message<"marco.v1.ListRecentWritesRequest"
  * Use `create(ListRecentWritesRequestSchema)` to create a new message.
  */
 export const ListRecentWritesRequestSchema: GenMessage<ListRecentWritesRequest> = /*@__PURE__*/
-  messageDesc(file_marco_v1_admin, 13);
+  messageDesc(file_marco_v1_admin, 15);
 
 /**
  * @generated from message marco.v1.ListRecentWritesResponse
@@ -767,7 +976,7 @@ export type ListRecentWritesResponse = Message<"marco.v1.ListRecentWritesRespons
  * Use `create(ListRecentWritesResponseSchema)` to create a new message.
  */
 export const ListRecentWritesResponseSchema: GenMessage<ListRecentWritesResponse> = /*@__PURE__*/
-  messageDesc(file_marco_v1_admin, 14);
+  messageDesc(file_marco_v1_admin, 16);
 
 /**
  * @generated from message marco.v1.RecentWrite
@@ -823,7 +1032,7 @@ export type RecentWrite = Message<"marco.v1.RecentWrite"> & {
  * Use `create(RecentWriteSchema)` to create a new message.
  */
 export const RecentWriteSchema: GenMessage<RecentWrite> = /*@__PURE__*/
-  messageDesc(file_marco_v1_admin, 15);
+  messageDesc(file_marco_v1_admin, 17);
 
 /**
  * @generated from message marco.v1.ListShardsRequest
@@ -836,7 +1045,7 @@ export type ListShardsRequest = Message<"marco.v1.ListShardsRequest"> & {
  * Use `create(ListShardsRequestSchema)` to create a new message.
  */
 export const ListShardsRequestSchema: GenMessage<ListShardsRequest> = /*@__PURE__*/
-  messageDesc(file_marco_v1_admin, 16);
+  messageDesc(file_marco_v1_admin, 18);
 
 /**
  * @generated from message marco.v1.ListShardsResponse
@@ -875,7 +1084,7 @@ export type ListShardsResponse = Message<"marco.v1.ListShardsResponse"> & {
  * Use `create(ListShardsResponseSchema)` to create a new message.
  */
 export const ListShardsResponseSchema: GenMessage<ListShardsResponse> = /*@__PURE__*/
-  messageDesc(file_marco_v1_admin, 17);
+  messageDesc(file_marco_v1_admin, 19);
 
 /**
  * @generated from message marco.v1.Shard
@@ -978,7 +1187,7 @@ export type Shard = Message<"marco.v1.Shard"> & {
  * Use `create(ShardSchema)` to create a new message.
  */
 export const ShardSchema: GenMessage<Shard> = /*@__PURE__*/
-  messageDesc(file_marco_v1_admin, 18);
+  messageDesc(file_marco_v1_admin, 20);
 
 /**
  * @generated from message marco.v1.GetStorageRequest
@@ -997,7 +1206,7 @@ export type GetStorageRequest = Message<"marco.v1.GetStorageRequest"> & {
  * Use `create(GetStorageRequestSchema)` to create a new message.
  */
 export const GetStorageRequestSchema: GenMessage<GetStorageRequest> = /*@__PURE__*/
-  messageDesc(file_marco_v1_admin, 19);
+  messageDesc(file_marco_v1_admin, 21);
 
 /**
  * @generated from message marco.v1.GetStorageResponse
@@ -1026,7 +1235,7 @@ export type GetStorageResponse = Message<"marco.v1.GetStorageResponse"> & {
  * Use `create(GetStorageResponseSchema)` to create a new message.
  */
 export const GetStorageResponseSchema: GenMessage<GetStorageResponse> = /*@__PURE__*/
-  messageDesc(file_marco_v1_admin, 20);
+  messageDesc(file_marco_v1_admin, 22);
 
 /**
  * @generated from message marco.v1.Section
@@ -1062,7 +1271,7 @@ export type Section = Message<"marco.v1.Section"> & {
  * Use `create(SectionSchema)` to create a new message.
  */
 export const SectionSchema: GenMessage<Section> = /*@__PURE__*/
-  messageDesc(file_marco_v1_admin, 21);
+  messageDesc(file_marco_v1_admin, 23);
 
 /**
  * @generated from message marco.v1.DeltaList
@@ -1104,7 +1313,7 @@ export type DeltaList = Message<"marco.v1.DeltaList"> & {
  * Use `create(DeltaListSchema)` to create a new message.
  */
 export const DeltaListSchema: GenMessage<DeltaList> = /*@__PURE__*/
-  messageDesc(file_marco_v1_admin, 22);
+  messageDesc(file_marco_v1_admin, 24);
 
 /**
  * @generated from message marco.v1.ListRelationsRequest
@@ -1117,7 +1326,7 @@ export type ListRelationsRequest = Message<"marco.v1.ListRelationsRequest"> & {
  * Use `create(ListRelationsRequestSchema)` to create a new message.
  */
 export const ListRelationsRequestSchema: GenMessage<ListRelationsRequest> = /*@__PURE__*/
-  messageDesc(file_marco_v1_admin, 23);
+  messageDesc(file_marco_v1_admin, 25);
 
 /**
  * @generated from message marco.v1.ListRelationsResponse
@@ -1141,7 +1350,7 @@ export type ListRelationsResponse = Message<"marco.v1.ListRelationsResponse"> & 
  * Use `create(ListRelationsResponseSchema)` to create a new message.
  */
 export const ListRelationsResponseSchema: GenMessage<ListRelationsResponse> = /*@__PURE__*/
-  messageDesc(file_marco_v1_admin, 24);
+  messageDesc(file_marco_v1_admin, 26);
 
 /**
  * @generated from message marco.v1.RelationInfo
@@ -1204,7 +1413,7 @@ export type RelationInfo = Message<"marco.v1.RelationInfo"> & {
  * Use `create(RelationInfoSchema)` to create a new message.
  */
 export const RelationInfoSchema: GenMessage<RelationInfo> = /*@__PURE__*/
-  messageDesc(file_marco_v1_admin, 25);
+  messageDesc(file_marco_v1_admin, 27);
 
 /**
  * @generated from message marco.v1.GetListStatsRequest
@@ -1221,7 +1430,7 @@ export type GetListStatsRequest = Message<"marco.v1.GetListStatsRequest"> & {
  * Use `create(GetListStatsRequestSchema)` to create a new message.
  */
 export const GetListStatsRequestSchema: GenMessage<GetListStatsRequest> = /*@__PURE__*/
-  messageDesc(file_marco_v1_admin, 26);
+  messageDesc(file_marco_v1_admin, 28);
 
 /**
  * @generated from message marco.v1.GetListStatsResponse
@@ -1274,7 +1483,7 @@ export type GetListStatsResponse = Message<"marco.v1.GetListStatsResponse"> & {
  * Use `create(GetListStatsResponseSchema)` to create a new message.
  */
 export const GetListStatsResponseSchema: GenMessage<GetListStatsResponse> = /*@__PURE__*/
-  messageDesc(file_marco_v1_admin, 27);
+  messageDesc(file_marco_v1_admin, 29);
 
 /**
  * @generated from message marco.v1.ListDist
@@ -1328,7 +1537,7 @@ export type ListDist = Message<"marco.v1.ListDist"> & {
  * Use `create(ListDistSchema)` to create a new message.
  */
 export const ListDistSchema: GenMessage<ListDist> = /*@__PURE__*/
-  messageDesc(file_marco_v1_admin, 28);
+  messageDesc(file_marco_v1_admin, 30);
 
 /**
  * @generated from message marco.v1.BigList
@@ -1355,7 +1564,7 @@ export type BigList = Message<"marco.v1.BigList"> & {
  * Use `create(BigListSchema)` to create a new message.
  */
 export const BigListSchema: GenMessage<BigList> = /*@__PURE__*/
-  messageDesc(file_marco_v1_admin, 29);
+  messageDesc(file_marco_v1_admin, 31);
 
 /**
  * @generated from message marco.v1.ListSourcesRequest
@@ -1368,7 +1577,7 @@ export type ListSourcesRequest = Message<"marco.v1.ListSourcesRequest"> & {
  * Use `create(ListSourcesRequestSchema)` to create a new message.
  */
 export const ListSourcesRequestSchema: GenMessage<ListSourcesRequest> = /*@__PURE__*/
-  messageDesc(file_marco_v1_admin, 30);
+  messageDesc(file_marco_v1_admin, 32);
 
 /**
  * @generated from message marco.v1.ListSourcesResponse
@@ -1385,7 +1594,7 @@ export type ListSourcesResponse = Message<"marco.v1.ListSourcesResponse"> & {
  * Use `create(ListSourcesResponseSchema)` to create a new message.
  */
 export const ListSourcesResponseSchema: GenMessage<ListSourcesResponse> = /*@__PURE__*/
-  messageDesc(file_marco_v1_admin, 31);
+  messageDesc(file_marco_v1_admin, 33);
 
 /**
  * @generated from message marco.v1.Source
@@ -1475,7 +1684,7 @@ export type Source = Message<"marco.v1.Source"> & {
  * Use `create(SourceSchema)` to create a new message.
  */
 export const SourceSchema: GenMessage<Source> = /*@__PURE__*/
-  messageDesc(file_marco_v1_admin, 32);
+  messageDesc(file_marco_v1_admin, 34);
 
 /**
  * @generated from message marco.v1.GetActorRequest
@@ -1494,7 +1703,7 @@ export type GetActorRequest = Message<"marco.v1.GetActorRequest"> & {
  * Use `create(GetActorRequestSchema)` to create a new message.
  */
 export const GetActorRequestSchema: GenMessage<GetActorRequest> = /*@__PURE__*/
-  messageDesc(file_marco_v1_admin, 33);
+  messageDesc(file_marco_v1_admin, 35);
 
 /**
  * @generated from message marco.v1.GetActorResponse
@@ -1547,7 +1756,7 @@ export type GetActorResponse = Message<"marco.v1.GetActorResponse"> & {
  * Use `create(GetActorResponseSchema)` to create a new message.
  */
 export const GetActorResponseSchema: GenMessage<GetActorResponse> = /*@__PURE__*/
-  messageDesc(file_marco_v1_admin, 34);
+  messageDesc(file_marco_v1_admin, 36);
 
 /**
  * @generated from message marco.v1.ActorRelation
@@ -1607,7 +1816,7 @@ export type ActorRelation = Message<"marco.v1.ActorRelation"> & {
  * Use `create(ActorRelationSchema)` to create a new message.
  */
 export const ActorRelationSchema: GenMessage<ActorRelation> = /*@__PURE__*/
-  messageDesc(file_marco_v1_admin, 35);
+  messageDesc(file_marco_v1_admin, 37);
 
 /**
  * @generated from message marco.v1.ListEdgesRequest
@@ -1648,7 +1857,7 @@ export type ListEdgesRequest = Message<"marco.v1.ListEdgesRequest"> & {
  * Use `create(ListEdgesRequestSchema)` to create a new message.
  */
 export const ListEdgesRequestSchema: GenMessage<ListEdgesRequest> = /*@__PURE__*/
-  messageDesc(file_marco_v1_admin, 36);
+  messageDesc(file_marco_v1_admin, 38);
 
 /**
  * @generated from message marco.v1.ListEdgesResponse
@@ -1675,7 +1884,7 @@ export type ListEdgesResponse = Message<"marco.v1.ListEdgesResponse"> & {
  * Use `create(ListEdgesResponseSchema)` to create a new message.
  */
 export const ListEdgesResponseSchema: GenMessage<ListEdgesResponse> = /*@__PURE__*/
-  messageDesc(file_marco_v1_admin, 37);
+  messageDesc(file_marco_v1_admin, 39);
 
 /**
  * @generated from message marco.v1.Edge
@@ -1723,7 +1932,7 @@ export type Edge = Message<"marco.v1.Edge"> & {
  * Use `create(EdgeSchema)` to create a new message.
  */
 export const EdgeSchema: GenMessage<Edge> = /*@__PURE__*/
-  messageDesc(file_marco_v1_admin, 38);
+  messageDesc(file_marco_v1_admin, 40);
 
 /**
  * @generated from message marco.v1.ResolveUriRequest
@@ -1740,7 +1949,7 @@ export type ResolveUriRequest = Message<"marco.v1.ResolveUriRequest"> & {
  * Use `create(ResolveUriRequestSchema)` to create a new message.
  */
 export const ResolveUriRequestSchema: GenMessage<ResolveUriRequest> = /*@__PURE__*/
-  messageDesc(file_marco_v1_admin, 39);
+  messageDesc(file_marco_v1_admin, 41);
 
 /**
  * @generated from message marco.v1.ResolveUriResponse
@@ -1862,7 +2071,7 @@ export type ResolveUriResponse = Message<"marco.v1.ResolveUriResponse"> & {
  * Use `create(ResolveUriResponseSchema)` to create a new message.
  */
 export const ResolveUriResponseSchema: GenMessage<ResolveUriResponse> = /*@__PURE__*/
-  messageDesc(file_marco_v1_admin, 40);
+  messageDesc(file_marco_v1_admin, 42);
 
 /**
  * @generated from message marco.v1.GetSettingsRequest
@@ -1875,7 +2084,7 @@ export type GetSettingsRequest = Message<"marco.v1.GetSettingsRequest"> & {
  * Use `create(GetSettingsRequestSchema)` to create a new message.
  */
 export const GetSettingsRequestSchema: GenMessage<GetSettingsRequest> = /*@__PURE__*/
-  messageDesc(file_marco_v1_admin, 41);
+  messageDesc(file_marco_v1_admin, 43);
 
 /**
  * @generated from message marco.v1.GetSettingsResponse
@@ -1897,7 +2106,7 @@ export type GetSettingsResponse = Message<"marco.v1.GetSettingsResponse"> & {
  * Use `create(GetSettingsResponseSchema)` to create a new message.
  */
 export const GetSettingsResponseSchema: GenMessage<GetSettingsResponse> = /*@__PURE__*/
-  messageDesc(file_marco_v1_admin, 42);
+  messageDesc(file_marco_v1_admin, 44);
 
 /**
  * @generated from message marco.v1.Flag
@@ -1926,7 +2135,7 @@ export type Flag = Message<"marco.v1.Flag"> & {
  * Use `create(FlagSchema)` to create a new message.
  */
 export const FlagSchema: GenMessage<Flag> = /*@__PURE__*/
-  messageDesc(file_marco_v1_admin, 43);
+  messageDesc(file_marco_v1_admin, 45);
 
 /**
  * @generated from message marco.v1.BuildInfo
@@ -1958,7 +2167,7 @@ export type BuildInfo = Message<"marco.v1.BuildInfo"> & {
  * Use `create(BuildInfoSchema)` to create a new message.
  */
 export const BuildInfoSchema: GenMessage<BuildInfo> = /*@__PURE__*/
-  messageDesc(file_marco_v1_admin, 44);
+  messageDesc(file_marco_v1_admin, 46);
 
 /**
  * @generated from message marco.v1.CheckpointRequest
@@ -1971,7 +2180,7 @@ export type CheckpointRequest = Message<"marco.v1.CheckpointRequest"> & {
  * Use `create(CheckpointRequestSchema)` to create a new message.
  */
 export const CheckpointRequestSchema: GenMessage<CheckpointRequest> = /*@__PURE__*/
-  messageDesc(file_marco_v1_admin, 45);
+  messageDesc(file_marco_v1_admin, 47);
 
 /**
  * @generated from message marco.v1.CheckpointResponse
@@ -1988,7 +2197,7 @@ export type CheckpointResponse = Message<"marco.v1.CheckpointResponse"> & {
  * Use `create(CheckpointResponseSchema)` to create a new message.
  */
 export const CheckpointResponseSchema: GenMessage<CheckpointResponse> = /*@__PURE__*/
-  messageDesc(file_marco_v1_admin, 46);
+  messageDesc(file_marco_v1_admin, 48);
 
 /**
  * @generated from message marco.v1.VerifyShardsRequest
@@ -2001,7 +2210,7 @@ export type VerifyShardsRequest = Message<"marco.v1.VerifyShardsRequest"> & {
  * Use `create(VerifyShardsRequestSchema)` to create a new message.
  */
 export const VerifyShardsRequestSchema: GenMessage<VerifyShardsRequest> = /*@__PURE__*/
-  messageDesc(file_marco_v1_admin, 47);
+  messageDesc(file_marco_v1_admin, 49);
 
 /**
  * @generated from message marco.v1.VerifyShardsResponse
@@ -2018,7 +2227,7 @@ export type VerifyShardsResponse = Message<"marco.v1.VerifyShardsResponse"> & {
  * Use `create(VerifyShardsResponseSchema)` to create a new message.
  */
 export const VerifyShardsResponseSchema: GenMessage<VerifyShardsResponse> = /*@__PURE__*/
-  messageDesc(file_marco_v1_admin, 48);
+  messageDesc(file_marco_v1_admin, 50);
 
 /**
  * @generated from message marco.v1.SetTraceRatioRequest
@@ -2037,7 +2246,7 @@ export type SetTraceRatioRequest = Message<"marco.v1.SetTraceRatioRequest"> & {
  * Use `create(SetTraceRatioRequestSchema)` to create a new message.
  */
 export const SetTraceRatioRequestSchema: GenMessage<SetTraceRatioRequest> = /*@__PURE__*/
-  messageDesc(file_marco_v1_admin, 49);
+  messageDesc(file_marco_v1_admin, 51);
 
 /**
  * @generated from message marco.v1.SetTraceRatioResponse
@@ -2054,7 +2263,7 @@ export type SetTraceRatioResponse = Message<"marco.v1.SetTraceRatioResponse"> & 
  * Use `create(SetTraceRatioResponseSchema)` to create a new message.
  */
 export const SetTraceRatioResponseSchema: GenMessage<SetTraceRatioResponse> = /*@__PURE__*/
-  messageDesc(file_marco_v1_admin, 50);
+  messageDesc(file_marco_v1_admin, 52);
 
 /**
  * @generated from message marco.v1.SetActorStatusRequest
@@ -2078,7 +2287,7 @@ export type SetActorStatusRequest = Message<"marco.v1.SetActorStatusRequest"> & 
  * Use `create(SetActorStatusRequestSchema)` to create a new message.
  */
 export const SetActorStatusRequestSchema: GenMessage<SetActorStatusRequest> = /*@__PURE__*/
-  messageDesc(file_marco_v1_admin, 51);
+  messageDesc(file_marco_v1_admin, 53);
 
 /**
  * @generated from message marco.v1.SetActorStatusResponse
@@ -2107,7 +2316,7 @@ export type SetActorStatusResponse = Message<"marco.v1.SetActorStatusResponse"> 
  * Use `create(SetActorStatusResponseSchema)` to create a new message.
  */
 export const SetActorStatusResponseSchema: GenMessage<SetActorStatusResponse> = /*@__PURE__*/
-  messageDesc(file_marco_v1_admin, 52);
+  messageDesc(file_marco_v1_admin, 54);
 
 /**
  * The operator API, on the admin listener (loopback by default) next to

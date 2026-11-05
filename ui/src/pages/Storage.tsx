@@ -7,7 +7,7 @@ import { last, sum, series, useOverview, useSeries, useShards, useStorage, verif
 import { SHARD_WORD, shardTone, verifyTone } from '../lib/tone'
 import { ShardMap, shardCounts, useAttention } from './Overview'
 import { dirOf, shardName, windowLabel } from './common'
-import type { Durability, GetOverviewResponse, ListShardsResponse, Section } from '../gen/marco/v1/admin_pb'
+import type { Cache, Durability, GetOverviewResponse, GetSeriesResponse, ListShardsResponse, Section } from '../gen/marco/v1/admin_pb'
 
 const PART: Record<string, [string, string]> = {
   'out.small': ['small out logs', 'out'],
@@ -134,12 +134,15 @@ export function Storage() {
                 { label: 'Merged since snapshot', value: mb, unit: mbU, sec: `${fmtCount(o.mergedLists)} lists`, title: 'marco_override_bytes', spark: <Spark data={sum(s, { metric: 'merges' })} /> },
                 { label: 'Tombstones', value: fmtCount(o.tombstones), spark: <Spark data={sum(s, { metric: 'tombstones' })} /> },
                 { label: 'Segments', value: fmtCount(o.durability?.segments), sec: `${bytes(o.durability?.segmentBytes)} · ${si(o.durability?.segmentOps)} ops`, right: o.durability?.segmentMs ? ago(o.durability.segmentMs) : undefined, title: 'change segments since the checkpoint' },
-                { label: 'Cold open', value: (o.snapshot!.openSeconds * 1000).toFixed(0), unit: 'ms', sec: verifyJob ? `verify ${verifyJob}` : undefined, title: 'mmap + footer checks, no full xxh3' },
+                o.cache
+                  ? { label: 'Open', value: dur(o.snapshot!.openSeconds * 1000), sec: verifyJob ? `verify ${verifyJob}` : undefined, title: 'pinned sections read and checked, pages loaded, segments replayed' }
+                  : { label: 'Cold open', value: (o.snapshot!.openSeconds * 1000).toFixed(0), unit: 'ms', sec: verifyJob ? `verify ${verifyJob}` : undefined, title: 'mmap + footer checks, no full xxh3' },
               ]}
             />
           )
         }}
       </Loaded>
+      {o?.cache && <CachePanel c={o.cache} o={o} s={s} />}
       {o && st.data && (
         <BytesPanel secs={st.data.sections} o={o} />
       )}
@@ -274,6 +277,151 @@ export function Storage() {
         </div>
       </div>
     </>
+  )
+}
+
+const STRUCT_LABEL: Record<string, string> = {
+  out_small: 'out.small',
+  out_subj: 'out.subj',
+  out_rkey: 'out.rkey',
+  out_bysubj: 'bysubj',
+  in_small: 'in.small',
+  in_blocks: 'in.blocks',
+}
+
+/** 1 - misses/lookups, pointwise; NaN where nothing was looked up. */
+function ratio(look: number[], miss: number[]) {
+  return look.map((l, i) => (l > 0 ? 1 - (miss[i] ?? 0) / l : NaN))
+}
+
+const lastOk = (v: number[]) => {
+  for (let i = v.length - 1; i >= 0; i--) if (isFinite(v[i])) return v[i]
+  return NaN
+}
+
+export function CachePanel({ c, o, s }: { c: Cache; o: GetOverviewResponse; s?: GetSeriesResponse }) {
+  const budget = n(c.budgetBytes)
+  const pinned = n(c.pinnedDirBytes) + n(c.pinnedIndexBytes) + n(c.pinnedHeadsBytes) + n(c.pinnedTablesBytes)
+  const parts: [string, number, string, string][] = [
+    ['pinned', pinned, 'c4', `directory ${bytes(c.pinnedDirBytes)} · index ${bytes(c.pinnedIndexBytes)} · heads ${bytes(c.pinnedHeadsBytes)} · sums, slots and tables ${bytes(c.pinnedTablesBytes)}`],
+    ['main', n(c.mainBytes), 'out', 'main queue'],
+    ['small', n(c.smallBytes), 'in', 'small queue'],
+    ['retired', n(c.retiredBytes), 'c3', 'frames waiting on the epoch'],
+    ['borrowed', n(c.borrowedBytes), 'c6', "a checkpoint's new files before their switch"],
+  ]
+  const used = parts.reduce((a, p) => a + p[1], 0)
+  const rest = Math.max(0, n(o.process?.rssBytes) - used)
+  const look = sum(s, { metric: 'store_lookups' })
+  const miss = sum(s, { metric: 'store_misses' })
+  const hit = ratio(look, miss)
+  const reads = sum(s, { metric: 'store_reads', dir: 'request' })
+  const ioB = sum(s, { metric: 'store_io_bytes' })
+  const errs = n(c.checksumErrors) + n(c.eioErrors) + n(c.shortErrors)
+  const d = o.durability
+  const rpcs = series(s, { metric: 'store_pages_p99' }).map((x) => x.rpc)
+  const rounds = Math.max(...series(s, { metric: 'store_rounds_p99' }).map((x) => lastOk(x.values)), 0)
+  return (
+    <Panel
+      title="Cache"
+      right={
+        <span className="mono">
+          {bytes(used)} of {bytes(budget)}
+          {c.resident && <> · <Chip k="ok" title="open loaded every page">resident</Chip></>}
+        </span>
+      }
+      foot={
+        <>
+          <span className="mono" title="paged bytes no index names, as of the last checkpoint or compaction">garbage {bytes(c.garbageBytes)}</span>
+          <span className="mono" title="cached pages requests hold">pins {bytes(c.pinsBytes)}</span>
+          <span className="mono" title="process RSS outside the store's budget: deltas, live DIDs, request heap">rest of RSS {bytes(rest)}</span>
+          <div className="r">
+            <span className="mono" title="pages checkpoints and compactions wrote into the cache · let go">
+              written through {si(c.writtenThrough)}
+              {n(c.writeThroughSkipped) > 0 && ` · ${si(c.writeThroughSkipped)} let go`}
+            </span>
+          </div>
+        </>
+      }
+    >
+      <PanelBody style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+        <div className="cx-bytes" role="img" aria-label="the store's budget by part">
+          {parts.map(([name, b, color, title]) => (b > 0 ? <span key={name} title={`${name} ${bytes(b)} · ${title}`} style={{ flex: `${(b / budget).toFixed(4)} 1 0`, background: `var(--${color})` }} /> : null))}
+          <span title={`free ${bytes(c.freeBytes)}`} style={{ flex: `${(n(c.freeBytes) / budget).toFixed(4)} 1 0` }} />
+        </div>
+        <Legend
+          items={[
+            ...parts.filter((p) => p[1] > 0 || p[0] !== 'borrowed').map(([name, b, color, title]): [ReactNode, ReactNode] => [<Swatch color={color} />, <span title={title}>{name} {bytes(b)}</span>]),
+            [<Swatch color="rule2" />, `free ${bytes(c.freeBytes)}`],
+          ]}
+        />
+      </PanelBody>
+      <Tiles
+        cols={4}
+        tiles={[
+          { label: 'Hit ratio', value: pct(lastOk(hit)), sec: `${si(last(miss))} misses/s`, title: 'page lookups that found the page in memory', spark: <Spark data={hit} color="ok" /> },
+          { label: 'Device reads', value: si(last(reads)), unit: '/s', sec: `${bytes(last(ioB))}/s`, title: 'read calls on the request lane · bytes on both lanes', spark: <Spark data={reads} /> },
+          {
+            label: 'Read latency',
+            value: lat(last(sum(s, { metric: 'store_read_p99', dir: 'request' }))),
+            unit: 'p99',
+            sec: `p50 ${lat(last(sum(s, { metric: 'store_read_p50', dir: 'request' })))}`,
+            title: 'per read call on the request lane',
+            spark: <Spark data={sum(s, { metric: 'store_read_p99', dir: 'request' })} />,
+          },
+          {
+            label: 'Miss pool',
+            value: fmtCount(last(sum(s, { metric: 'store_pool_busy' }))),
+            unit: `/ ${c.missThreads}`,
+            sec: `wait p99 ${lat(last(sum(s, { metric: 'store_pool_wait_p99' })))} · I/O queue ${fmtCount(last(sum(s, { metric: 'store_io_queue' })))}`,
+            title: 'requests that missed, on the pool’s threads now',
+            spark: <Spark data={sum(s, { metric: 'store_pool_busy' })} />,
+          },
+        ]}
+      />
+      <DataTable
+        compact
+        rows={c.structures}
+        rowKey={(x) => x.name}
+        cols={[
+          { id: 'name', label: 'Structure', render: (x) => <span className="mono">{STRUCT_LABEL[x.name] ?? x.name}</span> },
+          {
+            id: 'hit',
+            label: 'Hit ratio',
+            r: true,
+            title: 'the last 5 s',
+            render: (x) => pct(lastOk(ratio(sum(s, { metric: 'store_lookups', op: x.name }), sum(s, { metric: 'store_misses', op: x.name }))), 1),
+          },
+          { id: 'spark', label: '', fill: true, className: 'hide-phone', render: (x) => <Spark data={ratio(sum(s, { metric: 'store_lookups', op: x.name }), sum(s, { metric: 'store_misses', op: x.name }))} color="ok" /> },
+          { id: 'miss', label: 'Misses/s', r: true, render: (x) => si(last(sum(s, { metric: 'store_misses', op: x.name }))) },
+          { id: 'tot', label: 'Since start', r: true, className: 'hide-phone', title: 'lookups · misses', render: (x) => <span className="t2">{si(x.lookups)} · {si(x.misses)}</span> },
+        ]}
+      />
+      <PanelBody>
+        <KV
+          rows={[
+            [
+              'Pages per call',
+              <span className="mono">{rpcs.map((r) => `${(r ?? '').replace('Graph/', '')} ${fmtCount(last(sum(s, { metric: 'store_pages_p99', rpc: r })))}`).join(' · ') || '—'}</span>,
+              <span className="muted" title="pages a request read from disk, and the rounds it waited, p99">p99 · rounds {fmtCount(rounds)}</span>,
+            ],
+            [
+              'Errors',
+              <span className="mono">
+                bad pages {fmtCount(c.badPages)} · read errors {fmtCount(errs)} · retried {fmtCount(c.eioRetried)}
+              </span>,
+              n(c.badPages) > 0 || c.failingPages >= 64 ? <Chip k="err" title="64 pages failing in 60 s takes /readyz down">{c.failingPages >= 64 ? 'storm' : 'bad pages'}</Chip> : <Chip k="ok">ok</Chip>,
+            ],
+            [
+              'Last checkpoint',
+              <span className="mono" title="R: the changed lists and blocks · P_new: their pinned sections">
+                patch {bytes(d?.checkpointPatchBytes)} · pinned {bytes(d?.checkpointPinnedBytes)}
+              </span>,
+              <span className="muted">compactions 24 h {c.compactions24h}</span>,
+            ],
+          ]}
+        />
+      </PanelBody>
+    </Panel>
   )
 }
 

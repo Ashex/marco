@@ -573,6 +573,14 @@ pub struct GetOverviewResponse {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
     )]
     pub reads_before_ready: u64,
+    /// The storage engine's budget and reads; unset on --storage mmap.
+    ///
+    /// Field 27: `cache`
+    #[serde(
+        rename = "cache",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_unset_message_field"
+    )]
+    pub cache: ::buffa::MessageField<Cache, ::buffa::Inline<Cache>>,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -606,6 +614,7 @@ impl ::core::fmt::Debug for GetOverviewResponse {
             .field("ready", &self.ready)
             .field("ready_reason", &self.ready_reason)
             .field("reads_before_ready", &self.reads_before_ready)
+            .field("cache", &self.cache)
             .finish()
     }
 }
@@ -746,6 +755,14 @@ impl ::buffa::Message for GetOverviewResponse {
                 += 2u64
                     + ::buffa::types::uint64_encoded_len(self.reads_before_ready) as u64;
         }
+        if self.cache.is_set() {
+            let __slot = __cache.reserve();
+            let inner_size = self.cache.compute_size(__cache);
+            __cache.set(__slot, inner_size);
+            size
+                += 2u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
+                    + inner_size as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -863,6 +880,14 @@ impl ::buffa::Message for GetOverviewResponse {
         }
         if self.reads_before_ready != 0u64 {
             ::buffa::types::put_uint64_field(26u32, self.reads_before_ready, buf);
+        }
+        if self.cache.is_set() {
+            ::buffa::types::put_len_delimited_header(
+                27u32,
+                u64::from(__cache.consume_next()),
+                buf,
+            );
+            self.cache.write_to(__cache, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -1084,6 +1109,17 @@ impl ::buffa::Message for GetOverviewResponse {
                 )?;
                 self.reads_before_ready = ::buffa::types::decode_uint64(buf)?;
             }
+            27u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::Message::merge_length_delimited(
+                    self.cache.get_or_insert_default(),
+                    buf,
+                    ctx,
+                )?;
+            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -1118,6 +1154,7 @@ impl ::buffa::Message for GetOverviewResponse {
         self.ready = false;
         self.ready_reason.clear();
         self.reads_before_ready = 0u64;
+        self.cache = ::buffa::MessageField::none();
         self.__buffa_unknown_fields.clear();
     }
 }
@@ -1148,6 +1185,893 @@ pub const __GET_OVERVIEW_RESPONSE_JSON_ANY: ::buffa::type_registry::JsonAnyEntry
     type_url: "type.googleapis.com/marco.v1.GetOverviewResponse",
     to_json: ::buffa::type_registry::any_to_json::<GetOverviewResponse>,
     from_json: ::buffa::type_registry::any_from_json::<GetOverviewResponse>,
+    is_wkt: false,
+};
+/// Where the store's budget is, and what its reads did since start. Rates,
+/// ratios and quantiles over time are GetSeries' store_* series.
+#[derive(Clone, PartialEq, Default)]
+#[derive(::serde::Serialize, ::serde::Deserialize)]
+#[serde(default)]
+pub struct Cache {
+    /// --memory.
+    ///
+    /// Field 1: `budget_bytes`
+    #[serde(
+        rename = "budgetBytes",
+        alias = "budget_bytes",
+        with = "::buffa::json_helpers::uint64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
+    )]
+    pub budget_bytes: u64,
+    /// The pinned tier: the directory, the shards' indexes and heads, and the
+    /// tables (page sums, slots, side tables, statuses, the engine's own).
+    ///
+    /// Field 2: `pinned_dir_bytes`
+    #[serde(
+        rename = "pinnedDirBytes",
+        alias = "pinned_dir_bytes",
+        with = "::buffa::json_helpers::uint64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
+    )]
+    pub pinned_dir_bytes: u64,
+    /// Field 3: `pinned_index_bytes`
+    #[serde(
+        rename = "pinnedIndexBytes",
+        alias = "pinned_index_bytes",
+        with = "::buffa::json_helpers::uint64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
+    )]
+    pub pinned_index_bytes: u64,
+    /// Field 4: `pinned_heads_bytes`
+    #[serde(
+        rename = "pinnedHeadsBytes",
+        alias = "pinned_heads_bytes",
+        with = "::buffa::json_helpers::uint64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
+    )]
+    pub pinned_heads_bytes: u64,
+    /// Field 5: `pinned_tables_bytes`
+    #[serde(
+        rename = "pinnedTablesBytes",
+        alias = "pinned_tables_bytes",
+        with = "::buffa::json_helpers::uint64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
+    )]
+    pub pinned_tables_bytes: u64,
+    /// Field 6: `main_bytes`
+    #[serde(
+        rename = "mainBytes",
+        alias = "main_bytes",
+        with = "::buffa::json_helpers::uint64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
+    )]
+    pub main_bytes: u64,
+    /// Field 7: `small_bytes`
+    #[serde(
+        rename = "smallBytes",
+        alias = "small_bytes",
+        with = "::buffa::json_helpers::uint64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
+    )]
+    pub small_bytes: u64,
+    /// Frames waiting on the epoch before reuse.
+    ///
+    /// Field 8: `retired_bytes`
+    #[serde(
+        rename = "retiredBytes",
+        alias = "retired_bytes",
+        with = "::buffa::json_helpers::uint64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
+    )]
+    pub retired_bytes: u64,
+    /// Cached pages a request holds (inside main and small).
+    ///
+    /// Field 9: `pins_bytes`
+    #[serde(
+        rename = "pinsBytes",
+        alias = "pins_bytes",
+        with = "::buffa::json_helpers::uint64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
+    )]
+    pub pins_bytes: u64,
+    /// Field 10: `free_bytes`
+    #[serde(
+        rename = "freeBytes",
+        alias = "free_bytes",
+        with = "::buffa::json_helpers::uint64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
+    )]
+    pub free_bytes: u64,
+    /// Borrowed by anything but the served snapshot (a checkpoint's new files
+    /// before their switch).
+    ///
+    /// Field 11: `borrowed_bytes`
+    #[serde(
+        rename = "borrowedBytes",
+        alias = "borrowed_bytes",
+        with = "::buffa::json_helpers::uint64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
+    )]
+    pub borrowed_bytes: u64,
+    /// Paged bytes no index names, as of the last checkpoint or compaction.
+    ///
+    /// Field 12: `garbage_bytes`
+    #[serde(
+        rename = "garbageBytes",
+        alias = "garbage_bytes",
+        with = "::buffa::json_helpers::uint64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
+    )]
+    pub garbage_bytes: u64,
+    /// Lookups and misses since start, by structure (out_small, out_subj,
+    /// out_rkey, out_bysubj, in_small, in_blocks).
+    ///
+    /// Field 13: `structures`
+    #[serde(
+        rename = "structures",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_vec",
+        deserialize_with = "::buffa::json_helpers::null_as_default"
+    )]
+    pub structures: ::buffa::alloc::vec::Vec<CacheStructure>,
+    /// Field 14: `bad_pages`
+    #[serde(
+        rename = "badPages",
+        alias = "bad_pages",
+        with = "::buffa::json_helpers::uint64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
+    )]
+    pub bad_pages: u64,
+    /// Failed page reads since start: checksum, eio, short; and EIO a retry fixed.
+    ///
+    /// Field 15: `checksum_errors`
+    #[serde(
+        rename = "checksumErrors",
+        alias = "checksum_errors",
+        with = "::buffa::json_helpers::uint64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
+    )]
+    pub checksum_errors: u64,
+    /// Field 16: `eio_errors`
+    #[serde(
+        rename = "eioErrors",
+        alias = "eio_errors",
+        with = "::buffa::json_helpers::uint64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
+    )]
+    pub eio_errors: u64,
+    /// Field 17: `short_errors`
+    #[serde(
+        rename = "shortErrors",
+        alias = "short_errors",
+        with = "::buffa::json_helpers::uint64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
+    )]
+    pub short_errors: u64,
+    /// Field 18: `eio_retried`
+    #[serde(
+        rename = "eioRetried",
+        alias = "eio_retried",
+        with = "::buffa::json_helpers::uint64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
+    )]
+    pub eio_retried: u64,
+    /// Distinct pages failing on the device in the last 60 s; 64 is a storm.
+    ///
+    /// Field 19: `failing_pages`
+    #[serde(
+        rename = "failingPages",
+        alias = "failing_pages",
+        with = "::buffa::json_helpers::uint32",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u32"
+    )]
+    pub failing_pages: u32,
+    /// Field 20: `miss_threads`
+    #[serde(
+        rename = "missThreads",
+        alias = "miss_threads",
+        with = "::buffa::json_helpers::uint32",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u32"
+    )]
+    pub miss_threads: u32,
+    /// Compactions in the last 24 h.
+    ///
+    /// Field 21: `compactions_24h`
+    #[serde(
+        rename = "compactions24h",
+        alias = "compactions_24h",
+        with = "::buffa::json_helpers::uint32",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u32"
+    )]
+    pub compactions_24h: u32,
+    /// The whole snapshot was loaded at open.
+    ///
+    /// Field 22: `resident`
+    #[serde(
+        rename = "resident",
+        with = "::buffa::json_helpers::proto_bool",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_false"
+    )]
+    pub resident: bool,
+    /// Pages checkpoints and compactions wrote into the cache, and let go.
+    ///
+    /// Field 23: `written_through`
+    #[serde(
+        rename = "writtenThrough",
+        alias = "written_through",
+        with = "::buffa::json_helpers::uint64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
+    )]
+    pub written_through: u64,
+    /// Field 24: `write_through_skipped`
+    #[serde(
+        rename = "writeThroughSkipped",
+        alias = "write_through_skipped",
+        with = "::buffa::json_helpers::uint64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
+    )]
+    pub write_through_skipped: u64,
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub __buffa_unknown_fields: ::buffa::UnknownFields,
+}
+impl ::core::fmt::Debug for Cache {
+    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+        f.debug_struct("Cache")
+            .field("budget_bytes", &self.budget_bytes)
+            .field("pinned_dir_bytes", &self.pinned_dir_bytes)
+            .field("pinned_index_bytes", &self.pinned_index_bytes)
+            .field("pinned_heads_bytes", &self.pinned_heads_bytes)
+            .field("pinned_tables_bytes", &self.pinned_tables_bytes)
+            .field("main_bytes", &self.main_bytes)
+            .field("small_bytes", &self.small_bytes)
+            .field("retired_bytes", &self.retired_bytes)
+            .field("pins_bytes", &self.pins_bytes)
+            .field("free_bytes", &self.free_bytes)
+            .field("borrowed_bytes", &self.borrowed_bytes)
+            .field("garbage_bytes", &self.garbage_bytes)
+            .field("structures", &self.structures)
+            .field("bad_pages", &self.bad_pages)
+            .field("checksum_errors", &self.checksum_errors)
+            .field("eio_errors", &self.eio_errors)
+            .field("short_errors", &self.short_errors)
+            .field("eio_retried", &self.eio_retried)
+            .field("failing_pages", &self.failing_pages)
+            .field("miss_threads", &self.miss_threads)
+            .field("compactions_24h", &self.compactions_24h)
+            .field("resident", &self.resident)
+            .field("written_through", &self.written_through)
+            .field("write_through_skipped", &self.write_through_skipped)
+            .finish()
+    }
+}
+impl Cache {
+    /// Protobuf type URL for this message, for use with `Any::pack` and
+    /// `Any::unpack_if`.
+    ///
+    /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
+    pub const TYPE_URL: &'static str = "type.googleapis.com/marco.v1.Cache";
+}
+::buffa::impl_default_instance!(Cache);
+impl ::buffa::MessageName for Cache {
+    const PACKAGE: &'static str = "marco.v1";
+    const NAME: &'static str = "Cache";
+    const FULL_NAME: &'static str = "marco.v1.Cache";
+    const TYPE_URL: &'static str = "type.googleapis.com/marco.v1.Cache";
+}
+impl ::buffa::Message for Cache {
+    /// Returns the total encoded size in bytes.
+    ///
+    /// Accumulates in `u64` (which cannot overflow for in-memory
+    /// data) and saturates to `u32` at return, so a message whose
+    /// encoded size exceeds the 2 GiB protobuf limit yields a value
+    /// above [`::buffa::MAX_MESSAGE_BYTES`] that the encode entry
+    /// points reject, never a silently wrapped size.
+    #[allow(clippy::let_and_return)]
+    fn compute_size(&self, __cache: &mut ::buffa::SizeCache) -> u32 {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        let mut size = 0u64;
+        if self.budget_bytes != 0u64 {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(self.budget_bytes) as u64;
+        }
+        if self.pinned_dir_bytes != 0u64 {
+            size
+                += 1u64
+                    + ::buffa::types::uint64_encoded_len(self.pinned_dir_bytes) as u64;
+        }
+        if self.pinned_index_bytes != 0u64 {
+            size
+                += 1u64
+                    + ::buffa::types::uint64_encoded_len(self.pinned_index_bytes) as u64;
+        }
+        if self.pinned_heads_bytes != 0u64 {
+            size
+                += 1u64
+                    + ::buffa::types::uint64_encoded_len(self.pinned_heads_bytes) as u64;
+        }
+        if self.pinned_tables_bytes != 0u64 {
+            size
+                += 1u64
+                    + ::buffa::types::uint64_encoded_len(self.pinned_tables_bytes)
+                        as u64;
+        }
+        if self.main_bytes != 0u64 {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(self.main_bytes) as u64;
+        }
+        if self.small_bytes != 0u64 {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(self.small_bytes) as u64;
+        }
+        if self.retired_bytes != 0u64 {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(self.retired_bytes) as u64;
+        }
+        if self.pins_bytes != 0u64 {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(self.pins_bytes) as u64;
+        }
+        if self.free_bytes != 0u64 {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(self.free_bytes) as u64;
+        }
+        if self.borrowed_bytes != 0u64 {
+            size
+                += 1u64 + ::buffa::types::uint64_encoded_len(self.borrowed_bytes) as u64;
+        }
+        if self.garbage_bytes != 0u64 {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(self.garbage_bytes) as u64;
+        }
+        for v in &self.structures {
+            let __slot = __cache.reserve();
+            let inner_size = v.compute_size(__cache);
+            __cache.set(__slot, inner_size);
+            size
+                += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
+                    + inner_size as u64;
+        }
+        if self.bad_pages != 0u64 {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(self.bad_pages) as u64;
+        }
+        if self.checksum_errors != 0u64 {
+            size
+                += 1u64
+                    + ::buffa::types::uint64_encoded_len(self.checksum_errors) as u64;
+        }
+        if self.eio_errors != 0u64 {
+            size += 2u64 + ::buffa::types::uint64_encoded_len(self.eio_errors) as u64;
+        }
+        if self.short_errors != 0u64 {
+            size += 2u64 + ::buffa::types::uint64_encoded_len(self.short_errors) as u64;
+        }
+        if self.eio_retried != 0u64 {
+            size += 2u64 + ::buffa::types::uint64_encoded_len(self.eio_retried) as u64;
+        }
+        if self.failing_pages != 0u32 {
+            size += 2u64 + ::buffa::types::uint32_encoded_len(self.failing_pages) as u64;
+        }
+        if self.miss_threads != 0u32 {
+            size += 2u64 + ::buffa::types::uint32_encoded_len(self.miss_threads) as u64;
+        }
+        if self.compactions_24h != 0u32 {
+            size
+                += 2u64
+                    + ::buffa::types::uint32_encoded_len(self.compactions_24h) as u64;
+        }
+        if self.resident {
+            size += 2u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
+        }
+        if self.written_through != 0u64 {
+            size
+                += 2u64
+                    + ::buffa::types::uint64_encoded_len(self.written_through) as u64;
+        }
+        if self.write_through_skipped != 0u64 {
+            size
+                += 2u64
+                    + ::buffa::types::uint64_encoded_len(self.write_through_skipped)
+                        as u64;
+        }
+        size += self.__buffa_unknown_fields.encoded_len() as u64;
+        ::buffa::saturate_size(size)
+    }
+    fn write_to(
+        &self,
+        __cache: &mut ::buffa::SizeCache,
+        buf: &mut impl ::buffa::EncodeSink,
+    ) {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        if self.budget_bytes != 0u64 {
+            ::buffa::types::put_uint64_field(1u32, self.budget_bytes, buf);
+        }
+        if self.pinned_dir_bytes != 0u64 {
+            ::buffa::types::put_uint64_field(2u32, self.pinned_dir_bytes, buf);
+        }
+        if self.pinned_index_bytes != 0u64 {
+            ::buffa::types::put_uint64_field(3u32, self.pinned_index_bytes, buf);
+        }
+        if self.pinned_heads_bytes != 0u64 {
+            ::buffa::types::put_uint64_field(4u32, self.pinned_heads_bytes, buf);
+        }
+        if self.pinned_tables_bytes != 0u64 {
+            ::buffa::types::put_uint64_field(5u32, self.pinned_tables_bytes, buf);
+        }
+        if self.main_bytes != 0u64 {
+            ::buffa::types::put_uint64_field(6u32, self.main_bytes, buf);
+        }
+        if self.small_bytes != 0u64 {
+            ::buffa::types::put_uint64_field(7u32, self.small_bytes, buf);
+        }
+        if self.retired_bytes != 0u64 {
+            ::buffa::types::put_uint64_field(8u32, self.retired_bytes, buf);
+        }
+        if self.pins_bytes != 0u64 {
+            ::buffa::types::put_uint64_field(9u32, self.pins_bytes, buf);
+        }
+        if self.free_bytes != 0u64 {
+            ::buffa::types::put_uint64_field(10u32, self.free_bytes, buf);
+        }
+        if self.borrowed_bytes != 0u64 {
+            ::buffa::types::put_uint64_field(11u32, self.borrowed_bytes, buf);
+        }
+        if self.garbage_bytes != 0u64 {
+            ::buffa::types::put_uint64_field(12u32, self.garbage_bytes, buf);
+        }
+        for v in &self.structures {
+            ::buffa::types::put_len_delimited_header(
+                13u32,
+                u64::from(__cache.consume_next()),
+                buf,
+            );
+            v.write_to(__cache, buf);
+        }
+        if self.bad_pages != 0u64 {
+            ::buffa::types::put_uint64_field(14u32, self.bad_pages, buf);
+        }
+        if self.checksum_errors != 0u64 {
+            ::buffa::types::put_uint64_field(15u32, self.checksum_errors, buf);
+        }
+        if self.eio_errors != 0u64 {
+            ::buffa::types::put_uint64_field(16u32, self.eio_errors, buf);
+        }
+        if self.short_errors != 0u64 {
+            ::buffa::types::put_uint64_field(17u32, self.short_errors, buf);
+        }
+        if self.eio_retried != 0u64 {
+            ::buffa::types::put_uint64_field(18u32, self.eio_retried, buf);
+        }
+        if self.failing_pages != 0u32 {
+            ::buffa::types::put_uint32_field(19u32, self.failing_pages, buf);
+        }
+        if self.miss_threads != 0u32 {
+            ::buffa::types::put_uint32_field(20u32, self.miss_threads, buf);
+        }
+        if self.compactions_24h != 0u32 {
+            ::buffa::types::put_uint32_field(21u32, self.compactions_24h, buf);
+        }
+        if self.resident {
+            ::buffa::types::put_bool_field(22u32, self.resident, buf);
+        }
+        if self.written_through != 0u64 {
+            ::buffa::types::put_uint64_field(23u32, self.written_through, buf);
+        }
+        if self.write_through_skipped != 0u64 {
+            ::buffa::types::put_uint64_field(24u32, self.write_through_skipped, buf);
+        }
+        self.__buffa_unknown_fields.write_to(buf);
+    }
+    fn merge_field(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        buf: &mut impl ::buffa::bytes::Buf,
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<(), ::buffa::DecodeError> {
+        #[allow(unused_imports)]
+        use ::buffa::bytes::Buf as _;
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        match tag.field_number() {
+            1u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.budget_bytes = ::buffa::types::decode_uint64(buf)?;
+            }
+            2u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.pinned_dir_bytes = ::buffa::types::decode_uint64(buf)?;
+            }
+            3u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.pinned_index_bytes = ::buffa::types::decode_uint64(buf)?;
+            }
+            4u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.pinned_heads_bytes = ::buffa::types::decode_uint64(buf)?;
+            }
+            5u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.pinned_tables_bytes = ::buffa::types::decode_uint64(buf)?;
+            }
+            6u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.main_bytes = ::buffa::types::decode_uint64(buf)?;
+            }
+            7u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.small_bytes = ::buffa::types::decode_uint64(buf)?;
+            }
+            8u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.retired_bytes = ::buffa::types::decode_uint64(buf)?;
+            }
+            9u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.pins_bytes = ::buffa::types::decode_uint64(buf)?;
+            }
+            10u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.free_bytes = ::buffa::types::decode_uint64(buf)?;
+            }
+            11u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.borrowed_bytes = ::buffa::types::decode_uint64(buf)?;
+            }
+            12u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.garbage_bytes = ::buffa::types::decode_uint64(buf)?;
+            }
+            13u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                let mut elem = ::core::default::Default::default();
+                ctx.register_element_memory(
+                    ::buffa::__private::element_footprint(&elem),
+                )?;
+                ::buffa::Message::merge_length_delimited(&mut elem, buf, ctx)?;
+                self.structures.push(elem);
+            }
+            14u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.bad_pages = ::buffa::types::decode_uint64(buf)?;
+            }
+            15u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.checksum_errors = ::buffa::types::decode_uint64(buf)?;
+            }
+            16u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.eio_errors = ::buffa::types::decode_uint64(buf)?;
+            }
+            17u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.short_errors = ::buffa::types::decode_uint64(buf)?;
+            }
+            18u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.eio_retried = ::buffa::types::decode_uint64(buf)?;
+            }
+            19u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.failing_pages = ::buffa::types::decode_uint32(buf)?;
+            }
+            20u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.miss_threads = ::buffa::types::decode_uint32(buf)?;
+            }
+            21u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.compactions_24h = ::buffa::types::decode_uint32(buf)?;
+            }
+            22u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.resident = ::buffa::types::decode_bool(buf)?;
+            }
+            23u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.written_through = ::buffa::types::decode_uint64(buf)?;
+            }
+            24u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.write_through_skipped = ::buffa::types::decode_uint64(buf)?;
+            }
+            _ => {
+                self.__buffa_unknown_fields
+                    .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
+            }
+        }
+        ::core::result::Result::Ok(())
+    }
+    fn clear(&mut self) {
+        self.budget_bytes = 0u64;
+        self.pinned_dir_bytes = 0u64;
+        self.pinned_index_bytes = 0u64;
+        self.pinned_heads_bytes = 0u64;
+        self.pinned_tables_bytes = 0u64;
+        self.main_bytes = 0u64;
+        self.small_bytes = 0u64;
+        self.retired_bytes = 0u64;
+        self.pins_bytes = 0u64;
+        self.free_bytes = 0u64;
+        self.borrowed_bytes = 0u64;
+        self.garbage_bytes = 0u64;
+        self.structures.clear();
+        self.bad_pages = 0u64;
+        self.checksum_errors = 0u64;
+        self.eio_errors = 0u64;
+        self.short_errors = 0u64;
+        self.eio_retried = 0u64;
+        self.failing_pages = 0u32;
+        self.miss_threads = 0u32;
+        self.compactions_24h = 0u32;
+        self.resident = false;
+        self.written_through = 0u64;
+        self.write_through_skipped = 0u64;
+        self.__buffa_unknown_fields.clear();
+    }
+}
+impl ::buffa::ExtensionSet for Cache {
+    const PROTO_FQN: &'static str = "marco.v1.Cache";
+    fn unknown_fields(&self) -> &::buffa::UnknownFields {
+        &self.__buffa_unknown_fields
+    }
+    fn unknown_fields_mut(&mut self) -> &mut ::buffa::UnknownFields {
+        &mut self.__buffa_unknown_fields
+    }
+}
+impl ::buffa::json_helpers::ProtoElemJson for Cache {
+    fn serialize_proto_json<S: ::serde::Serializer>(
+        v: &Self,
+        s: S,
+    ) -> ::core::result::Result<S::Ok, S::Error> {
+        ::serde::Serialize::serialize(v, s)
+    }
+    fn deserialize_proto_json<'de, D: ::serde::Deserializer<'de>>(
+        d: D,
+    ) -> ::core::result::Result<Self, D::Error> {
+        <Self as ::serde::Deserialize>::deserialize(d)
+    }
+}
+#[doc(hidden)]
+pub const __CACHE_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
+    type_url: "type.googleapis.com/marco.v1.Cache",
+    to_json: ::buffa::type_registry::any_to_json::<Cache>,
+    from_json: ::buffa::type_registry::any_from_json::<Cache>,
+    is_wkt: false,
+};
+#[derive(Clone, PartialEq, Default)]
+#[derive(::serde::Serialize, ::serde::Deserialize)]
+#[serde(default)]
+pub struct CacheStructure {
+    /// Field 1: `name`
+    #[serde(
+        rename = "name",
+        with = "::buffa::json_helpers::proto_string",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    )]
+    pub name: ::buffa::alloc::string::String,
+    /// Field 2: `lookups`
+    #[serde(
+        rename = "lookups",
+        with = "::buffa::json_helpers::uint64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
+    )]
+    pub lookups: u64,
+    /// Field 3: `misses`
+    #[serde(
+        rename = "misses",
+        with = "::buffa::json_helpers::uint64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
+    )]
+    pub misses: u64,
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub __buffa_unknown_fields: ::buffa::UnknownFields,
+}
+impl ::core::fmt::Debug for CacheStructure {
+    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+        f.debug_struct("CacheStructure")
+            .field("name", &self.name)
+            .field("lookups", &self.lookups)
+            .field("misses", &self.misses)
+            .finish()
+    }
+}
+impl CacheStructure {
+    /// Protobuf type URL for this message, for use with `Any::pack` and
+    /// `Any::unpack_if`.
+    ///
+    /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
+    pub const TYPE_URL: &'static str = "type.googleapis.com/marco.v1.CacheStructure";
+}
+::buffa::impl_default_instance!(CacheStructure);
+impl ::buffa::MessageName for CacheStructure {
+    const PACKAGE: &'static str = "marco.v1";
+    const NAME: &'static str = "CacheStructure";
+    const FULL_NAME: &'static str = "marco.v1.CacheStructure";
+    const TYPE_URL: &'static str = "type.googleapis.com/marco.v1.CacheStructure";
+}
+impl ::buffa::Message for CacheStructure {
+    /// Returns the total encoded size in bytes.
+    ///
+    /// Accumulates in `u64` (which cannot overflow for in-memory
+    /// data) and saturates to `u32` at return, so a message whose
+    /// encoded size exceeds the 2 GiB protobuf limit yields a value
+    /// above [`::buffa::MAX_MESSAGE_BYTES`] that the encode entry
+    /// points reject, never a silently wrapped size.
+    #[allow(clippy::let_and_return)]
+    fn compute_size(&self, _cache: &mut ::buffa::SizeCache) -> u32 {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        let mut size = 0u64;
+        if !self.name.is_empty() {
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.name) as u64;
+        }
+        if self.lookups != 0u64 {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(self.lookups) as u64;
+        }
+        if self.misses != 0u64 {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(self.misses) as u64;
+        }
+        size += self.__buffa_unknown_fields.encoded_len() as u64;
+        ::buffa::saturate_size(size)
+    }
+    fn write_to(
+        &self,
+        _cache: &mut ::buffa::SizeCache,
+        buf: &mut impl ::buffa::EncodeSink,
+    ) {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        if !self.name.is_empty() {
+            ::buffa::types::put_string_field(1u32, &self.name, buf);
+        }
+        if self.lookups != 0u64 {
+            ::buffa::types::put_uint64_field(2u32, self.lookups, buf);
+        }
+        if self.misses != 0u64 {
+            ::buffa::types::put_uint64_field(3u32, self.misses, buf);
+        }
+        self.__buffa_unknown_fields.write_to(buf);
+    }
+    fn merge_field(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        buf: &mut impl ::buffa::bytes::Buf,
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<(), ::buffa::DecodeError> {
+        #[allow(unused_imports)]
+        use ::buffa::bytes::Buf as _;
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        match tag.field_number() {
+            1u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.name, buf)?;
+            }
+            2u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.lookups = ::buffa::types::decode_uint64(buf)?;
+            }
+            3u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.misses = ::buffa::types::decode_uint64(buf)?;
+            }
+            _ => {
+                self.__buffa_unknown_fields
+                    .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
+            }
+        }
+        ::core::result::Result::Ok(())
+    }
+    fn clear(&mut self) {
+        self.name.clear();
+        self.lookups = 0u64;
+        self.misses = 0u64;
+        self.__buffa_unknown_fields.clear();
+    }
+}
+impl ::buffa::ExtensionSet for CacheStructure {
+    const PROTO_FQN: &'static str = "marco.v1.CacheStructure";
+    fn unknown_fields(&self) -> &::buffa::UnknownFields {
+        &self.__buffa_unknown_fields
+    }
+    fn unknown_fields_mut(&mut self) -> &mut ::buffa::UnknownFields {
+        &mut self.__buffa_unknown_fields
+    }
+}
+impl ::buffa::json_helpers::ProtoElemJson for CacheStructure {
+    fn serialize_proto_json<S: ::serde::Serializer>(
+        v: &Self,
+        s: S,
+    ) -> ::core::result::Result<S::Ok, S::Error> {
+        ::serde::Serialize::serialize(v, s)
+    }
+    fn deserialize_proto_json<'de, D: ::serde::Deserializer<'de>>(
+        d: D,
+    ) -> ::core::result::Result<Self, D::Error> {
+        <Self as ::serde::Deserialize>::deserialize(d)
+    }
+}
+#[doc(hidden)]
+pub const __CACHE_STRUCTURE_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
+    type_url: "type.googleapis.com/marco.v1.CacheStructure",
+    to_json: ::buffa::type_registry::any_to_json::<CacheStructure>,
+    from_json: ::buffa::type_registry::any_from_json::<CacheStructure>,
     is_wkt: false,
 };
 /// Writes are applied in memory, then written every few seconds as a change
@@ -1340,6 +2264,25 @@ pub struct Durability {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
     )]
     pub checkpoint_failures: u64,
+    /// The last checkpoint's patch bytes (R, the changed lists and blocks) and
+    /// their pinned sections (P_new).
+    ///
+    /// Field 22: `checkpoint_patch_bytes`
+    #[serde(
+        rename = "checkpointPatchBytes",
+        alias = "checkpoint_patch_bytes",
+        with = "::buffa::json_helpers::uint64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
+    )]
+    pub checkpoint_patch_bytes: u64,
+    /// Field 23: `checkpoint_pinned_bytes`
+    #[serde(
+        rename = "checkpointPinnedBytes",
+        alias = "checkpoint_pinned_bytes",
+        with = "::buffa::json_helpers::uint64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
+    )]
+    pub checkpoint_pinned_bytes: u64,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -1368,6 +2311,8 @@ impl ::core::fmt::Debug for Durability {
             .field("segment_error", &self.segment_error)
             .field("checkpoint_error", &self.checkpoint_error)
             .field("checkpoint_failures", &self.checkpoint_failures)
+            .field("checkpoint_patch_bytes", &self.checkpoint_patch_bytes)
+            .field("checkpoint_pinned_bytes", &self.checkpoint_pinned_bytes)
             .finish()
     }
 }
@@ -1474,6 +2419,18 @@ impl ::buffa::Message for Durability {
                     + ::buffa::types::uint64_encoded_len(self.checkpoint_failures)
                         as u64;
         }
+        if self.checkpoint_patch_bytes != 0u64 {
+            size
+                += 2u64
+                    + ::buffa::types::uint64_encoded_len(self.checkpoint_patch_bytes)
+                        as u64;
+        }
+        if self.checkpoint_pinned_bytes != 0u64 {
+            size
+                += 2u64
+                    + ::buffa::types::uint64_encoded_len(self.checkpoint_pinned_bytes)
+                        as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -1546,6 +2503,12 @@ impl ::buffa::Message for Durability {
         }
         if self.checkpoint_failures != 0u64 {
             ::buffa::types::put_uint64_field(21u32, self.checkpoint_failures, buf);
+        }
+        if self.checkpoint_patch_bytes != 0u64 {
+            ::buffa::types::put_uint64_field(22u32, self.checkpoint_patch_bytes, buf);
+        }
+        if self.checkpoint_pinned_bytes != 0u64 {
+            ::buffa::types::put_uint64_field(23u32, self.checkpoint_pinned_bytes, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -1707,6 +2670,20 @@ impl ::buffa::Message for Durability {
                 )?;
                 self.checkpoint_failures = ::buffa::types::decode_uint64(buf)?;
             }
+            22u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.checkpoint_patch_bytes = ::buffa::types::decode_uint64(buf)?;
+            }
+            23u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.checkpoint_pinned_bytes = ::buffa::types::decode_uint64(buf)?;
+            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -1736,6 +2713,8 @@ impl ::buffa::Message for Durability {
         self.segment_error.clear();
         self.checkpoint_error.clear();
         self.checkpoint_failures = 0u64;
+        self.checkpoint_patch_bytes = 0u64;
+        self.checkpoint_pinned_bytes = 0u64;
         self.__buffa_unknown_fields.clear();
     }
 }

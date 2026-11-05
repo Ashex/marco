@@ -71,6 +71,8 @@ pub mod __buffa {
         reg.register_json_any(super::__GET_SESSION_RESPONSE_JSON_ANY);
         reg.register_json_any(super::__GET_OVERVIEW_REQUEST_JSON_ANY);
         reg.register_json_any(super::__GET_OVERVIEW_RESPONSE_JSON_ANY);
+        reg.register_json_any(super::__CACHE_JSON_ANY);
+        reg.register_json_any(super::__CACHE_STRUCTURE_JSON_ANY);
         reg.register_json_any(super::__DURABILITY_JSON_ANY);
         reg.register_json_any(super::__SNAPSHOT_INFO_JSON_ANY);
         reg.register_json_any(super::__DIRECTORY_INFO_JSON_ANY);
@@ -270,6 +272,14 @@ pub use self::__buffa::view::GetOverviewRequestOwnedView;
 pub use self::__buffa::view::GetOverviewResponseView;
 #[doc(inline)]
 pub use self::__buffa::view::GetOverviewResponseOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::CacheView;
+#[doc(inline)]
+pub use self::__buffa::view::CacheOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::CacheStructureView;
+#[doc(inline)]
+pub use self::__buffa::view::CacheStructureOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::DurabilityView;
 #[doc(inline)]

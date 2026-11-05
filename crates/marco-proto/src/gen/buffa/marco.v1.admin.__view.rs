@@ -814,6 +814,10 @@ pub struct GetOverviewResponseView<'a> {
     pub ready_reason: &'a str,
     /// Field 26: `reads_before_ready`
     pub reads_before_ready: u64,
+    /// The storage engine's budget and reads; unset on --storage mmap.
+    ///
+    /// Field 27: `cache`
+    pub cache: ::buffa::MessageFieldView<super::super::__buffa::view::CacheView<'a>>,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for GetOverviewResponseView<'a> {
@@ -1091,6 +1095,27 @@ impl<'a> ::buffa::MessageView<'a> for GetOverviewResponseView<'a> {
                 )?;
                 view.reads_before_ready = ::buffa::types::decode_uint64(&mut cur)?;
             }
+            27u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                let __sub_ctx = ctx.descend()?;
+                let sub = ::buffa::types::borrow_bytes(&mut cur)?;
+                match view.cache.as_mut() {
+                    Some(existing) => {
+                        ::buffa::MessageView::merge_into_view(existing, sub, __sub_ctx)?
+                    }
+                    None => {
+                        view.cache = ::buffa::MessageFieldView::set(
+                            <super::super::__buffa::view::CacheView as ::buffa::MessageView>::decode_view_ctx(
+                                sub,
+                                __sub_ctx,
+                            )?,
+                        );
+                    }
+                }
+            }
             7u32 => {
                 ::buffa::encoding::check_wire_type(
                     tag,
@@ -1209,6 +1234,15 @@ impl<'a> ::buffa::MessageView<'a> for GetOverviewResponseView<'a> {
             ready: self.ready,
             ready_reason: self.ready_reason.to_string(),
             reads_before_ready: self.reads_before_ready,
+            cache: match self.cache.as_option() {
+                Some(v) => {
+                    ::buffa::MessageField::<
+                        super::super::Cache,
+                        ::buffa::Inline<super::super::Cache>,
+                    >::some(v.to_owned_from_source(__buffa_src)?)
+                }
+                None => ::buffa::MessageField::none(),
+            },
             __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
@@ -1330,6 +1364,14 @@ impl<'a> ::buffa::ViewEncode<'a> for GetOverviewResponseView<'a> {
                 += 2u64
                     + ::buffa::types::uint64_encoded_len(self.reads_before_ready) as u64;
         }
+        if self.cache.is_set() {
+            let __slot = __cache.reserve();
+            let inner_size = self.cache.compute_size(__cache);
+            __cache.set(__slot, inner_size);
+            size
+                += 2u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
+                    + inner_size as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -1448,6 +1490,14 @@ impl<'a> ::buffa::ViewEncode<'a> for GetOverviewResponseView<'a> {
         }
         if self.reads_before_ready != 0u64 {
             ::buffa::types::put_uint64_field(26u32, self.reads_before_ready, buf);
+        }
+        if self.cache.is_set() {
+            ::buffa::types::put_len_delimited_header(
+                27u32,
+                u64::from(__cache.consume_next()),
+                buf,
+            );
+            self.cache.write_to(__cache, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -1605,6 +1655,11 @@ impl<'__a> ::serde::Serialize for GetOverviewResponseView<'__a> {
                     "readsBeforeReady",
                     &::buffa::json_helpers::ProtoJson(&self.reads_before_ready),
                 )?;
+        }
+        {
+            if let ::core::option::Option::Some(__v) = self.cache.as_option() {
+                __map.serialize_entry("cache", __v)?;
+            }
         }
         __map.end()
     }
@@ -1863,6 +1918,15 @@ impl GetOverviewResponseOwnedView {
     pub fn reads_before_ready(&self) -> u64 {
         self.0.reborrow().reads_before_ready
     }
+    /// The storage engine's budget and reads; unset on --storage mmap.
+    ///
+    /// Field 27: `cache`
+    #[must_use]
+    pub fn cache(
+        &self,
+    ) -> &::buffa::MessageFieldView<super::super::__buffa::view::CacheView<'_>> {
+        &self.0.reborrow().cache
+    }
 }
 impl ::core::convert::From<::buffa::OwnedView<GetOverviewResponseView<'static>>>
 for GetOverviewResponseOwnedView {
@@ -1887,6 +1951,1297 @@ impl ::buffa::HasMessageView for super::super::GetOverviewResponse {
     type ViewHandle = GetOverviewResponseOwnedView;
 }
 impl ::serde::Serialize for GetOverviewResponseOwnedView {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        ::serde::Serialize::serialize(&self.0, __s)
+    }
+}
+/// Where the store's budget is, and what its reads did since start. Rates,
+/// ratios and quantiles over time are GetSeries' store_* series.
+#[derive(Clone, Debug, Default)]
+pub struct CacheView<'a> {
+    /// --memory.
+    ///
+    /// Field 1: `budget_bytes`
+    pub budget_bytes: u64,
+    /// The pinned tier: the directory, the shards' indexes and heads, and the
+    /// tables (page sums, slots, side tables, statuses, the engine's own).
+    ///
+    /// Field 2: `pinned_dir_bytes`
+    pub pinned_dir_bytes: u64,
+    /// Field 3: `pinned_index_bytes`
+    pub pinned_index_bytes: u64,
+    /// Field 4: `pinned_heads_bytes`
+    pub pinned_heads_bytes: u64,
+    /// Field 5: `pinned_tables_bytes`
+    pub pinned_tables_bytes: u64,
+    /// Field 6: `main_bytes`
+    pub main_bytes: u64,
+    /// Field 7: `small_bytes`
+    pub small_bytes: u64,
+    /// Frames waiting on the epoch before reuse.
+    ///
+    /// Field 8: `retired_bytes`
+    pub retired_bytes: u64,
+    /// Cached pages a request holds (inside main and small).
+    ///
+    /// Field 9: `pins_bytes`
+    pub pins_bytes: u64,
+    /// Field 10: `free_bytes`
+    pub free_bytes: u64,
+    /// Borrowed by anything but the served snapshot (a checkpoint's new files
+    /// before their switch).
+    ///
+    /// Field 11: `borrowed_bytes`
+    pub borrowed_bytes: u64,
+    /// Paged bytes no index names, as of the last checkpoint or compaction.
+    ///
+    /// Field 12: `garbage_bytes`
+    pub garbage_bytes: u64,
+    /// Lookups and misses since start, by structure (out_small, out_subj,
+    /// out_rkey, out_bysubj, in_small, in_blocks).
+    ///
+    /// Field 13: `structures`
+    pub structures: ::buffa::RepeatedView<
+        'a,
+        super::super::__buffa::view::CacheStructureView<'a>,
+    >,
+    /// Field 14: `bad_pages`
+    pub bad_pages: u64,
+    /// Failed page reads since start: checksum, eio, short; and EIO a retry fixed.
+    ///
+    /// Field 15: `checksum_errors`
+    pub checksum_errors: u64,
+    /// Field 16: `eio_errors`
+    pub eio_errors: u64,
+    /// Field 17: `short_errors`
+    pub short_errors: u64,
+    /// Field 18: `eio_retried`
+    pub eio_retried: u64,
+    /// Distinct pages failing on the device in the last 60 s; 64 is a storm.
+    ///
+    /// Field 19: `failing_pages`
+    pub failing_pages: u32,
+    /// Field 20: `miss_threads`
+    pub miss_threads: u32,
+    /// Compactions in the last 24 h.
+    ///
+    /// Field 21: `compactions_24h`
+    pub compactions_24h: u32,
+    /// The whole snapshot was loaded at open.
+    ///
+    /// Field 22: `resident`
+    pub resident: bool,
+    /// Pages checkpoints and compactions wrote into the cache, and let go.
+    ///
+    /// Field 23: `written_through`
+    pub written_through: u64,
+    /// Field 24: `write_through_skipped`
+    pub write_through_skipped: u64,
+    pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
+}
+impl<'a> ::buffa::MessageView<'a> for CacheView<'a> {
+    type Owned = super::super::Cache;
+    fn decode_view(buf: &'a [u8]) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        let __limit = ::core::cell::Cell::new(::buffa::DEFAULT_UNKNOWN_FIELD_LIMIT);
+        let __elem = ::core::cell::Cell::new(::buffa::DEFAULT_ELEMENT_MEMORY_LIMIT);
+        <Self as ::buffa::MessageView>::decode_view_ctx(
+            buf,
+            ::buffa::DecodeContext::new(::buffa::RECURSION_LIMIT, &__limit)
+                .with_element_memory(&__elem),
+        )
+    }
+    fn decode_view_with_ctx(
+        buf: &'a [u8],
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        <Self as ::buffa::MessageView>::decode_view_ctx(buf, ctx)
+    }
+    #[inline]
+    fn merge_view_field(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        cur: &'a [u8],
+        before_tag: &'a [u8],
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<&'a [u8], ::buffa::DecodeError> {
+        let _ = ctx;
+        #[allow(unused_variables)]
+        let view = self;
+        let mut cur = cur;
+        match tag.field_number() {
+            1u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.budget_bytes = ::buffa::types::decode_uint64(&mut cur)?;
+            }
+            2u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.pinned_dir_bytes = ::buffa::types::decode_uint64(&mut cur)?;
+            }
+            3u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.pinned_index_bytes = ::buffa::types::decode_uint64(&mut cur)?;
+            }
+            4u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.pinned_heads_bytes = ::buffa::types::decode_uint64(&mut cur)?;
+            }
+            5u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.pinned_tables_bytes = ::buffa::types::decode_uint64(&mut cur)?;
+            }
+            6u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.main_bytes = ::buffa::types::decode_uint64(&mut cur)?;
+            }
+            7u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.small_bytes = ::buffa::types::decode_uint64(&mut cur)?;
+            }
+            8u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.retired_bytes = ::buffa::types::decode_uint64(&mut cur)?;
+            }
+            9u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.pins_bytes = ::buffa::types::decode_uint64(&mut cur)?;
+            }
+            10u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.free_bytes = ::buffa::types::decode_uint64(&mut cur)?;
+            }
+            11u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.borrowed_bytes = ::buffa::types::decode_uint64(&mut cur)?;
+            }
+            12u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.garbage_bytes = ::buffa::types::decode_uint64(&mut cur)?;
+            }
+            14u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.bad_pages = ::buffa::types::decode_uint64(&mut cur)?;
+            }
+            15u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.checksum_errors = ::buffa::types::decode_uint64(&mut cur)?;
+            }
+            16u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.eio_errors = ::buffa::types::decode_uint64(&mut cur)?;
+            }
+            17u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.short_errors = ::buffa::types::decode_uint64(&mut cur)?;
+            }
+            18u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.eio_retried = ::buffa::types::decode_uint64(&mut cur)?;
+            }
+            19u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.failing_pages = ::buffa::types::decode_uint32(&mut cur)?;
+            }
+            20u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.miss_threads = ::buffa::types::decode_uint32(&mut cur)?;
+            }
+            21u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.compactions_24h = ::buffa::types::decode_uint32(&mut cur)?;
+            }
+            22u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.resident = ::buffa::types::decode_bool(&mut cur)?;
+            }
+            23u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.written_through = ::buffa::types::decode_uint64(&mut cur)?;
+            }
+            24u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.write_through_skipped = ::buffa::types::decode_uint64(&mut cur)?;
+            }
+            13u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                let __sub_ctx = ctx.descend()?;
+                let sub = ::buffa::types::borrow_bytes(&mut cur)?;
+                ctx.register_element_memory(
+                    ::core::mem::size_of::<
+                        super::super::__buffa::view::CacheStructureView,
+                    >(),
+                )?;
+                view.structures
+                    .push(
+                        <super::super::__buffa::view::CacheStructureView as ::buffa::MessageView>::decode_view_ctx(
+                            sub,
+                            __sub_ctx,
+                        )?,
+                    );
+            }
+            _ => {
+                ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
+                let span_len = before_tag.len() - cur.len();
+                view.__buffa_unknown_fields.push_record(before_tag, span_len, ctx)?;
+            }
+        }
+        ::core::result::Result::Ok(cur)
+    }
+    fn to_owned_message(
+        &self,
+    ) -> ::core::result::Result<super::super::Cache, ::buffa::DecodeError> {
+        self.to_owned_from_source(None)
+    }
+    #[allow(clippy::useless_conversion, clippy::needless_update)]
+    fn to_owned_from_source(
+        &self,
+        __buffa_src: ::core::option::Option<&::buffa::bytes::Bytes>,
+    ) -> ::core::result::Result<super::super::Cache, ::buffa::DecodeError> {
+        #[allow(unused_imports)]
+        use ::buffa::alloc::string::ToString as _;
+        let _ = __buffa_src;
+        ::core::result::Result::Ok(super::super::Cache {
+            budget_bytes: self.budget_bytes,
+            pinned_dir_bytes: self.pinned_dir_bytes,
+            pinned_index_bytes: self.pinned_index_bytes,
+            pinned_heads_bytes: self.pinned_heads_bytes,
+            pinned_tables_bytes: self.pinned_tables_bytes,
+            main_bytes: self.main_bytes,
+            small_bytes: self.small_bytes,
+            retired_bytes: self.retired_bytes,
+            pins_bytes: self.pins_bytes,
+            free_bytes: self.free_bytes,
+            borrowed_bytes: self.borrowed_bytes,
+            garbage_bytes: self.garbage_bytes,
+            structures: self
+                .structures
+                .iter()
+                .map(|v| v.to_owned_from_source(__buffa_src))
+                .collect::<::core::result::Result<_, ::buffa::DecodeError>>()?,
+            bad_pages: self.bad_pages,
+            checksum_errors: self.checksum_errors,
+            eio_errors: self.eio_errors,
+            short_errors: self.short_errors,
+            eio_retried: self.eio_retried,
+            failing_pages: self.failing_pages,
+            miss_threads: self.miss_threads,
+            compactions_24h: self.compactions_24h,
+            resident: self.resident,
+            written_through: self.written_through,
+            write_through_skipped: self.write_through_skipped,
+            __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
+            ..::core::default::Default::default()
+        })
+    }
+}
+impl<'a> ::buffa::ViewEncode<'a> for CacheView<'a> {
+    #[allow(clippy::needless_borrow, clippy::let_and_return)]
+    fn compute_size(&self, __cache: &mut ::buffa::SizeCache) -> u32 {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        let mut size = 0u64;
+        if self.budget_bytes != 0u64 {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(self.budget_bytes) as u64;
+        }
+        if self.pinned_dir_bytes != 0u64 {
+            size
+                += 1u64
+                    + ::buffa::types::uint64_encoded_len(self.pinned_dir_bytes) as u64;
+        }
+        if self.pinned_index_bytes != 0u64 {
+            size
+                += 1u64
+                    + ::buffa::types::uint64_encoded_len(self.pinned_index_bytes) as u64;
+        }
+        if self.pinned_heads_bytes != 0u64 {
+            size
+                += 1u64
+                    + ::buffa::types::uint64_encoded_len(self.pinned_heads_bytes) as u64;
+        }
+        if self.pinned_tables_bytes != 0u64 {
+            size
+                += 1u64
+                    + ::buffa::types::uint64_encoded_len(self.pinned_tables_bytes)
+                        as u64;
+        }
+        if self.main_bytes != 0u64 {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(self.main_bytes) as u64;
+        }
+        if self.small_bytes != 0u64 {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(self.small_bytes) as u64;
+        }
+        if self.retired_bytes != 0u64 {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(self.retired_bytes) as u64;
+        }
+        if self.pins_bytes != 0u64 {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(self.pins_bytes) as u64;
+        }
+        if self.free_bytes != 0u64 {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(self.free_bytes) as u64;
+        }
+        if self.borrowed_bytes != 0u64 {
+            size
+                += 1u64 + ::buffa::types::uint64_encoded_len(self.borrowed_bytes) as u64;
+        }
+        if self.garbage_bytes != 0u64 {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(self.garbage_bytes) as u64;
+        }
+        for v in &self.structures {
+            let __slot = __cache.reserve();
+            let inner_size = v.compute_size(__cache);
+            __cache.set(__slot, inner_size);
+            size
+                += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
+                    + inner_size as u64;
+        }
+        if self.bad_pages != 0u64 {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(self.bad_pages) as u64;
+        }
+        if self.checksum_errors != 0u64 {
+            size
+                += 1u64
+                    + ::buffa::types::uint64_encoded_len(self.checksum_errors) as u64;
+        }
+        if self.eio_errors != 0u64 {
+            size += 2u64 + ::buffa::types::uint64_encoded_len(self.eio_errors) as u64;
+        }
+        if self.short_errors != 0u64 {
+            size += 2u64 + ::buffa::types::uint64_encoded_len(self.short_errors) as u64;
+        }
+        if self.eio_retried != 0u64 {
+            size += 2u64 + ::buffa::types::uint64_encoded_len(self.eio_retried) as u64;
+        }
+        if self.failing_pages != 0u32 {
+            size += 2u64 + ::buffa::types::uint32_encoded_len(self.failing_pages) as u64;
+        }
+        if self.miss_threads != 0u32 {
+            size += 2u64 + ::buffa::types::uint32_encoded_len(self.miss_threads) as u64;
+        }
+        if self.compactions_24h != 0u32 {
+            size
+                += 2u64
+                    + ::buffa::types::uint32_encoded_len(self.compactions_24h) as u64;
+        }
+        if self.resident {
+            size += 2u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
+        }
+        if self.written_through != 0u64 {
+            size
+                += 2u64
+                    + ::buffa::types::uint64_encoded_len(self.written_through) as u64;
+        }
+        if self.write_through_skipped != 0u64 {
+            size
+                += 2u64
+                    + ::buffa::types::uint64_encoded_len(self.write_through_skipped)
+                        as u64;
+        }
+        size += self.__buffa_unknown_fields.encoded_len() as u64;
+        ::buffa::saturate_size(size)
+    }
+    #[allow(clippy::needless_borrow)]
+    fn write_to(
+        &self,
+        __cache: &mut ::buffa::SizeCache,
+        buf: &mut impl ::buffa::EncodeSink,
+    ) {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        if self.budget_bytes != 0u64 {
+            ::buffa::types::put_uint64_field(1u32, self.budget_bytes, buf);
+        }
+        if self.pinned_dir_bytes != 0u64 {
+            ::buffa::types::put_uint64_field(2u32, self.pinned_dir_bytes, buf);
+        }
+        if self.pinned_index_bytes != 0u64 {
+            ::buffa::types::put_uint64_field(3u32, self.pinned_index_bytes, buf);
+        }
+        if self.pinned_heads_bytes != 0u64 {
+            ::buffa::types::put_uint64_field(4u32, self.pinned_heads_bytes, buf);
+        }
+        if self.pinned_tables_bytes != 0u64 {
+            ::buffa::types::put_uint64_field(5u32, self.pinned_tables_bytes, buf);
+        }
+        if self.main_bytes != 0u64 {
+            ::buffa::types::put_uint64_field(6u32, self.main_bytes, buf);
+        }
+        if self.small_bytes != 0u64 {
+            ::buffa::types::put_uint64_field(7u32, self.small_bytes, buf);
+        }
+        if self.retired_bytes != 0u64 {
+            ::buffa::types::put_uint64_field(8u32, self.retired_bytes, buf);
+        }
+        if self.pins_bytes != 0u64 {
+            ::buffa::types::put_uint64_field(9u32, self.pins_bytes, buf);
+        }
+        if self.free_bytes != 0u64 {
+            ::buffa::types::put_uint64_field(10u32, self.free_bytes, buf);
+        }
+        if self.borrowed_bytes != 0u64 {
+            ::buffa::types::put_uint64_field(11u32, self.borrowed_bytes, buf);
+        }
+        if self.garbage_bytes != 0u64 {
+            ::buffa::types::put_uint64_field(12u32, self.garbage_bytes, buf);
+        }
+        for v in &self.structures {
+            ::buffa::types::put_len_delimited_header(
+                13u32,
+                u64::from(__cache.consume_next()),
+                buf,
+            );
+            v.write_to(__cache, buf);
+        }
+        if self.bad_pages != 0u64 {
+            ::buffa::types::put_uint64_field(14u32, self.bad_pages, buf);
+        }
+        if self.checksum_errors != 0u64 {
+            ::buffa::types::put_uint64_field(15u32, self.checksum_errors, buf);
+        }
+        if self.eio_errors != 0u64 {
+            ::buffa::types::put_uint64_field(16u32, self.eio_errors, buf);
+        }
+        if self.short_errors != 0u64 {
+            ::buffa::types::put_uint64_field(17u32, self.short_errors, buf);
+        }
+        if self.eio_retried != 0u64 {
+            ::buffa::types::put_uint64_field(18u32, self.eio_retried, buf);
+        }
+        if self.failing_pages != 0u32 {
+            ::buffa::types::put_uint32_field(19u32, self.failing_pages, buf);
+        }
+        if self.miss_threads != 0u32 {
+            ::buffa::types::put_uint32_field(20u32, self.miss_threads, buf);
+        }
+        if self.compactions_24h != 0u32 {
+            ::buffa::types::put_uint32_field(21u32, self.compactions_24h, buf);
+        }
+        if self.resident {
+            ::buffa::types::put_bool_field(22u32, self.resident, buf);
+        }
+        if self.written_through != 0u64 {
+            ::buffa::types::put_uint64_field(23u32, self.written_through, buf);
+        }
+        if self.write_through_skipped != 0u64 {
+            ::buffa::types::put_uint64_field(24u32, self.write_through_skipped, buf);
+        }
+        self.__buffa_unknown_fields.write_to(buf);
+    }
+}
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for CacheView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.budget_bytes) {
+            __map
+                .serialize_entry(
+                    "budgetBytes",
+                    &::buffa::json_helpers::ProtoJson(&self.budget_bytes),
+                )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.pinned_dir_bytes) {
+            __map
+                .serialize_entry(
+                    "pinnedDirBytes",
+                    &::buffa::json_helpers::ProtoJson(&self.pinned_dir_bytes),
+                )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.pinned_index_bytes) {
+            __map
+                .serialize_entry(
+                    "pinnedIndexBytes",
+                    &::buffa::json_helpers::ProtoJson(&self.pinned_index_bytes),
+                )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.pinned_heads_bytes) {
+            __map
+                .serialize_entry(
+                    "pinnedHeadsBytes",
+                    &::buffa::json_helpers::ProtoJson(&self.pinned_heads_bytes),
+                )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.pinned_tables_bytes) {
+            __map
+                .serialize_entry(
+                    "pinnedTablesBytes",
+                    &::buffa::json_helpers::ProtoJson(&self.pinned_tables_bytes),
+                )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.main_bytes) {
+            __map
+                .serialize_entry(
+                    "mainBytes",
+                    &::buffa::json_helpers::ProtoJson(&self.main_bytes),
+                )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.small_bytes) {
+            __map
+                .serialize_entry(
+                    "smallBytes",
+                    &::buffa::json_helpers::ProtoJson(&self.small_bytes),
+                )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.retired_bytes) {
+            __map
+                .serialize_entry(
+                    "retiredBytes",
+                    &::buffa::json_helpers::ProtoJson(&self.retired_bytes),
+                )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.pins_bytes) {
+            __map
+                .serialize_entry(
+                    "pinsBytes",
+                    &::buffa::json_helpers::ProtoJson(&self.pins_bytes),
+                )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.free_bytes) {
+            __map
+                .serialize_entry(
+                    "freeBytes",
+                    &::buffa::json_helpers::ProtoJson(&self.free_bytes),
+                )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.borrowed_bytes) {
+            __map
+                .serialize_entry(
+                    "borrowedBytes",
+                    &::buffa::json_helpers::ProtoJson(&self.borrowed_bytes),
+                )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.garbage_bytes) {
+            __map
+                .serialize_entry(
+                    "garbageBytes",
+                    &::buffa::json_helpers::ProtoJson(&self.garbage_bytes),
+                )?;
+        }
+        if !self.structures.is_empty() {
+            __map.serialize_entry("structures", &*self.structures)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.bad_pages) {
+            __map
+                .serialize_entry(
+                    "badPages",
+                    &::buffa::json_helpers::ProtoJson(&self.bad_pages),
+                )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.checksum_errors) {
+            __map
+                .serialize_entry(
+                    "checksumErrors",
+                    &::buffa::json_helpers::ProtoJson(&self.checksum_errors),
+                )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.eio_errors) {
+            __map
+                .serialize_entry(
+                    "eioErrors",
+                    &::buffa::json_helpers::ProtoJson(&self.eio_errors),
+                )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.short_errors) {
+            __map
+                .serialize_entry(
+                    "shortErrors",
+                    &::buffa::json_helpers::ProtoJson(&self.short_errors),
+                )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.eio_retried) {
+            __map
+                .serialize_entry(
+                    "eioRetried",
+                    &::buffa::json_helpers::ProtoJson(&self.eio_retried),
+                )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u32(&self.failing_pages) {
+            __map
+                .serialize_entry(
+                    "failingPages",
+                    &::buffa::json_helpers::ProtoJson(&self.failing_pages),
+                )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u32(&self.miss_threads) {
+            __map
+                .serialize_entry(
+                    "missThreads",
+                    &::buffa::json_helpers::ProtoJson(&self.miss_threads),
+                )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u32(&self.compactions_24h) {
+            __map
+                .serialize_entry(
+                    "compactions24h",
+                    &::buffa::json_helpers::ProtoJson(&self.compactions_24h),
+                )?;
+        }
+        if self.resident {
+            __map.serialize_entry("resident", &self.resident)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.written_through) {
+            __map
+                .serialize_entry(
+                    "writtenThrough",
+                    &::buffa::json_helpers::ProtoJson(&self.written_through),
+                )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.write_through_skipped) {
+            __map
+                .serialize_entry(
+                    "writeThroughSkipped",
+                    &::buffa::json_helpers::ProtoJson(&self.write_through_skipped),
+                )?;
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for CacheView<'a> {
+    const PACKAGE: &'static str = "marco.v1";
+    const NAME: &'static str = "Cache";
+    const FULL_NAME: &'static str = "marco.v1.Cache";
+    const TYPE_URL: &'static str = "type.googleapis.com/marco.v1.Cache";
+}
+::buffa::impl_default_view_instance!(CacheView);
+::buffa::impl_view_reborrow!(CacheView);
+/** Self-contained, `'static` owned view of a `Cache` message.
+
+ Wraps [`::buffa::OwnedView`]`<`[`CacheView`]`<'static>>`: the decoded view and the [`::buffa::bytes::Bytes`] buffer it borrows from travel together, so the handle is `'static` and `Send + Sync` — suitable for async handlers, spawned tasks, and anywhere a `'static` bound is required.
+
+ Field accessors return borrows tied to `&self`. Use [`Self::view`] to get the full [`CacheView`] when you need struct patterns, iteration helpers, or to pass the view to lifetime-parameterised code.*/
+#[derive(Clone, Debug)]
+pub struct CacheOwnedView(::buffa::OwnedView<CacheView<'static>>);
+impl CacheOwnedView {
+    /// Decode an owned view from a [`::buffa::bytes::Bytes`] buffer.
+    ///
+    /// The view borrows directly from the buffer's data; the buffer is
+    /// retained inside the returned handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer contains invalid
+    /// protobuf data.
+    pub fn decode(
+        bytes: ::buffa::bytes::Bytes,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(CacheOwnedView(::buffa::OwnedView::decode(bytes)?))
+    }
+    /// Decode with custom [`::buffa::DecodeOptions`] (recursion limit,
+    /// max message size).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer is invalid or
+    /// exceeds the configured limits.
+    pub fn decode_with_options(
+        bytes: ::buffa::bytes::Bytes,
+        opts: &::buffa::DecodeOptions,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            CacheOwnedView(::buffa::OwnedView::decode_with_options(bytes, opts)?),
+        )
+    }
+    /// Build from an owned message via an encode → decode round-trip.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError::MessageTooLarge`] if the
+    /// message's encoded size exceeds the 2 GiB protobuf limit, or
+    /// another [`::buffa::DecodeError`] if the re-encoded bytes are
+    /// somehow invalid (should not happen for well-formed messages).
+    pub fn from_owned(
+        msg: &super::super::Cache,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(CacheOwnedView(::buffa::OwnedView::from_owned(msg)?))
+    }
+    /// Borrow the full [`CacheView`] with its lifetime tied to `&self`.
+    #[must_use]
+    pub fn view(&self) -> &CacheView<'_> {
+        self.0.reborrow()
+    }
+    /// Convert to the owned message type.
+    ///
+    /// Infallible: this type's constructors wire-decode their
+    /// buffer, and a view produced by wire decoding always
+    /// converts. Delegates to [`::buffa::OwnedView::to_owned_message`],
+    /// whose contract also governs handles converted from a raw
+    /// [`::buffa::OwnedView`].
+    #[must_use]
+    pub fn to_owned_message(&self) -> super::super::Cache {
+        self.0.to_owned_message()
+    }
+    /// The underlying bytes buffer.
+    #[must_use]
+    pub fn bytes(&self) -> &::buffa::bytes::Bytes {
+        self.0.bytes()
+    }
+    /// Consume the handle, returning the underlying bytes buffer.
+    #[must_use]
+    pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
+        self.0.into_bytes()
+    }
+    /// --memory.
+    ///
+    /// Field 1: `budget_bytes`
+    #[must_use]
+    pub fn budget_bytes(&self) -> u64 {
+        self.0.reborrow().budget_bytes
+    }
+    /// The pinned tier: the directory, the shards' indexes and heads, and the
+    /// tables (page sums, slots, side tables, statuses, the engine's own).
+    ///
+    /// Field 2: `pinned_dir_bytes`
+    #[must_use]
+    pub fn pinned_dir_bytes(&self) -> u64 {
+        self.0.reborrow().pinned_dir_bytes
+    }
+    /// Field 3: `pinned_index_bytes`
+    #[must_use]
+    pub fn pinned_index_bytes(&self) -> u64 {
+        self.0.reborrow().pinned_index_bytes
+    }
+    /// Field 4: `pinned_heads_bytes`
+    #[must_use]
+    pub fn pinned_heads_bytes(&self) -> u64 {
+        self.0.reborrow().pinned_heads_bytes
+    }
+    /// Field 5: `pinned_tables_bytes`
+    #[must_use]
+    pub fn pinned_tables_bytes(&self) -> u64 {
+        self.0.reborrow().pinned_tables_bytes
+    }
+    /// Field 6: `main_bytes`
+    #[must_use]
+    pub fn main_bytes(&self) -> u64 {
+        self.0.reborrow().main_bytes
+    }
+    /// Field 7: `small_bytes`
+    #[must_use]
+    pub fn small_bytes(&self) -> u64 {
+        self.0.reborrow().small_bytes
+    }
+    /// Frames waiting on the epoch before reuse.
+    ///
+    /// Field 8: `retired_bytes`
+    #[must_use]
+    pub fn retired_bytes(&self) -> u64 {
+        self.0.reborrow().retired_bytes
+    }
+    /// Cached pages a request holds (inside main and small).
+    ///
+    /// Field 9: `pins_bytes`
+    #[must_use]
+    pub fn pins_bytes(&self) -> u64 {
+        self.0.reborrow().pins_bytes
+    }
+    /// Field 10: `free_bytes`
+    #[must_use]
+    pub fn free_bytes(&self) -> u64 {
+        self.0.reborrow().free_bytes
+    }
+    /// Borrowed by anything but the served snapshot (a checkpoint's new files
+    /// before their switch).
+    ///
+    /// Field 11: `borrowed_bytes`
+    #[must_use]
+    pub fn borrowed_bytes(&self) -> u64 {
+        self.0.reborrow().borrowed_bytes
+    }
+    /// Paged bytes no index names, as of the last checkpoint or compaction.
+    ///
+    /// Field 12: `garbage_bytes`
+    #[must_use]
+    pub fn garbage_bytes(&self) -> u64 {
+        self.0.reborrow().garbage_bytes
+    }
+    /// Lookups and misses since start, by structure (out_small, out_subj,
+    /// out_rkey, out_bysubj, in_small, in_blocks).
+    ///
+    /// Field 13: `structures`
+    #[must_use]
+    pub fn structures(
+        &self,
+    ) -> &::buffa::RepeatedView<
+        '_,
+        super::super::__buffa::view::CacheStructureView<'_>,
+    > {
+        &self.0.reborrow().structures
+    }
+    /// Field 14: `bad_pages`
+    #[must_use]
+    pub fn bad_pages(&self) -> u64 {
+        self.0.reborrow().bad_pages
+    }
+    /// Failed page reads since start: checksum, eio, short; and EIO a retry fixed.
+    ///
+    /// Field 15: `checksum_errors`
+    #[must_use]
+    pub fn checksum_errors(&self) -> u64 {
+        self.0.reborrow().checksum_errors
+    }
+    /// Field 16: `eio_errors`
+    #[must_use]
+    pub fn eio_errors(&self) -> u64 {
+        self.0.reborrow().eio_errors
+    }
+    /// Field 17: `short_errors`
+    #[must_use]
+    pub fn short_errors(&self) -> u64 {
+        self.0.reborrow().short_errors
+    }
+    /// Field 18: `eio_retried`
+    #[must_use]
+    pub fn eio_retried(&self) -> u64 {
+        self.0.reborrow().eio_retried
+    }
+    /// Distinct pages failing on the device in the last 60 s; 64 is a storm.
+    ///
+    /// Field 19: `failing_pages`
+    #[must_use]
+    pub fn failing_pages(&self) -> u32 {
+        self.0.reborrow().failing_pages
+    }
+    /// Field 20: `miss_threads`
+    #[must_use]
+    pub fn miss_threads(&self) -> u32 {
+        self.0.reborrow().miss_threads
+    }
+    /// Compactions in the last 24 h.
+    ///
+    /// Field 21: `compactions_24h`
+    #[must_use]
+    pub fn compactions_24h(&self) -> u32 {
+        self.0.reborrow().compactions_24h
+    }
+    /// The whole snapshot was loaded at open.
+    ///
+    /// Field 22: `resident`
+    #[must_use]
+    pub fn resident(&self) -> bool {
+        self.0.reborrow().resident
+    }
+    /// Pages checkpoints and compactions wrote into the cache, and let go.
+    ///
+    /// Field 23: `written_through`
+    #[must_use]
+    pub fn written_through(&self) -> u64 {
+        self.0.reborrow().written_through
+    }
+    /// Field 24: `write_through_skipped`
+    #[must_use]
+    pub fn write_through_skipped(&self) -> u64 {
+        self.0.reborrow().write_through_skipped
+    }
+}
+impl ::core::convert::From<::buffa::OwnedView<CacheView<'static>>> for CacheOwnedView {
+    fn from(inner: ::buffa::OwnedView<CacheView<'static>>) -> Self {
+        CacheOwnedView(inner)
+    }
+}
+impl ::core::convert::From<CacheOwnedView> for ::buffa::OwnedView<CacheView<'static>> {
+    fn from(wrapper: CacheOwnedView) -> Self {
+        wrapper.0
+    }
+}
+impl ::core::convert::AsRef<::buffa::OwnedView<CacheView<'static>>> for CacheOwnedView {
+    fn as_ref(&self) -> &::buffa::OwnedView<CacheView<'static>> {
+        &self.0
+    }
+}
+impl ::buffa::HasMessageView for super::super::Cache {
+    type View<'a> = CacheView<'a>;
+    type ViewHandle = CacheOwnedView;
+}
+impl ::serde::Serialize for CacheOwnedView {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        ::serde::Serialize::serialize(&self.0, __s)
+    }
+}
+#[derive(Clone, Debug, Default)]
+pub struct CacheStructureView<'a> {
+    /// Field 1: `name`
+    pub name: &'a str,
+    /// Field 2: `lookups`
+    pub lookups: u64,
+    /// Field 3: `misses`
+    pub misses: u64,
+    pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
+}
+impl<'a> ::buffa::MessageView<'a> for CacheStructureView<'a> {
+    type Owned = super::super::CacheStructure;
+    fn decode_view(buf: &'a [u8]) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        let __limit = ::core::cell::Cell::new(::buffa::DEFAULT_UNKNOWN_FIELD_LIMIT);
+        let __elem = ::core::cell::Cell::new(::buffa::DEFAULT_ELEMENT_MEMORY_LIMIT);
+        <Self as ::buffa::MessageView>::decode_view_ctx(
+            buf,
+            ::buffa::DecodeContext::new(::buffa::RECURSION_LIMIT, &__limit)
+                .with_element_memory(&__elem),
+        )
+    }
+    fn decode_view_with_ctx(
+        buf: &'a [u8],
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        <Self as ::buffa::MessageView>::decode_view_ctx(buf, ctx)
+    }
+    #[inline]
+    fn merge_view_field(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        cur: &'a [u8],
+        before_tag: &'a [u8],
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<&'a [u8], ::buffa::DecodeError> {
+        let _ = ctx;
+        #[allow(unused_variables)]
+        let view = self;
+        let mut cur = cur;
+        match tag.field_number() {
+            1u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                view.name = ::buffa::types::borrow_str(&mut cur)?;
+            }
+            2u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.lookups = ::buffa::types::decode_uint64(&mut cur)?;
+            }
+            3u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.misses = ::buffa::types::decode_uint64(&mut cur)?;
+            }
+            _ => {
+                ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
+                let span_len = before_tag.len() - cur.len();
+                view.__buffa_unknown_fields.push_record(before_tag, span_len, ctx)?;
+            }
+        }
+        ::core::result::Result::Ok(cur)
+    }
+    fn to_owned_message(
+        &self,
+    ) -> ::core::result::Result<super::super::CacheStructure, ::buffa::DecodeError> {
+        self.to_owned_from_source(None)
+    }
+    #[allow(clippy::useless_conversion, clippy::needless_update)]
+    fn to_owned_from_source(
+        &self,
+        __buffa_src: ::core::option::Option<&::buffa::bytes::Bytes>,
+    ) -> ::core::result::Result<super::super::CacheStructure, ::buffa::DecodeError> {
+        #[allow(unused_imports)]
+        use ::buffa::alloc::string::ToString as _;
+        let _ = __buffa_src;
+        ::core::result::Result::Ok(super::super::CacheStructure {
+            name: self.name.to_string(),
+            lookups: self.lookups,
+            misses: self.misses,
+            __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
+            ..::core::default::Default::default()
+        })
+    }
+}
+impl<'a> ::buffa::ViewEncode<'a> for CacheStructureView<'a> {
+    #[allow(clippy::needless_borrow, clippy::let_and_return)]
+    fn compute_size(&self, _cache: &mut ::buffa::SizeCache) -> u32 {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        let mut size = 0u64;
+        if !self.name.is_empty() {
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.name) as u64;
+        }
+        if self.lookups != 0u64 {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(self.lookups) as u64;
+        }
+        if self.misses != 0u64 {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(self.misses) as u64;
+        }
+        size += self.__buffa_unknown_fields.encoded_len() as u64;
+        ::buffa::saturate_size(size)
+    }
+    #[allow(clippy::needless_borrow)]
+    fn write_to(
+        &self,
+        _cache: &mut ::buffa::SizeCache,
+        buf: &mut impl ::buffa::EncodeSink,
+    ) {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        if !self.name.is_empty() {
+            ::buffa::types::put_string_field(1u32, &self.name, buf);
+        }
+        if self.lookups != 0u64 {
+            ::buffa::types::put_uint64_field(2u32, self.lookups, buf);
+        }
+        if self.misses != 0u64 {
+            ::buffa::types::put_uint64_field(3u32, self.misses, buf);
+        }
+        self.__buffa_unknown_fields.write_to(buf);
+    }
+}
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for CacheStructureView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        if !::buffa::json_helpers::skip_if::is_empty_str(self.name) {
+            __map.serialize_entry("name", self.name)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.lookups) {
+            __map
+                .serialize_entry(
+                    "lookups",
+                    &::buffa::json_helpers::ProtoJson(&self.lookups),
+                )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.misses) {
+            __map
+                .serialize_entry(
+                    "misses",
+                    &::buffa::json_helpers::ProtoJson(&self.misses),
+                )?;
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for CacheStructureView<'a> {
+    const PACKAGE: &'static str = "marco.v1";
+    const NAME: &'static str = "CacheStructure";
+    const FULL_NAME: &'static str = "marco.v1.CacheStructure";
+    const TYPE_URL: &'static str = "type.googleapis.com/marco.v1.CacheStructure";
+}
+::buffa::impl_default_view_instance!(CacheStructureView);
+::buffa::impl_view_reborrow!(CacheStructureView);
+/** Self-contained, `'static` owned view of a `CacheStructure` message.
+
+ Wraps [`::buffa::OwnedView`]`<`[`CacheStructureView`]`<'static>>`: the decoded view and the [`::buffa::bytes::Bytes`] buffer it borrows from travel together, so the handle is `'static` and `Send + Sync` — suitable for async handlers, spawned tasks, and anywhere a `'static` bound is required.
+
+ Field accessors return borrows tied to `&self`. Use [`Self::view`] to get the full [`CacheStructureView`] when you need struct patterns, iteration helpers, or to pass the view to lifetime-parameterised code.*/
+#[derive(Clone, Debug)]
+pub struct CacheStructureOwnedView(::buffa::OwnedView<CacheStructureView<'static>>);
+impl CacheStructureOwnedView {
+    /// Decode an owned view from a [`::buffa::bytes::Bytes`] buffer.
+    ///
+    /// The view borrows directly from the buffer's data; the buffer is
+    /// retained inside the returned handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer contains invalid
+    /// protobuf data.
+    pub fn decode(
+        bytes: ::buffa::bytes::Bytes,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            CacheStructureOwnedView(::buffa::OwnedView::decode(bytes)?),
+        )
+    }
+    /// Decode with custom [`::buffa::DecodeOptions`] (recursion limit,
+    /// max message size).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer is invalid or
+    /// exceeds the configured limits.
+    pub fn decode_with_options(
+        bytes: ::buffa::bytes::Bytes,
+        opts: &::buffa::DecodeOptions,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            CacheStructureOwnedView(
+                ::buffa::OwnedView::decode_with_options(bytes, opts)?,
+            ),
+        )
+    }
+    /// Build from an owned message via an encode → decode round-trip.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError::MessageTooLarge`] if the
+    /// message's encoded size exceeds the 2 GiB protobuf limit, or
+    /// another [`::buffa::DecodeError`] if the re-encoded bytes are
+    /// somehow invalid (should not happen for well-formed messages).
+    pub fn from_owned(
+        msg: &super::super::CacheStructure,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            CacheStructureOwnedView(::buffa::OwnedView::from_owned(msg)?),
+        )
+    }
+    /// Borrow the full [`CacheStructureView`] with its lifetime tied to `&self`.
+    #[must_use]
+    pub fn view(&self) -> &CacheStructureView<'_> {
+        self.0.reborrow()
+    }
+    /// Convert to the owned message type.
+    ///
+    /// Infallible: this type's constructors wire-decode their
+    /// buffer, and a view produced by wire decoding always
+    /// converts. Delegates to [`::buffa::OwnedView::to_owned_message`],
+    /// whose contract also governs handles converted from a raw
+    /// [`::buffa::OwnedView`].
+    #[must_use]
+    pub fn to_owned_message(&self) -> super::super::CacheStructure {
+        self.0.to_owned_message()
+    }
+    /// The underlying bytes buffer.
+    #[must_use]
+    pub fn bytes(&self) -> &::buffa::bytes::Bytes {
+        self.0.bytes()
+    }
+    /// Consume the handle, returning the underlying bytes buffer.
+    #[must_use]
+    pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
+        self.0.into_bytes()
+    }
+    /// Field 1: `name`
+    #[must_use]
+    pub fn name(&self) -> &'_ str {
+        self.0.reborrow().name
+    }
+    /// Field 2: `lookups`
+    #[must_use]
+    pub fn lookups(&self) -> u64 {
+        self.0.reborrow().lookups
+    }
+    /// Field 3: `misses`
+    #[must_use]
+    pub fn misses(&self) -> u64 {
+        self.0.reborrow().misses
+    }
+}
+impl ::core::convert::From<::buffa::OwnedView<CacheStructureView<'static>>>
+for CacheStructureOwnedView {
+    fn from(inner: ::buffa::OwnedView<CacheStructureView<'static>>) -> Self {
+        CacheStructureOwnedView(inner)
+    }
+}
+impl ::core::convert::From<CacheStructureOwnedView>
+for ::buffa::OwnedView<CacheStructureView<'static>> {
+    fn from(wrapper: CacheStructureOwnedView) -> Self {
+        wrapper.0
+    }
+}
+impl ::core::convert::AsRef<::buffa::OwnedView<CacheStructureView<'static>>>
+for CacheStructureOwnedView {
+    fn as_ref(&self) -> &::buffa::OwnedView<CacheStructureView<'static>> {
+        &self.0
+    }
+}
+impl ::buffa::HasMessageView for super::super::CacheStructure {
+    type View<'a> = CacheStructureView<'a>;
+    type ViewHandle = CacheStructureOwnedView;
+}
+impl ::serde::Serialize for CacheStructureOwnedView {
     fn serialize<__S: ::serde::Serializer>(
         &self,
         __s: __S,
@@ -1959,6 +3314,13 @@ pub struct DurabilityView<'a> {
     pub checkpoint_error: &'a str,
     /// Field 21: `checkpoint_failures`
     pub checkpoint_failures: u64,
+    /// The last checkpoint's patch bytes (R, the changed lists and blocks) and
+    /// their pinned sections (P_new).
+    ///
+    /// Field 22: `checkpoint_patch_bytes`
+    pub checkpoint_patch_bytes: u64,
+    /// Field 23: `checkpoint_pinned_bytes`
+    pub checkpoint_pinned_bytes: u64,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for DurabilityView<'a> {
@@ -2138,6 +3500,20 @@ impl<'a> ::buffa::MessageView<'a> for DurabilityView<'a> {
                 )?;
                 view.checkpoint_failures = ::buffa::types::decode_uint64(&mut cur)?;
             }
+            22u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.checkpoint_patch_bytes = ::buffa::types::decode_uint64(&mut cur)?;
+            }
+            23u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.checkpoint_pinned_bytes = ::buffa::types::decode_uint64(&mut cur)?;
+            }
             _ => {
                 ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
                 let span_len = before_tag.len() - cur.len();
@@ -2181,6 +3557,8 @@ impl<'a> ::buffa::MessageView<'a> for DurabilityView<'a> {
             segment_error: self.segment_error.to_string(),
             checkpoint_error: self.checkpoint_error.to_string(),
             checkpoint_failures: self.checkpoint_failures,
+            checkpoint_patch_bytes: self.checkpoint_patch_bytes,
+            checkpoint_pinned_bytes: self.checkpoint_pinned_bytes,
             __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
@@ -2268,6 +3646,18 @@ impl<'a> ::buffa::ViewEncode<'a> for DurabilityView<'a> {
                     + ::buffa::types::uint64_encoded_len(self.checkpoint_failures)
                         as u64;
         }
+        if self.checkpoint_patch_bytes != 0u64 {
+            size
+                += 2u64
+                    + ::buffa::types::uint64_encoded_len(self.checkpoint_patch_bytes)
+                        as u64;
+        }
+        if self.checkpoint_pinned_bytes != 0u64 {
+            size
+                += 2u64
+                    + ::buffa::types::uint64_encoded_len(self.checkpoint_pinned_bytes)
+                        as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -2341,6 +3731,12 @@ impl<'a> ::buffa::ViewEncode<'a> for DurabilityView<'a> {
         }
         if self.checkpoint_failures != 0u64 {
             ::buffa::types::put_uint64_field(21u32, self.checkpoint_failures, buf);
+        }
+        if self.checkpoint_patch_bytes != 0u64 {
+            ::buffa::types::put_uint64_field(22u32, self.checkpoint_patch_bytes, buf);
+        }
+        if self.checkpoint_pinned_bytes != 0u64 {
+            ::buffa::types::put_uint64_field(23u32, self.checkpoint_pinned_bytes, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -2500,6 +3896,20 @@ impl<'__a> ::serde::Serialize for DurabilityView<'__a> {
                 .serialize_entry(
                     "checkpointFailures",
                     &::buffa::json_helpers::ProtoJson(&self.checkpoint_failures),
+                )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.checkpoint_patch_bytes) {
+            __map
+                .serialize_entry(
+                    "checkpointPatchBytes",
+                    &::buffa::json_helpers::ProtoJson(&self.checkpoint_patch_bytes),
+                )?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.checkpoint_pinned_bytes) {
+            __map
+                .serialize_entry(
+                    "checkpointPinnedBytes",
+                    &::buffa::json_helpers::ProtoJson(&self.checkpoint_pinned_bytes),
                 )?;
         }
         __map.end()
@@ -2714,6 +4124,19 @@ impl DurabilityOwnedView {
     #[must_use]
     pub fn checkpoint_failures(&self) -> u64 {
         self.0.reborrow().checkpoint_failures
+    }
+    /// The last checkpoint's patch bytes (R, the changed lists and blocks) and
+    /// their pinned sections (P_new).
+    ///
+    /// Field 22: `checkpoint_patch_bytes`
+    #[must_use]
+    pub fn checkpoint_patch_bytes(&self) -> u64 {
+        self.0.reborrow().checkpoint_patch_bytes
+    }
+    /// Field 23: `checkpoint_pinned_bytes`
+    #[must_use]
+    pub fn checkpoint_pinned_bytes(&self) -> u64 {
+        self.0.reborrow().checkpoint_pinned_bytes
     }
 }
 impl ::core::convert::From<::buffa::OwnedView<DurabilityView<'static>>>

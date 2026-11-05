@@ -186,6 +186,25 @@ function walk(seed: string, nPts: number, base: number, vol: number, t0: number)
   return out
 }
 
+/** structure, lookups/s, misses/s */
+const STRUCTS: [string, number, number][] = [
+  ['out_small', 310_000, 2_790],
+  ['out_subj', 120_000, 2_400],
+  ['out_rkey', 84_000, 3_190],
+  ['out_bysubj', 41_000, 164],
+  ['in_small', 260_000, 3_120],
+  ['in_blocks', 21_000, 903],
+]
+
+/** rpc, pages p99, rounds p99 */
+const STORE_RPCS: [string, number, number][] = [
+  ['Graph/Has', 2, 1],
+  ['Graph/Relationships', 9, 2],
+  ['Graph/BlockPairs', 3, 1],
+  ['Graph/Intersect', 41, 2],
+  ['Graph/ListOut', 3, 1],
+]
+
 function getSeries(windowSeconds: number) {
   const step = 5000 * Math.max(1, Math.ceil(windowSeconds / 5 / 180))
   const pts = Math.min(180, Math.ceil((windowSeconds * 1000) / step))
@@ -216,6 +235,23 @@ function getSeries(windowSeconds: number) {
   const dt = deltaTotal()
   series.push({ metric: 'delta_entries', values: walk('de', pts, dt, 0.02, end).map((x, i) => x * (0.7 + (0.3 * i) / pts)) })
   series.push({ metric: 'tombstones', values: walk('tb', pts, 1204, 0.1, end) })
+  for (const [st, look, miss] of STRUCTS) {
+    series.push({ metric: 'store_lookups', op: st, values: walk(`sl${st}`, pts, look, 0.06, end) })
+    series.push({ metric: 'store_misses', op: st, values: walk(`sm${st}`, pts, miss, 0.12, end) })
+  }
+  series.push({ metric: 'store_reads', dir: 'request', values: walk('srr', pts, 12_400, 0.08, end) })
+  series.push({ metric: 'store_reads', dir: 'background', values: walk('srb', pts, 310, 0.2, end) })
+  series.push({ metric: 'store_io_bytes', dir: 'request', values: walk('sbr', pts, 54e6, 0.08, end) })
+  series.push({ metric: 'store_io_bytes', dir: 'background', values: walk('sbb', pts, 9e6, 0.2, end) })
+  series.push({ metric: 'store_read_p50', dir: 'request', values: walk('s50', pts, 110e-6, 0.05, end) })
+  series.push({ metric: 'store_read_p99', dir: 'request', values: walk('s99', pts, 420e-6, 0.08, end) })
+  series.push({ metric: 'store_io_queue', values: walk('sq', pts, 3, 0.3, end) })
+  series.push({ metric: 'store_pool_busy', values: walk('spb', pts, 9, 0.2, end) })
+  series.push({ metric: 'store_pool_wait_p99', values: walk('spw', pts, 0.1e-3, 0.2, end) })
+  for (const [rpc, pages, rounds] of STORE_RPCS) {
+    series.push({ metric: 'store_pages_p99', rpc, values: walk(`spp${rpc}`, pts, pages, 0.1, end) })
+    series.push({ metric: 'store_rounds_p99', rpc, values: walk(`srp${rpc}`, pts, rounds, 0.1, end) })
+  }
   return { stepMs: BigInt(step), tMs, series }
 }
 
@@ -346,9 +382,11 @@ function durability() {
     checkpointMs: BigInt(state.written),
     checkpointOps: 3_000_000n,
     checkpointAgeSeconds: 86_400,
-    checkpointSeconds: 40,
-    checkpointBytes: 38_000_000_000n,
+    checkpointSeconds: 12,
+    checkpointBytes: 2_400_000_000n,
     checkpointShards: SHARDS,
+    checkpointPatchBytes: 1_200_000_000n,
+    checkpointPinnedBytes: 1_200_000_000n,
     replayedSegments: 12,
     replayedOps: 1_800n,
     replaySeconds: 0.06,
@@ -391,7 +429,33 @@ function overview() {
       tombstones: BigInt(r.name === 'follow' ? 1118 : 86),
       mergedBytes: BigInt(r.name === 'follow' ? 172e6 : 14e6),
     })),
-    process: { rssBytes: 14_200_000_000n, memTotalBytes: 64_000_000_000n, cpuSeconds: 68_211, threads: 41, snapshotCachedBytes: 31_000_000_000n },
+    process: { rssBytes: 16_600_000_000n, memTotalBytes: 64_000_000_000n, cpuSeconds: 68_211, threads: 41, snapshotCachedBytes: 0n },
+    cache: {
+      budgetBytes: 14_000_000_000n,
+      pinnedDirBytes: 890_000_000n,
+      pinnedIndexBytes: 500_000_000n,
+      pinnedHeadsBytes: 700_000_000n,
+      pinnedTablesBytes: 210_000_000n,
+      mainBytes: 10_600_000_000n,
+      smallBytes: 1_100_000_000n,
+      retiredBytes: 4_100_000n,
+      pinsBytes: 41_000_000n,
+      freeBytes: 0n,
+      borrowedBytes: 0n,
+      garbageBytes: 300_000_000n,
+      structures: STRUCTS.map(([name, look, miss]) => ({ name, lookups: BigInt(Math.round(look * 86_400)), misses: BigInt(Math.round(miss * 86_400)) })),
+      badPages: 0n,
+      checksumErrors: 0n,
+      eioErrors: 0n,
+      shortErrors: 0n,
+      eioRetried: 0n,
+      failingPages: 0,
+      missThreads: 64,
+      compactions24h: 3,
+      resident: false,
+      writtenThrough: 291_000n,
+      writeThroughSkipped: 0n,
+    },
     traceRatio: state.trace,
     job: { ...state.job },
     mergeRatio: 0.125,

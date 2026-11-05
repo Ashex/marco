@@ -30,6 +30,54 @@ fn stored(s: Stored) -> String {
     .into()
 }
 
+/// The Cache panel's numbers: the budget by part, lookups by structure,
+/// errors, and what checkpoints and compactions did.
+fn cache_pb(app: &App) -> Cache {
+    use marco_core::read::{Found, Structure};
+    let b = crate::metrics::store_bytes(app);
+    let st = app.engine.stats();
+    let structures = Structure::ALL
+        .iter()
+        .filter(|&&s| s != Structure::Other)
+        .map(|&s| {
+            let l = &st.lookups[s as usize];
+            CacheStructure {
+                name: s.name().into(),
+                lookups: l.iter().sum(),
+                misses: l[Found::Miss as usize],
+                ..Default::default()
+            }
+        })
+        .collect();
+    Cache {
+        budget_bytes: b.budget,
+        pinned_dir_bytes: b.pinned_dir,
+        pinned_index_bytes: b.pinned_index,
+        pinned_heads_bytes: b.pinned_heads,
+        pinned_tables_bytes: b.pinned_tables,
+        main_bytes: b.cache_main,
+        small_bytes: b.cache_small,
+        retired_bytes: b.retired,
+        pins_bytes: b.pinned_frames,
+        free_bytes: b.free,
+        borrowed_bytes: b.borrowed,
+        garbage_bytes: b.garbage,
+        structures,
+        bad_pages: st.bad_pages,
+        checksum_errors: st.checksum,
+        eio_errors: st.eio,
+        short_errors: st.short,
+        eio_retried: st.eio_retried,
+        failing_pages: app.engine.failing_pages(marco_core::store::engine::STORM_WINDOW) as u32,
+        miss_threads: app.cfg.miss_threads as u32,
+        compactions_24h: app.compactions_since(crate::app::now_ms() - 86_400_000),
+        resident: app.resident.load(Ordering::Relaxed),
+        written_through: st.written_through,
+        write_through_skipped: st.write_through_skipped,
+        ..Default::default()
+    }
+}
+
 fn job_pb(j: &JobState) -> Job {
     Job {
         kind: j.kind.into(),
@@ -135,6 +183,8 @@ fn durability_pb(app: &App) -> Durability {
         segment_error: d.segment_error,
         checkpoint_error: d.checkpoint_error,
         checkpoint_failures: d.checkpoint_failures,
+        checkpoint_patch_bytes: d.checkpoint_patch_bytes,
+        checkpoint_pinned_bytes: d.checkpoint_pinned_bytes,
         ..Default::default()
     }
 }
@@ -288,6 +338,7 @@ impl svc::Admin for AdminApi {
             ready,
             ready_reason,
             reads_before_ready: app.reads_before_ready.load(Ordering::Relaxed),
+            cache: if app.engine.paged() { cache_pb(app).into() } else { Default::default() },
             ..Default::default()
         };
         Response::ok(resp)

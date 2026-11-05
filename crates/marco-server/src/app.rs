@@ -341,6 +341,8 @@ pub struct App {
     /// Paged bytes in the shards' files no index names, as of the last
     /// checkpoint or compaction.
     pub garbage_bytes: AtomicU64,
+    /// When compactions committed, the last day's.
+    pub compacted_at: Mutex<VecDeque<i64>>,
 }
 
 pub fn now_ms() -> i64 {
@@ -560,6 +562,7 @@ impl App {
             cached_bytes: AtomicU64::new(0),
             resident: AtomicBool::new(resident),
             garbage_bytes: AtomicU64::new(0),
+            compacted_at: Mutex::new(VecDeque::new()),
         });
         if let Some(spare) = spare {
             let tx = writer::spawn(app.clone(), spare, writer::Init { cursors, segment: last, ops });
@@ -951,6 +954,20 @@ impl App {
             free: room.saturating_sub(used) * marco_core::store::page::PAGE as u64,
             need: d.checkpoint_patch_bytes + d.checkpoint_pinned_bytes,
         })
+    }
+
+    /// Compactions committed since `ms`, within the last day.
+    pub fn compactions_since(&self, ms: i64) -> u32 {
+        self.compacted_at.lock().unwrap().iter().filter(|&&t| t >= ms).count() as u32
+    }
+
+    pub(crate) fn note_compacted(&self) {
+        let now = now_ms();
+        let mut q = self.compacted_at.lock().unwrap();
+        while q.front().is_some_and(|&t| t < now - 86_400_000) {
+            q.pop_front();
+        }
+        q.push_back(now);
     }
 
     pub(crate) fn snapshot_files(&self) -> usize {

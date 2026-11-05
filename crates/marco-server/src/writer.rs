@@ -680,6 +680,7 @@ impl Writer {
         // only this thread sets it
         let g = self.app.garbage_bytes.load(Ordering::Relaxed);
         self.app.garbage_bytes.store(g.saturating_sub(c.before.pages), Ordering::Relaxed);
+        self.app.note_compacted();
         crate::metrics::COMPACTION_SHARDS.inc();
         crate::metrics::COMPACTION_BYTES.inc_by(c.bytes);
         crate::metrics::COMPACTION_GARBAGE.inc_by(c.before.bytes());
