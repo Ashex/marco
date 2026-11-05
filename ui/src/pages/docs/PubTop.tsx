@@ -4,7 +4,7 @@ import { setTheme } from '../../components/Shell'
 import { Link } from '../../lib/router'
 
 // The docs' bar and footer. The docs are public, the console isn't, so the
-// console link shows only where /admin answers (the API listener has none).
+// console link shows only on the listener that has it (/docs/_console).
 
 let reachable: Promise<boolean> | null = null
 
@@ -12,8 +12,8 @@ export function useConsoleReachable() {
   const [ok, setOk] = useState(false)
   useEffect(() => {
     let live = true
-    reachable ??= fetch('/admin/').then(
-      (r) => r.ok,
+    reachable ??= fetch('/docs/_console').then(
+      (r) => (r.ok ? r.json().then((j: { console?: boolean }) => j.console === true, () => false) : false),
       () => false,
     )
     reachable.then((v) => live && setOk(v))

@@ -76,6 +76,9 @@ async fn docs_are_public() {
         assert_eq!(get(addr, "/docs/nope.html", &[]).0, 404);
     }
 
+    assert_eq!(get(api, "/docs/_console", &[]).2, r#"{"console":false}"#);
+    assert_eq!(get(admin, "/docs/_console", &[]).2, r#"{"console":true}"#);
+
     // the console is on the admin listener only, and its data needs the token
     assert_eq!(get(api, "/admin/", &[]).0, 404);
     assert_eq!(get(admin, "/admin/", &[]).0, 200);

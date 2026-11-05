@@ -37,10 +37,11 @@ list? It's one binary on local disk. The whole network's follows and blocks are 
 served from a 32-thread box with 61 GiB of RAM.
 
 You can run it next to an appview and rebuild it from the appview's own follows and blocks tables
-in Scylla in about 7 minutes ([the Scylla run](scylla-results.html)). After that it keeps itself
+in Scylla in about 7 minutes ([Rebuilding from Scylla](scylla.md)). After that it keeps itself
 current from Jetstream. A Scylla rebuild holds only the relations its tables cover, follows and
 blocks, so it has no lists: the scan doesn't read `listitem`, and Jetstream fills only the
-relations the snapshot has.
+relations the snapshot has. The [Quickstart](quickstart.md) runs the whole path on a four-account
+example.
 
 ## What marco holds
 
@@ -60,7 +61,7 @@ edges:
 
 marco keeps actor-to-actor edges. A relation is a record collection whose records name a subject
 DID, and relations come from config, so a new app's graph records need no new code. The defaults
-are `follow`, `block` and `listitem`.
+are `follow`, `block` and `listitem` ([Relations](relations.md)).
 
 An edge is a record, so its identity is the actor, the relation and the rkey. A repeat create is a
 no-op, and a delete removes exactly one record. That matters because about 0.14% of follow records
@@ -70,7 +71,7 @@ subject itself.
 Lists are sets. A list gets an id in the directory like an actor, keyed by its AT URI, and its
 items are edges from the list to its members. So a list can be a side of any set operation: who's
 on it, which lists a DID is on, or a page of actors less a list's members
-([design: lists](design.html#lists)).
+([Relations: lists](relations.md#lists)).
 
 ## The shape of the data
 
@@ -100,11 +101,12 @@ edges:
   Follows' in sets come to 2.09 B a pair.
 
 Opening a snapshot maps it without reading it, so it takes milliseconds, and then marco reads its
-pages in the background so the first queries don't fault (`--no-prefault` skips that). Writes land in small
-per-list deltas in memory. The writer applies each batch to one of two copies of the graph,
+pages in the background so the first queries don't fault (`--no-prefault` skips that). Writes
+land in small per-list deltas in memory. The writer applies each batch to one of two copies of the graph,
 publishes it, then applies the same batch to the other copy once its readers have left, so reads
 never wait on a lock. Every 5 s the writes since the last cut go to a change segment with every
-source's cursor, and a checkpoint folds the segments into new shard files now and then.
+source's cursor, and a checkpoint folds the segments into new shard files now and then
+([Durability and restarts](durability.md)).
 
 ## What it isn't
 
@@ -117,7 +119,7 @@ source's cursor, and a checkpoint folds the segments into new shard files now an
 - List subjects. Every subject is a DID, so `listblock` isn't a relation yet.
 - Distributed. One box holds the whole network today, and sharding across nodes is a later option.
 - A write-ahead log. After a crash marco replays its sources from their cursors, so an API writer
-  keeps its own cursor and replays from it.
+  keeps its own cursor and replays from it ([Writing and ingest](ingest.md)).
 
 ## The numbers
 
@@ -131,3 +133,4 @@ source's cursor, and a checkpoint folds the segments into new shard files now an
 | Scylla to `/readyz` 200 | 6.8 min | [Rebuilding from ScyllaDB](scylla-results.html) |
 
 All of these are on one 32-thread box with 61 GiB of RAM and one NVMe drive.
+[Sizing and performance](sizing.md) has the rest.

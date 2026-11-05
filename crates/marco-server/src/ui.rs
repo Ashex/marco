@@ -152,16 +152,19 @@ pub fn routes(ui: Arc<Ui>) -> Router {
         .route("/admin", get(|| async { Redirect::to("/admin/") }))
         .route("/admin/", page(ui.clone()))
         .route("/admin/{*rest}", page(ui.clone()))
-        .merge(docs_routes(ui))
+        .merge(docs_routes(ui, true))
 }
 
-/// The docs and the files they load, for both listeners.
-pub fn docs_routes(ui: Arc<Ui>) -> Router {
+/// The docs and the files they load, for both listeners. `/docs/_console`
+/// tells the docs whether this listener has the console, without a 404 in
+/// the browser's console where it doesn't (no page's name starts with `_`).
+pub fn docs_routes(ui: Arc<Ui>, console: bool) -> Router {
     let page = |ui: Arc<Ui>| get(move || async move { ui.page() });
     let (a, b, c) = (ui.clone(), ui.clone(), ui.clone());
     Router::new()
         .route("/docs", page(ui.clone()))
         .route("/docs/", page(ui))
+        .route("/docs/_console", get(move || async move { axum::Json(serde_json::json!({ "console": console })) }))
         .route("/docs/{*rest}", get(move |UrlPath(rest): UrlPath<String>| async move { c.doc(&rest) }))
         .route(
             "/assets/{*rest}",

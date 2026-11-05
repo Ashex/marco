@@ -9,6 +9,24 @@ only page left off the site (`_internal.txt`).
 | Page | What's in it |
 |---|---|
 | [Overview](overview.md) | What marco is and isn't, the shape of the data, the numbers |
+| [Quickstart](quickstart.md) | Build from a tiny export, serve, catch up from Jetstream, first queries |
+| [Relations](relations.md) | The TOML config, the defaults, adding one, lists and the owner rule |
+| [Query API](query-api.md) | Every Graph read with examples, paging and limits |
+| [Writing and ingest](ingest.md) | The write API and its cursor, the Jetstream and firehose consumers, updates, deletes, tombstones, statuses |
+| [Durability and restarts](durability.md) | Segments, checkpoints, restart, the ready gate, kill -9 |
+| [Rebuilding from Scylla](scylla.md) | scan-scylla: tables, flags, memory and disk, timings, resume, catch-up |
+
+## Operations
+
+| Page | What's in it |
+|---|---|
+| [Operations](operations.md) | Listeners and auth, every flag, metrics, profiling and tracing, the console |
+
+## Reference
+
+| Page | What's in it |
+|---|---|
+| [Sizing and performance](sizing.md) | Disk, memory, reads, writes, rebuild and restart, growth |
 
 ## Standalone pages
 
