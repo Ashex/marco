@@ -32,6 +32,7 @@ firehose, or your own pipeline through the write API).
   `kill -9` is back to `/readyz` 200 in about half a second. → [Durability and restarts](docs/durability.md)
 - **An operator console and these docs are built in.** `/admin` on the admin listener shows the
   graph, its relations, ingest, requests, storage and settings, and `/docs` on both listeners serves the pages in `docs/`.
+  `/` on the API listener is an explorer that runs the read calls and shows each answer, its latency and its `curl`.
   → [Operations](docs/operations.md)
 
 ## Quickstart

@@ -138,7 +138,7 @@ target/release/marco serve --snapshot snap --admin-token-file token \
   --jetstream wss://jetstream2.us-east.bsky.network
 ```
 
-```text
+```text local
 marco 0.1.0 on snap: 5 DIDs, graph on http://0.0.0.0:7300, admin on http://127.0.0.1:7301/admin/, docs on http://0.0.0.0:7300/docs (opened in 2.7 ms)
 following jetstream:jetstream2.us-east.bsky.network (wss://jetstream2.us-east.bsky.network)
 ```
@@ -147,7 +147,7 @@ marco asks Jetstream for every follow, block and listitem since the snapshot's `
 them, and answers `/readyz` with 200 once it's under 1 s behind. Until then Graph reads on `:7300`
 answer `unavailable` ([the ready gate](durability.md#the-ready-gate)).
 
-```bash
+```bash local
 curl -s localhost:7300/readyz      # "catching up: jetstream:…" (503), then "ready"
 ```
 
@@ -159,7 +159,7 @@ on the snapshot holds real accounts too, because Jetstream is the whole network.
 The API is ConnectRPC, so plain JSON over POST works. Fields are lowerCamelCase, 64-bit counts
 come back as strings, and empty fields are left out.
 
-```bash
+```bash local
 alice=did:plc:alice2222222222222222222
 bob=did:plc:bob222222222222222222222
 dave=did:plc:dave22222222222222222222

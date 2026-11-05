@@ -11,6 +11,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import MarkdownIt from 'markdown-it'
 import hljs from 'highlight.js/lib/core'
+import { markOrigins } from './public-url.mjs'
 import bash from 'highlight.js/lib/languages/bash'
 import json from 'highlight.js/lib/languages/json'
 import yaml from 'highlight.js/lib/languages/yaml'
@@ -157,7 +158,7 @@ function makeMd(ctx) {
 
   md.renderer.rules.fence = (tokens, idx) => {
     const t = tokens[idx]
-    const info = t.info.trim().split(/\s+/)[0]
+    const [info, ...attrs] = t.info.trim().split(/\s+/)
     const where = `${ctx.file}:${(t.map?.[0] ?? 0) + 1 + ctx.bodyLine} (${info})`
     if (VISUAL_FENCES.has(info)) {
       let spec
@@ -191,10 +192,13 @@ function makeMd(ctx) {
       }
     }
     const lang = LANG_ALIASES[info] ?? info
-    const code = lang && hljs.getLanguage(lang) ? hljs.highlight(t.content, { language: lang, ignoreIllegals: true }).value : esc(t.content)
+    for (const a of attrs) if (a !== 'local') throw new Error(`${where}: unknown fence attribute "${a}" (only \`local\`)`)
+    const local = attrs.includes('local')
+    const hl = lang && hljs.getLanguage(lang) ? hljs.highlight(t.content, { language: lang, ignoreIllegals: true }).value : esc(t.content)
+    const code = local ? hl : markOrigins(hl)
     // DocsApp copies the block from this button
     return (
-      `<div class="code-block"><pre class="code"><code class="hljs${lang ? ` language-${esc(lang)}` : ''}">${code}</code></pre>` +
+      `<div class="code-block"${local ? ' data-local' : ''}><pre class="code"><code class="hljs${lang ? ` language-${esc(lang)}` : ''}">${code}</code></pre>` +
       `<button type="button" class="code-copy" aria-label="Copy code">Copy</button></div>`
     )
   }

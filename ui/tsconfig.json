@@ -13,5 +13,5 @@
     "noEmit": true,
     "types": ["vite/client"]
   },
-  "include": ["src", "vite.config.ts", "docs-build/plugin.d.mts"]
+  "include": ["src", "vite.config.ts", "docs-build/plugin.d.mts", "docs-build/public-url.d.mts"]
 }

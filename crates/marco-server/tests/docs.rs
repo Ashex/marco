@@ -1,4 +1,6 @@
-//! The docs are public on both listeners; the console's data stays behind the token.
+//! The docs are public on both listeners, with each page's card tags in its
+//! head; the landing page is the API listener's; the console's data stays
+//! behind the token.
 
 use std::io::{Read, Write};
 use std::net::SocketAddr;
@@ -9,6 +11,7 @@ use marco_server::auth::AuthConfig;
 
 const TOKEN: &str = "test-token-0123456789";
 const INDEX: &str = "<!doctype html><title>marco</title><script src=\"/assets/app-1.js\"></script>";
+const PAGES: &str = r#"[{"slug":"overview","title":"Overview","summary":"A graph database."},{"slug":"query-api","title":"Query API","summary":"Reads & <writes>."}]"#;
 
 /// One HTTP/1.1 GET: (status, lower-cased head, body).
 fn get(addr: SocketAddr, path: &str, headers: &[(&str, &str)]) -> (u16, String, String) {
@@ -49,20 +52,41 @@ async fn docs_are_public() {
     std::fs::write(ui_dir.join("favicon.svg"), "<svg/>").unwrap();
     std::fs::create_dir_all(ui_dir.join("docs")).unwrap();
     std::fs::write(ui_dir.join("docs/design.html"), "<!doctype html><style>p{}</style><p>design").unwrap();
+    std::fs::write(ui_dir.join("docs/_pages.json"), PAGES).unwrap();
+    std::fs::create_dir_all(ui_dir.join("og")).unwrap();
+    std::fs::write(ui_dir.join("og/marco.png"), "png").unwrap();
 
     let auth = AuthConfig { token: Some(TOKEN.into()), ..Default::default() };
     let app = App::open(Config { auth, ..Config::new(snap) }).unwrap();
-    let ui = Arc::new(marco_server::ui::Ui::load(Some(&ui_dir)).unwrap());
+    let site = marco_server::ui::Site { public_url: Some("https://marco.example.com".into()), handle_resolver: None };
+    let ui = Arc::new(marco_server::ui::Ui::load_with(Some(&ui_dir), site).unwrap());
     let (api, admin) = marco_server::serve(app, ui).await.unwrap();
 
     for addr in [api, admin] {
-        for path in ["/docs", "/docs/", "/docs/overview", "/docs/query-api#has"] {
+        for (path, title) in [
+            ("/docs", "Overview · marco docs"),
+            ("/docs/", "Overview · marco docs"),
+            ("/docs/overview", "Overview · marco docs"),
+            ("/docs/query-api", "Query API · marco docs"),
+            ("/docs/query-api/", "Query API · marco docs"),
+            ("/docs/nope", "marco docs"),
+        ] {
             let (status, head, body) = get(addr, path, &[]);
             assert_eq!(status, 200, "{addr}{path}");
             assert!(head.contains("content-type: text/html"), "{path}: {head}");
             assert!(head.contains("content-security-policy: default-src 'none'"), "{path}");
-            assert_eq!(body, INDEX, "{path}");
+            assert!(body.starts_with("<!doctype html><title>"), "{path}: {body}");
+            assert!(body.ends_with("<script src=\"/assets/app-1.js\"></script>"), "{path}");
+            assert!(body.contains(&format!("<title>{title}</title>")), "{path}: {body}");
+            assert!(body.contains(r#"<meta name="twitter:card" content="summary_large_image" />"#), "{path}");
+            assert!(body.contains(r#"<meta property="og:image" content="https://marco.example.com/og/marco.png" />"#));
+            assert!(body.contains(r#"<meta name="marco-public-url" content="https://marco.example.com" />"#));
         }
+        let (_, _, body) = get(addr, "/docs/query-api", &[]);
+        assert!(body.contains(r#"<meta property="og:url" content="https://marco.example.com/docs/query-api" />"#));
+        assert!(body.contains(r#"<meta name="description" content="Reads &amp; &lt;writes&gt;." />"#), "{body}");
+        assert!(body.contains(r#"<meta property="og:type" content="article" />"#));
+        assert_eq!(get(addr, "/og/marco.png", &[]).0, 200);
         let (status, head, body) = get(addr, "/assets/app-1.js", &[]);
         assert_eq!((status, body.as_str()), (200, "console.log(1)"));
         assert!(head.contains("immutable"));
@@ -75,6 +99,19 @@ async fn docs_are_public() {
         assert!(head.contains("style-src 'unsafe-inline'") && head.contains("sandbox"), "{head}");
         assert_eq!(get(addr, "/docs/nope.html", &[]).0, 404);
     }
+
+    // the landing page is the API listener's; the admin listener's / is the console
+    let (status, _, body) = get(api, "/", &[]);
+    assert_eq!(status, 200);
+    assert!(body.contains(r#"<meta property="og:url" content="https://marco.example.com/" />"#), "{body}");
+    assert!(body.contains(r#"<meta property="og:type" content="website" />"#));
+    let (status, head, _) = get(admin, "/", &[]);
+    assert_eq!(status, 303);
+    assert!(head.contains("location: /admin/"), "{head}");
+    // no --handle-resolver, no /resolve
+    assert_eq!(get(api, "/resolve?handle=alice.test", &[]).0, 404);
+    // the console's pages carry no card tags
+    assert_eq!(get(admin, "/admin/", &[]).2, INDEX);
 
     assert_eq!(get(api, "/docs/_console", &[]).2, r#"{"console":false}"#);
     assert_eq!(get(admin, "/docs/_console", &[]).2, r#"{"console":true}"#);

@@ -44,6 +44,15 @@ docs-check:
 docs-shots *args:
     cd ui && npm run docs-shots -- {{args}}
 
+# Screenshots of the landing page and its explorer: desktop and 390 px, light and dark; fails on console
+# errors. `--url` shoots a running marco, `--api <origin>` sends the explorer's calls to another one
+home-shots *args:
+    cd ui && npm run home-shots -- {{args}}
+
+# Redraw the social card (ui/public/og/marco.png, committed)
+og-card:
+    cd ui && npm run og-card
+
 # Screenshots of every section against the mock: desktop, 390 px, light and dark; fails on console errors
 shots *args:
     cd ui && npm run shots -- {{args}}

@@ -47,6 +47,14 @@ before it deletes the old ones), and RAM for the hot part of the snapshot in pag
 | `/metrics`, `/debug/*` | no | token or proxy login |
 | `/admin` (console) | no | the page is open, its data needs a login |
 | `/docs`, `/healthz`, `/readyz` | open | open |
+| `/` | the landing page and explorer | redirects to `/admin/` |
+| `/resolve?handle=` | with `--handle-resolver` | no |
+
+The API listener's `/` is a landing page with an explorer. It runs the Graph reads against the same
+origin and shows each response, its latency and the matching `curl`. With `--handle-resolver` the
+explorer takes handles too: `/resolve?handle=` asks that host, caches the answer for an hour (a miss
+for 5 minutes) and makes at most 10 lookups a second across all visitors. Without it, `/resolve` is
+404 and the explorer takes DIDs.
 
 With `--api-read-only` the API listener has no write routes at all: `Write` and `WriteBatch`
 answer 404 whatever the token, so a public API listener can't be written to even if the token
@@ -105,6 +113,8 @@ console's Settings page shows each one's value and where it came from.
 | `--trace-ratio` | `MARCO_TRACE_RATIO` | 0 | The share of ops that get a span, 0 to 1. |
 | `--otlp URL` | `MARCO_OTLP` | | An OTLP/HTTP collector's base URL for spans. |
 | `--ui-dir` | `MARCO_UI_DIR` | the embedded build | A built console and docs (`ui/dist`) to serve instead of the ones built into the binary. |
+| `--public-url` | `MARCO_PUBLIC_URL` | | The API listener's public origin (`https://marco.example.com`). The docs' and landing page's card tags use it, and the docs' read examples point at it. |
+| `--handle-resolver` | `MARCO_HANDLE_RESOLVER` | off | An XRPC host for `com.atproto.identity.resolveHandle` (`https://public.api.bsky.app`), behind `/resolve` for the explorer. |
 
 `marco synth --out DIR [--actors N] [--shards N]` writes a synthetic snapshot with fake DIDs, for
 trying the console and the API without data.
@@ -182,7 +192,7 @@ Grafana dashboard yet.
 | `GET /debug/pprof/heap` | jemalloc heap in use, pprof |
 | `GET /debug/tracing` | The trace ratio. `POST /debug/tracing?ratio=0.01` sets it. |
 
-```bash
+```bash local
 curl -s -H "authorization: Bearer $(cat token)" '127.0.0.1:7301/debug/pprof/profile?seconds=30' > cpu.pb.gz
 go tool pprof -http :8080 cpu.pb.gz
 ```

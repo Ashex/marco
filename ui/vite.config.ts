@@ -26,6 +26,8 @@ export default defineConfig({
       '/marco.v1.Admin': { target, changeOrigin: false },
       '/debug': { target, changeOrigin: false },
       '/metrics': { target, changeOrigin: false },
+      '/readyz': { target, changeOrigin: false },
+      '/resolve': { target, changeOrigin: false },
     },
   },
 })

@@ -2,7 +2,8 @@
 // metadata; each page's HTML is its own chunk (`virtual:marco-docs/page/<slug>`),
 // loaded when the page is opened. A docs error fails `vite build`; the dev
 // server reloads on any change under docs/ and shows errors in the overlay.
-// The standalone HTML pages in docs/ go into the build as dist/docs/<name>.html.
+// The standalone HTML pages in docs/ go into the build as dist/docs/<name>.html,
+// and each page's title and summary as dist/docs/_pages.json, for the server.
 
 import fs from 'node:fs'
 import path from 'node:path'
@@ -38,6 +39,9 @@ export function marcoDocs() {
       return `export default ${JSON.stringify(p.html)};\n`
     },
     generateBundle() {
+      // marco serve fills each docs page's <head> from this (crawlers don't run the script)
+      const meta = get().pages.map(({ slug, title, summary }) => ({ slug, title, summary }))
+      this.emitFile({ type: 'asset', fileName: 'docs/_pages.json', source: JSON.stringify(meta) })
       for (const name of htmlPages()) this.emitFile({ type: 'asset', fileName: `docs/${name}`, source: fs.readFileSync(path.join(DOCS_DIR, name)) })
     },
     configureServer(server) {

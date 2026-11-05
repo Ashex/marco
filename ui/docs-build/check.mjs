@@ -1,9 +1,11 @@
 // `npm run check-docs`: validates docs/ without a full build (front matter,
 // a hero first on every page, diagrams, links and anchors), checks the
-// published pages describe only the current version, and prints the nav.
+// published pages describe only the current version, checks which examples
+// point at the public instance, and prints the nav.
 import fs from 'node:fs'
 import path from 'node:path'
 import { loadDocs, publishedFiles, DOCS_DIR } from './docs.mjs'
+import { checkPublicExamples } from './public-url.mjs'
 
 const { pages, nav, errors, internal } = loadDocs()
 
@@ -20,6 +22,10 @@ for (const file of publishedFiles()) {
       }
     })
 }
+// With --public-url, read examples point at the public instance, and writes
+// and the admin listener stay on localhost (public-url.mjs).
+for (const p of pages) errors.push(...checkPublicExamples(p.file, p.html, 'https://marco.example.com'))
+
 for (const s of nav) {
   console.log(s.name)
   for (const slug of s.pages) {

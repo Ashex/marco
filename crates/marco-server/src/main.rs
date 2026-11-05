@@ -100,6 +100,14 @@ struct Serve {
     /// A built console (ui/dist) to serve instead of the one built into the binary.
     #[arg(long, env = "MARCO_UI_DIR")]
     ui_dir: Option<PathBuf>,
+    /// The API listener's public origin (https://marco.example.com): the docs' and landing page's
+    /// card tags, and the docs' read examples. Unset, the tags are relative.
+    #[arg(long, env = "MARCO_PUBLIC_URL")]
+    public_url: Option<String>,
+    /// An XRPC host for com.atproto.identity.resolveHandle (https://public.api.bsky.app), behind
+    /// /resolve on the API listener for the explorer's handles. Off by default.
+    #[arg(long, env = "MARCO_HANDLE_RESOLVER")]
+    handle_resolver: Option<String>,
     /// Seconds between change segments: the writes a kill -9 can lose, for a source to replay.
     #[arg(long, env = "MARCO_SEGMENT_INTERVAL", default_value_t = 5.0)]
     segment_interval: f64,
@@ -156,6 +164,8 @@ fn flags(m: &ArgMatches, s: &Serve) -> Vec<FlagInfo> {
         ("read_only", s.read_only.to_string()),
         ("api_read_only", s.api_read_only.to_string()),
         ("ui_dir", opt(&s.ui_dir)),
+        ("public_url", s.public_url.clone().unwrap_or_else(|| "—".into())),
+        ("handle_resolver", s.handle_resolver.clone().unwrap_or_else(|| "—".into())),
         ("segment_interval", s.segment_interval.to_string()),
         ("checkpoint_ops", s.checkpoint_ops.to_string()),
         ("checkpoint_age", s.checkpoint_age.to_string()),
@@ -178,6 +188,19 @@ fn flags(m: &ArgMatches, s: &Serve) -> Vec<FlagInfo> {
             FlagInfo { name: format!("--{}", id.replace('_', "-")), value, source: source.into() }
         })
         .collect()
+}
+
+/// An http(s) origin with no path, trailing slash dropped.
+fn origin(flag: &str, v: Option<&str>) -> Result<Option<String>> {
+    let Some(v) = v.map(str::trim).filter(|v| !v.is_empty()) else { return Ok(None) };
+    let v = v.trim_end_matches('/');
+    let Some(host) = v.strip_prefix("https://").or_else(|| v.strip_prefix("http://")) else {
+        bail!("{flag} {v}: needs http:// or https://");
+    };
+    if host.is_empty() || host.contains(['/', '?', '#', '"', '\'', '<', '>', ' ']) {
+        bail!("{flag} {v}: needs an origin (scheme and host, no path)");
+    }
+    Ok(Some(v.to_string()))
 }
 
 fn auth(s: &Serve) -> Result<AuthConfig> {
@@ -269,7 +292,11 @@ fn main() -> Result<()> {
                 expected_sources: source.iter().map(|s| s.name.clone()).collect(),
                 ..Config::new(s.snapshot.clone())
             };
-            let ui = Arc::new(marco_server::ui::Ui::load(s.ui_dir.as_deref())?);
+            let site = marco_server::ui::Site {
+                public_url: origin("--public-url", s.public_url.as_deref())?,
+                handle_resolver: origin("--handle-resolver", s.handle_resolver.as_deref())?,
+            };
+            let ui = Arc::new(marco_server::ui::Ui::load_with(s.ui_dir.as_deref(), site)?);
             let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
             rt.block_on(async move {
                 let app = App::open(cfg)?;

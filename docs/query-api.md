@@ -19,7 +19,7 @@ diagram:
     - "out.r -> ops.l25"
     - "inn.r -> ops.l75"
 facts:
-  - { value: "7", label: read calls, note: "plus Write and WriteBatch", tone: accent }
+  - { value: "8", label: read calls, note: "plus Write and WriteBatch", tone: accent }
   - { value: "100", label: others per Relationships, note: "and actors per Counts", tone: blue }
   - { value: "1,000", label: actors per Filter, note: "and items per ListOut page", tone: cyan }
   - { value: "3", label: protocols on :7300, note: "Connect · gRPC · gRPC-Web" }
@@ -28,7 +28,8 @@ facts:
 `marco.v1.Graph` is a ConnectRPC service defined in `proto/marco/v1/graph.proto`. The API listener
 (`--listen`, default `0.0.0.0:7300`) answers it as Connect (JSON or protobuf bodies over HTTP POST),
 gRPC and gRPC-Web on the same port, so curl works for poking at it and an appview uses generated
-clients. Reads are open. Writes need the admin token ([Writing and ingest](ingest.md)).
+clients. Reads are open. Writes need the admin token ([Writing and ingest](ingest.md)). The landing page at `/` on
+the API listener has an explorer that runs every read call and shows the `curl` for it.
 
 ## Calling it
 

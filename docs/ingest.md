@@ -40,7 +40,7 @@ pipeline sends many messages of up to 1,000 ops each on one stream, and gets eve
 closes the stream. Both need the admin token (`Authorization: Bearer <token>`, from
 `--admin-token-file`), and a `--read-only` marco refuses them.
 
-```bash
+```bash local
 curl -s localhost:7300/marco.v1.Graph/WriteBatch -H 'content-type: application/json' \
   -H "authorization: Bearer $(cat token)" -d '{
   "ops": [
@@ -102,7 +102,7 @@ marco has no write-ahead log ([Durability](durability.md)). So a kill -9 can los
 seconds of acknowledged writes, and your pipeline replays them. After a restart, ask marco where
 its state ends:
 
-```bash
+```bash local
 curl -s 127.0.0.1:7301/marco.v1.Admin/ListSources -H 'content-type: application/json' \
   -H "authorization: Bearer $(cat token)" -d '{}'
 ```

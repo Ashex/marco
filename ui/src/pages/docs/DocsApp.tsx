@@ -4,6 +4,8 @@ import { useTheme } from '../../components/Shell'
 import { toast, Toasts } from '../../components/toast'
 import { Link, navigate } from '../../lib/router'
 import '../../docs.css'
+import { applyPublicUrl } from '../../../docs-build/public-url.mjs'
+import { publicUrl } from '../../lib/site'
 import { Lightbox, diagramOf, type Diagram } from './Lightbox'
 import { PubFoot, PubTop, useConsoleReachable } from './PubTop'
 
@@ -43,8 +45,9 @@ export function DocsApp({ path }: { path: string }) {
     let live = true
     loaders[slug]()
       .then((m) => {
-        html.set(slug, m.default)
-        if (live) setBody(m.default)
+        const h = applyPublicUrl(m.default, publicUrl)
+        html.set(slug, h)
+        if (live) setBody(h)
       })
       .catch(() => live && setFailed(true))
     return () => {
