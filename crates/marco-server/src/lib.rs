@@ -39,6 +39,13 @@ fn connect(app: &Arc<App>, admin: bool) -> axum::Router {
     }
     let svc = r.into_axum_service();
     let mut router = axum::Router::new().route_service("/marco.v1.Graph/{*method}", svc.clone());
+    if !admin && app.cfg.api_read_only {
+        // connectrpc looks a procedure up by its exact path, so these two
+        // shadow the only paths that reach a write.
+        for path in auth::GRAPH_WRITES {
+            router = router.route(path, axum::routing::any(|| async { http::StatusCode::NOT_FOUND }));
+        }
+    }
     if admin {
         router = router.route_service("/marco.v1.Admin/{*method}", svc);
     }
@@ -73,6 +80,21 @@ pub fn admin_router(app: &Arc<App>, ui: Arc<ui::Ui>) -> axum::Router {
         .route("/readyz", axum::routing::get(readyz).with_state(app.clone()))
         .layer(axum::middleware::from_fn_with_state((app.clone(), Listener::Admin), auth::gate))
         .layer(axum::middleware::from_fn(metrics::time_rpcs))
+}
+
+/// The ops listener (`--ops-listen`), if set: /metrics and the pprof GETs,
+/// open, for a scraper that can't send the admin token. Bind it privately.
+pub async fn serve_ops(app: &Arc<App>) -> Result<Option<SocketAddr>> {
+    let Some(addr) = &app.cfg.ops_listen else { return Ok(None) };
+    let l = tokio::net::TcpListener::bind(addr).await.with_context(|| format!("bind --ops-listen {addr}"))?;
+    let local = l.local_addr()?;
+    let refresh = {
+        let app = app.clone();
+        Arc::new(move || app.graph().refresh_gauges()) as marco_ops::Refresh
+    };
+    let r = marco_ops::read_router(Some(refresh)).route("/healthz", axum::routing::get(|| async { "ok\n" }));
+    tokio::spawn(async move { axum::serve(l, r).await });
+    Ok(Some(local))
 }
 
 /// Binds both listeners and serves them on the current runtime.

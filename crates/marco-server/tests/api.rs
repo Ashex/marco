@@ -21,11 +21,16 @@ const TOKEN: &str = "test-token-0123456789";
 struct Srv {
     api: SocketAddr,
     admin: SocketAddr,
+    ops: SocketAddr,
     app: Arc<App>,
     _dir: tempfile::TempDir,
 }
 
 async fn start(read_only: bool, proxy: bool) -> Srv {
+    start_with(read_only, proxy, false).await
+}
+
+async fn start_with(read_only: bool, proxy: bool, api_read_only: bool) -> Srv {
     let dir = tempfile::tempdir().unwrap();
     let snap = dir.path().join("snap");
     marco_server::synth::write(&snap, N, 4).unwrap();
@@ -35,11 +40,12 @@ async fn start(read_only: bool, proxy: bool) -> Srv {
         proxy_from: if proxy { vec!["127.0.0.1/32".parse::<Cidr>().unwrap()] } else { vec![] },
         operators: if proxy { vec!["alice@example.com".into()] } else { vec![] },
     };
-    let cfg = Config { read_only, auth, ..Config::new(snap) };
+    let cfg = Config { read_only, api_read_only, auth, ops_listen: Some("127.0.0.1:0".into()), ..Config::new(snap) };
     let app = App::open(cfg).unwrap();
     let ui = Arc::new(marco_server::ui::Ui::load(None).unwrap());
     let (api, admin) = marco_server::serve(app.clone(), ui).await.unwrap();
-    Srv { api, admin, app, _dir: dir }
+    let ops = marco_server::serve_ops(&app).await.unwrap().unwrap();
+    Srv { api, admin, ops, app, _dir: dir }
 }
 
 fn cfg(addr: SocketAddr, token: Option<&str>) -> ClientConfig {
@@ -369,6 +375,76 @@ async fn pages_dont_wait_on_delayed_acks() {
     }
     times.sort();
     assert!(times[10] < Duration::from_millis(20), "median page {:?}", times[10]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn api_read_only() {
+    let s = start_with(false, false, true).await;
+    let (a3, a4) = (did(3), did(4));
+    let u = uri(&a3, FOLLOW, &tid(8_100_000, 5));
+    let body = format!(r#"{{"ops":[{{"add":{{"uri":"{u}","subject":"{a4}"}}}}]}}"#);
+    let bearer = format!("Bearer {TOKEN}");
+    for path in ["/marco.v1.Graph/WriteBatch", "/marco.v1.Graph/Write"] {
+        for ct in [
+            "application/json",
+            "application/proto",
+            "application/connect+json",
+            "application/grpc",
+            "application/grpc-web",
+        ] {
+            for auth in [None, Some(bearer.as_str())] {
+                let mut h = vec![("content-type", ct)];
+                h.extend(auth.map(|a| ("authorization", a)));
+                let (st, b) = http(s.api, "POST", path, &body, &h);
+                assert_eq!(st, 404, "{path} {ct} token={}: {b}", auth.is_some());
+            }
+        }
+    }
+    let e = graph(s.api, Some(TOKEN))
+        .write_batch(WriteBatchRequest { ops: vec![add(&u, &a4)], ..Default::default() })
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Unimplemented);
+    let h2 = GraphClient::new(HttpClient::plaintext_http2_only(), cfg(s.api, Some(TOKEN)));
+    let msgs = vec![WriteRequest { ops: vec![add(&u, &a4)], ..Default::default() }];
+    assert!(h2.write(futures::stream::iter(msgs)).await.is_err());
+
+    let has = |addr| async move {
+        graph(addr, None)
+            .has(HasRequest { rel: "follow".into(), from: did(3), to: did(4), ..Default::default() })
+            .await
+            .unwrap()
+            .into_owned()
+            .uri
+    };
+    assert_eq!(has(s.api).await, "", "nothing reached the writer");
+    let r = graph(s.admin, Some(TOKEN))
+        .write_batch(WriteBatchRequest { ops: vec![add(&u, &a4)], ..Default::default() })
+        .await
+        .unwrap()
+        .into_owned();
+    assert_eq!(r.results.iter().map(outcome).collect::<Vec<_>>(), vec!["added"]);
+    assert_eq!(has(s.api).await, u, "reads on the API listener see the admin listener's write");
+    let (st, _) = http(s.api, "GET", "/readyz", "", &[]);
+    assert_eq!(st, 200);
+    let (st, _) = http(s.api, "POST", "/marco.v1.Admin/ListSources", "{}", &[("content-type", "application/json")]);
+    assert_eq!(st, 404);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ops_listener() {
+    let s = start(false, false).await;
+    let (st, b) = http(s.ops, "GET", "/metrics", "", &[]);
+    assert_eq!(st, 200);
+    assert!(b.contains("marco_ready"), "{b}");
+    assert_eq!(http(s.ops, "GET", "/healthz", "", &[]).0, 200);
+    // nothing on it changes the process or reaches the graph
+    assert_eq!(http(s.ops, "POST", "/debug/tracing?ratio=1", "", &[]).0, 404);
+    assert_eq!(http(s.ops, "GET", "/debug/tracing", "", &[]).0, 404);
+    let body = r#"{"ops":[]}"#;
+    let h = [("content-type", "application/json"), ("authorization", "Bearer test-token-0123456789")];
+    assert_eq!(http(s.ops, "POST", "/marco.v1.Graph/WriteBatch", body, &h).0, 404);
+    assert_eq!(http(s.ops, "GET", "/admin/", "", &[]).0, 404);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

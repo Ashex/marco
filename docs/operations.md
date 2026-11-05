@@ -48,6 +48,10 @@ before it deletes the old ones), and RAM for the hot part of the snapshot in pag
 | `/admin` (console) | no | the page is open, its data needs a login |
 | `/docs`, `/healthz`, `/readyz` | open | open |
 
+With `--api-read-only` the API listener has no write routes at all: `Write` and `WriteBatch`
+answer 404 whatever the token, so a public API listener can't be written to even if the token
+leaks. Jetstream or the firehose keep the graph current, and the admin listener still takes writes.
+
 The token is the contents of `--admin-token-file`, at least 16 characters, sent as
 `Authorization: Bearer <token>`. Without a token file or a proxy header, Admin and Graph writes
 are off. Scrape `/metrics` with the bearer token too.
@@ -68,6 +72,7 @@ console's Settings page shows each one's value and where it came from.
 | `--snapshot DIR` | `MARCO_SNAPSHOT` | required | The snapshot directory. |
 | `--listen` | `MARCO_LISTEN` | `0.0.0.0:7300` | The API listener. |
 | `--admin-listen` | `MARCO_ADMIN_LISTEN` | `127.0.0.1:7301` | The admin listener. Keep it private. |
+| `--ops-listen` | `MARCO_OPS_LISTEN` | off | `/metrics` and `/debug/pprof/{profile,heap}` with no token, for a scraper. Keep it private. |
 | `--admin-token-file` | `MARCO_ADMIN_TOKEN_FILE` | | The admin token. |
 | `--admin-proxy-header` | `MARCO_ADMIN_PROXY_HEADER` | | A header a proxy sets to the operator's login. |
 | `--admin-proxy-from` | `MARCO_ADMIN_PROXY_FROM` | | The proxy's addresses, comma-separated CIDRs. |
@@ -77,6 +82,7 @@ console's Settings page shows each one's value and where it came from.
 | `--source-retention-hours` | `MARCO_SOURCE_RETENTION_HOURS` | 36 | How far back the Jetstream instance replays. An older bulk-built snapshot is refused. |
 | `--allow-gap` | `MARCO_ALLOW_GAP` | off | Follow past the retention, or a firehose from a bulk-built snapshot. |
 | `--read-only` | `MARCO_READ_ONLY` | off | Refuse every write. Can't follow a source. |
+| `--api-read-only` | `MARCO_API_READ_ONLY` | off | Don't route Graph writes on the API listener (404, token or not). The admin listener and the sources still write. |
 | `--serve-before-ready` | `MARCO_SERVE_BEFORE_READY` | off | Answer Graph reads before ready. |
 | `--segment-interval` | `MARCO_SEGMENT_INTERVAL` | 5 | Seconds between change segments: what a kill -9 can lose. |
 | `--checkpoint-ops` | `MARCO_CHECKPOINT_OPS` | 3000000 | Checkpoint once the segments since the last hold this many ops. |
@@ -101,6 +107,8 @@ trying the console and the API without data.
 ## Metrics
 
 `/metrics` on the admin listener is Prometheus text, with the process's own `process_*` series.
+A scraper that can't send the token reads the same text from `--ops-listen`, which serves only
+`/metrics`, the pprof GETs and `/healthz`.
 
 | Metric | Labels | |
 |---|---|---|

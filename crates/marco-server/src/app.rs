@@ -50,10 +50,15 @@ pub struct FlagInfo {
 pub struct Config {
     pub snapshot: PathBuf,
     pub read_only: bool,
+    /// The API listener doesn't route Graph writes at all, token or not; the
+    /// admin listener and the sources still write.
+    pub api_read_only: bool,
     pub merge_ratio: f64,
     pub compact_min: usize,
     pub api_listen: String,
     pub admin_listen: String,
+    /// /metrics and pprof without a token, for a scraper; off when None.
+    pub ops_listen: Option<String>,
     pub auth: AuthConfig,
     pub flags: Vec<FlagInfo>,
     /// How often the writes applied are written as a change segment.
@@ -78,10 +83,12 @@ impl Config {
         Config {
             snapshot,
             read_only: false,
+            api_read_only: false,
             merge_ratio: 0.125,
             compact_min: 0,
             api_listen: "127.0.0.1:0".into(),
             admin_listen: "127.0.0.1:0".into(),
+            ops_listen: None,
             auth: AuthConfig::default(),
             flags: Vec::new(),
             segment_interval: Duration::from_secs(5),

@@ -138,7 +138,7 @@ impl Refusal {
     }
 }
 
-const GRAPH_WRITES: [&str; 2] = ["/marco.v1.Graph/Write", "/marco.v1.Graph/WriteBatch"];
+pub const GRAPH_WRITES: [&str; 2] = ["/marco.v1.Graph/Write", "/marco.v1.Graph/WriteBatch"];
 
 /// Admin RPCs that change nothing, which a proxy login may call without the
 /// browser's same-origin marks (curl through the proxy).
@@ -174,7 +174,7 @@ pub async fn gate(
     let path = req.uri().path().to_string();
     let connect = path.starts_with("/marco.v1.");
     let needs = match kind {
-        Listener::Api => GRAPH_WRITES.contains(&path.as_str()),
+        Listener::Api => !app.cfg.api_read_only && GRAPH_WRITES.contains(&path.as_str()),
         Listener::Admin => {
             (connect
                 && path != "/marco.v1.Admin/GetSession"

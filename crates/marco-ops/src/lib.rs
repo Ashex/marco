@@ -75,11 +75,15 @@ pub fn serve(addr: &str, refresh: Option<Refresh>) -> Result<SocketAddr> {
 }
 
 pub fn router(refresh: Option<Refresh>) -> Router {
+    read_router(refresh).route("/debug/tracing", get(get_tracing).post(set_tracing))
+}
+
+/// /metrics and the pprof GETs: nothing in it changes the process.
+pub fn read_router(refresh: Option<Refresh>) -> Router {
     Router::new()
         .route("/metrics", get(move || metrics(refresh.clone())))
         .route("/debug/pprof/profile", get(profile))
         .route("/debug/pprof/heap", get(heap))
-        .route("/debug/tracing", get(get_tracing).post(set_tracing))
 }
 
 /// The default registry as Prometheus text.

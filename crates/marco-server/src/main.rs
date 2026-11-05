@@ -50,6 +50,9 @@ struct Serve {
     /// Graph, marco.v1.Admin, /metrics, /debug/* and the console at /admin. Keep it private.
     #[arg(long, env = "MARCO_ADMIN_LISTEN", default_value = "127.0.0.1:7301")]
     admin_listen: String,
+    /// /metrics and /debug/pprof/{profile,heap} with no token, for a scraper. Keep it private; off by default.
+    #[arg(long, env = "MARCO_OPS_LISTEN")]
+    ops_listen: Option<String>,
     /// A file holding the admin token. Without it (or a proxy header) Admin and Graph writes are off.
     #[arg(long, env = "MARCO_ADMIN_TOKEN_FILE")]
     admin_token_file: Option<PathBuf>,
@@ -77,6 +80,10 @@ struct Serve {
     /// Refuse every write: Graph writes, actor statuses and snapshot writes.
     #[arg(long, env = "MARCO_READ_ONLY")]
     read_only: bool,
+    /// Don't route Graph writes on --listen at all (404, token or not). The admin
+    /// listener and --jetstream/--firehose still write.
+    #[arg(long, env = "MARCO_API_READ_ONLY")]
+    api_read_only: bool,
     /// A built console (ui/dist) to serve instead of the one built into the binary.
     #[arg(long, env = "MARCO_UI_DIR")]
     ui_dir: Option<PathBuf>,
@@ -121,6 +128,7 @@ fn flags(m: &ArgMatches, s: &Serve) -> Vec<FlagInfo> {
     let rows: Vec<(&str, String)> = vec![
         ("listen", s.listen.clone()),
         ("admin_listen", s.admin_listen.clone()),
+        ("ops_listen", s.ops_listen.clone().unwrap_or_else(|| "—".into())),
         ("snapshot", s.snapshot.display().to_string()),
         ("admin_token_file", opt(&s.admin_token_file)),
         ("admin_proxy_header", s.admin_proxy_header.clone().unwrap_or_else(|| "—".into())),
@@ -131,6 +139,7 @@ fn flags(m: &ArgMatches, s: &Serve) -> Vec<FlagInfo> {
         ("trace_ratio", s.trace_ratio.to_string()),
         ("otlp", s.otlp.clone().unwrap_or_else(|| "—".into())),
         ("read_only", s.read_only.to_string()),
+        ("api_read_only", s.api_read_only.to_string()),
         ("ui_dir", opt(&s.ui_dir)),
         ("segment_interval", s.segment_interval.to_string()),
         ("checkpoint_ops", s.checkpoint_ops.to_string()),
@@ -222,10 +231,12 @@ fn main() -> Result<()> {
             }
             let cfg = Config {
                 read_only: s.read_only,
+                api_read_only: s.api_read_only,
                 merge_ratio: s.merge_ratio,
                 compact_min: s.compact_min,
                 api_listen: s.listen.clone(),
                 admin_listen: s.admin_listen.clone(),
+                ops_listen: s.ops_listen.clone(),
                 auth: auth(&s)?,
                 flags: flags(m, &s),
                 segment_interval: std::time::Duration::from_secs_f64(s.segment_interval),
@@ -242,6 +253,9 @@ fn main() -> Result<()> {
             rt.block_on(async move {
                 let app = App::open(cfg)?;
                 let (api, admin) = marco_server::serve(app.clone(), ui).await?;
+                if let Some(ops) = marco_server::serve_ops(&app).await? {
+                    eprintln!("metrics on http://{ops}/metrics");
+                }
                 eprintln!(
                     "marco {} on {}: {} DIDs, graph on http://{api}, admin on http://{admin}/admin/, docs on http://{api}/docs (opened in {:.1} ms{})",
                     marco_server::VERSION,
