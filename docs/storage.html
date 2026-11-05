@@ -93,22 +93,32 @@ tr:last-child td { border-bottom: none; }
 <main>
 
 <h1>marco storage engine: no mmap, no page cache</h1>
-<p class="sub">Design and phase plan · written 2026-11-05 · status: proposed, not built</p>
+<p class="sub">Design and phase plan · written 2026-11-05, revised the same day after an independent review · status: proposed, not built</p>
 <span class="status">design record (internal)</span>
 
-<p>marco reads its snapshot through <code>mmap</code>. That makes a bad disk read a SIGBUS, a page fault a stalled tokio worker, and the kernel's 4 KiB LRU with readahead the only cache. This doc replaces it with one engine: snapshot pages read with <code>O_DIRECT</code> into memory marco owns, a pinned tier for what every request touches, a scan-resistant page cache under <code>--memory</code>, reads that never block a runtime thread, checksums on every page read from disk, and a checkpoint switch that never goes over the budget. When the budget holds the whole snapshot, everything loads at open and the same code never misses.</p>
+<p>marco reads its snapshot through <code>mmap</code>. That turns a bad disk read into a SIGBUS, a page fault into a stalled tokio worker, and leaves the kernel's 4 KiB LRU with readahead as the only cache. This design replaces it with one engine:</p>
+<ul>
+<li>Snapshot pages are read with <code>O_DIRECT</code> into memory marco owns.</li>
+<li>A pinned tier holds what every request touches.</li>
+<li>A scan-resistant page cache sits under <code>--memory</code>.</li>
+<li>Every request starts on its tokio worker. A request that misses moves whole to a bounded blocking pool, so no runtime thread waits on a disk.</li>
+<li>Every page read from disk is checked against its checksum.</li>
+<li>Checkpoints write only the pages that changed, as patch files next to an immutable base. Cached pages stay valid across a checkpoint, and the switch fits inside the budget.</li>
+</ul>
+<p>When the budget holds the whole snapshot, everything loads at open and the same code never misses.</p>
 
 <ol class="toc">
 <li><a href="#questions">Open questions</a></li>
+<li><a href="#changes">Changes after review</a></li>
 <li><a href="#arch">Architecture</a></li>
 <li><a href="#format">FORMAT 6: pages and columns</a></li>
 <li><a href="#tiers">Tiers and their sizes</a></li>
-<li><a href="#unit">The cache unit and the policy</a></li>
+<li><a href="#unit">The cache unit, the policy, memory</a></li>
 <li><a href="#read">The read path</a></li>
 <li><a href="#bounds">Disk reads per request</a></li>
 <li><a href="#io">Async I/O</a></li>
 <li><a href="#writes">Writes</a></li>
-<li><a href="#ckpt">Checkpoints and the switch</a></li>
+<li><a href="#ckpt">Checkpoints: base plus patches</a></li>
 <li><a href="#errors">Errors</a></li>
 <li><a href="#obs">Observability</a></li>
 <li><a href="#measure">Measurement plan and gates</a></li>
@@ -118,115 +128,165 @@ tr:last-child td { border-bottom: none; }
 <!-- ============================================================== -->
 <h2 id="questions">1. Open questions</h2>
 
-<div class="q"><b>Q1. What <code>--memory</code> covers.</b> The budget caps the snapshot store: pinned tier, page frames and the engine's own tables. Deltas, live DIDs, tombstone maps and the request heap sit on top, because they grow with writes between checkpoints and can't be evicted.
-<br><span class="rec">Recommend:</span> store only. Startup warns when <code>--memory</code> is over the cgroup limit less 3 GiB, and the console shows the rest of the RSS next to the budget.</div>
+<div class="q"><b>Q1. What <code>--memory</code> covers.</b> The budget caps the snapshot store: the pinned tier (immutable arrays read from the files), page frames, retired frames waiting on the epoch, and the engine's own tables. Everything that grows with writes sits outside it:
+<ul>
+<li>the deltas, for three graph copies while a checkpoint runs (the two served copies and the checkpoint's own replay copy);</li>
+<li>live DIDs;</li>
+<li>the tombstone and stamp maps;</li>
+<li>the request heap.</li>
+</ul>
+At the archive day's rate that comes to about 1.1 GB of deltas (2.48M delta entries at their peak on the public instance, × ~150 B, × 3 copies) plus the maps.
+<br><span class="rec">Recommend:</span> store only. Startup warns when the cgroup limit less <code>--memory</code> is under 2 GiB, and the console shows the rest of the RSS next to the budget.</div>
 
-<div class="q"><b>Q2. One bad page.</b> RPCs that touch a page that failed its checksum (or EIO three times) get <code>data_loss</code> (or <code>unavailable</code>) naming file and page. Everything else keeps serving.
-<br><span class="rec">Recommend:</span> <code>/readyz</code> stays ready for isolated bad pages and an alert pages, since the fix (rebuild or restore the file) needs a human. Readiness drops only on an EIO storm: 64 distinct pages failing within 60 s, meaning the disk is going.</div>
+<div class="q"><b>Q2. One bad page.</b> RPCs that touch a page that failed its checksum (or got EIO three times) get <code>data_loss</code> (or <code>unavailable</code>) naming file and page. Everything else keeps serving.
+<br><span class="rec">Recommend:</span> <code>/readyz</code> stays ready for isolated bad pages and an alert pages, because the fix (a rebuild or a restored file) needs a human. Readiness drops only on an EIO storm: 64 distinct pages failing within 60 s, which means the disk is going.</div>
 
-<div class="q"><b>Q3. Full residency gets about 9% bigger.</b> FORMAT 6 needs about 42.1 GB to hold the whole network in memory, against 38.5 GB of page cache today. The extra comes from page packing, page sums, frame tables and a by-subject index that carries its subjects, so <code>Has</code> on a long list reads one page and not ten.
-<br><span class="rec">Recommend:</span> accept it. Under the 48 GiB limit that still leaves about 4.3 GB above a 44 GiB budget for deltas and the process, plus about 5 GB of budget headroom for the checkpoint switch.</div>
+<div class="q"><b>Q3. Full residency gets about 10% bigger.</b> FORMAT 6 needs about 43.8 GB to hold the whole network with list items in memory, against the 40.0 GB snapshot today. The extra comes from page packing, page sums and frame tables, and from a by-subject index that carries its subjects, so <code>Has</code> on a long list reads one page instead of ten.
+<br><span class="rec">Recommend:</span> accept it. Under the 48 GiB limit, a 44 GiB budget leaves 3.4 GB of headroom for a checkpoint and 4.3 GB outside the budget for deltas and the process.</div>
 
-<div class="q"><b>Q4. Heat-ordered layout.</b> The builder could lay small lists out by each actor's last write (newest rkey), so active accounts share pages. It's cheap for the builder, but it's a second layout to keep correct.
-<br><span class="rec">Recommend:</span> build it as an option in phase 6 and adopt it only if the 8 GiB skewed run shows at least 20% fewer misses.</div>
+<div class="q"><b>Q4. Heat-ordered layout.</b> The builder could lay small lists out by each actor's last write (its newest rkey), so that active accounts share pages.
+<br><span class="rec">Recommend:</span> build it as an option in phase 6, and adopt it only if the skewed runs at Tight and Half both show at least 20% fewer misses (E8).</div>
+
+<div class="q"><b>Q5. Compaction when everything fits.</b> Old versions of changed lists stay in memory inside pages that still hold live lists. When the budget holds everything, compaction has to clear about a day's changes (R ≈ 1.2 GB) of that garbage every day so the next checkpoint fits its headroom. With garbage spread evenly over 64 shards, that comes close to rewriting every shard daily: about 40 GB a day, one shard at a time, rate-limited. That is the same volume a checkpoint writes today, spread out and never over budget. Below full residency, garbage pages drop out of the cache on their own, and compaction runs only for disk space: a few shards a day.
+<br><span class="rec">Recommend:</span> accept it. If the volume matters, the alternative is more headroom: about 3 GB more budget would halve it.</div>
 
 <!-- ============================================================== -->
-<h2 id="arch">2. Architecture</h2>
+<h2 id="changes">2. Changes after review</h2>
+
+<table class="small">
+<tr><th>Finding</th><th>What changed</th><th>Where</th></tr>
+<tr><td>B1</td><td><code>ReadCx&lt;'g&gt;</code> borrows a guard the caller pins (<code>&amp;'g Guard</code>), so a slice can't outlive it. <code>missing</code>, <code>touched</code> and the stats use interior mutability (<code>RefCell</code>/<code>Cell</code>), so every call takes <code>&amp;ReadCx</code>.</td><td>§7</td></tr>
+<tr><td>B2</td><td>The <code>Mode</code> enum is gone. Every blocking reader (miss pool, writer, checkpoint, admin) runs a synchronous loop of passes: pass, drop the guard, blocking fetch, pass again. Added a retired-frame reserve inside the budget, and defined what happens when the free list is empty (<code>flush</code>, evict, wait).</td><td>§6, §7</td></tr>
+<tr><td>B3</td><td>New phase 0, an interface CR, before phases 2 and 3a. Phase 2's registry parses FORMAT 6 footers, not a test format.</td><td>§15</td></tr>
+<tr><td>B4</td><td>Evict snapshot files and check <code>memory.stat file</code> and <code>io.stat</code> before every mmap run. E1 runs during the crawl are provisional. The official E1 and E2 run back to back per case after the crawl. <code>memory.peak</code> is reset per window, and request streams are seeded.</td><td>§14</td></tr>
+<tr><td>B5</td><td>The E1 and E2 snapshots include list items. Half runs on 4 server threads. E10 is one informational run in the deployment shape (a 16 GiB, 4-vCPU VM with virtio-blk); the gates say they don't cover it.</td><td>§14</td></tr>
+<tr><td>S1</td><td>No <code>MAX_ROUNDS</code>. The handler round loop is gone: a request that misses finishes on the miss pool, however many rounds it takes (Alternative 1).</td><td>§7</td></tr>
+<tr><td>S2</td><td>Fixed the ListOut distinct, Intersect, Filter, Has and Counts rows. The probe-or-decode choice in <code>Intersect</code> compares pages when a side isn't resident. The whole handler, response building included, runs inside the pass.</td><td>§8</td></tr>
+<tr><td>S3</td><td>Pin budget: at most 2,048 pages (8 MiB) per request and 64 requests on the pool, so pins stay under 512 MiB. A per-request page limit (half the small queue) makes over-sized requests fail with <code>resource_exhausted</code> rather than thrash. The minimum budget is the pinned tier plus 2 GiB.</td><td>§6, §7</td></tr>
+<tr><td>S4</td><td>Checkpoints write only changed objects, as patch files (Alternative 2). R is estimated from a real archive day at about 1.2 GB. The switch gate is stated in terms of R against headroom. Compaction replaces the 85% re-pack.</td><td>§11</td></tr>
+<tr><td>S5</td><td>Patch, compaction and build writes use <code>O_DIRECT</code> from aligned buffers. Background I/O (compaction, verify, list stats) goes through a token bucket.</td><td>§9, §11</td></tr>
+<tr><td>S6</td><td>The frame arena is committed and returned in 2 MiB groups (<code>MADV_DONTNEED</code>), so memory borrowed for new pinned parts lowers RSS first.</td><td>§6</td></tr>
+<tr><td>S7</td><td>No remap and no two-owner frames: unchanged pages keep their (file, page) identity. A frame is freed only when it has no owner and no pins. A pin that loses a race with eviction counts as a miss. Old Stores that a <code>SharedSnapshot</code> keeps alive just keep their files open.</td><td>§6, §11</td></tr>
+<tr><td>S8</td><td>The writer plans in rounds until nothing is pending, and keeps its pins through the second copy's apply. The doc now says plainly that the writer waits on disk.</td><td>§10</td></tr>
+<tr><td>S9</td><td>Added mmap on FORMAT 6 (phase 3b on) and mmap-lazy with <code>--mmap-advice random</code> as baselines.</td><td>§14</td></tr>
+<tr><td>S10</td><td>No FORMAT 5 reader. Phase 3 is split into 3a, 3b and 3c. The public instance stays pinned at its current image through phase 6, and phase 6 has an explicit cutover. "What each phase touches" is rebuilt from the real callers.</td><td>§15</td></tr>
+<tr><td>S11</td><td>Latency histograms carry a <code>path</code> label (fast or pool) for E9. Bytes used for mmap come from the engine replaying the same seeded stream.</td><td>§13, §14</td></tr>
+<tr><td>S12</td><td>Q1 and §5 now agree: graph state is outside the budget, and the outside share covers three copies' deltas.</td><td>§1, §5</td></tr>
+<tr><td>Nits</td><td>
+<ul>
+<li>Checkpoint gates compare against E1's own measurement (29-30 s whole network), not kill-test runs.</li>
+<li>85.4M lists (3.4 GB of object-cache overhead).</li>
+<li>7.2M by-subject fences.</li>
+<li>Q4 and E8 agree.</li>
+<li>The startup warning rule fits the Tight settings.</li>
+<li>Which reads enter the cache is now consistent.</li>
+<li>The absent-list sentinel is <code>u32::MAX</code>.</li>
+<li>Coalesced reads use <code>preadv</code> into frames.</li>
+<li>Misses cost ~100-250 µs.</li>
+<li>A write skipped on a bad page reapplies from its segment after repair.</li>
+</ul>
+</td><td>throughout</td></tr>
+</table>
+
+<!-- ============================================================== -->
+<h2 id="arch">3. Architecture</h2>
 
 <figure>
-<svg viewBox="0 0 960 470" role="img" aria-label="Architecture: handlers run sync passes over the graph, misses go to the I/O pool, pages land in frames under a budget">
+<svg viewBox="0 0 960 480" role="img" aria-label="Architecture: handlers run one pass on the tokio worker, requests that miss move to the miss pool, pages land in frames under a budget, checkpoints write patch files">
   <defs>
     <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0,0 L10,5 L0,10 z"/></marker>
   </defs>
-  <!-- tokio -->
-  <rect class="box" x="16" y="20" width="200" height="120" rx="8"/>
-  <text class="h" x="28" y="42">tokio workers</text>
-  <text class="t2" x="28" y="62">Graph RPC handlers</text>
-  <text class="mu" x="28" y="82">pass: sync, no I/O, under an</text>
-  <text class="mu" x="28" y="97">epoch guard; misses collected</text>
-  <text class="mu" x="28" y="117">between passes: await fetch,</text>
-  <text class="mu" x="28" y="132">graph Arc dropped</text>
-  <!-- other threads -->
-  <rect class="box" x="16" y="170" width="200" height="62" rx="8"/>
-  <text class="h" x="28" y="192">writer thread</text>
-  <text class="mu" x="28" y="210">Block mode: prefetch a batch,</text>
-  <text class="mu" x="28" y="224">then apply to both copies</text>
-  <rect class="box" x="16" y="250" width="200" height="76" rx="8"/>
-  <text class="h" x="28" y="272">checkpoint thread</text>
-  <text class="mu" x="28" y="290">replay: Block mode via cache</text>
-  <text class="mu" x="28" y="304">write: streams old shards,</text>
-  <text class="mu" x="28" y="318">bypasses the cache</text>
-  <!-- graph -->
-  <rect class="box" x="262" y="20" width="200" height="120" rx="8"/>
-  <text class="h" x="274" y="42">Graph copy</text>
-  <text class="t2" x="274" y="62">deltas (BTreeMaps), live</text>
-  <text class="t2" x="274" y="78">DIDs, statuses: unchanged</text>
-  <text class="t2" x="274" y="100">Base → Store (FORMAT 6)</text>
-  <text class="mu" x="274" y="120">reads return Pending on a</text>
-  <text class="mu" x="274" y="134">miss instead of faulting</text>
-  <path class="ln" d="M216,80 L260,80" marker-end="url(#a)"/>
-  <!-- engine -->
+  <rect class="box" x="16" y="16" width="210" height="96" rx="8"/>
+  <text class="h" x="28" y="38">tokio workers</text>
+  <text class="t2" x="28" y="58">Graph RPC handlers</text>
+  <text class="mu" x="28" y="78">one pass, sync, never waits:</text>
+  <text class="mu" x="28" y="93">all hit → respond; any miss →</text>
+  <text class="mu" x="28" y="106">hand the request to the pool</text>
+  <rect class="io" x="16" y="128" width="210" height="96" rx="8"/>
+  <text class="h" x="28" y="150">miss pool · 64 threads</text>
+  <text class="mu" x="28" y="170">loop: pass, pin touched pages,</text>
+  <text class="mu" x="28" y="185">drop guard + Arc, blocking fetch</text>
+  <text class="mu" x="28" y="200">permits awaited async; full for</text>
+  <text class="mu" x="28" y="214">1 s → resource_exhausted</text>
+  <rect class="box" x="16" y="240" width="210" height="58" rx="8"/>
+  <text class="h" x="28" y="262">writer thread</text>
+  <text class="mu" x="28" y="280">plans in rounds, then applies to</text>
+  <text class="mu" x="28" y="293">both copies with its pins held</text>
+  <rect class="box" x="16" y="312" width="210" height="72" rx="8"/>
+  <text class="h" x="28" y="334">checkpoint + compaction</text>
+  <text class="mu" x="28" y="352">write patch files (changed lists),</text>
+  <text class="mu" x="28" y="366">compact shards one at a time;</text>
+  <text class="mu" x="28" y="379">O_DIRECT, token-bucketed</text>
+  <rect class="box" x="262" y="16" width="210" height="120" rx="8"/>
+  <text class="h" x="274" y="38">Graph copy</text>
+  <text class="t2" x="274" y="58">deltas (BTreeMaps), live</text>
+  <text class="t2" x="274" y="74">DIDs, statuses: unchanged</text>
+  <text class="t2" x="274" y="96">Base → Store (FORMAT 6)</text>
+  <text class="mu" x="274" y="116">base reads return Pending on</text>
+  <text class="mu" x="274" y="130">a miss instead of faulting</text>
+  <path class="ln" d="M226,64 L260,64" marker-end="url(#a)"/>
+  <path class="ln" d="M226,176 C245,176 245,110 260,110" marker-end="url(#a)"/>
+  <path class="lnw" d="M120,112 L120,126" marker-end="url(#a)"/>
   <rect class="box" x="508" y="12" width="436" height="330" rx="10"/>
   <text class="h" x="522" y="34">Engine (one per process, shared by every Store version)</text>
   <rect class="pin" x="522" y="46" width="200" height="132" rx="7"/>
-  <text class="h" x="534" y="66">Pinned tier · ~2.1 GB</text>
+  <text class="h" x="534" y="66">Pinned tier · ~2.3 GB</text>
   <text class="t2" x="534" y="86">directory (all of it)</text>
   <text class="t2" x="534" y="102">list index per rel/dir</text>
   <text class="t2" x="534" y="118">big-list heads, fences</text>
   <text class="t2" x="534" y="134">page sums, side, statuses</text>
-  <text class="mu" x="534" y="154">loaded at open, section xxh3</text>
+  <text class="mu" x="534" y="154">read at open, section xxh3</text>
   <text class="mu" x="534" y="168">checked, never evicted</text>
   <rect class="cache" x="732" y="46" width="200" height="132" rx="7"/>
   <text class="h" x="744" y="66">Page cache</text>
-  <text class="t2" x="744" y="86">4 KiB frames in one arena</text>
-  <text class="t2" x="744" y="102">slots: file page → frame</text>
+  <text class="t2" x="744" y="86">4 KiB frames, 2 MiB groups</text>
+  <text class="t2" x="744" y="102">slots: (file, page) → frame</text>
   <text class="t2" x="744" y="118">S3-FIFO: small, main, ghost</text>
-  <text class="t2" x="744" y="134">pins for in-flight requests</text>
+  <text class="t2" x="744" y="134">pins ≤ 512 MiB, retired reserve</text>
   <text class="mu" x="744" y="154">budget − pinned; full</text>
   <text class="mu" x="744" y="168">residency = never evicts</text>
   <rect class="io" x="522" y="192" width="410" height="70" rx="7"/>
-  <text class="h" x="534" y="212">I/O backend</text>
-  <text class="t2" x="534" y="230">DirectPool: 64 threads, O_DIRECT pread, runs ≤ 256 KiB</text>
-  <text class="t2" x="534" y="248">verify xxh3 per page → install frame, or mark the page bad</text>
+  <text class="h" x="534" y="212">I/O pool · 64 threads</text>
+  <text class="t2" x="534" y="230">O_DIRECT preadv into frames, adjacent pages coalesced</text>
+  <text class="t2" x="534" y="248">xxh3 per page → install frame, or mark the page bad</text>
   <rect class="box" x="522" y="274" width="410" height="56" rx="7"/>
   <text class="t2" x="534" y="294">file registry: name → FileState (fd, pinned parts, slots)</text>
-  <text class="mu" x="534" y="312">unchanged files shared across checkpoints; an old file's pinned</text>
-  <text class="mu" x="534" y="325">memory frees when the last Store holding it drops</text>
-  <path class="ln" d="M462,80 L506,80" marker-end="url(#a)"/>
-  <path class="lnw" d="M216,128 C380,170 420,225 520,228" marker-end="url(#a)"/>
-  <text class="mu" x="236" y="156">fetch(misses).await</text>
-  <path class="ln" d="M216,200 C380,210 440,240 520,240" marker-end="url(#a)"/>
-  <path class="lnd" d="M216,300 C400,330 440,300 520,300" marker-end="url(#a)"/>
-  <!-- disk -->
-  <rect class="box" x="508" y="370" width="436" height="86" rx="8"/>
+  <text class="mu" x="534" y="312">files are immutable; a (file, page) frame stays valid until the</text>
+  <text class="mu" x="534" y="325">last Store naming the file drops</text>
+  <path class="ln" d="M472,64 L506,64" marker-end="url(#a)"/>
+  <path class="lnw" d="M226,200 C380,230 420,226 520,226" marker-end="url(#a)"/>
+  <path class="lnw" d="M226,268 C380,268 440,246 520,246" marker-end="url(#a)"/>
+  <text class="mu" x="300" y="222">blocking fetch</text>
+  <rect class="box" x="508" y="370" width="436" height="96" rx="8"/>
   <text class="h" x="522" y="392">snapshot directory on local NVMe</text>
-  <text class="t2" x="522" y="412">directory.marco (pinned) · 64 shard files (pinned + paged)</text>
-  <text class="t2" x="522" y="430">manifest.json (the commit) · change segments (unchanged)</text>
-  <text class="mu" x="522" y="448">opened read-only O_DIRECT; fds keep deleted files alive for old readers</text>
+  <text class="t2" x="522" y="412">directory.marco · per shard: a base file + 0..8 patch files</text>
+  <text class="t2" x="522" y="430">manifest.json names them (the commit) · change segments</text>
+  <text class="mu" x="522" y="448">opened read-only O_DIRECT; fds keep deleted files alive</text>
+  <text class="mu" x="522" y="461">for old readers</text>
   <path class="lnw" d="M727,262 L727,368" marker-end="url(#a)"/>
-  <path class="lnd" d="M216,316 C300,420 400,420 506,415" marker-end="url(#a)"/>
-  <text class="mu" x="300" y="440">sequential 1 MiB reads, no cache</text>
-  <rect class="box" x="16" y="360" width="200" height="96" rx="8"/>
-  <text class="h" x="28" y="382">gone</text>
-  <text class="mu" x="28" y="400">memmap2, Bytes::Map, --prefault,</text>
-  <text class="mu" x="28" y="414">--no-prefault, MADV_POPULATE_READ,</text>
-  <text class="mu" x="28" y="428">the mincore cached-bytes gauge</text>
-  <text class="mu" x="28" y="446">(removed in the last phase)</text>
+  <path class="lnd" d="M226,350 C320,420 420,420 506,410" marker-end="url(#a)"/>
+  <text class="mu" x="262" y="440">patch and compaction writes,</text>
+  <text class="mu" x="262" y="454">written through to the cache</text>
+  <rect class="box" x="16" y="400" width="210" height="70" rx="8"/>
+  <text class="h" x="28" y="422">gone in phase 6</text>
+  <text class="mu" x="28" y="440">memmap2, Bytes::Map, --prefault,</text>
+  <text class="mu" x="28" y="454">--no-prefault, --mmap-advice,</text>
+  <text class="mu" x="28" y="467">--storage, the mincore gauge</text>
 </svg>
-<figcaption>Orange is disk I/O. Request paths only ever await it. The writer and checkpoint threads are OS threads, not runtime workers, so they may block on it.</figcaption>
+<figcaption>Orange is disk I/O. Only the miss pool, the writer, checkpoints and compaction wait on it, and those are OS threads, not runtime workers.</figcaption>
 </figure>
 
-<p>The Graph keeps its shape: two copies, deltas in memory, the writer swapping copies. Only <code>Base</code> changes. It reads through a <code>Store</code> whose files live in an engine-wide registry, so the checkpoint's own copy of the graph and the next snapshot share every unchanged file, its pinned parts and its cached pages. Nothing is mapped from a file. The frame arena is anonymous memory with <code>MADV_HUGEPAGE</code>, which takes TLB pressure off the hot path that the 4 KiB page-cache mappings put on it today.</p>
+<p>The Graph keeps its shape: two copies, deltas in memory, the writer swapping copies. Only <code>Base</code> changes. It reads through a <code>Store</code> whose files live in an engine-wide registry. Files never change after they're written, so a cached page is keyed by (file, page) and stays valid until the file is gone. A checkpoint adds patch files and leaves unchanged pages where they were. The checkpoint's replay copy and the next snapshot share every file, its pinned parts and its cached pages. Nothing is mapped from a file. The frame arena is anonymous memory with <code>MADV_HUGEPAGE</code>, committed and released in 2 MiB groups.</p>
 
 <!-- ============================================================== -->
-<h2 id="format">3. FORMAT 6: pages and columns</h2>
+<h2 id="format">4. FORMAT 6: pages and columns</h2>
 
 <figure>
 <svg viewBox="0 0 960 400" role="img" aria-label="Shard file layout: paged sections of 4 KiB pages, pinned sections, footer; small lists packed whole, big lists split into columns">
   <defs>
     <marker id="b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0,0 L10,5 L0,10 z"/></marker>
   </defs>
-  <text class="h" x="16" y="22">shard-NNN-CCCCCCCC.marco (per relation r, both directions)</text>
+  <text class="h" x="16" y="22">a shard base or patch file (per relation r, both directions)</text>
   <rect class="cache" x="16" y="34" width="96" height="40"/><text class="mono" x="22" y="58">out.small</text>
   <rect class="cache" x="112" y="34" width="96" height="40"/><text class="mono" x="118" y="58">out.subj</text>
   <rect class="cache" x="208" y="34" width="110" height="40"/><text class="mono" x="214" y="58">out.rkey</text>
@@ -239,8 +299,6 @@ tr:last-child td { border-bottom: none; }
   <rect class="pin" x="778" y="34" width="120" height="40"/><text class="mono" x="784" y="52">side tomb stamp</text><text class="mono" x="784" y="67">status live</text>
   <rect class="box" x="898" y="34" width="46" height="40"/><text class="mono" x="903" y="58">footer</text>
   <text class="mu" x="16" y="92">blue: paged (4 KiB pages, cached, page sum checked on every read from disk) · green: pinned (read whole at open, section xxh3 checked)</text>
-
-  <!-- small page -->
   <text class="h" x="16" y="130">a small-list page (n ≤ 128): whole lists, none crossing a page</text>
   <rect class="box" x="16" y="142" width="420" height="44"/>
   <rect class="cache" x="16" y="142" width="58" height="44"/><text class="mono" x="20" y="168">id 812</text>
@@ -249,9 +307,7 @@ tr:last-child td { border-bottom: none; }
   <rect class="cache" x="244" y="142" width="160" height="44"/><text class="mono" x="250" y="168">id 830 (128 rec)</text>
   <rect class="box" x="404" y="142" width="32" height="44"/><text class="mu" x="406" y="168">pad</text>
   <text class="mu" x="16" y="204">same bytes as a FORMAT 5 one-block list: n, dups, subjects u32, first rkey, deltas</text>
-  <text class="mu" x="16" y="219">index entry: u32 byte offset in the section (high bit clear)</text>
-
-  <!-- big list -->
+  <text class="mu" x="16" y="219">index entry: u32 offset in the shard's space (high bit clear); u32::MAX: no list</text>
   <text class="h" x="480" y="130">a big list (n &gt; 128): head pinned, columns paged</text>
   <rect class="pin" x="480" y="142" width="200" height="104" rx="5"/>
   <text class="mono" x="490" y="160">head (out)</text>
@@ -268,112 +324,118 @@ tr:last-child td { border-bottom: none; }
   <path class="ln" d="M680,230 L728,233" marker-end="url(#b)"/>
   <text class="mu" x="480" y="266">index entry: high bit set, u31 offset into the pinned head section</text>
   <text class="mu" x="480" y="281">in sets: head = n, per block first id u32 + at u32; blocks are the FORMAT 5 EF blocks</text>
-
-  <!-- page -->
+  <text class="mu" x="480" y="296">block pointers may point into the base or any patch file</text>
   <text class="h" x="16" y="270">page = I/O unit = cache unit</text>
   <rect class="cache" x="16" y="282" width="420" height="36"/>
   <text class="mono" x="24" y="305">4096 bytes of payload, no in-page header or trailer</text>
   <text class="mu" x="16" y="338">sum: low 32 bits of xxh3_64(page, seed = file salt ^ section ^ page no.), in *.sums (pinned)</text>
-  <text class="mu" x="16" y="353">a read from disk is checked against it; a page served from memory is not checked again</text>
+  <text class="mu" x="16" y="353">checked on every read from disk; a page served from memory isn't checked again</text>
   <text class="mu" x="16" y="368">blocks never cross a page, so every block is one contiguous slice of one frame</text>
-  <text class="mu" x="16" y="383">offsets are plain u32 per shard section (the biggest, follow out.rkey, is ~0.2 GB a shard)</text>
+  <text class="mu" x="16" y="383">offsets are u32 in a per-shard, per-section space: the base's pages, then each patch's</text>
 </svg>
 <figcaption>One shard file in FORMAT 6. The directory file keeps its FORMAT 5 sections and is pinned whole.</figcaption>
 </figure>
 
-<p>Three changes do the work. Lists of 128 records or fewer, about 92% of out lists, keep their FORMAT 5 bytes and pack whole into pages, so a small list is one page read. Big lists split into columns. <code>Has</code>, <code>BlockPairs</code>, known followers and filters scan subjects and in sets and never pull in the 13.5 GB of rkeys. Last, everything a lookup needs to find the right block (skips, firsts, offsets, by-subject fences) moves into a pinned head. Every request can then plan the pages it needs from memory and fetch them all in one round.</p>
+<p>Three changes do the work:</p>
+<ul>
+<li><b>Small lists stay whole.</b> Lists of 128 records or fewer, about 92% of out lists, keep their FORMAT 5 bytes and pack whole into pages. A small list is one page read.</li>
+<li><b>Big lists split into columns.</b> <code>Has</code>, <code>BlockPairs</code>, known followers and filters scan subjects and in sets, and never pull in the 13.5 GB of rkeys.</li>
+<li><b>Lookup state moves into a pinned head.</b> Everything a lookup needs to find the right block (skips, firsts, offsets, by-subject fences) lives in memory, so every pass can name all the pages it needs before reading any.</li>
+</ul>
 
-<p>The by-subject index changes from positions sorted by subject (4 B a record) to blocks of 128 holding the subjects as Elias-Fano, through the in-set block codec, which takes repeats, plus the positions as u32. FORMAT 5 compared <code>subject(bysubj[mid])</code> at each binary-search step, which on a cold cache is a random subject page per step, about ten dependent reads. The new form costs ~5.6 B a record (4.8 GB against 3.4 GB) and turns the lookup into one page.</p>
+<p>The by-subject index changes from positions sorted by subject (4 B a record) to blocks of 128. Each block holds the subjects as Elias-Fano, through the in-set block codec, which takes repeats, plus the positions as u32. FORMAT 5's binary search reads <code>subject(bysubj[mid])</code> at every step, which on a cold cache is about ten dependent page reads. The new form costs about 5.6 B a record (4.8 GB against 3.4 GB) and makes the lookup one page.</p>
 
-<p>Offsets in the index are plain u32 per section, not ascending runs, and lists are self-delimiting. So the order of lists in a section is free, which is what the heat-ordered option (Q4) needs, and the index loses its per-128 base array. FORMAT bumps to 6. There is no reader for 5 and no migration: snapshots are rebuilt from the archive.</p>
+<p>Blocks stay positional (128 records each), as in FORMAT 5. Slack leaves, which would let one edge change rewrite one block, were costed against the real day in §11. They save about 0.6 GB of patch bytes a day, but by-subject would have to key on rkeys instead of positions. That isn't worth it.</p>
+
+<p>Offsets are u32 within a shard's space for each section kind: the base file's pages first, then each patch file's, so a list can move to a patch without its neighbours moving. Lists are self-delimiting and their order is free, which is what the heat-ordered option (Q4) needs. <code>u32::MAX</code> marks an id with no list in a dense index, and the sparse form keeps its bitmap. FORMAT bumps to 6. There is no FORMAT 5 reader and no migration: snapshots are rebuilt from the archive (§15, the cutover).</p>
 
 <!-- ============================================================== -->
-<h2 id="tiers">4. Tiers and their sizes</h2>
+<h2 id="tiers">5. Tiers and their sizes</h2>
 
 <figure>
-<svg viewBox="0 0 960 350" role="img" aria-label="Footprint of the full network in FORMAT 6 and what each budget holds">
-  <text class="h" x="16" y="22">whole network (follows + blocks, 45.66M DIDs), GB · scale 1 GB = 13 px</text>
+<svg viewBox="0 0 960 350" role="img" aria-label="Footprint of the full network with lists in FORMAT 6 and what each budget holds">
+  <text class="h" x="16" y="22">whole network (follows, blocks, list items; 47.45M DIDs and list URIs), GB · 1 GB = 13 px</text>
   <text class="t2" x="16" y="54">FORMAT 6</text>
-  <rect class="pin" x="180" y="38" width="9.9" height="24"/>
-  <rect class="pin" x="189.9" y="38" width="6" height="24"/>
-  <rect class="pin" x="195.9" y="38" width="8.7" height="24"/>
-  <rect class="pin" x="204.6" y="38" width="2.7" height="24"/>
-  <rect class="cache" x="207.3" y="38" width="334.1" height="24"/>
-  <rect class="cache" x="541.4" y="38" width="65" height="24"/>
-  <rect class="cache" x="606.4" y="38" width="75.4" height="24"/>
-  <rect class="cache" x="681.8" y="38" width="44.2" height="24"/>
+  <rect class="pin" x="180" y="38" width="11.6" height="24"/>
+  <rect class="pin" x="191.6" y="38" width="6.5" height="24"/>
+  <rect class="pin" x="198.1" y="38" width="9.1" height="24"/>
+  <rect class="pin" x="207.2" y="38" width="2.7" height="24"/>
+  <rect class="cache" x="209.9" y="38" width="334.1" height="24"/>
+  <rect class="cache" x="544" y="38" width="65" height="24"/>
+  <rect class="cache" x="609" y="38" width="75.4" height="24"/>
+  <rect class="cache" x="684.4" y="38" width="44.2" height="24"/>
+  <rect class="cache" x="728.6" y="38" width="20.8" height="24"/>
   <text class="mono" x="320" y="55">follow out 25.7</text>
-  <text class="mono" x="563" y="55">5.0</text>
-  <text class="mono" x="633" y="55">5.8</text>
-  <text class="mono" x="694" y="55">3.4</text>
-  <text class="t2" x="736" y="55">42.1 = 2.1 + 40.0</text>
-  <text class="mu" x="180" y="78">↑ pinned 2.1</text><text class="mu" x="541" y="78">↑ by-subject · follow in · blocks</text>
+  <text class="mono" x="566" y="55">5.0</text>
+  <text class="mono" x="636" y="55">5.8</text>
+  <text class="mono" x="696" y="55">3.4</text>
+  <text class="t2" x="756" y="55">43.8 = 2.3 + 41.5</text>
+  <text class="mu" x="180" y="78">↑ pinned 2.3</text>
+  <text class="mu" x="544" y="78">↑ by-subject · follow in · blocks · lists</text>
   <text class="t2" x="16" y="104">FORMAT 5 (mmap)</text>
-  <rect class="box" x="180" y="90" width="500.5" height="24"/>
-  <text class="mu" x="190" y="107">38.5 GB of files, all page cache when resident</text>
-  <text class="mu" x="180" y="134">pinned 2.1: directory 0.76 · list index 0.46 · big-list heads and fences 0.67 · sums, slots, frame table 0.20 (at full residency)</text>
-
+  <rect class="box" x="180" y="90" width="520" height="24"/>
+  <text class="mu" x="190" y="107">40.0 GB of files, all page cache when resident</text>
+  <text class="mu" x="180" y="134">pinned 2.3: directory 0.89 · list index 0.50 · big-list heads and fences 0.70 · sums, slots, frame table 0.20 (at full residency)</text>
   <text class="h" x="16" y="170">what each measured case's --memory holds</text>
   <text class="t2" x="16" y="198">Fits · 48 GiB limit</text>
   <text class="mu" x="16" y="212">--memory 44 GiB = 47.2 GB</text>
-  <rect class="pin" x="180" y="188" width="27.3" height="24"/>
-  <rect class="cache" x="207.3" y="188" width="520" height="24"/>
-  <rect class="okf" x="727.3" y="188" width="66.3" height="24"/>
-  <text class="mono" x="380" y="205">all 40.0 GB paged, resident</text>
-  <text class="mu" x="733" y="205">5.1 switch</text>
+  <rect class="pin" x="180" y="188" width="29.9" height="24"/>
+  <rect class="cache" x="209.9" y="188" width="539.5" height="24"/>
+  <rect class="okf" x="749.4" y="188" width="44.2" height="24"/>
+  <text class="mono" x="380" y="205">all 41.5 GB paged, resident</text>
+  <text class="mu" x="754" y="205">3.4 H</text>
   <text class="mu" x="800" y="205">+4.3 GB outside</text>
-
   <text class="t2" x="16" y="244">Half · 16 GiB limit</text>
   <text class="mu" x="16" y="258">--memory 13 GiB = 14.0 GB</text>
-  <rect class="pin" x="180" y="234" width="27.3" height="24"/>
-  <rect class="cache" x="207.3" y="234" width="154.7" height="24"/>
-  <rect class="box" x="362" y="234" width="365.3" height="24" style="fill:none;stroke-dasharray:4 3"/>
-  <text class="mono" x="214" y="251">cache 11.9 (30%)</text>
+  <rect class="pin" x="180" y="234" width="29.9" height="24"/>
+  <rect class="cache" x="209.9" y="234" width="152.1" height="24"/>
+  <rect class="box" x="362" y="234" width="387.4" height="24" style="fill:none;stroke-dasharray:4 3"/>
+  <text class="mono" x="216" y="251">cache 11.7 (28%)</text>
   <text class="mu" x="372" y="251">on disk only</text>
-  <text class="mu" x="740" y="251">public-instance size</text>
-
+  <text class="mu" x="760" y="251">public-instance size</text>
   <text class="t2" x="16" y="290">Tight · 8 GiB limit</text>
   <text class="mu" x="16" y="304">--memory 6 GiB = 6.4 GB</text>
-  <rect class="pin" x="180" y="280" width="27.3" height="24"/>
-  <rect class="cache" x="207.3" y="280" width="55.9" height="24"/>
-  <rect class="box" x="263.2" y="280" width="464.1" height="24" style="fill:none;stroke-dasharray:4 3"/>
-  <text class="mono" x="214" y="297">4.3</text>
-  <text class="mu" x="272" y="297">11% of paged bytes cached</text>
-  <text class="mu" x="16" y="336">pinned sizes are from the whole-network build's section bytes; paged sizes add ~5% for blocks that may not cross a page</text>
+  <rect class="pin" x="180" y="280" width="29.9" height="24"/>
+  <rect class="cache" x="209.9" y="280" width="53.3" height="24"/>
+  <rect class="box" x="263.2" y="280" width="486.2" height="24" style="fill:none;stroke-dasharray:4 3"/>
+  <text class="mono" x="216" y="297">4.1</text>
+  <text class="mu" x="272" y="297">10% of paged bytes cached</text>
+  <text class="mu" x="16" y="336">from the whole-network builds' section bytes (follows and blocks; lists add ~1.7 GB in FORMAT 6); paged sizes include ~5% for blocks that can't cross a page</text>
 </svg>
-<figcaption>Green is pinned, blue is the page cache. The page cache holds frames only up to the budget less the pinned tier.</figcaption>
+<figcaption>Green is pinned and blue is the page cache. H is the headroom left for a checkpoint when everything is resident.</figcaption>
 </figure>
 
 <table>
 <tr><th>Part</th><th>Tier</th><th class="r">Bytes</th><th>Why there</th></tr>
-<tr><td>Directory: <code>dir.plc</code> 648 MB, radix 17 MB, others 99 MB</td><td><span class="tag p">pinned</span></td><td class="r">0.76 GB</td><td>every RPC maps DIDs to ids and back, and <code>hidden()</code> asks on every DID</td></tr>
-<tr><td>List index: follow out and in, dense u32 per id (183 MB each); block out and in, sparse (28 + 63 MB)</td><td><span class="tag p">pinned</span></td><td class="r">0.46 GB</td><td>first hop of every list read</td></tr>
-<tr><td>Big-list heads: 19.3M out blocks × 16 B, 21.4M in blocks × 8 B, 6.6M by-subject fences × 8 B, per-list headers</td><td><span class="tag p">pinned</span></td><td class="r">0.67 GB</td><td>a request picks the exact pages it needs before reading any, so it does one I/O round per dependency level</td></tr>
+<tr><td>Directory: <code>dir.plc</code> 648 MB, radix 17 MB, other DIDs and list URIs ~0.23 GB</td><td><span class="tag p">pinned</span></td><td class="r">0.89 GB</td><td>every RPC maps DIDs to ids and back, and <code>hidden()</code> asks on every DID</td></tr>
+<tr><td>List index: follow out and in, dense u32 per id; blocks and list items, sparse</td><td><span class="tag p">pinned</span></td><td class="r">0.50 GB</td><td>first hop of every list read</td></tr>
+<tr><td>Big-list heads: ~19M out blocks × 16 B, ~21M in blocks × 8 B, 7.2M by-subject fences × 8 B, per-list headers</td><td><span class="tag p">pinned</span></td><td class="r">0.70 GB</td><td>a pass names the exact pages it needs, so a request does one I/O round per dependency level</td></tr>
 <tr><td>Page sums (u32 per page), slot tables, frame table</td><td><span class="tag p">pinned</span></td><td class="r">0.20 GB</td><td>checks and lookups on every page</td></tr>
-<tr><td>Side (non-TID rkeys), statuses, live DIDs, tombstone and stamp maps</td><td><span class="tag p">pinned</span></td><td class="r">~0.02 GB + maps</td><td>already decoded into memory at open today; now counted against the budget</td></tr>
-<tr><td>Small lists (out and in), subject blocks, rkey blocks, by-subject blocks, in-set EF blocks</td><td><span class="tag c">paged</span></td><td class="r">40.0 GB</td><td>the data; a 4 KiB page is the unit of I/O and of caching</td></tr>
+<tr><td>Side (non-TID rkeys) and status sections</td><td><span class="tag p">pinned</span></td><td class="r">~0.02 GB</td><td>immutable, read at open</td></tr>
+<tr><td>Small lists, subject blocks, rkey blocks, by-subject blocks, in-set EF blocks (base and patch files)</td><td><span class="tag c">paged</span></td><td class="r">41.5 GB</td><td>the data; a 4 KiB page is the unit of I/O and of caching</td></tr>
+<tr><td>Deltas (three copies at a checkpoint), live DIDs, tombstone and stamp maps, request heap</td><td>outside</td><td class="r">~1.1 GB + maps</td><td>graph state that grows with writes and can't be evicted</td></tr>
 </table>
 
-<p>Counts of big lists come from the pinned head, so <code>Counts</code> on a popular account reads nothing. A small list's count sits in its one page. If the budget can't hold the pinned tier plus 256 MiB of frames, marco refuses to start and prints the minimum.</p>
+<p>Counts of big lists come from the pinned head, so <code>Counts</code> on a popular account reads nothing. A small list's count sits in its one page. If the budget can't hold the pinned tier plus 2 GiB (four times the pin budget), marco refuses to start and prints the minimum.</p>
 
 <!-- ============================================================== -->
-<h2 id="unit">5. The cache unit and the policy</h2>
+<h2 id="unit">6. The cache unit, the policy, memory</h2>
 
 <table>
-<tr><th>Unit</th><th>Lookup</th><th>Memory overhead at full residency</th><th>Waste on a miss</th><th>Verdict</th></tr>
-<tr><td>Whole list, any size (object cache)</td><td>hash map per access</td><td>~40 B × 66M lists ≈ 2.6 GB, plus allocator fragmentation</td><td>none</td><td>no: the full-residency case pays the most for it</td></tr>
-<tr><td>64 KiB extent</td><td>array index</td><td>tiny</td><td>16× a page; small lists of unrelated actors ride along</td><td>no: this is readahead's problem again</td></tr>
+<tr><th>Unit</th><th>Lookup</th><th>Overhead at full residency</th><th>Waste on a miss</th><th>Verdict</th></tr>
+<tr><td>Whole list, any size (object cache)</td><td>hash map per access</td><td>~40 B × 85.4M lists ≈ 3.4 GB, plus allocator fragmentation</td><td>none</td><td>no: full residency pays the most for it</td></tr>
+<tr><td>64 KiB extent</td><td>array index</td><td>tiny</td><td>16× a page; small lists of unrelated actors ride along</td><td>no: it's readahead's problem again</td></tr>
 <tr><td>4 KiB page of one column, blocks never crossing pages</td><td>array index (<code>slots[page]</code>)</td><td>12 B a frame ≈ 0.12 GB</td><td>small lists share a page with ~5 neighbours; big lists waste &lt; 5%</td><td class="gate">chosen</td></tr>
 </table>
 
-<p>The page wins because the lookup is the same at every budget: index → offset → <code>slots[offset / 4096]</code> → frame. That's one dependent load more than an mmap slice, with no hashing and no per-object allocation. The column split takes care of most of the co-location waste. A page of subjects carries only subjects, and big lists, which hold 82% of records, have pages of their own blocks. The rest is the tail of tiny lists sharing pages, which the heat-ordered option (Q4) targets.</p>
+<p>The page wins because the lookup is the same at every budget: index → offset → <code>slots[page]</code> → frame. That's one dependent load more than an mmap slice, with no hashing and no allocation per object. The column split removes most of the co-location waste. A page of subjects carries only subjects, and big lists, which hold 82% of records, get pages of their own blocks.</p>
 
 <figure>
 <svg viewBox="0 0 960 220" role="img" aria-label="S3-FIFO: new pages enter small, pages hit again move to main, one-hit pages leave and leave a ghost">
   <defs>
     <marker id="c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0,0 L10,5 L0,10 z"/></marker>
   </defs>
-  <rect class="io" x="16" y="70" width="120" height="50" rx="6"/><text class="h" x="28" y="92">miss</text><text class="mu" x="28" y="110">page read, verified</text>
+  <rect class="io" x="16" y="70" width="120" height="50" rx="6"/><text class="h" x="28" y="92">miss</text><text class="mu" x="28" y="110">or write-through</text>
   <rect class="cache" x="200" y="20" width="200" height="56" rx="6"/><text class="h" x="212" y="42">small FIFO · 10%</text><text class="mu" x="212" y="62">new pages; freq 0..3</text>
   <rect class="cache" x="200" y="130" width="420" height="56" rx="6"/><text class="h" x="212" y="152">main FIFO · 90% (CLOCK on freq)</text><text class="mu" x="212" y="172">freq &gt; 0 at the tail: decrement, go around · freq 0: evict</text>
   <rect class="box" x="480" y="20" width="200" height="56" rx="6"/><text class="h" x="492" y="42">ghost</text><text class="mu" x="492" y="62">ids only, as many as main</text>
@@ -384,113 +446,183 @@ tr:last-child td { border-bottom: none; }
   <path class="ln" d="M300,76 L300,128" marker-end="url(#c)"/><text class="mu" x="306" y="106">tail, freq ≥ 1</text>
   <path class="ln" d="M620,158 L758,112" marker-end="url(#c)"/>
   <path class="ln" d="M680,48 L758,95" marker-end="url(#c)"/>
-  <text class="mu" x="16" y="210">A hit sets freq = min(freq + 1, 3) only if it's below 3, so hot frames' cache lines aren't written. Pinned frames are skipped. With no eviction pressure the policy does nothing.</text>
+  <text class="mu" x="16" y="210">A hit sets freq = min(freq + 1, 3) only when it's below 3, so hot frames' cache lines aren't written. Pinned frames are skipped. With no eviction pressure, the policy does nothing.</text>
 </svg>
 <figcaption>S3-FIFO (Yang et al., SOSP 2023).</figcaption>
 </figure>
 
-<p>S3-FIFO over W-TinyLFU: it's scan-resistant in the way that matters here, since a page touched once (one big <code>Intersect</code>, a <code>ListIn</code> walk, a cold viewer) dies in the small queue without touching the main one. It's frequency-aware through its 2-bit counters and the ghost. It needs no sketch and no LRU list on hits, only a mutex on the eviction path, which is already a miss costing ~80 µs of disk. Checkpoint, verify and open reads never enter the cache.</p>
+<p>S3-FIFO beats W-TinyLFU here on two counts. It's scan-resistant in the way that matters: a page touched once (one big <code>Intersect</code>, a <code>ListIn</code> walk, a cold viewer) dies in the small queue without touching the main one. And it's frequency-aware through 2-bit counters and the ghost, with no sketch and no list update on a hit, only a mutex on the eviction path. That path already costs a disk read.</p>
 
-<p>Reclamation uses epochs. A request pass pins the epoch (crossbeam-epoch, a few ns) and reads frames as plain slices. The evictor clears a frame's slots, then retires the frame, and reuses it only after every pass that could have seen it has ended. Passes never span an await, so the epoch always advances. Pages a request had to fetch get a pin count until the request ends, so its next pass finds them. Hits take no atomic write.</p>
+<p>Which reads go where:</p>
+<ul>
+<li>Request and writer misses enter the small queue.</li>
+<li>Patch and compaction pages a checkpoint writes are written through into the small queue.</li>
+<li>The full-residency load at open fills main directly.</li>
+<li>Verify, list stats and compaction's own reads of old pages bypass the cache.</li>
+</ul>
+
+<h3>Frames, epochs, pins, memory</h3>
+<ul>
+<li><b>Epochs.</b> A pass reads frames as plain slices under a crossbeam-epoch guard. The evictor clears a frame's slot, then retires the frame. The frame is reused only after every guard that could have seen it is gone. Passes never wait on I/O (§7), so the epoch always moves.</li>
+<li><b>Retired-frame reserve.</b> Retired frames count against the budget. The evictor keeps at least max(1,024 frames, 0.5%) free or retired. When the free list is empty, a fetch calls <code>guard.flush()</code>, evicts again, and then waits on a condvar for reclamation. It never allocates past the budget.</li>
+<li><b>Pins.</b> A frame's state word holds RESIDENT plus a pin count, changed by CAS. A request that missed pins the pages it touched before dropping its guard. A pin that finds the frame retired or reassigned fails, and that page counts as missing for the next pass. A frame goes back to the free list only when it has no owner and no pins. The last unpin frees a frame whose file was dropped.</li>
+<li><b>Pin budget.</b> A request holds at most 2,048 pins (8 MiB), and at most 64 requests run on the miss pool, so pins never exceed 512 MiB. A request that has touched more pages keeps going without new pins, relying on the small queue. If it needs more pages at once than half the small queue holds, it fails with <code>resource_exhausted</code>: "this request needs N MiB of pages at once".</li>
+<li><b>Giving memory back.</b> Frames come in 2 MiB groups. To borrow memory for new pinned parts or a compaction, the engine picks the groups with the most free frames, evicts the rest of their frames, and returns each group with <code>MADV_DONTNEED</code>. RSS falls before the new allocation lands, so the "≤ <code>--memory</code>" gates measure RSS and not just the engine's books.</li>
+</ul>
 
 <!-- ============================================================== -->
-<h2 id="read">6. The read path</h2>
+<h2 id="read">7. The read path</h2>
 
 <figure>
-<svg viewBox="0 0 960 360" role="img" aria-label="Sequence: pass 1 collects misses, fetch awaits I/O, pass 2 computes on resident pages">
+<svg viewBox="0 0 960 400" role="img" aria-label="Sequence: one pass on the tokio worker; on a miss the request moves to the miss pool, which loops pass and blocking fetch">
   <defs>
     <marker id="d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0,0 L10,5 L0,10 z"/></marker>
   </defs>
-  <text class="h" x="40" y="22">handler (tokio)</text>
-  <text class="h" x="250" y="22">Graph pass</text>
-  <text class="h" x="440" y="22">Engine</text>
-  <text class="h" x="620" y="22">I/O pool</text>
-  <text class="h" x="820" y="22">NVMe</text>
-  <path class="lnd" d="M90,30 L90,350"/><path class="lnd" d="M285,30 L285,350"/><path class="lnd" d="M465,30 L465,350"/><path class="lnd" d="M650,30 L650,350"/><path class="lnd" d="M845,30 L845,350"/>
-  <rect class="okf" x="270" y="44" width="30" height="88"/>
-  <path class="ln" d="M90,50 L268,50" marker-end="url(#d)"/><text class="mu" x="100" y="45">g = graph(); epoch pin</text>
-  <path class="ln" d="M300,70 L463,70" marker-end="url(#d)"/><text class="mu" x="310" y="65">slots[page]: hit → &amp;[u8]</text>
-  <path class="ln" d="M300,92 L463,92" marker-end="url(#d)"/><text class="mu" x="310" y="87">miss → Pending, id kept</text>
-  <path class="ln" d="M268,126 L92,126" marker-end="url(#d)"/><text class="mu" x="100" y="121">Partial(missing); drop g, unpin</text>
-  <path class="lnw" d="M90,152 L463,152" marker-end="url(#d)"/><text class="mu" x="100" y="147">fetch(missing, hold).await</text>
-  <path class="lnw" d="M465,170 L648,170" marker-end="url(#d)"/><text class="mu" x="475" y="165">single-flight; coalesce runs</text>
-  <path class="lnw" d="M650,188 L843,188" marker-end="url(#d)"/><text class="mu" x="660" y="183">pread O_DIRECT ×k in parallel</text>
-  <path class="lnw" d="M843,214 L652,214" marker-end="url(#d)"/><text class="mu" x="700" y="209">~80-250 µs</text>
-  <path class="lnw" d="M648,236 L467,236" marker-end="url(#d)"/><text class="mu" x="475" y="231">xxh3 ok → frame, slot, pin</text>
-  <path class="lnw" d="M463,256 L92,256" marker-end="url(#d)"/><text class="mu" x="100" y="251">wake (or Err: data_loss / unavailable)</text>
-  <rect class="okf" x="270" y="270" width="30" height="50"/>
-  <path class="ln" d="M90,276 L268,276" marker-end="url(#d)"/><text class="mu" x="100" y="271">pass 2: g = graph(); all hit</text>
-  <path class="ln" d="M268,314 L92,314" marker-end="url(#d)"/><text class="mu" x="100" y="309">Done(response); release pins</text>
-  <text class="mu" x="16" y="345">At full residency the first pass is the only pass: no allocation, no await, one slot load per page touched.</text>
+  <text class="h" x="40" y="22">tokio worker</text>
+  <text class="h" x="240" y="22">miss pool thread</text>
+  <text class="h" x="470" y="22">Engine</text>
+  <text class="h" x="640" y="22">I/O pool</text>
+  <text class="h" x="830" y="22">NVMe</text>
+  <path class="lnd" d="M85,30 L85,390"/><path class="lnd" d="M290,30 L290,390"/><path class="lnd" d="M490,30 L490,390"/><path class="lnd" d="M670,30 L670,390"/><path class="lnd" d="M850,30 L850,390"/>
+  <rect class="okf" x="72" y="40" width="26" height="54"/>
+  <text class="mu" x="104" y="52">pass 1: pin epoch, load graph,</text>
+  <text class="mu" x="104" y="66">run the whole handler closure</text>
+  <path class="ln" d="M98,80 L488,80" marker-end="url(#d)"/><text class="mu" x="300" y="76">slots[page]: hit → &amp;[u8] · miss → Pending</text>
+  <text class="mu" x="104" y="112">all hit → respond here (the common case)</text>
+  <path class="lnw" d="M85,134 L288,134" marker-end="url(#d)"/><text class="mu" x="96" y="128">a miss: await a permit, send the closure</text>
+  <rect class="okf" x="277" y="150" width="26" height="40"/>
+  <text class="mu" x="310" y="166">pass: need() names every page,</text>
+  <text class="mu" x="310" y="180">pin touched, drop guard + Arc</text>
+  <path class="lnw" d="M290,206 L488,206" marker-end="url(#d)"/><text class="mu" x="300" y="201">fetch(missing) and block</text>
+  <path class="lnw" d="M490,222 L668,222" marker-end="url(#d)"/><text class="mu" x="500" y="217">single-flight, coalesce runs</text>
+  <path class="lnw" d="M670,238 L848,238" marker-end="url(#d)"/><text class="mu" x="680" y="233">preadv O_DIRECT ×k in parallel</text>
+  <path class="lnw" d="M848,262 L672,262" marker-end="url(#d)"/><text class="mu" x="700" y="257">~100-250 µs</text>
+  <path class="lnw" d="M668,280 L492,280" marker-end="url(#d)"/><text class="mu" x="500" y="275">xxh3 ok → frame, slot, pin</text>
+  <path class="lnw" d="M488,298 L292,298" marker-end="url(#d)"/><text class="mu" x="300" y="293">wake (or a storage error)</text>
+  <rect class="okf" x="277" y="310" width="26" height="36"/>
+  <text class="mu" x="310" y="330">next pass: one round per dependency level</text>
+  <path class="ln" d="M288,366 L87,366" marker-end="url(#d)"/><text class="mu" x="96" y="361">response (oneshot); pins released</text>
+  <text class="mu" x="16" y="392">At full residency the first pass is the only pass: no allocation, no await, one slot load per page touched.</text>
 </svg>
-<figcaption>The graph's Arc is held only inside a pass, so the writer's swap, which waits for readers to leave a copy, never waits on a disk.</figcaption>
+<figcaption>A pass holds the graph's Arc and the epoch guard only while it computes, never across a fetch. The writer's swap, which waits for readers to leave a copy, never waits on a disk.</figcaption>
 </figure>
 
 <h3>Find the pages, fetch the misses, compute</h3>
 <p>Structures stay synchronous and slice-based. What changes is where a slice comes from:</p>
 <pre>
 // marco-core
-pub struct ReadCx&lt;'g&gt; { guard: epoch::Guard, mode: Mode, missing: PageSet, touched: PageSet, stats: ReadStats }
-pub enum Mode { Collect, Block }          // Collect: request path. Block: writer, checkpoint, admin
-pub struct Pending;                       // a miss in Collect mode; never returned in Block mode
-type R&lt;T&gt; = Result&lt;T, Pending&gt;;
+pub struct Pending;                                   // a miss; the pass can't finish
+pub type R&lt;T&gt; = Result&lt;T, Pending&gt;;
+pub struct ReadCx&lt;'g&gt; {
+    guard: &amp;'g epoch::Guard,                          // pinned by the caller: no slice outlives it
+    engine: &amp;'g Engine,
+    missing: RefCell&lt;PageSet&gt;,                        // pages to fetch
+    touched: RefCell&lt;PageSet&gt;,                        // kept once anything missed, to pin
+    stats: Cell&lt;ReadStats&gt;,
+}
+impl&lt;'g&gt; ReadCx&lt;'g&gt; { pub fn page(&amp;self, p: PageId) -&gt; R&lt;&amp;'g [u8; 4096]&gt;; }
+pub trait Blocks&lt;'g&gt; {
+    fn block(&amp;self, cx: &amp;ReadCx&lt;'g&gt;, b: usize) -&gt; R&lt;&amp;'g [u8]&gt;;
+    fn need(&amp;self, cx: &amp;ReadCx&lt;'g&gt;, bs: Range&lt;usize&gt;) -&gt; R&lt;()&gt;;   // registers every miss in bs
+}
+OutList&lt;'g, B: Blocks&lt;'g&gt;&gt; / InList&lt;'g, B: Blocks&lt;'g&gt;&gt;            // head pinned, or the one small-list slice
+impl Graph { fn base_out&lt;'g&gt;(&amp;'g self, cx: &amp;ReadCx&lt;'g&gt;, rel, id) -&gt; R&lt;Option&lt;OutList&lt;'g, _&gt;&gt;&gt;; ... }
 
-trait Blocks&lt;'g&gt; { fn block(&amp;self, cx: &amp;ReadCx&lt;'g&gt;, b: usize) -&gt; R&lt;&amp;'g [u8]&gt;;
-                  fn need(&amp;self, cx: &amp;ReadCx&lt;'g&gt;, bs: Range&lt;usize&gt;) -&gt; R&lt;()&gt;; }   // registers every miss in bs
-OutList&lt;'g, B: Blocks&gt; / InList&lt;'g, B: Blocks&gt;    // head from the pinned tier (or the one small-list slice)
-impl Graph { fn base_out(&amp;self, cx, rel, id) -&gt; R&lt;Option&lt;OutList&gt;&gt;; fn in_contains(&amp;self, cx, ..) -&gt; R&lt;bool&gt;; ... }
+// one pass; the guard lives on this stack frame and dies with it
+pub fn pass&lt;T&gt;(e: &amp;Engine, hold: &amp;mut Hold, f: impl FnOnce(&amp;ReadCx) -&gt; R&lt;T&gt;) -&gt; Result&lt;T, Misses&gt; {
+    let guard = epoch::pin();
+    let cx = ReadCx::new(e, &amp;guard);
+    let r = f(&amp;cx);
+    match r { Ok(t) if cx.clean() =&gt; Ok(t), _ =&gt; Err(cx.pin_touched_and_take(hold)) }  // before guard drops
+}
+// every blocking reader: miss pool, writer, checkpoint, admin jobs
+pub fn read_blocking&lt;T&gt;(e: &amp;Engine, hold: &amp;mut Hold, f: impl Fn(&amp;ReadCx) -&gt; R&lt;T&gt;) -&gt; Result&lt;T, StorageError&gt; {
+    loop { match pass(e, hold, &amp;f) { Ok(t) =&gt; return Ok(t), Err(m) =&gt; e.fetch_blocking(m, hold)? } }
+}
 </pre>
-<p>Each structure method first calls <code>need()</code> for every block it will read, which it can work out from the pinned head, and only then decodes. A scan misses all its blocks in one pass, not one per restart. Batch calls (<code>relationships</code>, <code>block_pairs</code>, <code>filter</code>, the probe loops of <code>intersect</code>) catch <code>Pending</code> per item and go on to the next one, so twenty others missing in twenty different lists cost one round, not twenty. In-memory overrides (<code>out_over</code>, <code>in_over</code>) implement <code>Blocks</code> and never miss. The Graph code keeps its logic. It gains <code>cx</code> and a <code>?</code> at each base access.</p>
+
+<p>Each structure method calls <code>need()</code> first for every block it will read, which it can work out from the pinned head, and only then decodes. A scan misses all its blocks in one pass, not one per round. Batch calls (<code>relationships</code>, <code>block_pairs</code>, <code>filter</code>, the probe loops of <code>intersect</code>) catch <code>Pending</code> per item and carry on with the next, so twenty others missing in twenty lists cost one round, not twenty. In-memory overrides (<code>out_over</code>, <code>in_over</code>) implement <code>Blocks</code> and never miss. A <code>Pending</code> swallowed into a <code>None</code> can't produce a wrong answer, because <code>clean()</code> fails any pass that recorded a miss.</p>
 
 <pre>
-// marco-server handler, e.g. relationships
-let mut hold = Hold::default();                       // pins on fetched pages, released on drop
-for round in 0..MAX_ROUNDS {                          // 6; the table below bounds real requests at 3
-    let r = {
-        let g = app.graph();                          // Arc, held only for this block
-        let mut cx = ReadCx::collect(&amp;app.engine);
-        let r = g.relationships(&amp;mut cx, &amp;req.actor, &amp;others, &amp;rels);
-        cx.finish(&amp;mut hold)                          // pins everything touched if anything missed
-            .map(|()| r)
-    };                                                // g and the epoch guard dropped here
-    match r {
-        Ok(r) =&gt; return Ok(build_response(r)),
-        Err(missing) =&gt; app.engine.fetch(missing, Prio::Request, &amp;mut hold).await
-                           .map_err(storage_error)?,  // data_loss / unavailable
-    }
+// marco-server handler, e.g. relationships: the whole handler is the closure
+let work = move |cx: &amp;ReadCx| -&gt; R&lt;RelationshipsResponse&gt; {
+    let g = app.graph();                      // per pass; dropped at the end of it
+    build_relationships(&amp;g, cx, &amp;req)          // lookups, hidden(), did_of, the response: all inside
+};
+match app.engine.pass(&amp;mut Hold::none(), &amp;work) {           // on the tokio worker, never waits
+    Ok(resp) =&gt; Ok(resp),
+    Err(_) =&gt; app.miss_pool.run(work).await.map_err(storage_error)?,   // read_blocking on a pool thread
 }
-Err(ConnectError::internal("storage: read did not settle"))
 </pre>
 
-<p>A pass that missed pins every page it touched, hits included, before it drops the guard. Each round therefore strictly grows the resident set the next pass needs, and rounds equal the dependency depth. If a checkpoint switch lands between rounds, the next pass reads the new copy from scratch, and the answer is still computed from one consistent copy. The handler's code runs <code>hidden()</code>, <code>did_of</code> and the rest of the response building inside the final pass, and those use only the pinned tier.</p>
+<p>The miss pool has 64 threads by default (<code>--miss-threads</code>). Little's law sizes it: a request that misses spends ~0.3-0.6 ms in two or three rounds, so 64 threads carry about 100k missing requests a second. That's above the miss rate the I/O pool can feed (§9).</p>
+
+<p>A handler waits for a pool permit asynchronously, so its worker keeps serving hits. A request that waits longer than 1 s (or its deadline) gets <code>resource_exhausted</code> "storage busy". The queue wait is a metric. A request runs as many rounds as it needs: rounds equal the dependency depth, plus any writes or a checkpoint switch that change what the next pass needs. Nothing turns a slow request into an error. A request whose missing set stops shrinking for 16 rounds is logged and counted, as a bug signal.</p>
 
 <!-- ============================================================== -->
-<h2 id="bounds">7. Disk reads per request</h2>
+<h2 id="bounds">8. Disk reads per request</h2>
 
-<p>Bounds at a cold cache, in 4 KiB pages, from the pinned heads plus the format. These are what the per-RPC <code>pages read</code> histograms must stay under: phase 4's tests assert them on a starved cache.</p>
+<p>Bounds at a cold cache, in 4 KiB pages, from the pinned heads plus the format. Phase 4's tests assert them on a small cache with request sizes that fit it.</p>
 
 <table>
 <tr><th>RPC</th><th>Pages read, at most</th><th class="r">Rounds</th><th>From</th></tr>
-<tr><td>Has</td><td class="mono">7</td><td class="r">3</td><td>to's in set: 1 (small set, or the one EF block the pinned firsts name) · from's out list: small 1 page holding subjects and rkeys; 129-4,095 records ≤ 5 subject pages + 1 rkey page; ≥ 4,096 records 1 by-subject page + 1 rkey page</td></tr>
-<tr><td>Counts</td><td class="mono">2 (0 for big lists)</td><td class="r">1</td><td>n is in the pinned head for big lists, in the list's page for small ones</td></tr>
+<tr><td>Has</td><td class="mono">7 + d</td><td class="r">3</td><td>
+<ul>
+<li>to's in set: 1 page (a small set, or the one EF block the pinned firsts name).</li>
+<li>from's out list:
+  <ul>
+  <li>small: 1 page holding subjects and rkeys;</li>
+  <li>129-4,095 records: ≤ 5 subject pages + 1 rkey page;</li>
+  <li>≥ 4,096 records: 1 by-subject page + 1 rkey page.</li>
+  </ul></li>
+<li>d: one rkey page per base record naming the subject that the delta deleted.</li>
+</ul>
+</td></tr>
+<tr><td>Counts, A actors, R rels</td><td class="mono">2·A·R (0 for big lists)</td><td class="r">1</td><td>n is in the pinned head for big lists and in the list's page for small ones; A ≤ 100</td></tr>
 <tr><td>BlockPairs, P pairs, R rels</td><td class="mono">2·P·R</td><td class="r">1</td><td>one in-set page per direction per rel; P ≤ 1,000</td></tr>
-<tr><td>Relationships, N others, R rels</td><td class="mono">R·(10N + 5)</td><td class="r">3</td><td>actor's in set: ≤ N blocks (1 page if small) · actor's out side: a scan of ≤ 1,024 records is ≤ 6 pages; past that, per other 1 in-set page + 1 by-subject page + 1 rkey page, plus ≤ 5 shared subject pages · per in-hit, the other's out list as in Has (≤ 6). Feed mean (N 21, R 2): ≤ 430; cold and mostly small lists: ~2N per rel</td></tr>
-<tr><td>ListOut, limit L</td><td class="mono">2·(⌈L/128⌉ + 1)</td><td class="r">1</td><td>newest subject and rkey blocks; small list 1. <code>distinct</code> adds ≤ L by-subject pages (round 2)</td></tr>
-<tr><td>ListIn, limit L, cursor</td><td class="mono">⌈L/128⌉ + 1</td><td class="r">1</td><td>cursor's block from the pinned firsts, then forward</td></tr>
-<tr><td>Intersect a, b</td><td class="mono">pages(a) + pages(b)</td><td class="r">2</td><td>round 1 sizes the sides (pinned or one page); the small side is decoded and the big side probed, which touches ≤ min(|small|, blocks(big)) pages, or decoded when that's cheaper. Never more than reading both lists</td></tr>
-<tr><td>Filter, A actors, D drops, S sets</td><td class="mono">pages(viewer out) + A·(D + S)</td><td class="r">1</td><td>an out drop decodes the viewer's subject column; an in drop and each set is one in-set page per actor</td></tr>
+<tr><td>Relationships, N others, R rels</td><td class="mono">R·(10N + 5)</td><td class="r">3</td><td>
+<ul>
+<li>actor's in set: ≤ N blocks (1 page if small).</li>
+<li>actor's out side: a scan of ≤ 1,024 records is ≤ 6 pages. Past that, per other: 1 in-set page + 1 by-subject page + 1 rkey page, plus ≤ 5 shared subject pages.</li>
+<li>per in-hit: the other's out list, as in Has (≤ 6).</li>
+<li>Feed mean (N 21, R 2): ≤ 430. Cold and mostly small lists: ~2N per rel.</li>
+</ul>
+</td></tr>
+<tr><td>ListOut, limit L</td><td class="mono">2·(⌈L/128⌉ + 1)</td><td class="r">1</td><td>the newest subject and rkey blocks; a small list is 1 page</td></tr>
+<tr><td>ListOut distinct, limit L</td><td class="mono">pages(list), or per chunk 2·(⌈C/128⌉+1) + 2·C</td><td class="r">2 per chunk</td><td>
+<ul>
+<li>≤ 4,096 records, or mostly repeats (<code>distinct·2 &lt; n</code>): the whole list. The 640k-record, 119-member list is ~1.4k pages.</li>
+<li>Otherwise chunks of C = clamp(L, 64, 4,096) records: their blocks, then <code>out_first_subject</code> for each record (1 by-subject page + 1 rkey page).</li>
+</ul>
+</td></tr>
+<tr><td>ListIn, limit L, cursor</td><td class="mono">⌈L/128⌉ + 1</td><td class="r">1</td><td>the cursor's block from the pinned firsts, then forward</td></tr>
+<tr><td>Intersect a, b</td><td class="mono">≤ pages(a) + pages(b)</td><td class="r">2-3</td><td>
+<ul>
+<li>Round 1 sizes the sides (pinned, or one page each).</li>
+<li>The small side is decoded.</li>
+<li>The big side is probed block by block (≤ min(|small|, blocks(big)) pages) or decoded.</li>
+<li>An out side probed through members' in sets costs |small| pages of other lists, so it's chosen only when |small| &lt; pages(big)/4. The RAM ratio (32 members) applies only when the big side is resident.</li>
+<li>Side size has no request cap. The per-request page limit (§6) bounds it with <code>resource_exhausted</code>.</li>
+</ul>
+</td></tr>
+<tr><td>Filter, A actors, D drops, S sets</td><td class="mono">pages(viewer out) + A·(D + S) + 7·dropped</td><td class="r">3</td><td>
+<ul>
+<li><code>filter_sets</code> in one round.</li>
+<li>Then, for each dropped actor, the handler finds the reason: <code>has_id</code> (as Has), <code>in_contains</code> or <code>side_contains</code>.</li>
+<li>A ≤ 1,000.</li>
+</ul>
+</td></tr>
 </table>
 
-<p>Request size caps (<code>others</code> ≤ 100, pairs ≤ 1,000, list limits) make every row finite. Pages read for one request also never exceed the bytes of the lists it names: there is no readahead.</p>
+<p>Pages read for one request never exceed the bytes of the lists it names, because nothing reads ahead. Every graph access a handler makes, the response included, runs inside the pass closure, so these rows cover all of it.</p>
 
 <!-- ============================================================== -->
-<h2 id="io">8. Async I/O</h2>
+<h2 id="io">9. Async I/O</h2>
 
 <figure>
 <svg viewBox="0 0 960 250" role="img" aria-label="Measured O_DIRECT 4 KiB random read IOPS by thread count on the load box">
-  <text class="h" x="16" y="22">O_DIRECT 4 KiB random preads on the load box's NVMe (1 TB, PCIe 4), 5 s each, measured 2026-11-05</text>
+  <text class="h" x="16" y="22">O_DIRECT 4 KiB random preads on the load box's NVMe (1 TB, PCIe 4), 5 s each, 2026-11-05, during the archive crawl</text>
   <line class="lnd" x1="120" y1="200" x2="720" y2="200"/>
-  <!-- scale: 500k = 160 px -->
   <rect class="io" x="140" y="195.9" width="60" height="4.1"/><text class="mono" x="146" y="190">13k</text><text class="mu" x="152" y="216">1</text>
   <rect class="io" x="240" y="170.5" width="60" height="29.5"/><text class="mono" x="246" y="165">92k</text><text class="mu" x="252" y="216">8</text>
   <rect class="io" x="340" y="101.9" width="60" height="98.1"/><text class="mono" x="342" y="96">307k</text><text class="mu" x="350" y="216">32</text>
@@ -506,87 +638,139 @@ Err(ConnectError::internal("storage: read did not settle"))
   <text class="t2" x="740" y="184">64 KiB × 32: 5.5 GB/s</text>
   <text class="t2" x="740" y="204">1 MiB × 8: 6.4 GB/s</text>
 </svg>
-<figcaption>A small C probe over 1,020 export files (~70 GB, so not the page cache's), while the archive crawl ran on the same box. Latency buckets are powers of two.</figcaption>
+<figcaption>A small C probe over 1,020 export files (~70 GB, so not the page cache), taken while the archive crawl ran on the same box. Latency buckets are powers of two. These numbers are provisional, like E1 during the crawl, and E7 retakes them afterwards.</figcaption>
 </figure>
 
-<p>Default: a pool of 64 threads doing blocking <code>pread</code> on <code>O_DIRECT</code> fds, fed by two bounded queues (requests first, then writer prefetch and re-warm), with adjacent pages of one file coalesced into one read of up to 256 KiB. It reaches 384k reads/s on this disk at ~3.5 µs of CPU a read. That's 0.35 of a core at 100k misses/s, and it builds and runs everywhere. io_uring (one ring per I/O thread through the <code>io-uring</code> crate, no SQPOLL) would cut the CPU per read to roughly a third and reach deeper queues on one thread. That only pays above ~150k misses/s, and whether the target load gets there is a measurement, not a guess.</p>
+<p>The default backend is a pool of 64 threads doing blocking <code>preadv</code> on <code>O_DIRECT</code> fds straight into frames. It's fed by two bounded queues: request and writer misses first, then background work. Adjacent pages of one file are coalesced into one read of up to 256 KiB. On this disk it reaches 384k reads/s at ~3.5 µs of CPU a read, which is 0.35 of a core at 100k misses/s, and it builds and runs everywhere.</p>
+
+<p>io_uring (one ring per I/O thread through the <code>io-uring</code> crate, no SQPOLL) would cut the CPU per read to roughly a third, and reach deeper queues from one thread. That pays only above ~150k misses/s. Whether the target load gets there is a measurement, not a guess.</p>
 
 <table>
 <tr><th>Backend</th><th>Where</th><th>What</th></tr>
-<tr><td><code>DirectPool</code></td><td>Linux, production</td><td>O_DIRECT, 4 KiB-aligned buffers (frames are aligned), EIO retried 3× with 1/4/16 ms backoff</td></tr>
-<tr><td><code>Plain</code></td><td>CI, the Mac, tests</td><td>the same pool with buffered <code>pread</code> (<code>F_NOCACHE</code> on macOS); same checks</td></tr>
-<tr><td><code>Fault</code></td><td>tests, the fault-injection runs</td><td>wraps either one: EIO on a page set or with a probability, flip a byte after the read, short read, added latency</td></tr>
+<tr><td><code>DirectPool</code></td><td>Linux, production</td><td>O_DIRECT; frames are 4 KiB-aligned; EIO retried 3× with 1/4/16 ms backoff</td></tr>
+<tr><td><code>Plain</code></td><td>CI, the Mac, tests</td><td>the same pool with buffered <code>preadv</code> (<code>F_NOCACHE</code> on macOS); same checks</td></tr>
+<tr><td><code>Fault</code></td><td>tests, the fault-injection runs</td><td>wraps either one: EIO on a page set or at a probability, a flipped byte after the read, a short read, added latency</td></tr>
 <tr><td><code>Uring</code></td><td>only if E7 says so</td><td>same trait, completion-driven</td></tr>
 </table>
 
-<p>The deciding experiment is E7: the Tight case on the skewed mix at its sustained rate with pool sizes 16, 64 and 128. It records misses/s, queue wait p99 and I/O CPU as a share of server CPU. io_uring gets a prototype only if misses/s at the sustained rate exceed 150k, or I/O CPU exceeds 10% of the server's, or pool queue wait p99 exceeds 200 µs at 128 threads.</p>
+<p>Background I/O goes through a token bucket: compaction, verify, list stats, and the checkpoint's patch writes. The default is 200 MB/s and 5k IOPS, set by <code>--background-io</code>. ioprio does nothing on NVMe's <code>none</code> scheduler, so the bucket is the only lever. Every snapshot write uses <code>O_DIRECT</code> from aligned buffers and an fsync before the rename: build, patch files and compaction. Writes never fill the page cache inside marco's cgroup.</p>
+
+<p>E7 decides on io_uring. It runs the Tight case on the skewed mix at its sustained rate, with I/O pool sizes of 16, 64 and 128, and records misses/s, queue wait p99, and I/O CPU as a share of server CPU. io_uring gets a prototype only if one of these holds:</p>
+<ul>
+<li>misses/s at the sustained rate exceed 150k;</li>
+<li>I/O CPU exceeds 10% of the server's;</li>
+<li>queue wait p99 at 128 threads exceeds 200 µs.</li>
+</ul>
 
 <!-- ============================================================== -->
-<h2 id="writes">9. Writes</h2>
+<h2 id="writes">10. Writes</h2>
 
 <figure>
-<svg viewBox="0 0 960 120" role="img" aria-label="Writer batch: plan pass collects pages, blocking fetch with pins, then apply to both copies">
+<svg viewBox="0 0 960 130" role="img" aria-label="Writer batch: plan in rounds until nothing is pending, then apply to both copies with the pins held">
   <defs><marker id="e" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0,0 L10,5 L0,10 z"/></marker></defs>
-  <rect class="box" x="16" y="30" width="170" height="56" rx="6"/><text class="h" x="28" y="52">drain ≤ 4,096 recs</text><text class="mu" x="28" y="72">as today</text>
-  <rect class="okf" x="230" y="30" width="210" height="56" rx="6"/><text class="h" x="242" y="52">plan pass (Collect)</text><text class="mu" x="242" y="72">actor out lists, subject in sets</text>
-  <rect class="io" x="484" y="30" width="200" height="56" rx="6"/><text class="h" x="496" y="52">fetch, blocking</text><text class="mu" x="496" y="72">one parallel round, pinned</text>
-  <rect class="box" x="728" y="30" width="216" height="56" rx="6"/><text class="h" x="740" y="52">apply to both copies</text><text class="mu" x="740" y="72">Block mode; pins dropped after</text>
-  <path class="ln" d="M186,58 L228,58" marker-end="url(#e)"/><path class="ln" d="M440,58 L482,58" marker-end="url(#e)"/><path class="ln" d="M684,58 L726,58" marker-end="url(#e)"/>
-  <text class="mu" x="16" y="110">Writes stay as they are: deltas, segments, the two copies, decision 63's cursors. The writer only learns to make its base reads resident first.</text>
+  <rect class="box" x="16" y="30" width="160" height="56" rx="6"/><text class="h" x="28" y="52">drain ≤ 4,096 recs</text><text class="mu" x="28" y="72">as today</text>
+  <rect class="okf" x="216" y="30" width="200" height="56" rx="6"/><text class="h" x="228" y="52">plan pass</text><text class="mu" x="228" y="72">actor out lists, subject in sets</text>
+  <rect class="io" x="456" y="30" width="190" height="56" rx="6"/><text class="h" x="468" y="52">fetch, blocking</text><text class="mu" x="468" y="72">pins kept</text>
+  <rect class="box" x="696" y="30" width="248" height="56" rx="6"/><text class="h" x="708" y="52">apply to both copies</text><text class="mu" x="708" y="72">read_blocking; pins dropped after copy 2</text>
+  <path class="ln" d="M176,58 L214,58" marker-end="url(#e)"/><path class="ln" d="M416,58 L454,58" marker-end="url(#e)"/>
+  <path class="ln" d="M550,86 C550,110 316,110 316,88" marker-end="url(#e)"/><text class="mu" x="380" y="118">until nothing is pending</text>
+  <path class="ln" d="M416,44 C560,10 640,10 694,44" marker-end="url(#e)"/><text class="mu" x="520" y="16">clean</text>
 </svg>
 </figure>
 
-<p>An add reads the actor's out list (does the key exist, what did it name) and the subject's in set (is the pair new). A write can't stop halfway through a mutation, so the writer runs a read-only plan pass over the batch that calls the same lookups in Collect mode. It then fetches every missing page in one blocking parallel round on its own OS thread, pinned, and applies in Block mode. A miss the plan didn't predict (a status delete's whole out list, say) blocks only the writer thread, which is allowed. On the Tight case, a cold write costs one I/O round per batch of up to 4,096 records, not one per op. Checkpoint replay (<code>open_replayed</code>) uses the same batching.</p>
+<p>An add reads the actor's out list (does the key exist, what did it name) and the subject's in set (is the pair new). A write can't stop halfway through a mutation. So the writer first runs a read-only plan pass over the batch through the same lookups, fetches what's missing, and plans again until a pass comes back clean. Only then does it apply.</p>
+
+<p>The apply goes through <code>read_blocking</code>, and the plan's pins are held until the second copy is done. A miss the plan didn't predict (a status delete's whole out list, say) makes the apply fetch and retry a lookup: <code>read_blocking</code> is idempotent for reads, and the mutation happens after its reads succeed.</p>
+
+<p>The writer does wait on disk: one fetch round per dependency level per batch, on its own OS thread. At Tight a cold batch adds ~0.3-0.6 ms, against the 5 s segment interval. Writes, segments, the two copies and decision 63's cursors don't change.</p>
 
 <!-- ============================================================== -->
-<h2 id="ckpt">10. Checkpoints and the switch</h2>
+<h2 id="ckpt">11. Checkpoints: base plus patches</h2>
 
 <figure>
-<svg viewBox="0 0 960 330" role="img" aria-label="Memory during a checkpoint: the budget line is flat, new pinned parts are borrowed from the cache, remapped pages are shared">
-  <text class="h" x="16" y="22">store memory through one checkpoint (all shards dirty), budget never exceeded</text>
-  <line class="lne" x1="80" y1="50" x2="930" y2="50"/><text class="mu" x="84" y="44">--memory</text>
-  <line class="lnd" x1="80" y1="270" x2="930" y2="270"/>
-  <!-- pinned old -->
-  <rect class="pin" x="80" y="240" width="850" height="30"/><text class="mono" x="88" y="260">pinned: directory (shared, never reloaded)</text>
-  <rect class="pin" x="80" y="215" width="560" height="25"/><text class="mono" x="88" y="232">pinned parts of the old shard files</text>
-  <rect class="vio" x="440" y="190" width="200" height="25"/><text class="mono" x="446" y="207">new shards' pinned</text>
-  <rect class="pin" x="640" y="215" width="290" height="25"/><text class="mono" x="648" y="232">pinned parts of the new files</text>
-  <!-- cache -->
-  <rect class="cache" x="80" y="60" width="360" height="155"/>
-  <rect class="cache" x="440" y="60" width="200" height="130"/>
-  <rect class="okf" x="540" y="60" width="100" height="40"/><text class="mono" x="546" y="84">re-warm</text>
-  <rect class="cache" x="640" y="60" width="290" height="155"/>
-  <text class="mono" x="100" y="140">page cache</text>
-  <text class="mono" x="450" y="140">cache, shrunk</text>
-  <text class="mono" x="660" y="140">cache, refilled</text>
-  <!-- phases -->
-  <line class="lnd" x1="300" y1="56" x2="300" y2="300"/><line class="lnd" x1="440" y1="56" x2="440" y2="300"/><line class="lnd" x1="540" y1="56" x2="540" y2="300"/><line class="lnd" x1="640" y1="56" x2="640" y2="300"/>
-  <text class="mu" x="84" y="290">1 replay + write shards</text>
-  <text class="mu" x="84" y="304">streams old pages past the cache</text>
-  <text class="mu" x="304" y="290">2 commit</text>
-  <text class="mu" x="304" y="304">manifest rename</text>
-  <text class="mu" x="444" y="290">3 open new</text>
-  <text class="mu" x="444" y="304">borrow, remap</text>
-  <text class="mu" x="544" y="290">4 re-warm</text>
-  <text class="mu" x="544" y="304">re-packed pages</text>
-  <text class="mu" x="644" y="290">5 switch, then old files drop: their pinned parts and</text>
-  <text class="mu" x="644" y="304">the frames only they held go back to the cache</text>
+<svg viewBox="0 0 960 250" role="img" aria-label="A shard over time: an immutable base, patch files added by checkpoints, compaction folding them into a new base">
+  <defs><marker id="h" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+  <text class="h" x="16" y="22">one shard over time (manifest: shard k → base + patches, in order)</text>
+  <rect class="cache" x="16" y="40" width="300" height="34"/><text class="mono" x="24" y="61">base ~0.6 GB</text>
+  <rect class="okf" x="316" y="40" width="40" height="34"/><text class="mono" x="320" y="61">p1</text>
+  <rect class="okf" x="356" y="40" width="44" height="34"/><text class="mono" x="362" y="61">p2</text>
+  <rect class="okf" x="400" y="40" width="38" height="34"/><text class="mono" x="406" y="61">p3</text>
+  <text class="mu" x="450" y="54">each checkpoint adds ≤ 1 patch per changed shard: changed</text>
+  <text class="mu" x="450" y="68">small lists, changed suffix blocks, new pinned sections</text>
+  <rect class="bad" x="140" y="40" width="10" height="34"/><rect class="bad" x="200" y="40" width="8" height="34"/><rect class="bad" x="262" y="40" width="12" height="34"/><rect class="bad" x="340" y="40" width="8" height="34"/>
+  <text class="mu" x="16" y="92">red: garbage (old versions of lists a later file replaced); its pages stay resident while they hold any live list</text>
+  <path class="ln" d="M226,100 L226,124" marker-end="url(#h)"/>
+  <text class="mu" x="236" y="116">compaction: stream live lists past the cache, write a new base O_DIRECT, write it through, swap in place</text>
+  <rect class="cache" x="16" y="130" width="280" height="34"/><text class="mono" x="24" y="151">new base, no garbage</text>
+  <text class="mu" x="310" y="151">same logical content, so the swap doesn't touch deltas or the graph switch</text>
+  <text class="h" x="16" y="196">when compaction runs</text>
+  <text class="t2" x="16" y="216">budget below everything: when live bytes &lt; 70% of the shard's files, &gt; 8 patches, or its space passes 3 GiB (a few shards a day)</text>
+  <text class="t2" x="16" y="236">budget holds everything: also while resident garbage G &gt; H − P_new − R, highest-garbage shard first, one at a time</text>
 </svg>
-<figcaption>Purple is the only memory both versions need at once. It comes out of the page cache by eviction, never out of the budget.</figcaption>
 </figure>
 
+<p>A checkpoint writes only what changed. For each shard with changes, it writes one patch file. The patch holds the changed small lists whole, the changed suffix blocks of each changed big list's columns (an append changes only the tail block, and an insert or delete changes the blocks from that position on), and that shard's complete new pinned sections: index, heads, and sums for the patch's own pages. The manifest names each shard's base and its patches, and its rename is still the commit. Decision 63 doesn't change: no WAL, cursors in the manifest, replay after it.</p>
+
+<p>Unchanged pages never move, so every cached frame stays valid across the switch with no remap. Pages the checkpoint writes go straight from its buffers into the cache (write-through), so a fully resident server stays fully resident. Old versions of changed lists become garbage inside pages that still hold live lists, until compaction rewrites the shard.</p>
+
+<h3>R, the bytes a checkpoint writes</h3>
+<p>Checkpoints run every 3M ops or 24 h. The public instance ingested 1.20M ops in its last day, so a checkpoint comes daily. Of its edge changes, follows were +801k/−170k, blocks +187k/−3k and list items +18k/−11k. The archive's last 24 h (to 2026-11-05 16:43 UTC) is heavier: 1.91M follow creates from 323k actors to 753k subjects, and 375k deletes from 44k actors. R below uses the archive day, joined with follower and following counts, so it's the conservative one.</p>
+
+<table>
+<tr><th>Part (archive day)</th><th class="r">Changed</th><th class="r">Pages re-packed (first design)</th><th class="r">Patch bytes R</th></tr>
+<tr><td>Follow in sets ≤ 128 members</td><td class="r">414k sets</td><td class="r">1.7 GB</td><td class="r">0.02 GB</td></tr>
+<tr><td>Follow in sets &gt; 128 (suffix from the first change, k/(k+1) of the set)</td><td class="r">339k sets, 876k blocks</td><td class="r">0.58 GB</td><td class="r">0.58 GB</td></tr>
+<tr><td>Follow out lists ≤ 128 records</td><td class="r">216k lists</td><td class="r">0.88 GB</td><td class="r">0.06 GB</td></tr>
+<tr><td>Follow out lists &gt; 128: appended tail blocks, 2 columns</td><td class="r">125k lists</td><td class="r">~1.0 GB</td><td class="r">0.14 GB</td></tr>
+<tr><td>Follow out deletes: suffix of both columns</td><td class="r">44k actors</td><td class="r">0.13 GB</td><td class="r">0.13 GB</td></tr>
+<tr><td>By-subject suffixes (lists ≥ 4,096 records)</td><td class="r">4.5k lists</td><td class="r">0.14 GB</td><td class="r">0.14 GB</td></tr>
+<tr><td>Blocks and list items (scaled by their op counts)</td><td class="r"></td><td class="r">~0.7 GB</td><td class="r">~0.15 GB</td></tr>
+<tr><td><b>Total</b></td><td class="r"></td><td class="r"><b>~5.1 GB + a 40 GB rewrite</b></td><td class="r"><b>~1.2 GB</b></td></tr>
+</table>
+
+<p>Pinned sections add about 1.2 GB a checkpoint (P_new), because every shard's index changes somewhere. A daily checkpoint therefore writes about 2.4 GB, against the 37.7 GB the current snapshot format rewrites. It reads only the old versions of changed lists, through the cache, and takes seconds.</p>
+
+<p>Slack leaves, which let an insert rewrite one block instead of a suffix, would cut the in-set row to 0.24 GB and the delete and by-subject rows to about zero. That saves ~0.6 GB a day, and isn't worth by-subject keying on rkeys.</p>
+
+<figure>
+<svg viewBox="0 0 960 330" role="img" aria-label="Memory at the Fits case through a checkpoint and compaction: the switch takes new pinned parts plus the written-through patch pages from headroom; compaction frees garbage one shard at a time">
+  <text class="h" x="16" y="22">store memory at Fits through one day (GB, budget 47.2, headroom H = 3.4)</text>
+  <line class="lne" x1="80" y1="50" x2="930" y2="50"/><text class="mu" x="84" y="44">--memory 47.2</text>
+  <rect class="cache" x="80" y="110" width="850" height="160"/><text class="mono" x="100" y="200">pinned 2.3 + paged 41.5, all resident (43.8)</text>
+  <rect class="vio" x="300" y="80" width="140" height="30"/><text class="mono" x="306" y="99">new pinned 1.2</text>
+  <rect class="okf" x="300" y="56" width="140" height="24"/><text class="mono" x="306" y="73">patch R 1.2</text>
+  <rect class="okf" x="440" y="86" width="490" height="24"/><text class="mono" x="446" y="103">patch pages (now live) 1.2</text>
+  <rect class="bad" x="440" y="62" width="150" height="24"/><text class="mono" x="446" y="79">garbage 1.2</text>
+  <rect class="cache" x="590" y="62" width="40" height="24" style="opacity:.6"/>
+  <rect class="bad" x="630" y="62" width="300" height="24" style="opacity:.35"/>
+  <line class="lnd" x1="300" y1="44" x2="300" y2="290"/><line class="lnd" x1="440" y1="44" x2="440" y2="290"/><line class="lnd" x1="590" y1="44" x2="590" y2="290"/>
+  <text class="mu" x="84" y="290">day: writes go to deltas</text>
+  <text class="mu" x="84" y="304">(outside the budget)</text>
+  <text class="mu" x="304" y="290">checkpoint: P_new + R</text>
+  <text class="mu" x="304" y="304">≤ H (2.4 ≤ 3.4)</text>
+  <text class="mu" x="444" y="290">switch: old pinned freed;</text>
+  <text class="mu" x="444" y="304">old versions are garbage</text>
+  <text class="mu" x="594" y="290">compaction, one shard (≤ 0.7) at a time,</text>
+  <text class="mu" x="594" y="304">until G ≤ H − P_new − R before the next one</text>
+</svg>
+<figcaption>Purple and green are what the switch adds. Both come out of headroom, and at Half or Tight out of the page cache by eviction. Store memory never goes over <code>--memory</code>.</figcaption>
+</figure>
+
+<h3>The switch, step by step</h3>
 <ol>
-<li><b>Replay and write.</b> The checkpoint thread's <code>open_replayed</code> gets its files from the registry, the same <code>FileState</code>s the served copies use: no second pinned tier and no second cache. For each dirty shard it streams the old file's paged sections in 1 MiB <code>O_DIRECT</code> reads into two private buffers, checking page sums, and merges them with the deltas. A page none of whose lists changed is copied as-is, and the writer records the run <code>(old page, new page, count)</code>. A page with a changed list is re-packed, and the writer records which old pages fed it. Old bytes for changed lists come from the same stream, not the cache. Today's checkpoint rewrote the network in 20-22 s writing 37.7 GB, and the gate is 1.3× that.</li>
-<li><b>Commit.</b> The manifest rename, exactly as now. Decision 63 doesn't change: no WAL, cursors in the manifest, replay after it.</li>
-<li><b>Open the new snapshot.</b> Unchanged files come from the registry. For each new shard file the engine first evicts frames worth its pinned parts (~1.2 GB if every shard is dirty), then loads and checks them. For every copied run, resident frames gain the new file's slot as a second owner (a frame owns at most two slots, and eviction clears both). Copied pages cost no memory and no I/O.</li>
-<li><b>Re-warm.</b> Re-packed pages whose old versions were resident are read back on the low-priority queue into frames, evicting cold ones first. When the budget fits everything (the Fits case), this uses the switch headroom, and if that runs out the coldest pages go. The switch never waits for it, and what it doesn't finish turns into ordinary misses.</li>
-<li><b>Switch.</b> The writer replays the segments after the cut and publishes, as now. When the last Store holding an old shard file drops, its pinned parts free and its frames lose that owner. A frame with no owner left returns to the free list.</li>
+<li><b>Replay and write.</b> The checkpoint thread's <code>open_replayed</code> gets its files from the registry, so there's no second pinned tier and no second cache. It reads the base versions of changed lists through <code>read_blocking</code>, merges in the deltas, and writes each changed shard's patch with <code>O_DIRECT</code>, written through into the cache.</li>
+<li><b>Commit.</b> The manifest rename, as now.</li>
+<li><b>Open.</b> Every base and every earlier patch comes from the registry. The engine first borrows the memory for each new patch's pinned sections by returning 2 MiB groups (§6), then reads them.</li>
+<li><b>Switch.</b> The writer replays the segments after the cut and publishes, as now. When the last Store holding the old pinned parts drops, they're freed. A Store that a <code>SharedSnapshot</code> (series, verify, list stats) keeps alive across two checkpoints just keeps its files open: frames are keyed by file, so it reads correct pages and nothing needs a third owner.</li>
+<li><b>Compact</b> (the shard figure above). Compaction streams a shard's live lists past the cache, writes a new base with <code>O_DIRECT</code>, writes it through, commits a manifest naming the new base with no patches, and swaps the shard in place. The logical content is identical, so neither the deltas nor the graph copies change. Its extra memory is one shard, at most 0.7 GB.</li>
 </ol>
 
-<p>The extra memory at the switch is the new files' pinned parts plus the re-warmed pages. Both are taken from the cache, so store memory peaks at <code>--memory</code>, and what varies is how many pages go cold. That's the number E4 measures at 48 GiB, where two copies of a 38.5 GB snapshot can't fit and where today's mmap path lets the kernel evict the served copy's pages to make room for the new files. Over many checkpoints re-packed pages fill unevenly. A shard whose paged sections fall below 85% fill is re-packed whole at its next checkpoint, so copied runs don't decay into half-empty pages.</p>
+<p><b>The switch gate</b> is P_new + R ≤ H, where H is the budget less what's resident. At Fits on the archive day that's 1.2 + 1.2 = 2.4 ≤ 3.4 GB. When the budget doesn't hold everything, the same bytes come out of the cache by eviction, and the patch pages enter the small queue, where only reuse keeps them.</p>
+
+<p><b>Compaction cost.</b> When everything fits, compaction must clear about R of garbage a day so that G ≤ H − P_new − R = 1.0 GB holds at the next checkpoint. Garbage spreads evenly over shards, so that comes close to compacting every shard daily, about 40 GB of writes, rate-limited between checkpoints (Q5). Below full residency, garbage pages fall out of the cache, and compaction runs only on its disk triggers. Disk use stays under 1.43× live.</p>
 
 <!-- ============================================================== -->
-<h2 id="errors">11. Errors</h2>
+<h2 id="errors">12. Errors</h2>
 
 <figure>
 <svg viewBox="0 0 960 230" role="img" aria-label="Page states: absent, loading, resident, bad">
@@ -597,7 +781,7 @@ Err(ConnectError::internal("storage: read did not settle"))
   <rect class="bad" x="770" y="80" width="160" height="56" rx="28"/><text class="h" x="826" y="113">bad</text>
   <path class="ln" d="M170,100 L268,100" marker-end="url(#f)"/><text class="mu" x="178" y="92">first miss</text>
   <path class="ln" d="M420,100 L528,100" marker-end="url(#f)"/><text class="mu" x="428" y="92">read, sum ok</text>
-  <path class="ln" d="M605,136 C605,200 100,200 100,138" marker-end="url(#f)"/><text class="mu" x="300" y="196">evicted (slots cleared, frame retired after the epoch)</text>
+  <path class="ln" d="M605,136 C605,200 100,200 100,138" marker-end="url(#f)"/><text class="mu" x="250" y="196">evicted with no pins (slot cleared, frame retired after the epoch)</text>
   <path class="lne" d="M345,80 C400,20 760,20 840,78" marker-end="url(#f)"/><text class="mu" x="430" y="30">sum fails twice, or EIO after 3 retries, or short read past the file's end</text>
   <path class="ln" d="M345,136 L345,160 L232,160" marker-end="url(#f)"/><text class="mu" x="236" y="174">waiters (single-flight) get the one result</text>
   <text class="mu" x="770" y="160">not cached; later reads of it fail at</text>
@@ -608,184 +792,312 @@ Err(ConnectError::internal("storage: read did not settle"))
 
 <table>
 <tr><th>Failure</th><th>RPC gets</th><th>Engine does</th><th>Seen as</th></tr>
-<tr><td>Checksum mismatch (after one re-read)</td><td><code>data_loss</code>: <span class="mono">"shard-017-00000042.marco r0.in.blocks page 51203: checksum"</span></td><td>marks the page bad; never caches it</td><td><code>marco_store_read_errors_total{kind="checksum"}</code>, <code>marco_store_bad_pages</code> &gt; 0 → page alert; console lists the page</td></tr>
-<tr><td>EIO after 3 tries, or short read</td><td><code>unavailable</code>, same detail</td><td>marks the page bad</td><td><code>kind="eio"|"short"</code>; ≥ 64 distinct pages in 60 s → <code>/readyz</code> 503 "storage failing"</td></tr>
-<tr><td>EIO that a retry fixed</td><td>nothing</td><td>counts it</td><td><code>kind="eio_retried"</code> → warning, never a page</td></tr>
+<tr><td>Checksum mismatch (after one re-read)</td><td><code>data_loss</code>: <span class="mono">"shard-017 patch 00000042 r0.in.blocks page 51203: checksum"</span></td><td>marks the page bad; never caches it</td><td><code>marco_store_read_errors_total{kind="checksum"}</code>; <code>marco_store_bad_pages</code> &gt; 0 pages an alert; the console lists the page</td></tr>
+<tr><td>EIO after 3 tries, or a short read</td><td><code>unavailable</code>, same detail</td><td>marks the page bad</td><td><code>kind="eio"|"short"</code>; 64 or more distinct pages in 60 s → <code>/readyz</code> 503 "storage failing"</td></tr>
+<tr><td>EIO that a retry fixed</td><td>nothing</td><td>counts it</td><td><code>kind="eio_retried"</code> → a warning, never a page</td></tr>
 <tr><td>Pinned section bad at open</td><td>(no RPCs)</td><td>open fails naming the section, as a bad footer does today</td><td>process exits non-zero</td></tr>
-<tr><td>Bad page under a checkpoint's copy or re-pack</td><td>(none)</td><td>the checkpoint fails naming the page; segments keep accruing</td><td><code>marco_checkpoint_errors_total</code> (exists) → alert; fix is a rebuild or a restored file</td></tr>
-<tr><td>Writer hits a bad page</td><td>that write's result is an error</td><td>skips the op, as for a bad URI</td><td>writer error counter</td></tr>
+<tr><td>Bad page under a checkpoint's merge or a compaction</td><td>(none)</td><td>that checkpoint or compaction fails naming the page; segments keep accruing</td><td><code>marco_checkpoint_errors_total</code> (exists) → alert; the fix is a rebuild or a restored file</td></tr>
+<tr><td>Writer hits a bad page</td><td>that write's result is an error</td><td>skips the op, as for a bad URI. The op stays in its segment, so a restart after the repair applies it again</td><td>writer error counter</td></tr>
 </table>
 
-<p>A batch call fails whole when any page it needs is bad. Returning partial relationships would look like "no edge", which is a wrong answer and not a missing one. The process never dies on a disk error, which is the point of the change. The <code>verify</code> admin job reads every page and section by streaming, past the cache, and clears a bad mark when it reads the page clean (a transient fault).</p>
+<p>A batch call fails whole when any page it needs is bad. Partial relationships would read as "no edge", which is a wrong answer and not a missing one. The process never dies on a disk error, which is the point of the change. The <code>verify</code> admin job streams every page and section past the cache, and clears a bad mark when it reads the page clean (a transient fault).</p>
 
 <!-- ============================================================== -->
-<h2 id="obs">12. Observability</h2>
+<h2 id="obs">13. Observability</h2>
 
 <figure>
 <svg viewBox="0 0 960 200" role="img" aria-label="Console Storage page: a new Cache panel">
   <rect class="box" x="16" y="12" width="928" height="176" rx="8"/>
   <text class="h" x="30" y="34">Storage · Cache (new panel)</text>
   <rect class="pin" x="30" y="48" width="70" height="20"/><rect class="cache" x="100" y="48" width="430" height="20"/><rect class="cache" x="530" y="48" width="50" height="20" style="opacity:.55"/><rect class="box" x="580" y="48" width="60" height="20"/>
-  <text class="mu" x="30" y="84">pinned 2.1 · main 11.0 · small 1.2 · free 0.4 of 14.0 GB · rest of RSS 2.6 GB</text>
+  <text class="mu" x="30" y="84">pinned 2.3 · main 10.6 · small 1.2 · free 0.0 of 14.0 GB · garbage 0.3 · pins 41 MB · rest of RSS 2.6 GB</text>
   <text class="t2" x="660" y="62">hit ratio 97.8% · 12.4k misses/s</text>
   <text class="mono" x="30" y="110">hit ratio by structure   out.small 99.1  out.subj 98.0  out.rkey 96.2  bysubj 99.6  in.small 98.8  in.blocks 95.7</text>
-  <text class="mono" x="30" y="130">reads/s 12.4k · 54 MB/s · queue 3 (p99 18) · read p50 96 µs p99 410 µs · rounds/request p99 2</text>
-  <text class="mono" x="30" y="150">pages read per call (p99): has 2 · relationships 9 · block_pairs 3 · intersect 41 · list_out 3</text>
-  <text class="mono" x="30" y="170">bad pages 0 · read errors 0 · last switch: borrowed 1.2 GB, remapped 1.31M pages, re-warmed 84k, cold 0</text>
+  <text class="mono" x="30" y="130">reads/s 12.4k · 54 MB/s · I/O queue 3 (p99 18) · miss pool 9/64, wait p99 0.1 ms · read p50 110 µs p99 420 µs</text>
+  <text class="mono" x="30" y="150">pages per call (p99): has 2 · relationships 9 · block_pairs 3 · intersect 41 · list_out 3 · rounds p99 2</text>
+  <text class="mono" x="30" y="170">bad pages 0 · read errors 0 · last checkpoint: patch 1.2 GB, pinned 1.2 GB borrowed · compaction 3 shards today</text>
 </svg>
 <figcaption>Mock values. Sparklines per row come from the series the console already keeps.</figcaption>
 </figure>
 
 <table>
 <tr><th>Metric</th><th>Labels</th><th>Answers</th></tr>
-<tr><td><code>marco_store_bytes</code></td><td>part = budget, pinned_dir, pinned_index, pinned_heads, pinned_tables, cache_main, cache_small, free, borrowed</td><td>where the budget is</td></tr>
+<tr><td><code>marco_store_bytes</code></td><td>part = budget, pinned_dir, pinned_index, pinned_heads, pinned_tables, cache_main, cache_small, retired, pinned_frames, free, borrowed, garbage</td><td>where the budget is</td></tr>
 <tr><td><code>marco_store_lookups_total</code></td><td>structure = out_small, out_subj, out_rkey, out_bysubj, in_small, in_blocks; result = hit, miss; queue = small, main</td><td>hit ratio by tier and structure</td></tr>
-<tr><td><code>marco_store_request_pages</code> (histogram), <code>marco_store_request_read_bytes_total</code></td><td>rpc</td><td>disk reads and bytes per request type; checks the bounds table</td></tr>
-<tr><td><code>marco_store_request_rounds</code> (histogram), <code>marco_store_request_wait_seconds</code></td><td>rpc</td><td>I/O rounds and time spent waiting on them</td></tr>
-<tr><td><code>marco_store_io_seconds</code> (histogram), <code>marco_store_io_queue_depth</code>, <code>marco_store_io_bytes_total</code></td><td>queue = request, background, bypass</td><td>device latency, queue depth, bytes by purpose</td></tr>
+<tr><td><code>marco_rpc_seconds</code> (histogram)</td><td>rpc, path = fast, pool</td><td>latency; <code>path="fast"</code> is the hit-only set E9 compares</td></tr>
+<tr><td><code>marco_store_request_pages</code>, <code>marco_store_request_rounds</code> (histograms)</td><td>rpc</td><td>disk reads and rounds per request type; checks the bounds table</td></tr>
+<tr><td><code>marco_store_miss_pool_busy</code>, <code>marco_store_miss_pool_wait_seconds</code>, <code>marco_store_busy_total</code></td><td></td><td>the miss pool, and requests refused when it's full</td></tr>
+<tr><td><code>marco_store_io_seconds</code> (histogram), <code>marco_store_io_queue_depth</code>, <code>marco_store_io_bytes_total</code></td><td>queue = request, background</td><td>device latency, queue depth, bytes by purpose</td></tr>
 <tr><td><code>marco_store_read_errors_total</code>, <code>marco_store_bad_pages</code></td><td>kind = checksum, eio, eio_retried, short</td><td>errors; alerts</td></tr>
 <tr><td><code>marco_store_evictions_total</code>, <code>marco_store_ghost_hits_total</code></td><td>queue</td><td>policy health</td></tr>
-<tr><td><code>marco_store_switch_*</code></td><td>borrowed_bytes, remapped_pages, rewarmed_pages, cold_pages, seconds</td><td>the checkpoint switch bound</td></tr>
-<tr><td><code>marco_store_bytes_used_total</code></td><td>structure</td><td>bytes of lists and blocks actually read by requests, so bytes read ÷ bytes used is a ratio on /metrics</td></tr>
+<tr><td><code>marco_store_checkpoint_bytes</code>, <code>marco_store_compaction_*</code></td><td>part = patch, pinned; shards, bytes, seconds</td><td>R per checkpoint, P_new, compaction volume</td></tr>
+<tr><td><code>marco_store_bytes_used_total</code></td><td>structure</td><td>bytes of lists and blocks requests actually read, for bytes read ÷ bytes used</td></tr>
 </table>
 
-<p>The existing <code>marco_snapshot_cached_bytes</code> (mincore) and the "Cold open: mmap + footer checks" stat go away. Open time becomes "load + verify", split into pinned load, page load and replay. The admin overview proto gains a <code>Cache</code> message carrying the panel's numbers. Alert rules live on the deploy side. <code>marco_store_bad_pages &gt; 0</code> pages. <code>eio_retried</code>, and a hit ratio under 80% for 15 min, are warnings. <code>/readyz</code> covers the storm case.</p>
+<p>The existing <code>marco_snapshot_cached_bytes</code> (mincore) and the "Cold open: mmap + footer checks" stat go away. Open time becomes "load + verify", split into pinned load, page load and replay. The admin overview proto gains a <code>Cache</code> message carrying the panel's numbers. Alert rules live on the deploy side. <code>marco_store_bad_pages &gt; 0</code> pages. <code>eio_retried</code>, a hit ratio under 80% for 15 min, and busy refusals are warnings. <code>/readyz</code> covers the storm case.</p>
 
 <!-- ============================================================== -->
-<h2 id="measure">13. Measurement plan and gates</h2>
+<h2 id="measure">14. Measurement plan and gates</h2>
 
 <table>
-<tr><th>Case</th><th>cgroup v2 limit (page cache counted)</th><th>mmap, prefault</th><th>mmap, lazy</th><th>engine (<code>--memory</code>)</th><th>When on the load box</th></tr>
-<tr><td><b>Fits</b> (headline, at parity)</td><td class="mono">MemoryMax=48G, swap 0</td><td>yes</td><td>yes</td><td>44 GiB, everything loaded at open</td><td>after the archive crawl ends (~2026-11-06 18:00 UTC)</td></tr>
-<tr><td><b>Half</b> (public-instance size)</td><td class="mono">MemoryMax=16G</td><td>yes</td><td>yes</td><td>13 GiB</td><td>now: 16 GiB + client stay under 24 GiB</td></tr>
-<tr><td><b>Tight</b></td><td class="mono">MemoryMax=8G</td><td>yes</td><td>yes</td><td>6 GiB</td><td>now</td></tr>
+<tr><th>Case</th><th>cgroup v2 limit (page cache counted)</th><th>Baselines</th><th>Engine (<code>--memory</code>)</th><th>When on the load box</th></tr>
+<tr><td><b>Fits</b> (headline, at parity)</td><td class="mono">MemoryMax=48G, swap 0</td><td>mmap prefault on FORMAT 5 and on FORMAT 6</td><td>44 GiB, everything loaded at open</td><td>after the archive crawl ends (~2026-11-06 18:00 UTC), back to back with its baselines</td></tr>
+<tr><td><b>Half</b> (public-instance size, 4 server threads)</td><td class="mono">MemoryMax=16G</td><td>mmap prefault, lazy, lazy with <code>--mmap-advice random</code>; FORMAT 5 and FORMAT 6</td><td>13 GiB</td><td>provisional runs during the crawl (under 24 GiB in all); official ones after it, back to back with the engine</td></tr>
+<tr><td><b>Tight</b></td><td class="mono">MemoryMax=8G</td><td>as Half</td><td>6 GiB</td><td>as Half</td></tr>
 </table>
 
-<p>Each case runs both mixes from <code>docs/read-mix.html</code> (v2 as the main one: BlockPairs per response, counted known followers, with v1 at Fits for continuity) with two actor distributions, uniform and skewed. Server on 16 threads (cores 0-7), the lean client on 16 more, as in <code>perf.html</code>. Three repeats per point to measure noise. The snapshot is the whole network rebuilt from the archive export, in FORMAT 5 for the mmap baselines and FORMAT 6 for the engine. Both carry follows and blocks, from the same export.</p>
+<p>Each case runs both mixes from <code>docs/read-mix.html</code>: v2 as the main one (BlockPairs per response, counted known followers) and v1 at Fits for continuity. Each mix runs with two actor distributions, uniform and skewed. Fits and Tight use 16 server threads on cores 0-7 and the lean client on 16 more, as in <code>perf.html</code>. Half uses 4 server threads, as the public instance has. Three repeats per point measure the noise. Each repeat is a seeded request stream, so the mmap and engine runs replay the same requests.</p>
+
+<p>The snapshots are the whole network with follows, blocks and list items, rebuilt from the same archive export. mmap runs on FORMAT 5 and, from phase 3b on, on FORMAT 6, so that the engine gets no credit for the layout. The engine runs on FORMAT 6.</p>
+
+<h3>Making the baselines fair</h3>
+<ul>
+<li><b>Evict before each run.</b> Before every mmap run, evict every snapshot file (<code>posix_fadvise DONTNEED</code>, then <code>vmtouch -e</code>). Then check that <code>memory.stat file</code> in the new scope starts near zero, and that <code>io.stat</code> rbytes grows during warm-up. Otherwise pages charged to an earlier scope give mmap free memory.</li>
+<li><b>Measure memory per window.</b> Reset <code>memory.peak</code> per measurement window (per-fd reset, which this kernel has) and sample <code>memory.current</code>, so that peaks exclude open.</li>
+<li><b>Same conditions for both.</b> The disk numbers in §9 and any E1 run made during the crawl are provisional. The official E1 and E2 for each case run back to back after the crawl, on the same box state.</li>
+<li><b>Deployment shape (E10).</b> The public instance is a 16 GiB, 4-vCPU VM on virtio-blk, where <code>O_DIRECT</code> can still be served from the host's page cache. One run in that shape is informational. The gates don't cover VM I/O.</li>
+</ul>
 
 <h3>The skew, and why</h3>
-<p>AppView reads have two sides, and they're skewed differently. Both weights come from the archive's public records (latest version of each record), exported by an internal script:</p>
+<p>AppView reads have two sides, and they're skewed differently. Both weights come from the archive's public records (the latest version of each record), exported by an internal script.</p>
 <ul>
-<li><b>Viewers</b> (the actor of relationships, known followers, follows pages, filters): DIDs with at least one record created in the 30 days before the snapshot's cut, weighted by distinct active days (1-30). The read mix is per active user, and accounts that write on more days open the app on more days. Lurkers who never write are missed, and the uniform run covers the cold tail.</li>
-<li><b>Others and subjects</b> (feed and thread authors, profiles, block-pair authors, known-followers subjects): weighted by likes received in the last 7 days, plus 1 for any DID that posted. An author shows up in hydrations when their posts are shown, and likes are a roughly steady fraction of views, so likes received tracks exposure. Follower count would over-weight big accounts that have gone quiet. It runs as a sensitivity check (<code>--subject-weights followers</code>) at Half only.</li>
+<li><b>Viewers</b> (the actor of relationships, known followers, follows pages, filters): DIDs with at least one record created in the 30 days before the snapshot's cut, weighted by distinct active days (1-30). The read mix is per active user, and accounts that write on more days open the app on more days. Lurkers who never write are missed, and the uniform run covers that cold tail.</li>
+<li><b>Others and subjects</b> (feed and thread authors, profiles, block-pair authors, known-followers subjects): weighted by likes received in the last 7 days, plus 1 for any DID that posted. An author shows up in hydrations when their posts are shown, and likes are a roughly steady fraction of views, so likes received tracks exposure. Follower count would over-weight big accounts that have gone quiet. It runs as a sensitivity check at Half only.</li>
 </ul>
-<p>Every run reports the share of draws that land on the top 1% and top 10% of weights, and distinct lists touched per minute, so runs are comparable. The public instance's request logs were the other candidate. If an AppView's traffic reaches it, they replace these weights, since they'd be the real thing.</p>
+<p>Every run reports the share of draws landing on the top 1% and top 10% of weights, and the distinct lists touched per minute, so runs can be compared. If an AppView's traffic ever reaches the public instance, its request logs would be the real thing and would replace these weights.</p>
 
 <h3>Experiments</h3>
 <table>
 <tr><th>Id</th><th>What</th><th>Reports</th></tr>
-<tr><td>E1</td><td>mmap baselines: every case × prefault/lazy × uniform/skew × v2 (v1 at Fits)</td><td>closed-loop max throughput; sustained open-loop rate (no queue growth, p50 &lt; 1 ms); p50/p99/p999 per RPC at 50% and 90% of mmap-prefault's sustained rate; cgroup <code>io.stat</code> rbytes; <code>memory.peak</code></td></tr>
-<tr><td>E2</td><td>engine: the same matrix</td><td>the same, plus hit ratios by structure, pages and rounds per RPC, bytes read ÷ bytes used</td></tr>
-<tr><td>E3</td><td>open time with a cold page cache (<code>posix_fadvise DONTNEED</code> on every file first): mmap prefault until populate ends; engine until loaded and verified</td><td>seconds to ready, split pinned / pages / replay; read GB/s</td></tr>
-<tr><td>E4</td><td>a checkpoint under the v2 skewed load at 50% of sustained, live Jetstream writes, at each case; at Fits the headline</td><td>checkpoint seconds; <code>memory.peak</code> over the window; engine borrowed/remapped/re-warmed/cold pages; p99 and p999 in the 60 s around the switch vs steady; OOM kills (must be 0)</td></tr>
-<tr><td>E5</td><td>write throughput: replay a fixed hour of segments into the snapshot (catch-up), then live Jetstream lag at each case</td><td>ops/s applied, writer batch latency, Jetstream lag p99</td></tr>
-<tr><td>E6</td><td>faults: <code>Fault</code> backend with EIO on 10 pages, then a flipped byte in a copy of one shard file on disk; for contrast, mmap with that file truncated under it</td><td>RPC codes for requests touching those pages; p99 of the others unchanged; bad-pages gauge; /readyz; mmap: SIGBUS</td></tr>
-<tr><td>E7</td><td>I/O backend: Tight, skewed v2, pool 16/64/128</td><td>misses/s, queue wait p99, I/O CPU share; decides io_uring per section 8</td></tr>
-<tr><td>E8</td><td>heat-ordered small lists (Q4): Tight and Half, skewed, both layouts</td><td>misses/s and hit ratio of <code>out_small</code>/<code>in_small</code>; adopt at ≥ 20% fewer misses</td></tr>
-<tr><td>E9</td><td>hit-only latency: from E2 at Half, requests that read nothing from disk</td><td>their p99 vs the same requests at Fits: shows misses don't hold up hits (no worker blocking)</td></tr>
+<tr><td>E1</td><td>mmap baselines: every case × the baselines above × uniform/skew × v2 (and v1 at Fits)</td><td>closed-loop max throughput; sustained open-loop rate (no queue growth, p50 &lt; 1 ms); p50/p99/p999 per RPC at 50% and 90% of mmap-prefault's sustained rate; <code>io.stat</code> rbytes; <code>memory.current</code>/peak per window; checkpoint seconds</td></tr>
+<tr><td>E2</td><td>engine: the same matrix, same seeds</td><td>the same, plus hit ratios by structure, pages and rounds per RPC, bytes read ÷ bytes used, miss-pool wait</td></tr>
+<tr><td>E3</td><td>open time from an evicted page cache: mmap prefault until populate ends; engine until loaded and verified</td><td>seconds to ready, split pinned / pages / replay; read GB/s</td></tr>
+<tr><td>E4</td><td>checkpoint and compaction of a full <code>checkpoint_ops</code>: 3M ops from the archive's most recent days, written as segments, replayed under the v2 skewed load at 50% of sustained, at each case. Fits is the headline</td><td>R and P_new per checkpoint; checkpoint seconds; memory over the window; p99 and p999 in the 60 s around the switch vs steady; garbage and compaction volume over a simulated week (7 such days); OOM kills (must be 0)</td></tr>
+<tr><td>E5</td><td>writes: replay a fixed day of segments (catch-up), then live Jetstream lag, at each case</td><td>ops/s applied, writer batch latency, Jetstream lag p99</td></tr>
+<tr><td>E6</td><td>faults: the <code>Fault</code> backend with EIO on 10 pages, then a flipped byte in a copy of one shard file on disk; for contrast, mmap with that file truncated under it</td><td>RPC codes for requests touching those pages; p99 of the others; the bad-pages gauge; <code>/readyz</code>; mmap: SIGBUS</td></tr>
+<tr><td>E7</td><td>I/O backend: Tight, skewed v2, I/O pool of 16, 64 or 128</td><td>misses/s, queue wait p99, I/O CPU share; decides io_uring (§9)</td></tr>
+<tr><td>E8</td><td>heat-ordered small lists (Q4): Tight and Half, skewed, both layouts</td><td>misses/s and hit ratio of <code>out_small</code>/<code>in_small</code>; adopt at ≥ 20% fewer misses in both</td></tr>
+<tr><td>E9</td><td>hit-only latency: from E2 at Half, <code>path="fast"</code> requests</td><td>their p99 against Fits': shows that misses don't hold up hits</td></tr>
+<tr><td>E10</td><td>deployment shape: Half settings in a 16 GiB, 4-vCPU VM on virtio-blk</td><td>the E2 report; informational, not gated</td></tr>
 </table>
 
 <h3>Pass gates</h3>
-<p>"Meaningfully slower" means more than 5% less throughput, or a p99 more than 10% (and 20 µs) higher at the same offered load. 5% is meant as twice the run-to-run spread. E1's three repeats measure that spread, and if it comes out over 2.5% the gate becomes twice the measured spread, since a gate tighter than the noise can't be passed or failed.</p>
+<p>"Meaningfully slower" means more than 5% less throughput, or a p99 more than 10% (and 20 µs) higher, at the same offered load. 5% is meant as twice the run-to-run spread. E1's repeats measure that spread. If it comes out over 2.5%, the gate becomes twice the measured spread, since a gate tighter than the noise can't be passed or failed. Engine numbers are compared with the better of the FORMAT 5 and FORMAT 6 baselines.</p>
 <table>
-<tr><th>Case</th><th>Gate (engine vs mmap in the same case)</th></tr>
-<tr><td>Fits</td><td class="gate">closed-loop max and sustained rate ≥ 95% of prefault; p50 ≤ 1.05×, p99 ≤ 1.10×, p999 ≤ 1.25× per RPC, both mixes and distributions; 0 disk reads on the request path after open (counter); open to ready ≤ 1.5× prefault's and ≤ 60 s; E4 at 48 GiB: no OOM, store memory ≤ <code>--memory</code> throughout, switch-window p99 ≤ 2× steady and no worse than mmap's switch window, cold pages after the switch ≤ 1% of re-packed</td></tr>
-<tr><td>Half</td><td class="gate">skewed v2: sustained rate ≥ mmap-lazy's and p99 ≤ 0.5× mmap-lazy's; p999 ≤ 5 ms; bytes read ÷ bytes used ≤ 3 (report mmap's from <code>io.stat</code>); E9 hit-only p99 ≤ 1.2× Fits'; every RPC under its bounds row</td></tr>
-<tr><td>Tight</td><td class="gate">no OOM; serves both distributions; p99 ≤ mmap-lazy's; throughput reported, not gated</td></tr>
-<tr><td>Writes</td><td class="gate">E5 catch-up ops/s ≥ 95% of mmap at Fits and ≥ 80% at Half; checkpoint seconds ≤ 1.3× (today 20-22 s)</td></tr>
-<tr><td>Faults</td><td class="gate">every faulted request gets <code>data_loss</code> or <code>unavailable</code> naming the page; 0 process deaths; other requests' p99 within 10%; one bad page leaves /readyz ready</td></tr>
-<tr><td>Build</td><td class="gate">whole-network FORMAT 6 build ≤ 1.3× today's 115 s wall and under 24 GiB RSS; sizes within 10% of section 4's estimates</td></tr>
+<tr><th>Case</th><th>Gate (engine against mmap in the same case and window)</th></tr>
+<tr><td>Fits</td><td class="gate">
+<ul>
+<li>Throughput: closed-loop max and sustained rate ≥ 95% of prefault.</li>
+<li>Latency: p50 ≤ 1.05×, p99 ≤ 1.10× and p999 ≤ 1.25× per RPC, for both mixes and both distributions.</li>
+<li>0 disk reads on the request path after open (counter).</li>
+<li>Open to ready ≤ 1.5× prefault's and ≤ 60 s.</li>
+<li>E4: P_new + R ≤ H on every checkpoint, no OOM, RSS ≤ cgroup limit and store memory ≤ <code>--memory</code> throughout. Switch-window p99 ≤ 2× steady and no worse than mmap's. Garbage ≤ H − P_new − R before each checkpoint through the simulated week.</li>
+</ul>
+</td></tr>
+<tr><td>Half</td><td class="gate">
+<ul>
+<li>Skewed v2: sustained rate ≥ the best mmap-lazy variant's, and p99 ≤ 0.5× of it.</li>
+<li>p999 ≤ 5 ms.</li>
+<li>Bytes read ÷ bytes used ≤ 3 (mmap's reported from <code>io.stat</code> over the engine's bytes used for the same seed).</li>
+<li>E9: fast-path p99 ≤ 1.2× Fits'.</li>
+<li>Every RPC under its bounds row.</li>
+</ul>
+</td></tr>
+<tr><td>Tight</td><td class="gate">no OOM; serves both distributions; p99 ≤ the best mmap-lazy variant's; throughput reported, not gated</td></tr>
+<tr><td>Writes</td><td class="gate">E5 catch-up ops/s ≥ 95% of mmap at Fits and ≥ 80% at Half; checkpoint seconds ≤ E1's mmap checkpoint (29-30 s whole network today)</td></tr>
+<tr><td>Faults</td><td class="gate">every faulted request gets <code>data_loss</code> or <code>unavailable</code> naming the page; 0 process deaths; other requests' p99 within 10%; one bad page leaves <code>/readyz</code> ready</td></tr>
+<tr><td>Build</td><td class="gate">whole-network FORMAT 6 build with lists ≤ 1.3× today's 127 s wall and under 24 GiB RSS; sizes within 10% of §5's estimates</td></tr>
 </table>
 
-<p>Memory on the load box: the archive crawl holds ~20 GiB until about 2026-11-06 18:00 UTC. Until then runs keep the box under 24 GiB in all: Half and Tight cases, builds one at a time (a build peaks at 10.6 GB RSS), no Fits. Fits runs and E4 at 48 GiB go after the crawl. Nobody touches the crawl's process or files.</p>
+<p>Memory on the load box: the archive crawl holds ~20 GiB until about 2026-11-06 18:00 UTC. Until then, runs keep the box under 24 GiB in all: provisional Half and Tight runs only, with builds run one at a time (a build with lists peaks at ~11 GB RSS). Nobody touches the crawl's process or files.</p>
 
 <!-- ============================================================== -->
-<h2 id="phases">14. Phase plan</h2>
+<h2 id="phases">15. Phase plan</h2>
 
 <figure>
-<svg viewBox="0 0 960 225" role="img" aria-label="Phase timeline: three lanes start in parallel, then read path, switch, measure and cut over">
+<svg viewBox="0 0 960 300" role="img" aria-label="Phase DAG: 0 interface first; 1 baseline in parallel; 2 engine and 3a-3c format in parallel after 0; 4 needs 2 and 3b; 5 needs 3c and 4; 6 needs 1 and 5">
   <defs><marker id="g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0,0 L10,5 L0,10 z"/></marker></defs>
-  <text class="mu" x="16" y="20">each bar is one CR; parallel lanes start together; the server works at every step (mmap stays the default until phase 6)</text>
-  <rect class="okf" x="16" y="34" width="300" height="40" rx="6"/><text class="h" x="26" y="54">1 Baseline + skew harness</text><text class="mu" x="26" y="68">E1 Half/Tight now, Fits after the crawl</text>
-  <rect class="cache" x="16" y="88" width="250" height="40" rx="6"/><text class="h" x="26" y="108">2 Engine core</text><text class="mu" x="26" y="122">pages, I/O, cache, budget</text>
-  <rect class="pin" x="16" y="142" width="290" height="40" rx="6"/><text class="h" x="26" y="162">3 FORMAT 6 over mmap</text><text class="mu" x="26" y="176">builder, structures, checkpoint re-pack</text>
-  <rect class="io" x="330" y="112" width="240" height="40" rx="6"/><text class="h" x="340" y="132">4 Miss-aware read path</text><text class="mu" x="340" y="146">--storage engine, --memory, errors</text>
-  <rect class="vio" x="590" y="112" width="190" height="40" rx="6"/><text class="h" x="600" y="132">5 Switch + ops</text><text class="mu" x="600" y="146">remap, borrow, console</text>
-  <rect class="okf" x="800" y="60" width="144" height="92" rx="6"/><text class="h" x="810" y="80">6 Measure,</text><text class="h" x="810" y="96">cut over</text><text class="mu" x="810" y="114">E1-E9, gates,</text><text class="mu" x="810" y="128">default engine,</text><text class="mu" x="810" y="142">mmap removed</text>
-  <path class="ln" d="M266,108 L328,128" marker-end="url(#g)"/><path class="ln" d="M306,162 L328,140" marker-end="url(#g)"/>
-  <path class="ln" d="M570,132 L588,132" marker-end="url(#g)"/><path class="ln" d="M780,132 L798,132" marker-end="url(#g)"/>
-  <path class="lnd" d="M316,54 L798,80" marker-end="url(#g)"/>
-  <line class="lne" x1="560" y1="56" x2="560" y2="80"/><text class="mu" x="440" y="96">crawl ends ~2026-11-06 18:00 UTC: Fits runs unlock</text>
-  <text class="mu" x="16" y="214">At this repo's pace each phase is hours, not days; phase 3 is the biggest diff, phase 4 the riskiest.</text>
+  <text class="mu" x="16" y="20">each box is one CR; arrows are needs; main stays working (tests, a FORMAT 6 dev server) and the public instance stays pinned to its image until 6</text>
+  <rect class="okf" x="16" y="36" width="250" height="40" rx="6"/><text class="h" x="26" y="56">1 Baseline + skew harness</text><text class="mu" x="26" y="70">provisional now, official after the crawl</text>
+  <rect class="box" x="16" y="120" width="130" height="40" rx="6"/><text class="h" x="26" y="140">0 Interfaces</text><text class="mu" x="26" y="154">types, footer, sums</text>
+  <rect class="cache" x="190" y="96" width="170" height="40" rx="6"/><text class="h" x="200" y="116">2 Engine core</text><text class="mu" x="200" y="130">I/O, cache, budget</text>
+  <rect class="pin" x="190" y="152" width="170" height="40" rx="6"/><text class="h" x="200" y="172">3a Codecs + builder</text><text class="mu" x="200" y="186">FORMAT 6 writer</text>
+  <rect class="pin" x="390" y="152" width="170" height="40" rx="6"/><text class="h" x="400" y="172">3b Reads over mmap</text><text class="mu" x="400" y="186">Blocks, R&lt;T&gt;, all callers</text>
+  <rect class="pin" x="390" y="210" width="170" height="40" rx="6"/><text class="h" x="400" y="230">3c Patch checkpoints</text><text class="mu" x="400" y="244">patches, compaction</text>
+  <rect class="io" x="590" y="110" width="160" height="40" rx="6"/><text class="h" x="600" y="130">4 Read path</text><text class="mu" x="600" y="144">fast pass, miss pool</text>
+  <rect class="vio" x="590" y="190" width="160" height="40" rx="6"/><text class="h" x="600" y="210">5 Engine checkpoints</text><text class="mu" x="600" y="224">write-through, ops</text>
+  <rect class="okf" x="790" y="120" width="154" height="92" rx="6"/><text class="h" x="800" y="140">6 Measure,</text><text class="h" x="800" y="156">cut over</text><text class="mu" x="800" y="174">E1-E10, gates,</text><text class="mu" x="800" y="188">rebuild + deploy,</text><text class="mu" x="800" y="202">mmap removed</text>
+  <path class="ln" d="M146,134 L188,118" marker-end="url(#g)"/><path class="ln" d="M146,146 L188,170" marker-end="url(#g)"/>
+  <path class="ln" d="M360,172 L388,172" marker-end="url(#g)"/><path class="ln" d="M475,192 L475,208" marker-end="url(#g)"/>
+  <path class="ln" d="M360,116 L588,126" marker-end="url(#g)"/><path class="ln" d="M560,166 L588,140" marker-end="url(#g)"/>
+  <path class="ln" d="M670,150 L670,188" marker-end="url(#g)"/><path class="ln" d="M560,230 L588,214" marker-end="url(#g)"/>
+  <path class="ln" d="M750,210 L788,196" marker-end="url(#g)"/>
+  <path class="lnd" d="M266,46 L866,46 L866,118" marker-end="url(#g)"/>
+  <line class="lne" x1="520" y1="36" x2="520" y2="56"/><text class="mu" x="530" y="70">crawl ends ~2026-11-06 18:00 UTC: official runs unlock</text>
+  <text class="mu" x="16" y="285">Parallel: 1 from the start; 2 and 3a-3c after 0. Phase 3b is the widest diff, 4 the riskiest.</text>
 </svg>
 </figure>
 
-<h3>Phase 1 · Baseline and skew harness <span class="tag c">parallel from the start</span></h3>
+<h3>Phase 0 · Interfaces <span class="tag w">first; small</span></h3>
 <ul>
-<li>Internal export script: viewer and subject weight files from the archive (section 13), written to <code>internal/raw-storage/</code>.</li>
-<li><code>marco-harness perf-inputs --viewer-weights F --subject-weights F</code>: weighted pools next to the existing ones; mix files name them (<code>"actor": "viewer_skew"</code>, <code>"subjects": {"pool": "author_skew"}</code>). The report gains top-1%/10% shares and distinct lists per minute.</li>
-<li>An internal run script: cgroup v2 scopes (<code>systemd-run --user --scope -p MemoryMax= -p MemorySwapMax=0</code>), <code>memory.peak</code> and <code>io.stat</code> collection, cold-cache open via <code>fadvise</code>.</li>
-<li>E1 on FORMAT 5: Half and Tight right away, Fits after the crawl. Results in <code>internal/raw-storage/</code>.</li>
-<li><b>Tests:</b> weighted draws match their weights (chi-square on 1M draws); mix files with the new pools load; the existing harness tests pass.</li>
-<li><b>Leaves:</b> the baseline numbers every later gate compares against. No server change.</li>
+<li>The page-sum function (seeded xxh3_64, low 32 bits), 4096-aligned paged sections, footer section kinds (pinned or paged), and file kinds (base or patch).</li>
+<li>The manifest shape: shard → base + patches.</li>
+<li>Page and file ids.</li>
+<li><code>Pending</code>, <code>R&lt;T&gt;</code>, <code>ReadCx&lt;'g&gt;</code> with the borrowed guard and interior mutability, and <code>Blocks</code>, all as stubs with a trivial always-resident implementation.</li>
+<li><b>Tests:</b> sums are stable and seeded; footer round trips; a compile-fail test showing that a slice can't outlive the guard.</li>
+<li><b>Leaves:</b> the types phases 2 and 3 build against.</li>
 </ul>
 
-<h3>Phase 2 · Engine core <span class="tag c">parallel from the start</span></h3>
+<h3>Phase 1 · Baseline and skew harness <span class="tag c">parallel from the start</span></h3>
 <ul>
-<li><code>marco-core::store::{page, io, cache, engine}</code>: page sums, the <code>IoBackend</code> trait with <code>DirectPool</code>, <code>Plain</code> and <code>Fault</code>; the frame arena (anonymous, <code>MADV_HUGEPAGE</code>), per-file slot tables, S3-FIFO with ghost, epoch reclamation (crossbeam-epoch), pins, single-flight, two priority queues, coalescing, budget accounting with <code>borrow()</code>; the bad-page set; the file registry; core counters.</li>
-<li>A <code>PageFile</code> test format (a file of 4 KiB pages with a sums section) so the engine is tested without FORMAT 6.</li>
-<li><b>Tests:</b> stress with 32 reader threads plus a tiny budget, every page's content tagged with its id and checked on every read (catches a reused frame); scan resistance (a hot set keeps ≥ 90% hits through a 10× cache-size scan); single-flight (64 concurrent misses on one page → 1 read); budget never exceeded (debug assertion on every allocation); EIO, flipped byte and short read → the right error and a bad page; <code>Plain</code> runs in CI and on the Mac; a criterion bench of the hit path (target ≤ 15 ns per page lookup including the epoch pin per pass).</li>
+<li>An internal export script for the viewer and subject weights.</li>
+<li>Weighted pools in <code>perf-inputs</code> and mix files; seeded request streams.</li>
+<li><code>--mmap-advice random</code> on the server.</li>
+<li>An internal run script: cgroup v2 scopes, evicting snapshot files before mmap runs, <code>memory.stat</code>/<code>io.stat</code> checks, per-window peaks.</li>
+<li>Snapshots with list items.</li>
+<li>Provisional E1 now; official E1 after the crawl, scheduled back to back with E2.</li>
+<li><b>Tests:</b> weighted draws match their weights (chi-square on 1M draws); seeded streams repeat exactly; the harness tests pass.</li>
+<li><b>Leaves:</b> baseline numbers and the run tooling. No change to the read path.</li>
+</ul>
+
+<h3>Phase 2 · Engine core <span class="tag c">needs 0</span></h3>
+<ul>
+<li>The I/O backends (<code>DirectPool</code>, <code>Plain</code>, <code>Fault</code>).</li>
+<li>The frame arena in 2 MiB groups, slots per file, S3-FIFO with ghost.</li>
+<li>Epochs, the retired reserve, pins with CAS state, single-flight, two queues, <code>preadv</code> coalescing, the token bucket.</li>
+<li>Budget accounting with borrow; the bad-page set.</li>
+<li>The file registry, parsing FORMAT 6 footers (phase 0's types; test files written with phase 0's helpers).</li>
+<li><code>pass</code> and <code>read_blocking</code>; core counters.</li>
+<li><b>Tests:</b>
+  <ul>
+  <li>32 reader threads plus a tiny budget, with every page's content tagged with its id and checked on every read (catches a reused frame).</li>
+  <li>Scan resistance: a hot set keeps ≥ 90% hits through a 10× cache-size scan.</li>
+  <li>Single-flight: 64 concurrent misses on one page make 1 read.</li>
+  <li>The budget is never exceeded, checked with RSS as well as the counters.</li>
+  <li>The free-list-empty path (flush, evict, wait).</li>
+  <li>Pin races with eviction.</li>
+  <li>EIO, a flipped byte and a short read each give the right error and a bad page.</li>
+  <li><code>Plain</code> runs in CI and on the Mac.</li>
+  <li>A criterion bench of the hit path (≤ 15 ns per page lookup).</li>
+  </ul></li>
 <li><b>Leaves:</b> a tested library, not wired in.</li>
 </ul>
 
-<h3>Phase 3 · FORMAT 6, read over mmap <span class="tag c">parallel from the start</span></h3>
+<h3>Phase 3a · FORMAT 6 codecs, writer, builder <span class="tag c">needs 0</span></h3>
 <ul>
-<li>FORMAT 6 writer: small/big split, columns, heads, by-subject blocks (EF subjects + positions), u32 index, page sums, pinned/paged section kinds in the footer. Builder (<code>marco-load build</code>) and <code>write_snapshot</code> produce it.</li>
-<li><code>Blocks</code> trait and the block-accessor <code>OutList</code>/<code>InList</code>, with <code>R&lt;T&gt;</code> signatures already in place. The only implementation here is over the mmap, and it never returns <code>Pending</code>, so the Graph's logic changes once.</li>
-<li>Checkpoint writer for FORMAT 6: dirty shards re-packed page by page, unchanged pages copied, the remap runs emitted (unused until phase 5), whole-shard re-pack below 85% fill.</li>
-<li><b>Tests:</b> property tests of the new list codecs against FORMAT 5's on random lists (sizes 1, 8, 9, 127-129, 4,095-4,097, repeats, non-TID keys); every existing marco-core and marco-server test on FORMAT 6; the kill tests (<code>killtest</code>) pass; the whole-network build on the load box against the build gate, and <code>verify</code> clean.</li>
-<li><b>Leaves:</b> the server running on FORMAT 6 through mmap, so the format is proven in production shape before the engine reads it.</li>
+<li>The small/big split, columns, heads, by-subject blocks (EF subjects + positions), u32 index with the <code>u32::MAX</code> sentinel, page sums.</li>
+<li>An <code>O_DIRECT</code> writer.</li>
+<li><code>marco-load build --format 6</code> (opt-in; the default stays 5, so main keeps serving).</li>
+<li><b>Tests:</b> property tests of the new codecs against FORMAT 5's on random lists (sizes 1, 8, 9, 127-129, 4,095-4,097, repeats, non-TID keys); the whole-network build with lists on the load box against the build gate.</li>
+<li><b>Leaves:</b> FORMAT 6 snapshots can be built.</li>
 </ul>
 
-<h3>Phase 4 · Miss-aware read path <span class="tag w">needs 2 and 3</span></h3>
+<h3>Phase 3b · Reads on FORMAT 6, over mmap <span class="tag c">needs 3a</span></h3>
 <ul>
-<li><code>ReadCx</code> (Collect/Block), <code>Pending</code>, per-item catch in batch calls, <code>need()</code> planning in the structures; the handler loop in <code>graph_svc.rs</code> (and the admin console's reads) with <code>Hold</code> pins and <code>MAX_ROUNDS</code>; writer plan-pass prefetch; Block mode for checkpoint replay and admin jobs.</li>
-<li><code>--storage mmap|engine</code> (default mmap) and <code>--memory</code>; full-residency load at open; error mapping to <code>data_loss</code>/<code>unavailable</code>; the per-RPC page and round histograms.</li>
-<li>Checkpoints in this phase reopen new files without remap (a cold switch), which is correct but not yet bounded.</li>
-<li><b>Tests:</b> a differential test that runs randomized requests of every RPC against the same snapshot through mmap and through the engine with a 64-page budget, and requires identical answers; bounds tests asserting pages and rounds per RPC ≤ section 7 on a starved cache; <code>Fault</code> backend end-to-end through the Connect API; a debug assertion that the blocking fetch is never called from a tokio runtime thread; the full test suite with <code>--storage engine</code>.</li>
+<li><code>Blocks</code> and <code>R&lt;T&gt;</code> across every caller, each running through <code>pass</code> with an mmap source that never misses.</li>
+<li>Handler logic moves into closures.</li>
+<li>The builder and <code>write_snapshot</code> default to 6.</li>
+<li>Checkpoints rewrite dirty shards whole in FORMAT 6 until 3c.</li>
+<li><b>Tests:</b> every marco-core, marco-server, marco-load and harness test on FORMAT 6; the kill tests.</li>
+<li><b>Leaves:</b> main runs on FORMAT 6 through mmap, which is the FORMAT 6 baseline for E1.</li>
+</ul>
+
+<h3>Phase 3c · Patch checkpoints and compaction <span class="tag c">needs 3b</span></h3>
+<ul>
+<li>Patch files and the base + patches manifest.</li>
+<li>Compaction with its triggers and the in-place shard swap.</li>
+<li><code>remove_unlisted</code> for patches.</li>
+<li>R and P_new reported per checkpoint.</li>
+<li><b>Tests:</b> 20 checkpoints with random writes, then compare with a full rebuild; kill tests mid-patch and mid-compaction; R on the recorded archive day matches §11 within 30%.</li>
+<li><b>Leaves:</b> checkpoints write ~2.4 GB a day instead of ~38 GB, still over mmap.</li>
+</ul>
+
+<h3>Phase 4 · Miss-aware read path <span class="tag w">needs 2 and 3b</span></h3>
+<ul>
+<li>The engine-backed Store.</li>
+<li>Fast pass on the worker plus the miss pool (permits, the 1 s busy refusal, <code>--miss-threads</code>).</li>
+<li>The pin budget and the per-request page limit.</li>
+<li>The writer's plan rounds; <code>read_blocking</code> for checkpoint replay, admin jobs, series and list stats.</li>
+<li><code>--storage mmap|engine</code> (default mmap) and <code>--memory</code>.</li>
+<li>Full-residency load at open.</li>
+<li>Error mapping, and the path, pages and rounds histograms.</li>
+<li><b>Tests:</b>
+  <ul>
+  <li>A differential test: randomized requests of every RPC through mmap and through the engine with a 4,096-page budget, requiring identical answers.</li>
+  <li>Requests over the page limit get <code>resource_exhausted</code>.</li>
+  <li>Bounds tests asserting pages and rounds per RPC against §8.</li>
+  <li><code>Fault</code> backend end-to-end through the Connect API.</li>
+  <li>A debug assertion that <code>read_blocking</code> never runs on a tokio runtime thread.</li>
+  <li>The whole suite with <code>--storage engine</code>.</li>
+  </ul></li>
 <li><b>Leaves:</b> the engine serving correctly at any budget, behind a flag.</li>
 </ul>
 
-<h3>Phase 5 · Bounded switch and operations <span class="tag w">needs 4</span></h3>
+<h3>Phase 5 · Checkpoints on the engine, and operations <span class="tag w">needs 3c and 4</span></h3>
 <ul>
-<li>Shared file registry through the checkpoint (no second open of unchanged files); streaming bypass reads for the checkpoint writer and <code>verify</code>; remap with two owners per frame; pinned parts borrowed from the cache; re-warm on the low-priority queue; owner release when old files drop.</li>
-<li>Metrics complete (section 12); the console's Cache panel and Storage changes; admin proto <code>Cache</code>; <code>/readyz</code> storm rule; alert rules on the deploy side.</li>
-<li><b>Tests:</b> checkpoint under a starved budget and under a fits-all budget with an accounting assertion that store memory never passes <code>--memory</code>; remapped frames serve correct content (tagged-content check across 20 checkpoints with random writes); the kill tests on <code>--storage engine</code>; a bad page under a checkpoint fails it cleanly; console screenshots (<code>just ui-shot</code>) with mock data.</li>
+<li>Write-through of patch and compaction pages.</li>
+<li>Borrowing for new pinned parts through 2 MiB groups.</li>
+<li>Compaction gated on resident garbage when everything fits.</li>
+<li>Background I/O through the token bucket.</li>
+<li>Metrics complete (§13); the console's Cache panel and admin proto <code>Cache</code>; the <code>/readyz</code> storm rule; alert rules on the deploy side.</li>
+<li><b>Tests:</b>
+  <ul>
+  <li>Checkpoints and compactions under a small and a fits-all budget, asserting RSS and store memory against <code>--memory</code>.</li>
+  <li>A fits-all server stays at 0 misses across 10 checkpoints.</li>
+  <li>A bad page under a checkpoint fails it cleanly.</li>
+  <li>The kill tests on <code>--storage engine</code>.</li>
+  <li>Console screenshots with mock data.</li>
+  </ul></li>
 <li><b>Leaves:</b> the engine at feature parity, still behind the flag.</li>
 </ul>
 
 <h3>Phase 6 · Measure and cut over <span class="tag e">needs 1 and 5</span></h3>
 <ul>
-<li>E2-E9 on the load box; <code>docs/storage-results.html</code> (listed in <code>_internal.txt</code> like this one, or published if it reads as evidence) with every gate's number; E7 decides io_uring and E8 decides the heat layout, each its own follow-up CR if adopted.</li>
-<li>If every gate passes: the engine becomes the only path. Delete <code>memmap2</code>, <code>Bytes::Map</code>, <code>populate</code>/<code>advise_willneed</code>, <code>--prefault</code>/<code>--no-prefault</code>, the mincore gauge and <code>--storage</code>. Update <code>docs/operations.md</code> and <code>docs/sizing.md</code> (current version only: <code>--memory</code>, what the tiers need, errors and alerts).</li>
-<li>If a gate fails: the report names it and the lead decides; the flag stays until then.</li>
+<li>Official E1 and E2-E10 on the load box, and <code>docs/storage-results.html</code> with every gate's number. E7 decides io_uring and E8 decides the heat layout, each as its own follow-up CR if adopted.</li>
+<li>If every gate passes, the engine becomes the only path. Delete <code>memmap2</code>, <code>Bytes::Map</code>, <code>populate</code>/<code>advise_willneed</code>, <code>--prefault</code>/<code>--no-prefault</code>, <code>--mmap-advice</code>, <code>--storage</code>, the mincore gauge and <code>sys.rs</code>'s page-cache code. Update <code>docs/operations.md</code>, <code>docs/sizing.md</code> and <code>docs/durability.md</code> (current version only).</li>
+<li><b>Cutover of the public instance</b>, which has run its pinned image until now. All of it must fit inside Jetstream's ~36 h retention, following the deployment's rebuild runbook:
+  <ol>
+  <li>Build FORMAT 6 from the archive export with the new binaries.</li>
+  <li>Move the snapshot onto the instance's volume.</li>
+  <li>Deploy the new image with <code>--memory</code> set for 16 GiB.</li>
+  <li>Let Jetstream catch up.</li>
+  </ol></li>
+<li>If a gate fails, the report names it and the lead decides. The flag stays until then, and the public instance stays on its image.</li>
 <li><b>Tests:</b> the whole suite with no mmap code left; <code>just check</code>.</li>
-<li><b>Leaves:</b> marco without mmap or the page cache, measured.</li>
+<li><b>Leaves:</b> marco without mmap or the page cache, measured, in production.</li>
 </ul>
 
 <h3>What each phase touches</h3>
 <table class="small">
-<tr><th>Phase</th><th>Files</th></tr>
-<tr><td>1</td><td><code>crates/marco-harness/src/{perf,mixfile}.rs</code>, <code>internal/</code> scripts and raw results</td></tr>
-<tr><td>2</td><td>new <code>crates/marco-core/src/store/{page,io,cache,engine}.rs</code> (today's <code>store.rs</code> becomes <code>store/mod.rs</code>), <code>Cargo.toml</code> (crossbeam-epoch)</td></tr>
-<tr><td>3</td><td><code>snapshot.rs</code>, <code>outlog.rs</code>, <code>inset.rs</code>, <code>graph.rs</code> (reads take <code>cx</code>, checkpoint writer), <code>store.rs</code>, <code>marco-load/src/build.rs</code>, <code>verify.rs</code></td></tr>
-<tr><td>4</td><td><code>graph.rs</code>, <code>marco-server/src/{graph_svc,admin_svc,app,writer,main}.rs</code>, <code>obs.rs</code></td></tr>
-<tr><td>5</td><td><code>store/engine.rs</code>, <code>graph.rs</code> (<code>write_checkpoint</code>), <code>writer.rs</code> (<code>rewrite</code>), <code>metrics.rs</code>, <code>proto/marco/v1/admin.proto</code>, <code>ui/src/pages/Storage.tsx</code></td></tr>
-<tr><td>6</td><td>deletions across the above, <code>docs/</code></td></tr>
+<tr><th>Phase</th><th>Files (under <code>crates/</code>)</th></tr>
+<tr><td>0</td><td><code>marco-core/src/{snapshot,store}.rs</code>, new <code>marco-core/src/read.rs</code> and <code>store/page.rs</code></td></tr>
+<tr><td>1</td><td><code>marco-harness/src/{perf,mixfile}.rs</code>; <code>marco-server/src/{main,app}.rs</code> and <code>marco-core/src/snapshot.rs</code> (<code>--mmap-advice</code>); <code>internal/</code> scripts and results</td></tr>
+<tr><td>2</td><td>new <code>marco-core/src/store/{io,cache,engine}.rs</code> (<code>store.rs</code> becomes <code>store/mod.rs</code>); <code>Cargo.toml</code> (crossbeam-epoch, libc)</td></tr>
+<tr><td>3a</td><td><code>marco-core/src/{outlog,inset,snapshot,store}.rs</code>; <code>marco-load/src/build.rs</code>; codec tests</td></tr>
+<tr><td>3b</td><td>
+<ul>
+<li><b>marco-core:</b> <code>graph.rs</code> (every read takes <code>cx</code>), <code>obs.rs</code>; tests <code>semantics.rs</code>, <code>index_flip.rs</code>.</li>
+<li><b>marco-server:</b> <code>graph_svc.rs</code> (handlers as closures), <code>admin_svc.rs</code> (<code>get_actor</code>, <code>resolve_uri</code>, list pages), <code>app.rs</code> (verify's <code>Snapshot::open</code>, prefault), <code>writer.rs</code>, <code>series.rs</code> (<code>shared_snapshot</code>), <code>liststats.rs</code> (its own <code>Store::open</code> and header pass), <code>live_bench.rs</code>, <code>metrics.rs</code>; tests <code>api.rs</code>, <code>durability.rs</code>.</li>
+<li><b>marco-load:</b> <code>bench.rs</code>, <code>diff.rs</code>, <code>verify.rs</code>, <code>lists_bench.rs</code>, <code>metrics.rs</code>, <code>build.rs</code> (its reopen), <code>tests/common</code>.</li>
+<li><b>marco-harness:</b> <code>perf.rs</code> (<code>shared_snapshot</code>), <code>killtest.rs</code>, <code>synth.rs</code>, <code>mixfile.rs</code>.</li>
+</ul>
+</td></tr>
+<tr><td>3c</td><td><code>marco-core/src/graph.rs</code> (<code>write_checkpoint</code>, <code>write_shard_*</code>, <code>dirty_shards</code>), <code>store.rs</code> (manifest, <code>remove_unlisted</code>); <code>marco-server/src/writer.rs</code> (<code>rewrite</code>), <code>app.rs</code> (<code>open_replayed</code>); <code>marco-harness/src/killtest.rs</code>; durability tests</td></tr>
+<tr><td>4</td><td><code>marco-core/src/{read,graph,obs}.rs</code>, <code>store/engine.rs</code>; <code>marco-server/src/{graph_svc,admin_svc,app,main,writer,series,liststats,metrics}.rs</code></td></tr>
+<tr><td>5</td><td><code>marco-core/src/store/engine.rs</code>, <code>graph.rs</code>; <code>marco-server/src/{writer,app,admin_svc,metrics}.rs</code>; <code>proto/marco/v1/admin.proto</code> and <code>marco-proto</code>'s generated code; <code>ui/src/pages/Storage.tsx</code></td></tr>
+<tr><td>6</td><td>deletions across the above (<code>marco-server/src/sys.rs</code>, <code>snapshot.rs</code>'s <code>Bytes::Map</code>); <code>docs/</code></td></tr>
 </table>
 
 <h3>Not in this plan</h3>
-<p>A WAL, replicas, compression of pages, warming the cache at open from a saved list of hot pages (cheap, and worth a follow-up if Half restarts show a long cold tail), and changes to the delta path. Writes and decision 63's semantics stay as they are.</p>
+<ul>
+<li>A WAL.</li>
+<li>Replicas.</li>
+<li>Page compression.</li>
+<li>Slack leaves (§4).</li>
+<li>Warming the cache at open from a saved list of hot pages. It's cheap, and worth a follow-up if restarts at Half show a long cold tail.</li>
+<li>Changes to the delta path.</li>
+</ul>
+<p>Writes and decision 63's semantics stay as they are.</p>
 
 </main>
 </body>
