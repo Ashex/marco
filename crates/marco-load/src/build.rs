@@ -250,6 +250,10 @@ pub struct Report {
     /// FORMAT 6: per relation, how its lists were laid out.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub layout: Vec<RelLayout>,
+    /// FORMAT 6: each section's largest size in one shard, against the
+    /// spaces' caps.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub sections_shard_max: BTreeMap<String, u64>,
     /// FORMAT 6: whether the files were written with O_DIRECT.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub direct_io: Option<bool>,
@@ -1357,6 +1361,8 @@ pub fn build(o: &Opts) -> Result<Report> {
         for f in std::iter::once(&df).chain(footers.iter().flatten()) {
             for s in &f.sections {
                 *rep.sections.entry(s.name.clone()).or_default() += s.len();
+                let m = rep.sections_shard_max.entry(s.name.clone()).or_default();
+                *m = (*m).max(s.len());
             }
         }
         let size = |p: &Path| std::fs::metadata(p).map(|m| m.len());

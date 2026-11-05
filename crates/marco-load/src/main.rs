@@ -106,6 +106,9 @@ enum Cmd {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    // a build holds every export file's reader, a spill file per shard, sub-bucket and relation,
+    // and a writer per shard at once: past a shell's usual soft limit of 1024
+    eprintln!("open-file limit {}", sys::raise_nofile());
     if let Some(addr) = &cli.ops {
         let a = marco_ops::serve(addr, None)?;
         eprintln!("ops on http://{a}");
