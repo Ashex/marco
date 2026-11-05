@@ -1,0 +1,62 @@
+// Vite plugin (ported from vlpds): `virtual:marco-docs` is the nav and page
+// metadata; each page's HTML is its own chunk (`virtual:marco-docs/page/<slug>`),
+// loaded when the page is opened. A docs error fails `vite build`; the dev
+// server reloads on any change under docs/ and shows errors in the overlay.
+// The standalone HTML pages in docs/ go into the build as dist/docs/<name>.html.
+
+import fs from 'node:fs'
+import path from 'node:path'
+import { loadDocs, htmlPages, DOCS_DIR } from './docs.mjs'
+
+const ID = 'virtual:marco-docs'
+const PAGE = `${ID}/page/`
+
+export function marcoDocs() {
+  let docs = null
+  const get = () => (docs ??= loadDocs())
+  const fail = (errors) => new Error(`docs: ${errors.length} problem(s):\n  ${errors.join('\n  ')}`)
+  return {
+    name: 'marco-docs',
+    buildStart() {
+      docs = null
+    },
+    resolveId(id) {
+      if (id === ID || id.startsWith(PAGE)) return '\0' + id
+    },
+    load(id) {
+      if (!id.startsWith('\0' + ID)) return
+      const d = get()
+      if (d.errors.length) throw fail(d.errors)
+      if (id === '\0' + ID) {
+        const meta = d.pages.map(({ html: _html, file: _file, ...m }) => m)
+        const loaders = d.pages.map((p) => `${JSON.stringify(p.slug)}: () => import(${JSON.stringify(PAGE + p.slug)})`)
+        return `export const nav = ${JSON.stringify(d.nav)};\nexport const pages = ${JSON.stringify(meta)};\nexport const loaders = {${loaders.join(',\n')}};\n`
+      }
+      const slug = id.slice(('\0' + PAGE).length)
+      const p = d.pages.find((x) => x.slug === slug)
+      if (!p) throw new Error(`docs: no page ${slug}`)
+      return `export default ${JSON.stringify(p.html)};\n`
+    },
+    generateBundle() {
+      for (const name of htmlPages()) this.emitFile({ type: 'asset', fileName: `docs/${name}`, source: fs.readFileSync(path.join(DOCS_DIR, name)) })
+    },
+    configureServer(server) {
+      server.middlewares.use((req, res, next) => {
+        const name = req.url?.match(/^\/docs\/([\w.-]+\.html)(?:[?#]|$)/)?.[1]
+        if (!name || !htmlPages().includes(name)) return next()
+        res.setHeader('content-type', 'text/html; charset=utf-8')
+        res.end(fs.readFileSync(path.join(DOCS_DIR, name)))
+      })
+      server.watcher.add(DOCS_DIR)
+      const reload = (file) => {
+        if (!file.startsWith(DOCS_DIR)) return
+        docs = null
+        for (const m of server.moduleGraph.idToModuleMap.values()) if (m.id?.startsWith('\0' + ID)) server.moduleGraph.invalidateModule(m)
+        server.ws.send({ type: 'full-reload' })
+      }
+      server.watcher.on('change', reload)
+      server.watcher.on('add', reload)
+      server.watcher.on('unlink', reload)
+    },
+  }
+}

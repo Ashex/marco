@@ -1,6 +1,10 @@
-//! The console (built from `ui/` into `ui/dist`, base `/admin/`), read
-//! whole at start from `--ui-dir` or this source tree's build. Serving only
-//! the names read here rules out traversal.
+//! The console and the docs, one build (`ui/` into `ui/dist`), read whole
+//! at start from `--ui-dir` or this source tree's build. Serving only the
+//! names read here rules out traversal. `/admin/*` and `/docs/*` get
+//! index.html, `/assets/*`, `/favicon.svg` and the standalone pages
+//! (`/docs/<name>.html`: design and results) are files. The docs and the
+//! files are public: the console's page is static, and its data comes from
+//! the Admin RPCs behind the token.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -14,7 +18,7 @@ use axum::Router;
 use http::{header, HeaderValue, StatusCode};
 
 const PLACEHOLDER: &str = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>marco</title></head>\
-<body><p>This marco runs without its console. Build it (<code>cd ui &amp;&amp; npm ci &amp;&amp; npm run build</code>), \
+<body><p>This marco runs without its console and docs. Build them (<code>cd ui &amp;&amp; npm ci &amp;&amp; npm run build</code>), \
 or point <code>--ui-dir</code> at a built <code>ui/dist</code>, then restart.</p></body></html>";
 
 /// Same-origin only. Inline style attributes set through the CSSOM (React
@@ -22,6 +26,10 @@ or point <code>--ui-dir</code> at a built <code>ui/dist</code>, then restart.</p
 const CSP: &str =
     "default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self' data: blob:; \
 connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'";
+
+/// The standalone pages carry their styles inline and run no script.
+const PAGE_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:; \
+frame-ancestors 'none'; base-uri 'none'; form-action 'none'; sandbox";
 
 struct File {
     data: axum::body::Bytes,
@@ -71,27 +79,49 @@ impl Ui {
         Ok(Ui { files })
     }
 
-    fn serve(&self, rest: &str) -> Response {
-        let (f, cache) = match self.files.get(rest) {
-            Some(f) if !rest.is_empty() => (f, rest.starts_with("assets/")),
-            _ => match self.files.get("index.html") {
-                Some(f) => (f, false),
-                None => return StatusCode::NOT_FOUND.into_response(),
-            },
-        };
-        let cc = if cache { "public, max-age=31536000, immutable" } else { "no-cache" };
-        (
-            [
-                (header::CONTENT_TYPE, f.mime.clone()),
-                (header::CACHE_CONTROL, HeaderValue::from_static(cc)),
-                (header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(CSP)),
-                (header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff")),
-                (header::REFERRER_POLICY, HeaderValue::from_static("no-referrer")),
-            ],
-            f.data.clone(),
-        )
-            .into_response()
+    fn page(&self) -> Response {
+        match self.files.get("index.html") {
+            Some(f) => respond(f, false),
+            None => StatusCode::NOT_FOUND.into_response(),
+        }
     }
+
+    fn file(&self, name: &str) -> Response {
+        match self.files.get(name) {
+            Some(f) => respond(f, name.starts_with("assets/")),
+            None => StatusCode::NOT_FOUND.into_response(),
+        }
+    }
+
+    fn doc(&self, rest: &str) -> Response {
+        if !rest.ends_with(".html") {
+            return self.page();
+        }
+        match self.files.get(&format!("docs/{rest}")) {
+            Some(f) => {
+                let mut r = respond(f, false);
+                r.headers_mut().insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(PAGE_CSP));
+                r
+            }
+            None => StatusCode::NOT_FOUND.into_response(),
+        }
+    }
+}
+
+fn respond(f: &File, immutable: bool) -> Response {
+    // hashed names under assets/ never change content
+    let cc = if immutable { "public, max-age=31536000, immutable" } else { "no-cache" };
+    (
+        [
+            (header::CONTENT_TYPE, f.mime.clone()),
+            (header::CACHE_CONTROL, HeaderValue::from_static(cc)),
+            (header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(CSP)),
+            (header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff")),
+            (header::REFERRER_POLICY, HeaderValue::from_static("no-referrer")),
+        ],
+        f.data.clone(),
+    )
+        .into_response()
 }
 
 fn walk(root: &Path, dir: &Path, out: &mut HashMap<String, File>) -> Result<()> {
@@ -114,12 +144,28 @@ fn walk(root: &Path, dir: &Path, out: &mut HashMap<String, File>) -> Result<()> 
     Ok(())
 }
 
+/// The admin listener's: the console, the docs and their files.
 pub fn routes(ui: Arc<Ui>) -> Router {
-    let a = ui.clone();
-    let b = ui.clone();
+    let page = |ui: Arc<Ui>| get(move || async move { ui.page() });
     Router::new()
         .route("/", get(|| async { Redirect::to("/admin/") }))
         .route("/admin", get(|| async { Redirect::to("/admin/") }))
-        .route("/admin/", get(move || async move { a.serve("") }))
-        .route("/admin/{*rest}", get(move |UrlPath(rest): UrlPath<String>| async move { b.serve(&rest) }))
+        .route("/admin/", page(ui.clone()))
+        .route("/admin/{*rest}", page(ui.clone()))
+        .merge(docs_routes(ui))
+}
+
+/// The docs and the files they load, for both listeners.
+pub fn docs_routes(ui: Arc<Ui>) -> Router {
+    let page = |ui: Arc<Ui>| get(move || async move { ui.page() });
+    let (a, b, c) = (ui.clone(), ui.clone(), ui.clone());
+    Router::new()
+        .route("/docs", page(ui.clone()))
+        .route("/docs/", page(ui))
+        .route("/docs/{*rest}", get(move |UrlPath(rest): UrlPath<String>| async move { c.doc(&rest) }))
+        .route(
+            "/assets/{*rest}",
+            get(move |UrlPath(rest): UrlPath<String>| async move { a.file(&format!("assets/{rest}")) }),
+        )
+        .route("/favicon.svg", get(move || async move { b.file("favicon.svg") }))
 }

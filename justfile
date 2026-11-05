@@ -24,8 +24,9 @@ check: check-private check-gen
     cargo clippy --all-targets -- -D warnings
     cargo fmt --check
     cd ui && npm run typecheck
+    cd ui && npm run check-docs
 
-# The console: build into ui/dist (the server reads it at start), dev servers, screenshots
+# The console and the docs: build into ui/dist (the server reads it at start), dev servers, screenshots
 ui:
     cd ui && npm ci && npm run build
 
@@ -34,6 +35,14 @@ ui-dev url="http://127.0.0.1:7301":
 
 ui-mock:
     cd ui && npm run dev:mock
+
+# The docs site (/docs; docs/_style.md): validate it and print its nav
+docs-check:
+    cd ui && npm run check-docs
+
+# Screenshots of every docs page: desktop and 390 px, light and dark; fails on console errors
+docs-shots *args:
+    cd ui && npm run docs-shots -- {{args}}
 
 # Screenshots of every section against the mock: desktop, 390 px, light and dark; fails on console errors
 shots *args:

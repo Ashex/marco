@@ -243,7 +243,7 @@ fn main() -> Result<()> {
                 let app = App::open(cfg)?;
                 let (api, admin) = marco_server::serve(app.clone(), ui).await?;
                 eprintln!(
-                    "marco {} on {}: {} DIDs, graph on http://{api}, admin on http://{admin}/admin/ (opened in {:.1} ms{})",
+                    "marco {} on {}: {} DIDs, graph on http://{api}, admin on http://{admin}/admin/, docs on http://{api}/docs (opened in {:.1} ms{})",
                     marco_server::VERSION,
                     s.snapshot.display(),
                     app.graph().n_ids(),

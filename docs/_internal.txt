@@ -1,0 +1,4 @@
+# Left off the docs site (/docs). One path per line, relative to docs/.
+# See _style.md, "Public and internal".
+
+index.md                # the repo's reading list of every page

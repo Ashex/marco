@@ -1,5 +1,6 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
+import { marcoDocs } from './docs-build/plugin.mjs'
 
 declare const process: { env: Record<string, string | undefined> }
 
@@ -8,8 +9,8 @@ declare const process: { env: Record<string, string | undefined> }
 const target = process.env.MARCO_URL ?? 'http://127.0.0.1:7301'
 
 export default defineConfig({
-  plugins: [react()],
-  base: '/admin/',
+  plugins: [react(), marcoDocs()],
+  base: '/',
   build: {
     outDir: 'dist',
     emptyOutDir: true,
