@@ -47,10 +47,10 @@ export function Home() {
             </div>
           </div>
           <div className="facts home-facts">
-            <Fact v="2.97B" l="follows and blocks" n="the whole network" tone="blue" />
-            <Fact v="38.5" u="GB" l="snapshot" n="13 B an edge" tone="amber" />
-            <Fact v="~1M" u="Has/s" l="through the server, measured" n="16 threads of a 32-thread box" tone="cyan" />
-            <Fact v="8" l="read calls" n="Connect · gRPC · gRPC‑Web" />
+            <Fact v="2.97B" l="edges" n="follows + blocks" tone="blue" />
+            <Fact v="38.5" u="GB" l="snapshot" n="13 B/edge" tone="amber" />
+            <Fact v="1.05M" u="Has/s" l="server throughput" n="16 threads" tone="cyan" />
+            <Fact v="8" l="read RPCs" n="Connect · gRPC · gRPC‑Web" />
           </div>
         </section>
         <Explorer />
