@@ -1,6 +1,6 @@
 [package]
 name = "marco-harness"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 description = "marco's harness: record a Jetstream or firehose capture, replay it as a fake source, the kill -9 test against a capture, the live tail-lag and throughput measurements, and the Graph read load generator (perf)"
 license = "MIT"

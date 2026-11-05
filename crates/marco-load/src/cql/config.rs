@@ -245,6 +245,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn example_config_parses() {
+        let mut c = Config::parse(include_str!("../../../../examples/scylla.toml")).unwrap();
+        c.resolve(&marco_core::Relations::bsky_default()).unwrap();
+        let rels: Vec<_> = c.tables.iter().map(|t| t.relation.as_str()).collect();
+        assert_eq!(rels, ["follow", "block", "listitem"]);
+        assert_eq!(c.tables[2].list.as_deref(), Some("list"));
+    }
+
+    #[test]
     fn parses_with_defaults() {
         let c = Config::parse(
             r#"

@@ -54,10 +54,15 @@ test *args:
 fmt:
     cargo fmt
 
-# No private host, domain, address or name outside internal/: this tree will be published
+# No private host, domain, address or name outside internal/: this tree is published. The deny
+# lists stay in the monorepo, so the public repo skips it.
 check-private:
-    python3 ../../scripts/check-private/check_private.py --deny ../../scripts/check-private/delta.deny --allow ../../scripts/check-private/delta.allow --exclude internal .
-    python3 ../../scripts/check-private/check_private.py --deny ../../scripts/check-private/marco.deny --exclude internal .
+    #!/usr/bin/env bash
+    set -euo pipefail
+    lists=../../scripts/check-private
+    if [ ! -f "$lists/check_private.py" ]; then echo "check-private: no deny lists here, skipped"; exit 0; fi
+    python3 "$lists/check_private.py" --deny "$lists/delta.deny" --allow "$lists/delta.allow" --exclude internal .
+    python3 "$lists/check_private.py" --deny "$lists/marco.deny" --allow "$lists/marco.allow" --exclude internal .
 
 # Build a snapshot from export files (see marco-load --help)
 load *args:
@@ -89,10 +94,15 @@ gen_dirs := "crates/marco-proto/src/gen ui/src/gen"
 gen: tools
     cd proto && buf lint && buf generate
 
-# Fail if the committed generated code is stale
-check-gen: gen
-    ../../scripts/vcs.sh diff {{gen_dirs}}
-    test -z "$(../../scripts/vcs.sh dirty {{gen_dirs}})"
+# Fail if the generated code is stale: regenerate it and compare
+check-gen: tools
+    #!/usr/bin/env bash
+    set -euo pipefail
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
+    for d in {{gen_dirs}}; do mkdir -p "$tmp/$d" && cp -R "$d/." "$tmp/$d"; done
+    (cd proto && buf lint && buf generate)
+    for d in {{gen_dirs}}; do diff -r "$tmp/$d" "$d"; done
 
 # The server on a snapshot (see marco serve --help)
 serve *args:

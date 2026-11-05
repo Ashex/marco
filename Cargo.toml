@@ -6,6 +6,10 @@
 resolver = "2"
 members = ["crates/*"]
 
+# Every crate's version: a release (scripts/marco-public/release.sh) bumps it here.
+[workspace.package]
+version = "0.1.0"
+
 [workspace.dependencies]
 marco-core = { path = "crates/marco-core", default-features = false }
 marco-ingest = { path = "crates/marco-ingest" }
@@ -54,6 +58,12 @@ opt-level = 3
 lto = "thin"
 codegen-units = 16
 debug = 1
+
+# Release images (the image workflow on v* tags): fat LTO, one codegen unit.
+[profile.dist]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
 
 [profile.test]
 opt-level = 1

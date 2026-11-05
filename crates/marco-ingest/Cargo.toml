@@ -1,6 +1,6 @@
 [package]
 name = "marco-ingest"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 description = "marco's built-in ingest: Jetstream and firehose (subscribeRepos) consumers that turn records into edge ops and apply them in order with a durable cursor"
 license = "MIT"

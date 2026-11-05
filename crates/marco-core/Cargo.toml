@@ -1,6 +1,6 @@
 [package]
 name = "marco-core"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 description = "marco's engine: the DID directory, relations, per-actor out logs, per-subject in sets and the snapshot file"
 license = "MIT"

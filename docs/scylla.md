@@ -87,6 +87,34 @@ names that aren't plain lower-case identifiers are quoted for you.
 or more. For anything else, scan with `--keep-spill` (or without `--snapshot`) and run
 `marco-load build --input /data/scan --relations /data/scan/relations.toml --shards N` yourself.
 
+`examples/scylla.toml` is this config with every table's columns spelled out.
+
+## Try it on one machine
+
+You can run the whole path against a throwaway Scylla in Docker. `fill-scylla` loads build input
+into tables as current state, so the [Quickstart](quickstart.md)'s four-account `input` works:
+
+```bash
+docker run -d --name scylla scylladb/scylla --smp 2 --memory 2G --developer-mode 1 --overprovisioned 1
+ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' scylla)
+sed -e "s/^nodes = .*/nodes = [\"$ip:9042\"]/" -e 's/^keyspace = .*/keyspace = "marco"/' \
+  examples/scylla.toml > scylla.toml
+
+# 1. the input into Scylla: makes the keyspace and the three tables, keyed ((actor_did), rkey)
+target/release/marco-load fill-scylla --config scylla.toml --input input --create actor-rkey
+
+# 2. scan it back and build, then compare with the direct build
+target/release/marco-load scan-scylla --config scylla.toml --out scan --snapshot snap-scylla
+target/release/marco-load build --input input --out snap
+target/release/marco-load diff --a snap --b snap-scylla
+
+# 3. serve the rebuilt snapshot as in the quickstart
+target/release/marco serve --snapshot snap-scylla --jetstream wss://jetstream2.us-east.bsky.network
+```
+
+`diff` compares the two snapshots DID by DID and reports any record that differs.
+`docker rm -f scylla` removes the container and its data.
+
 ## What it assumes about the tables
 
 - One row per record: the record's repo DID, its rkey and its subject DID, as text. A list

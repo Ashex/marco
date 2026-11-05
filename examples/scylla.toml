@@ -1,0 +1,42 @@
+# scan-scylla's config for an appview's graph tables (docs/scylla.md):
+#
+#   marco-load scan-scylla --config scylla.toml --out /data/scan --snapshot /data/snap
+#
+# Each table is one row per record: the repo DID, the rkey, the subject DID
+# and, for list items, the list's AT URI. A relation left out isn't in the
+# snapshot, and Jetstream then never fills it.
+nodes = ["10.0.0.1:9042", "10.0.0.2:9042"]   # contact points; the driver finds the rest
+keyspace = "bsky"
+# datacenter = "us-east"         # read only this datacenter's replicas, retries included
+# username = "marco"             # with password_file
+# password_file = "/run/secrets/scylla-password"
+# consistency = "local_quorum"   # default one (local_one with a datacenter)
+page_size = 5000                 # rows per page
+ranges_per_shard = 8             # ranges per replica shard: the unit of work and resume
+in_flight_per_shard = 2          # ranges read at once per replica shard
+bypass_cache = true              # SELECT … BYPASS CACHE
+compression = "lz4"              # lz4, snappy, none
+request_timeout_secs = 60
+retries = 8                      # attempts per page before the scan stops (a rerun resumes it)
+
+[[table]]
+relation = "follow"
+name = "follows"
+actor = "actor_did"
+rkey = "rkey"
+subject = "target_did"
+
+[[table]]
+relation = "block"
+name = "blocks"
+actor = "actor_did"
+rkey = "rkey"
+subject = "target_did"
+
+[[table]]
+relation = "listitem"            # a list relation: its table has the list column
+name = "list_items"
+actor = "actor_did"
+rkey = "rkey"
+subject = "subject"
+list = "list"

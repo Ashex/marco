@@ -1,6 +1,6 @@
 [package]
 name = "marco-server"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 description = "marco's server: marco.v1.Graph on the API listener; Graph, marco.v1.Admin, /metrics, /debug/* and the console at /admin on the admin listener"
 license = "MIT"

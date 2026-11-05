@@ -1,6 +1,6 @@
 [package]
 name = "marco-load"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 description = "marco's bulk loader (snapshot from exported (repo, rkey, subject) rows) and the P0 measurements: open, reads, verify, delete replay"
 license = "MIT"
