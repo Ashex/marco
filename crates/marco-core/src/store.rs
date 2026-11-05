@@ -452,6 +452,13 @@ impl DirFile {
         if meta.format != PAGED_FORMAT {
             bail!("snapshot format {}, this build reads {PAGED_FORMAT}: rebuild the snapshot", meta.format);
         }
+        if meta.layout != crate::format6::LAYOUT {
+            bail!(
+                "snapshot block layout {}, this build reads {}: rebuild the snapshot",
+                meta.layout,
+                crate::format6::LAYOUT
+            );
+        }
         if file.sections().iter().any(|s| s.is_paged() || file.pin(&s.name).is_some_and(|p| p.buf != 0)) {
             bail!("{}: a directory file's sections are pinned and contiguous", path.display());
         }

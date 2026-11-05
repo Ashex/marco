@@ -129,6 +129,93 @@ impl Packer {
     }
 }
 
+// ---------------------------------------------------------------- slack blocks
+
+/// FORMAT 6's block layout, in the directory's meta. 1: in sets and
+/// by-subject indexes carry a count per block (slack blocks). A snapshot of
+/// another layout is refused: rebuild it.
+pub const LAYOUT: u32 = 1;
+
+/// The fewest entries a block other than the last holds after a patch
+/// rewrites it; a fresh write fills every block but the last to [`WHOLE`].
+pub const MIN_FILL: usize = WHOLE / 2;
+
+/// One block of a patched sequence: an old block kept as it is, or a run of
+/// the new sequence to encode as a block.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Piece {
+    Keep(usize),
+    Write(Range<usize>),
+}
+
+/// Blocks for the sorted sequence `new` over the blocks of `old` (its
+/// entries, in runs of `old_lens`), so a change rewrites only the blocks
+/// it lands in. Each old block takes the run of `new` from its first entry
+/// up to the next block's (the first block from the start, the last to the
+/// end). A run equal to the old block's keeps it. Another is written: runs
+/// over [`WHOLE`] split evenly, the last block's into whole blocks (appends
+/// land there), and one under [`MIN_FILL`] that isn't last takes in the
+/// next block's run first, so every block but the last keeps at least
+/// [`MIN_FILL`] entries.
+pub fn relayout<T: Ord + Copy>(old: &[T], old_lens: &[usize], new: &[T]) -> Vec<Piece> {
+    let nbo = old_lens.len();
+    if nbo == 0 {
+        return (0..new.len()).step_by(WHOLE).map(|c| Piece::Write(c..(c + WHOLE).min(new.len()))).collect();
+    }
+    let mut starts = Vec::with_capacity(nbo + 1);
+    let mut at = 0;
+    for &l in old_lens {
+        starts.push(at);
+        at += l;
+    }
+    starts.push(at);
+    debug_assert_eq!(at, old.len());
+    // each old block's run of `new`
+    let mut runs = Vec::with_capacity(nbo);
+    let mut i = 0;
+    for b in 0..nbo {
+        let j = if b + 1 == nbo { new.len() } else { i + new[i..].partition_point(|x| *x < old[starts[b + 1]]) };
+        runs.push(i..j);
+        i = j;
+    }
+    let mut out = Vec::new();
+    let mut b = 0;
+    while b < nbo {
+        let r = runs[b].clone();
+        if new[r.clone()] == old[starts[b]..starts[b + 1]] {
+            out.push(Piece::Keep(b));
+            b += 1;
+            continue;
+        }
+        let mut r = r;
+        let mut last = b + 1 == nbo;
+        while r.len() < MIN_FILL && !last {
+            b += 1;
+            r = r.start..runs[b].end;
+            last = b + 1 == nbo;
+        }
+        b += 1;
+        if r.is_empty() {
+            continue;
+        }
+        if last {
+            for c in (r.start..r.end).step_by(WHOLE) {
+                out.push(Piece::Write(c..(c + WHOLE).min(r.end)));
+            }
+        } else {
+            let m = r.len().div_ceil(WHOLE);
+            let (q, rem) = (r.len() / m, r.len() % m);
+            let mut c = r.start;
+            for k in 0..m {
+                let len = q + usize::from(k < rem);
+                out.push(Piece::Write(c..c + len));
+                c += len;
+            }
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------- spaces
 
 /// One file's run of pages in a shard's space for a section name.
@@ -627,8 +714,9 @@ impl InSections {
     }
 
     /// [`Self::push`] for a patch: a big set keeps the blocks it shares with
-    /// `old`, (its ids, its head) in the space. Returns the blocks kept.
-    pub fn push_over(&mut self, local: u32, ids: &[u32], old: Option<(&[u32], &[u8])>) -> Result<u64> {
+    /// `old`, (its ids, its head) in the space. Returns the blocks kept and
+    /// written.
+    pub fn push_over(&mut self, local: u32, ids: &[u32], old: Option<(&[u32], &[u8])>) -> Result<(u64, u64)> {
         check_order(&self.entries, local)?;
         if ids.len() <= WHOLE {
             self.buf.clear();
@@ -636,7 +724,7 @@ impl InSections {
             let at = small_offset(self.small.put(&self.buf), self.rel, "in.small")?;
             self.layout.small_sets += 1;
             put_entry(&mut self.entries, local, Entry::Small(at));
-            return Ok(0);
+            return Ok((0, 0));
         }
         let at = head_offset(self.head.len(), self.rel, "in.head")?;
         let kept = crate::inset::encode_split_over(ids, &mut self.blocks, &mut self.head, old)?;
@@ -1005,6 +1093,136 @@ mod tests {
                 assert!(n == 0 || Entries::parse(&b[..b.len() - 1], n).is_none());
             }
         }
+    }
+
+    /// Pieces cover the new sequence in order; kept blocks are the old ones
+    /// unchanged; every block but the last holds MIN_FILL to WHOLE; a change
+    /// keeps every block it doesn't land in (or the one after a short one).
+    #[test]
+    fn relayout_rewrites_only_what_changes() {
+        let mut s = 0xabcd_ef01u64;
+        for round in 0..400 {
+            let n = 129 + (rng(&mut s) % 3000) as usize;
+            let mut old: Vec<u32> = (0..n as u32).map(|i| i * 7 + (rng(&mut s) % 7) as u32).collect();
+            old.dedup();
+            // old blocks: full, or a patch's slack ones
+            let mut lens = Vec::new();
+            let mut left = old.len();
+            while left > 0 {
+                let k = if round % 2 == 0 {
+                    WHOLE
+                } else {
+                    MIN_FILL + (rng(&mut s) % (WHOLE - MIN_FILL + 1) as u64) as usize
+                };
+                let k = k.min(left);
+                lens.push(k);
+                left -= k;
+            }
+            let mut new = old.clone();
+            let edits = 1 + rng(&mut s) % 20;
+            for _ in 0..edits {
+                match rng(&mut s) % 3 {
+                    0 if !new.is_empty() => {
+                        let i = (rng(&mut s) % new.len() as u64) as usize;
+                        new.remove(i);
+                    }
+                    1 => new.push(new.last().copied().unwrap_or(0) + 1 + (rng(&mut s) % 5) as u32),
+                    _ => {
+                        let x = (rng(&mut s) % (8 * n as u64)) as u32;
+                        if let Err(i) = new.binary_search(&x) {
+                            new.insert(i, x);
+                        }
+                    }
+                }
+            }
+            let pieces = relayout(&old, &lens, &new);
+            let mut starts = vec![0];
+            for l in &lens {
+                starts.push(starts.last().unwrap() + l);
+            }
+            let mut got = Vec::new();
+            let mut sizes = Vec::new();
+            for p in &pieces {
+                match p {
+                    Piece::Keep(b) => {
+                        got.extend_from_slice(&old[starts[*b]..starts[b + 1]]);
+                        sizes.push(lens[*b]);
+                    }
+                    Piece::Write(r) => {
+                        got.extend_from_slice(&new[r.clone()]);
+                        sizes.push(r.len());
+                    }
+                }
+            }
+            assert_eq!(got, new, "round {round}");
+            for (i, &k) in sizes.iter().enumerate() {
+                assert!((1..=WHOLE).contains(&k), "round {round}: block {i} of {k}");
+                if i + 1 < sizes.len() {
+                    assert!(k >= MIN_FILL, "round {round}: block {i} of {k}");
+                }
+            }
+            let written = pieces.iter().filter(|p| matches!(p, Piece::Write(_))).count();
+            assert!(written as u64 <= 3 * edits + 2, "round {round}: {written} blocks for {edits} edits");
+        }
+        // patches over patches keep the layout's rules
+        let mut seq: Vec<u32> = (0..3000).map(|x| 3 * x).collect();
+        let mut lens: Vec<usize> = seq.chunks(WHOLE).map(<[u32]>::len).collect();
+        for patch in 0..200 {
+            let mut new = seq.clone();
+            for _ in 0..1 + rng(&mut s) % 40 {
+                let x = (rng(&mut s) % 12_000) as u32;
+                match new.binary_search(&x) {
+                    Ok(i) if rng(&mut s).is_multiple_of(2) => {
+                        let to = (i + (rng(&mut s) % 200) as usize).min(new.len());
+                        new.drain(i..to);
+                    }
+                    Ok(_) => {}
+                    Err(i) => new.insert(i, x),
+                }
+            }
+            let pieces = relayout(&seq, &lens, &new);
+            let mut starts = vec![0];
+            for l in &lens {
+                starts.push(starts.last().unwrap() + l);
+            }
+            let mut got = Vec::new();
+            let mut next = Vec::new();
+            for p in &pieces {
+                let run = match p {
+                    Piece::Keep(b) => &seq[starts[*b]..starts[b + 1]],
+                    Piece::Write(r) => &new[r.clone()],
+                };
+                got.extend_from_slice(run);
+                next.push(run.len());
+            }
+            assert_eq!(got, new, "patch {patch}");
+            assert!(next.iter().all(|&k| (1..=WHOLE).contains(&k)), "patch {patch}");
+            assert!(next[..next.len().saturating_sub(1)].iter().all(|&k| k >= MIN_FILL), "patch {patch}: {next:?}");
+            seq = new;
+            lens = next;
+        }
+        assert_eq!(relayout::<u32>(&[], &[], &[1, 2, 3]), vec![Piece::Write(0..3)]);
+        // a change the last block takes, appends, fills whole blocks
+        let old: Vec<u32> = (0..300).collect();
+        let new: Vec<u32> = (0..700).collect();
+        let p = relayout(&old, &[128, 128, 44], &new);
+        assert_eq!(
+            p,
+            vec![
+                Piece::Keep(0),
+                Piece::Keep(1),
+                Piece::Write(256..384),
+                Piece::Write(384..512),
+                Piece::Write(512..640),
+                Piece::Write(640..700)
+            ]
+        );
+        // an insert into a full interior block splits it in two
+        let mut new: Vec<u32> = (0..300).map(|x| 2 * x).collect();
+        let old = new.clone();
+        new.insert(130, 261);
+        let p = relayout(&old, &[128, 128, 44], &new);
+        assert_eq!(p, vec![Piece::Keep(0), Piece::Write(128..193), Piece::Write(193..257), Piece::Keep(2)]);
     }
 
     #[test]

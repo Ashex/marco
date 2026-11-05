@@ -86,6 +86,13 @@ pub struct Meta {
     /// Out logs this long or longer carry a by-subject index.
     pub subj_index: u32,
     pub relations: Vec<Relation>,
+    /// FORMAT 6's block layout ([`crate::format6::LAYOUT`]); FORMAT 5 has none.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub layout: u32,
+}
+
+fn is_zero(v: &u32) -> bool {
+    *v == 0
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

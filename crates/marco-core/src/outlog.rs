@@ -411,12 +411,19 @@ fn col_at(at: u64, col: &str) -> Result<u32> {
 /// head:  u32 n, u32 dups, u32 nbs (by-subject blocks; 0 below subj_index)
 ///        nb  x (u64 first rkey, u32 subject block at, u32 rkey block at)
 ///        nbs x (u32 first subject, u32 by-subject block at)
+///        nbs x u8 (by-subject block count - 1)
 /// subj:  per block, its k subjects as u32
 /// rkey:  per block, its k - 1 rkey deltas as varints (the first rkey is in the head)
-/// bysubj: per block of 128 positions sorted by (subject, position): the
-///        positions as u32, then their subjects as one inset block (Elias-Fano
-///        from the block's first subject, which is in the head; repeats allowed)
+/// bysubj: per block of up to 128 positions sorted by (subject, position):
+///        the positions as u32, then their subjects as one inset block
+///        (Elias-Fano from the block's first subject, which is in the head;
+///        repeats allowed)
 /// ```
+///
+/// Subject and rkey blocks are positional, 128 records each. By-subject
+/// blocks are filled to 128 by a fresh write and hold
+/// [`crate::format6::MIN_FILL`] to 128 after a patch
+/// ([`crate::format6::relayout`]), so an append rewrites the one it lands in.
 ///
 /// `edges` sorted by rkey, rkeys unique.
 pub fn encode_split(
@@ -442,13 +449,16 @@ pub struct OldSplit<'a> {
 pub struct Reused {
     pub blocks: u64,
     pub bysubj: u64,
+    /// Block positions written: a subject block with its rkey block, or a
+    /// by-subject block.
+    pub written: u64,
 }
 
 /// The bytes of a big list's head that starts `head`: None if it's cut short.
 pub fn split_head_len(head: &[u8]) -> Option<usize> {
     let h = head.get(..HEAD_FIXED)?;
     let n = u32_at(h, 0) as usize;
-    let len = HEAD_FIXED + HEAD_BLOCK * n.div_ceil(BLOCK) + HEAD_FENCE * u32_at(h, 8) as usize;
+    let len = HEAD_FIXED + HEAD_BLOCK * n.div_ceil(BLOCK) + (HEAD_FENCE + 1) * u32_at(h, 8) as usize;
     (head.len() >= len).then_some(len)
 }
 
@@ -519,6 +529,11 @@ pub fn encode_split_over(
     let mut keys = Vec::with_capacity(10 * BLOCK);
     let old_chunks: Vec<&[(u64, u32)]> = old.map_or_else(Vec::new, |(o, _)| o.edges.chunks(BLOCK).collect());
     for (b, chunk) in edges.chunks(BLOCK).enumerate() {
+        if let Some((_, oh)) = old.filter(|_| old_chunks.get(b) == Some(&chunk)) {
+            head.extend_from_slice(&oh[HEAD_FIXED + HEAD_BLOCK * b..HEAD_FIXED + HEAD_BLOCK * (b + 1)]);
+            reused.blocks += 1;
+            continue;
+        }
         blk.clear();
         for &(_, s) in chunk {
             blk.extend_from_slice(&s.to_le_bytes());
@@ -527,13 +542,7 @@ pub fn encode_split_over(
         for w in chunk.windows(2) {
             varint::put(&mut keys, w[1].0 - w[0].0);
         }
-        bytes.subjects += blk.len() as u64;
-        bytes.rkeys += keys.len() as u64;
-        if let Some((_, oh)) = old.filter(|_| old_chunks.get(b) == Some(&chunk)) {
-            head.extend_from_slice(&oh[HEAD_FIXED + HEAD_BLOCK * b..HEAD_FIXED + HEAD_BLOCK * (b + 1)]);
-            reused.blocks += 1;
-            continue;
-        }
+        reused.written += 1;
         let sat = col_at(cols.subj.put(&blk), "subj")?;
         let rat = col_at(cols.rkey.put(&keys), "rkey")?;
         head.extend_from_slice(&chunk[0].0.to_le_bytes());
@@ -541,35 +550,61 @@ pub fn encode_split_over(
         head.extend_from_slice(&rat.to_le_bytes());
     }
     if nbs > 0 {
+        use crate::format6::Piece;
         let pairs = by_subject(edges);
-        let (old_pairs, old_fences) = match old {
+        let pieces = match old {
             Some((o, oh)) if u32_at(oh, 8) > 0 => {
-                (by_subject(o.edges), &oh[HEAD_FIXED + HEAD_BLOCK * o.edges.len().div_ceil(BLOCK)..])
+                let onb = o.edges.len().div_ceil(BLOCK);
+                let onbs = u32_at(oh, 8) as usize;
+                let f0 = HEAD_FIXED + HEAD_BLOCK * onb;
+                let counts = &oh[f0 + HEAD_FENCE * onbs..f0 + (HEAD_FENCE + 1) * onbs];
+                let lens: Vec<usize> = counts.iter().map(|&c| c as usize + 1).collect();
+                if lens.iter().sum::<usize>() != o.edges.len() {
+                    anyhow::bail!("an old by-subject index that doesn't hold its {} records", o.edges.len());
+                }
+                let old_pairs = by_subject(o.edges);
+                crate::format6::relayout(&old_pairs, &lens, &pairs)
+                    .into_iter()
+                    .map(|p| (p, Some((&oh[f0..f0 + HEAD_FENCE * onbs], counts))))
+                    .collect::<Vec<_>>()
             }
-            _ => (Vec::new(), &[][..]),
+            _ => {
+                (0..pairs.len()).step_by(BLOCK).map(|c| (Piece::Write(c..(c + BLOCK).min(pairs.len())), None)).collect()
+            }
         };
-        let old_chunks: Vec<&[(u32, u32)]> = old_pairs.chunks(BLOCK).collect();
+        let f0 = head.len();
+        head[h0 + 8..h0 + 12].copy_from_slice(&(pieces.len() as u32).to_le_bytes());
+        let mut counts = Vec::with_capacity(pieces.len());
         let mut subj = Vec::with_capacity(BLOCK);
-        for (j, chunk) in pairs.chunks(BLOCK).enumerate() {
-            blk.clear();
-            subj.clear();
-            for &(s, p) in chunk {
-                blk.extend_from_slice(&p.to_le_bytes());
-                subj.push(s);
+        for (p, o) in pieces {
+            match (p, o) {
+                (Piece::Keep(j), Some((fences, ocounts))) => {
+                    head.extend_from_slice(&fences[HEAD_FENCE * j..HEAD_FENCE * (j + 1)]);
+                    counts.push(ocounts[j]);
+                    reused.bysubj += 1;
+                }
+                (Piece::Write(r), _) => {
+                    let chunk = &pairs[r];
+                    blk.clear();
+                    subj.clear();
+                    for &(s, p) in chunk {
+                        blk.extend_from_slice(&p.to_le_bytes());
+                        subj.push(s);
+                    }
+                    crate::inset::encode_block(&subj, &mut blk);
+                    reused.written += 1;
+                    let at = col_at(cols.bysubj.put(&blk), "bysubj")?;
+                    head.extend_from_slice(&subj[0].to_le_bytes());
+                    head.extend_from_slice(&at.to_le_bytes());
+                    counts.push((chunk.len() - 1) as u8);
+                }
+                (Piece::Keep(_), None) => unreachable!("a kept block needs an old head"),
             }
-            crate::inset::encode_block(&subj, &mut blk);
-            bytes.bysubj += blk.len() as u64;
-            if old_chunks.get(j) == Some(&chunk) {
-                head.extend_from_slice(&old_fences[HEAD_FENCE * j..HEAD_FENCE * (j + 1)]);
-                reused.bysubj += 1;
-                continue;
-            }
-            let at = col_at(cols.bysubj.put(&blk), "bysubj")?;
-            head.extend_from_slice(&subj[0].to_le_bytes());
-            head.extend_from_slice(&at.to_le_bytes());
         }
+        debug_assert_eq!(head.len() - f0, HEAD_FENCE * counts.len());
+        head.extend_from_slice(&counts);
     }
-    bytes.header += (head.len() - h0) as u64;
+    bytes.add(&split_bytes(edges, subj_index));
     Ok(reused)
 }
 
@@ -579,7 +614,7 @@ pub fn split_bytes(edges: &[(u64, u32)], subj_index: usize) -> OutBytes {
     let nb = n.div_ceil(BLOCK);
     let nbs = if n >= subj_index { nb } else { 0 };
     let mut o = OutBytes {
-        header: (HEAD_FIXED + HEAD_BLOCK * nb + HEAD_FENCE * nbs) as u64,
+        header: (HEAD_FIXED + HEAD_BLOCK * nb + (HEAD_FENCE + 1) * nbs) as u64,
         subjects: 4 * n as u64,
         ..Default::default()
     };
@@ -617,6 +652,8 @@ pub struct SplitOut<'g> {
     nbs: usize,
     blocks: &'g [u8],
     fences: &'g [u8],
+    /// Per by-subject block, its count less one.
+    counts: &'g [u8],
     sp: OutSpaces<'g>,
 }
 
@@ -664,7 +701,8 @@ impl<'g> SplitOut<'g> {
         let blocks = head.get(HEAD_FIXED..HEAD_FIXED + HEAD_BLOCK * nb)?;
         let f0 = HEAD_FIXED + HEAD_BLOCK * nb;
         let fences = head.get(f0..f0 + HEAD_FENCE * nbs)?;
-        Some(SplitOut { n, dups, nb, nbs, blocks, fences, sp })
+        let counts = head.get(f0 + HEAD_FENCE * nbs..f0 + (HEAD_FENCE + 1) * nbs)?;
+        Some(SplitOut { n, dups, nb, nbs, blocks, fences, counts, sp })
     }
 
     pub fn len(&self) -> usize {
@@ -739,7 +777,7 @@ impl<'g> SplitOut<'g> {
 
     /// By-subject block j: its positions (u32s) and subjects, decoded.
     fn by_block(&self, cx: &ReadCx<'g>, j: usize, subj: &mut [u32; BLOCK]) -> R<(&'g [u8], usize)> {
-        let k = self.block_len(j);
+        let k = self.counts[j] as usize + 1;
         let b = self.by_subject().block(cx, j)?;
         crate::inset::decode_block(&b[4 * k..], self.fence(j), k, subj);
         Ok((&b[..4 * k], k))

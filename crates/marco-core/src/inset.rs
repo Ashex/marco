@@ -305,68 +305,97 @@ impl<'a> InList<'a> {
 /// blocks into `blocks`, its head onto `head`.
 ///
 /// ```text
-/// head:   u32 n, then nb x (u32 first id, u32 block at)
+/// head:   u32 n, u32 nb, nb x (u32 first id, u32 block at), nb x u8 (block count - 1)
 /// blocks: FORMAT 5's: per block, Elias-Fano of the ids after its first
 /// ```
+///
+/// A fresh write fills every block but the last to [`BLOCK`]; a patch's
+/// blocks hold [`crate::format6::MIN_FILL`] to [`BLOCK`] ([`crate::format6::relayout`]).
 pub fn encode_split(ids: &[u32], blocks: &mut Packer, head: &mut Vec<u8>) -> Result<()> {
     encode_split_over(ids, blocks, head, None).map(|_| ())
 }
 
+const SET_FIXED: usize = 8;
+
+fn set_nb(head: &[u8]) -> Option<usize> {
+    Some(u32_at(head.get(..SET_FIXED)?, 4) as usize)
+}
+
 /// The bytes of a big set's head that starts `head`: None if it's cut short.
 pub fn split_head_len(head: &[u8]) -> Option<usize> {
-    let n = u32_at(head.get(..4)?, 0) as usize;
-    let len = 4 + 8 * n.div_ceil(BLOCK);
+    let len = SET_FIXED + 9 * set_nb(head)?;
     (head.len() >= len).then_some(len)
 }
 
 /// Where the blocks of the big set whose head starts `head` are: `f(at)` for
 /// each block that takes bytes. False if the head is cut short.
 pub fn split_blocks(head: &[u8], mut f: impl FnMut(u64)) -> bool {
-    if split_head_len(head).is_none() {
-        return false;
-    }
-    let n = u32_at(head, 0) as usize;
-    for b in 0..n.div_ceil(BLOCK) {
-        if (n - b * BLOCK).min(BLOCK) > 1 {
-            f(u32_at(head, 4 + 8 * b + 4) as u64);
+    let Some(len) = split_head_len(head) else { return false };
+    let nb = set_nb(head).unwrap_or(0);
+    let counts = &head[SET_FIXED + 8 * nb..len];
+    for (b, &c) in counts.iter().enumerate() {
+        if c > 0 {
+            f(u32_at(head, SET_FIXED + 8 * b + 4) as u64);
         }
     }
     true
 }
 
 /// [`encode_split`] over `old`, the set's version in the shard's space, as
-/// (its ids, its head): a block whose ids are the old block's at the same
-/// index keeps the old block. Returns the blocks kept.
+/// (its ids, its head): a change rewrites only the blocks it lands in, and
+/// every other block is kept ([`crate::format6::relayout`]). Returns the
+/// blocks kept and the blocks written.
 pub fn encode_split_over(
     ids: &[u32],
     blocks: &mut Packer,
     head: &mut Vec<u8>,
     old: Option<(&[u32], &[u8])>,
-) -> Result<u64> {
+) -> Result<(u64, u64)> {
+    use crate::format6::Piece;
     debug_assert!(ids.len() > crate::format6::WHOLE && ids.windows(2).all(|w| w[0] < w[1]));
-    if let Some((oi, oh)) = old {
-        if split_head_len(oh).is_none() || u32_at(oh, 0) as usize != oi.len() {
-            anyhow::bail!("an old set head that isn't {} ids", oi.len());
+    let pieces = match old {
+        Some((oi, oh)) => {
+            let len = split_head_len(oh).filter(|_| u32_at(oh, 0) as usize == oi.len());
+            let Some(len) = len else { anyhow::bail!("an old set head that isn't {} ids", oi.len()) };
+            let nb = set_nb(oh).unwrap_or(0);
+            let lens: Vec<usize> = oh[SET_FIXED + 8 * nb..len].iter().map(|&c| c as usize + 1).collect();
+            if lens.iter().sum::<usize>() != oi.len() {
+                anyhow::bail!("an old set head whose blocks don't hold its {} ids", oi.len());
+            }
+            crate::format6::relayout(oi, &lens, ids).into_iter().map(|p| (p, Some(oh))).collect::<Vec<_>>()
         }
-    }
-    let old_chunks: Vec<&[u32]> = old.map_or_else(Vec::new, |(oi, _)| oi.chunks(BLOCK).collect());
+        None => (0..ids.len()).step_by(BLOCK).map(|c| (Piece::Write(c..(c + BLOCK).min(ids.len())), None)).collect(),
+    };
     head.extend_from_slice(&(ids.len() as u32).to_le_bytes());
+    head.extend_from_slice(&(pieces.len() as u32).to_le_bytes());
+    let mut counts = Vec::with_capacity(pieces.len());
     let mut buf = Vec::with_capacity(4 * BLOCK);
-    let mut kept = 0;
-    for (b, chunk) in ids.chunks(BLOCK).enumerate() {
-        if let Some((_, oh)) = old.filter(|_| old_chunks.get(b) == Some(&chunk)) {
-            head.extend_from_slice(&oh[4 + 8 * b..4 + 8 * (b + 1)]);
-            kept += 1;
-            continue;
+    let (mut kept, mut written) = (0, 0);
+    for (p, oh) in pieces {
+        match (p, oh) {
+            (Piece::Keep(b), Some(oh)) => {
+                let nb = set_nb(oh).unwrap_or(0);
+                head.extend_from_slice(&oh[SET_FIXED + 8 * b..SET_FIXED + 8 * (b + 1)]);
+                counts.push(oh[SET_FIXED + 8 * nb + b]);
+                kept += 1;
+            }
+            (Piece::Write(r), _) => {
+                let chunk = &ids[r];
+                buf.clear();
+                encode_block(chunk, &mut buf);
+                let at = u32::try_from(blocks.put(&buf)).map_err(|_| {
+                    anyhow::anyhow!("an in.blocks column passes 4 GiB in one shard: build with more shards")
+                })?;
+                head.extend_from_slice(&chunk[0].to_le_bytes());
+                head.extend_from_slice(&at.to_le_bytes());
+                counts.push((chunk.len() - 1) as u8);
+                written += 1;
+            }
+            (Piece::Keep(_), None) => unreachable!("a kept block needs an old head"),
         }
-        buf.clear();
-        encode_block(chunk, &mut buf);
-        let at = u32::try_from(blocks.put(&buf))
-            .map_err(|_| anyhow::anyhow!("an in.blocks column passes 4 GiB in one shard: build with more shards"))?;
-        head.extend_from_slice(&chunk[0].to_le_bytes());
-        head.extend_from_slice(&at.to_le_bytes());
     }
-    Ok(kept)
+    head.extend_from_slice(&counts);
+    Ok((kept, written))
 }
 
 /// A big set read through the page store: firsts pinned, blocks paged.
@@ -374,6 +403,8 @@ pub fn encode_split_over(
 pub struct SplitIn<'g> {
     n: usize,
     heads: &'g [u8],
+    /// Per block, its count less one.
+    counts: &'g [u8],
     space: &'g Space,
 }
 
@@ -393,9 +424,12 @@ impl<'g> Blocks<'g> for SetBlocks<'_, 'g> {
 
 impl<'g> SplitIn<'g> {
     pub fn parse(head: &'g [u8], space: &'g Space) -> Option<SplitIn<'g>> {
-        let n = u32_at(head.get(..4)?, 0) as usize;
-        let heads = head.get(4..4 + 8 * n.div_ceil(BLOCK))?;
-        Some(SplitIn { n, heads, space })
+        let len = split_head_len(head)?;
+        let n = u32_at(head, 0) as usize;
+        let nb = set_nb(head)?;
+        let heads = &head[SET_FIXED..SET_FIXED + 8 * nb];
+        let counts = &head[SET_FIXED + 8 * nb..len];
+        Some(SplitIn { n, heads, counts, space })
     }
 
     pub fn len(&self) -> usize {
@@ -411,7 +445,7 @@ impl<'g> SplitIn<'g> {
     }
 
     fn nb(&self) -> usize {
-        self.n.div_ceil(BLOCK)
+        self.counts.len()
     }
 
     fn first(&self, b: usize) -> u32 {
@@ -423,7 +457,7 @@ impl<'g> SplitIn<'g> {
     }
 
     fn block_len(&self, b: usize) -> usize {
-        (self.n - b * BLOCK).min(BLOCK)
+        self.counts[b] as usize + 1
     }
 
     fn decode(&self, cx: &ReadCx<'g>, b: usize, out: &mut [u32; BLOCK]) -> R<usize> {
@@ -484,8 +518,14 @@ impl<'g> SplitIn<'g> {
             None => 0,
             Some(a) => self.block_for(a, 0).unwrap_or(0),
         };
-        let span = want.saturating_add(BLOCK - 1) / BLOCK + 1;
-        self.blocks().need(cx, start..start.saturating_add(span).min(self.nb()))?;
+        // the start block, where `after` may sit at the end, then blocks
+        // until they hold `want` ids
+        let (mut end, mut got) = ((start + 1).min(self.nb()), 0usize);
+        while end < self.nb() && got < want {
+            got += self.block_len(end);
+            end += 1;
+        }
+        self.blocks().need(cx, start..end)?;
         let mut buf = [0u32; BLOCK];
         for b in start..self.nb() {
             let k = self.decode(cx, b, &mut buf)?;

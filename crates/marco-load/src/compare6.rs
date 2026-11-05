@@ -60,6 +60,14 @@ pub fn compare(a: &Path, b: &Path) -> Result<Report> {
     let m6 = Manifest::read(b)?;
     let dir6 = read_footer(&b.join(DIR_FILE))?;
     let meta6: Meta = serde_json::from_value(dir6.meta.clone()).context("directory meta")?;
+    if meta6.layout != marco_core::format6::LAYOUT {
+        bail!(
+            "{}: block layout {}, this build reads {}: rebuild it",
+            b.display(),
+            meta6.layout,
+            marco_core::format6::LAYOUT
+        );
+    }
     let d5 = &five.dir.meta;
     if (meta6.n_ids, meta6.shard_width, meta6.subj_index, meta6.relations.len())
         != (d5.n_ids, d5.shard_width, d5.subj_index, d5.relations.len())

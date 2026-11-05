@@ -103,8 +103,8 @@ comes due stops it, and a crash leaves either the old files or the new base, nev
 
 On the whole network, a day of the archive's follows, blocks and list items (2.75M ops) made a
 checkpoint of 20 s on a warm page cache: 11 s replaying the day, 9 s writing 65 patches. They held
-3.66 GB of changed lists and blocks and 1.19 GB of indexes and heads, against the 44 GB snapshot. At
-today's write rate that's about once a day. Compacting a shard (about 0.73 GB) took 2.2 s unpaced.
+1.17 GB of changed lists and blocks and 1.23 GB of indexes and heads, against the 44 GB snapshot. At
+today's write rate that's about once a day. Compacting a shard (about 0.75 GB) took 2.8 s unpaced.
 
 ## Restart
 

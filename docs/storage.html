@@ -1141,10 +1141,56 @@ On the load box, the whole-network FORMAT 6 snapshot (44.1 GB, 64 shards, follow
 </ul>
 So one insert rewrites every block after it, and a popular set or long list that changes several times a day is rewritten nearly whole. §11 assumed by-subject suffixes were small, and its in-set row undercounts how far the first change sits from the end.
 <br><b>What that does to the gates:</b> P_new + R = 4.85 GB, which is over Fits' 3.4 GB headroom. Compaction would also have to clear about 3.7 GB of garbage a day; this checkpoint left 3.67 GB across the shards. So at full residency the switch gate (§11) doesn't hold with this layout.
-<br><b>What would bring it down:</b> blocks that don't have to hold 128, so an insert rewrites the block it lands in (split when full) and the head carries each block's count. That's §4's slack leaves, applied to in sets and by-subject blocks only, a FORMAT 6 codec change. A bound from the day's changes: about 2.2M changed pairs at about 200 B a set block, which puts in.blocks under ~0.45 GB. The alternative was more headroom at Fits. <b>Decided by the lead: slack blocks</b> (B-tree-style leaves for in sets and by-subject blocks: an insert rewrites only its own block, split when full), not more headroom, since R also sets the daily garbage and compaction volume that decision 67 sized at about 1.2 GB. Task 1011 builds it and measures R again on this day.
+<br><b>What would bring it down:</b> blocks that don't have to hold 128, so an insert rewrites the block it lands in (split when full) and the head carries each block's count. That's §4's slack leaves, applied to in sets and by-subject blocks only, a FORMAT 6 codec change. A bound from the day's changes: about 2.2M changed pairs at about 200 B a set block, which puts in.blocks under ~0.45 GB. The alternative was more headroom at Fits. <b>Decided by the lead: slack blocks</b> (B-tree-style leaves for in sets and by-subject blocks: an insert rewrites only its own block, split when full), not more headroom, since R also sets the daily garbage and compaction volume that decision 67 sized at about 1.2 GB. Phase 3d builds it; on this day R came to 1.17 GB.
 <br>List items: the list-item export was taken after the day (2026-11-05 16:39 UTC), so the day's list-item creates were already in the snapshot. §11 puts them at a few MB, so it doesn't change R.
 </td><td><code>internal/raw-p3c/</code></td></tr>
 <tr><td>Measuring R</td><td><code>marco-harness checkpoint-day</code> replays a day of record ops (an export of the archive's <code>repo_records</code>) into an App over hard links to a snapshot, checkpoints once, and reports R, P_new, the garbage left and two unpaced compactions. The day is the 24 h after the snapshot's export (2026-11-04 07:20 to 2026-11-05 07:20 UTC), so its deletes find their records.</td><td><code>marco-harness/src/day.rs</code></td></tr>
+</table>
+
+<h3>Phase 3d · Slack blocks <span class="tag c">needs 3c</span></h3>
+<ul>
+<li>In sets and by-subject indexes get blocks of 64 to 128 entries, with a count per block in the pinned head, so an insert rewrites only the block it lands in (§4's slack leaves, for these two only).</li>
+<li><b>Tests:</b> the relayout's property test; an insert into a big set rewrites at most two blocks; FORMAT 5 property tests, compare6 and the 20-checkpoint rebuild comparison stay green; R re-measured on 3c's day.</li>
+<li><b>Gate</b> (the lead's): P_new + R within Fits' 3.4 GB headroom with margin, and R within 30% of the estimate written before building (1.2 GB).</li>
+</ul>
+
+<p><b>Phase 3d decisions.</b></p>
+<table class="small">
+<tr><th>Point</th><th>Decided</th><th>Where</th></tr>
+<tr><td>Which blocks</td><td>In-set blocks and by-subject blocks only. Out lists' subject and rkey blocks stay positional, 128 records each: new records are new TIDs and land at the tail, which is what they do now. By-subject entries still name positions, so a delete in a long list still shifts the positions after it and rewrites the by-subject blocks that hold them. On 3c's day that was 0.18 GB of R, too little for dead slots.</td><td><code>outlog</code>, <code>inset</code></td></tr>
+<tr><td>Heads</td><td>An in set's head is <code>u32 n, u32 nb</code>, then <code>nb × (u32 first id, u32 at)</code>, then <code>nb × u8</code> (count − 1). An out list's head adds <code>nbs × u8</code> counts after its fences. Nothing ranks by position inside these two: Has, Intersect probes and ListIn cursors find their block by the pinned firsts, and Counts reads <code>n</code>. So firsts plus counts are all the heads need. ListIn's one-round fetch adds counts until it covers <code>want</code>. That's about 1 B a block more pinned: about 28 MB on the whole network.</td><td><code>inset::SplitIn</code>, <code>outlog::SplitOut</code></td></tr>
+<tr><td>Relayout</td><td>Each old block takes the new entries from its first entry up to the next block's. A run equal to the old block keeps it. Otherwise it's rewritten:
+<ul>
+<li>a run over 128 splits evenly, so every piece holds at least 64;</li>
+<li>the last block's run fills whole blocks, which is where appends land;</li>
+<li>a run under 64 that isn't last takes in the next block's run first.</li>
+</ul>
+So every block but the last holds 64 to 128. Fresh writes, compaction among them, still fill every block to 128.</td><td><code>format6::relayout</code></td></tr>
+<tr><td>Bounds (§8)</td><td>After patches, ListIn reads at most ⌈L/64⌉ + 1 blocks, against ⌈L/128⌉ + 1 on a fresh write. A subject's run of up to 64 records spans at most two by-subject blocks. Has, Counts and BlockPairs don't change.</td><td>§8</td></tr>
+<tr><td>Stats</td><td><code>RelStats.out_bytes</code> counts a list's bytes as a fresh write would lay it out, whatever its patched blocks hold, so stats still equal a full rebuild's.</td><td><code>outlog::encode_split_over</code></td></tr>
+<tr><td>Layout</td><td>No compatibility with 3c's FORMAT 6. The directory's meta gains <code>layout</code> (<code>format6::LAYOUT</code> = 1), and a snapshot of another layout is refused with "rebuild the snapshot". The load box's snapshot is rebuilt from <code>~/marco/storage/in</code>.</td><td><code>store::DirFile</code></td></tr>
+<tr><td>R, measured</td><td>
+Set-up:
+<ul>
+<li>Snapshot: rebuilt from <code>~/marco/storage/in</code> with this layout. 44.1 GB in 64 shards; compare6 passes against phase 1's FORMAT 5 build of the same input. It replaced the 3c-layout <code>~/marco/storage/snap6</code>, which was deleted, so phase 6 measures the layout that ships.</li>
+<li>Ops: 3c's day, 2.75M ops.</li>
+</ul>
+<table class="small">
+<tr><th>Section</th><th>3c layout</th><th>Slack blocks</th></tr>
+<tr><td>follow in.blocks</td><td>1.67 GB</td><td>0.29 GB</td></tr>
+<tr><td>follow out.bysubj</td><td>1.22 GB</td><td>0.29 GB</td></tr>
+<tr><td>block out.bysubj</td><td>0.20 GB</td><td>0.06 GB</td></tr>
+<tr><td>follow out.subj + out.rkey</td><td>0.33 GB</td><td>0.33 GB</td></tr>
+<tr><td>everything else</td><td>0.24 GB</td><td>0.20 GB</td></tr>
+<tr><td><b>R</b></td><td><b>3.66 GB</b></td><td><b>1.17 GB</b></td></tr>
+<tr><td>P_new</td><td>1.19 GB</td><td>1.23 GB</td></tr>
+<tr><td>P_new + R</td><td>4.85 GB</td><td><b>2.41 GB</b></td></tr>
+</table>
+R is 2% under the 1.2 GB estimate written before the build.
+<br>P_new + R leaves 1.0 GB of Fits' 3.4 GB headroom, so the lead's gate passes.
+<br>The day left 1.62 GB of garbage (45.67 GB of files against 44.05 GB live). That's close to decision 67's assumption.
+<br>The checkpoint took 20 s on a warm page cache, 9.2 s of it writing, and 83 s cold. Compacting a shard took 2.7–2.8 s unpaced.
+</td><td><code>internal/raw-p3d/</code></td></tr>
 </table>
 
 <h3>Phase 4 · Miss-aware read path <span class="tag w">needs 2 and 3b</span></h3>
@@ -1238,6 +1284,7 @@ So one insert rewrites every block after it, and a popular set or long list that
 </ul>
 </td></tr>
 <tr><td>3c</td><td>new <code>marco-core/src/graph/checkpoint.rs</code> (<code>write_checkpoint</code>, <code>write_shard_*</code>, <code>dirty_shards</code>, patches, compaction, garbage), <code>graph.rs</code> (the base swap), <code>store.rs</code> (<code>ShardFile</code> over base and patches), <code>format6.rs</code>, <code>outlog.rs</code>, <code>inset.rs</code> (block reuse), <code>snapshot.rs</code>; <code>marco-server/src/writer.rs</code> (<code>rewrite</code>, the compaction thread and swap), <code>app.rs</code> (config, durability), <code>main.rs</code> (flags), <code>metrics.rs</code>, <code>admin_svc.rs</code> (files per shard); <code>marco-harness/src/{killtest,day}.rs</code>; tests <code>checkpoints.rs</code>, durability tests</td></tr>
+<tr><td>3d</td><td><code>marco-core/src/{format6,inset,outlog,store,snapshot}.rs</code> (relayout, heads with counts, the layout check), <code>graph/checkpoint.rs</code> (blocks written), <code>marco-load/src/build.rs</code> (layout); tests <code>checkpoints.rs</code>, <code>format6.rs</code>'s relayout test</td></tr>
 <tr><td>4</td><td><code>marco-core/src/{read,graph,obs}.rs</code>, <code>store/engine.rs</code>; <code>marco-server/src/{graph_svc,admin_svc,app,main,writer,series,liststats,metrics}.rs</code></td></tr>
 <tr><td>5</td><td><code>marco-core/src/store/engine.rs</code>, <code>graph.rs</code>; <code>marco-server/src/{writer,app,admin_svc,metrics}.rs</code>; <code>proto/marco/v1/admin.proto</code> and <code>marco-proto</code>'s generated code; <code>ui/src/pages/Storage.tsx</code></td></tr>
 <tr><td>6</td><td>deletions across the above (<code>marco-server/src/sys.rs</code>, <code>snapshot.rs</code>'s <code>Bytes::Map</code>); <code>docs/</code></td></tr>

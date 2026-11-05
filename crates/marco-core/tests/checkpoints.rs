@@ -81,6 +81,29 @@ fn same(a: &Graph, b: &Graph, what: &str) {
             }
             let (ia, ib) = (a.read(|cx| a.in_set(cx, rel, id)).unwrap(), b.read(|cx| b.in_set(cx, rel, id)).unwrap());
             assert_eq!(ia, ib, "{what}: in {rel} of {id}");
+            // the by-subject index and the in set's blocks, read the ways requests do
+            let d = |g: &Graph| g.read(|cx| g.out_distinct(cx, rel, id)).unwrap();
+            assert_eq!(d(a), d(b), "{what}: distinct {rel} of {id}");
+            for &(_, subj) in oa.iter().step_by(oa.len().div_ceil(8).max(1)) {
+                let f = |g: &Graph| g.read(|cx| g.out_find_subject(cx, rel, id, subj)).unwrap();
+                assert_eq!(f(a), f(b), "{what}: find {subj} in {rel} of {id}");
+                let f = |g: &Graph| g.read(|cx| g.out_first_subject(cx, rel, id, subj)).unwrap();
+                assert_eq!(f(a), f(b), "{what}: first {subj} in {rel} of {id}");
+            }
+            for (k, after) in
+                [None, ia.get(ia.len() / 3).copied(), ia.get(ia.len() * 2 / 3).copied()].into_iter().enumerate()
+            {
+                let lim = [1, 70, 300][k];
+                let p = |g: &Graph| g.read(|cx| g.in_page(cx, rel, id, lim, after)).unwrap();
+                assert_eq!(p(a), p(b), "{what}: in page {rel} of {id} after {after:?}");
+            }
+            for x in (0..a.n_ids()).step_by(7) {
+                let c = |g: &Graph| g.read(|cx| g.in_contains(cx, rel, id, x)).unwrap();
+                assert_eq!(c(a), c(b), "{what}: {x} in {rel} of {id}");
+            }
+            let probes: Vec<u32> = (0..a.n_ids()).step_by(3).collect();
+            let i = |g: &Graph| g.read(|cx| g.in_intersect(cx, rel, id, &probes, 50)).unwrap();
+            assert_eq!(i(a), i(b), "{what}: intersect {rel} of {id}");
         }
     }
     for id in 0..a.n_ids() {
@@ -449,4 +472,54 @@ fn a_compaction_unmaps_the_old_files() {
     }
     let id = g.id_of(&did(1)).unwrap();
     assert_eq!(g.read(|cx| g.out_all(cx, 0, id)).unwrap().len(), 499);
+}
+
+/// A new follower in the middle of a big in set rewrites the block it lands
+/// in (split in two when full), not the blocks after it.
+#[test]
+fn an_insert_rewrites_its_own_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("g");
+    let mut g = Graph::new(Relations::bsky_default());
+    g.shards = 1;
+    let popular = did(0);
+    // followers 1..6000, every other one: ids spread over the set
+    for a in 1..6000u32 {
+        let d = did(a);
+        if a % 2 == 0 {
+            g.add(&format!("at://{d}/{}/{}", COLLS[0], tid(a as u64)), &popular).unwrap();
+        } else {
+            g.add(&format!("at://{d}/{}/{}", COLLS[1], tid(a as u64)), &did(a - 1)).unwrap();
+        }
+    }
+    g.write_snapshot(&path).unwrap();
+    let mut g = reopen(&path);
+    let p = g.id_of(&popular).unwrap();
+    let before = g.read(|cx| g.in_set(cx, 0, p)).unwrap();
+    let mid = did(3001);
+    assert!(g.id_of(&mid).is_some_and(|i| !before.contains(&i)));
+    g.add(&format!("at://{mid}/{}/{}", COLLS[0], tid(99_999)), &popular).unwrap();
+    let rep = g.write_checkpoint(&path, 1, 0, Default::default()).unwrap();
+    assert!(rep.blocks_written <= 2, "{rep:?}");
+    assert!(rep.patch_bytes <= 2 * 4096, "{rep:?}");
+    let g2 = reopen(&path);
+    let after = g2.read(|cx| g2.in_set(cx, 0, p)).unwrap();
+    assert_eq!(after.len(), before.len() + 1);
+    assert_eq!(after, g.read(|cx| g.in_set(cx, 0, p)).unwrap());
+    for x in after.iter().step_by(97) {
+        assert!(g2.read(|cx| g2.in_contains(cx, 0, p, *x)).unwrap());
+    }
+}
+
+/// A snapshot records its block layout, which opening checks.
+#[test]
+fn snapshots_record_their_layout() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("g");
+    let mut g = Graph::new(Relations::bsky_default());
+    g.add(&format!("at://{}/{}/{}", did(1), COLLS[0], tid(1)), &did(2)).unwrap();
+    g.write_snapshot(&path).unwrap();
+    reopen(&path);
+    let st = Store::open(&path).unwrap();
+    assert_eq!(st.dir.meta.layout, marco_core::format6::LAYOUT);
 }

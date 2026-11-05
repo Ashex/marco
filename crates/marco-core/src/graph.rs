@@ -2137,6 +2137,7 @@ impl Graph {
             n_other: oth_v.len() as u32,
             subj_index: self.subj_index as u32,
             relations: self.rels.list.clone(),
+            layout: crate::format6::LAYOUT,
         };
         set.finish(&meta, BTreeMap::new())?;
         Ok(())

@@ -1342,6 +1342,7 @@ pub fn build(o: &Opts) -> Result<Report> {
         n_other: rep.dids_other as u32,
         subj_index: o.subj_index as u32,
         relations: o.rels.list.clone(),
+        layout: if o.format == 6 { marco_core::format6::LAYOUT } else { 0 },
     };
     if let Some(s) = set5 {
         s.finish_with(&meta, o.cursors.clone())?;

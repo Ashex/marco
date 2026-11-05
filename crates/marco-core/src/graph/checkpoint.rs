@@ -585,13 +585,8 @@ impl Graph {
                 _ => None,
             };
             let reused = out.push_over(local, &v, old_split)?;
-            if v.len() > crate::format6::WHOLE {
-                let total = v.len().div_ceil(outlog::BLOCK) as u64
-                    + if v.len() >= self.subj_index { v.len().div_ceil(outlog::BLOCK) as u64 } else { 0 };
-                let kept = reused.blocks + reused.bysubj;
-                blocks.kept += kept;
-                blocks.written += total - kept;
-            }
+            blocks.kept += reused.blocks + reused.bysubj;
+            blocks.written += reused.written;
             out.drain(w)?;
         }
         let (bytes, _) = out.finish(w, n)?;
@@ -644,17 +639,13 @@ impl Graph {
                 (Some(Entry::Head(at)), Some(was)) => {
                     let head = old_in.as_ref().map_or(&[][..], |s| s.head);
                     let h = head.get(at as usize..).context("an in head past its section")?;
-                    let kept = inn.push_over(local, &v, Some((was, h)))?;
-                    if v.len() > crate::format6::WHOLE {
-                        blocks.kept += kept;
-                        blocks.written += v.len().div_ceil(inset::BLOCK) as u64 - kept;
-                    }
+                    let (kept, written) = inn.push_over(local, &v, Some((was, h)))?;
+                    blocks.kept += kept;
+                    blocks.written += written;
                 }
                 _ => {
-                    inn.push_over(local, &v, None)?;
-                    if v.len() > crate::format6::WHOLE {
-                        blocks.written += v.len().div_ceil(inset::BLOCK) as u64;
-                    }
+                    let (_, written) = inn.push_over(local, &v, None)?;
+                    blocks.written += written;
                 }
             }
         }
