@@ -36,15 +36,16 @@ network. Every command here was run as written on Linux with Rust (the toolchain
 
 ```bash
 cd marco
+(cd ui && npm ci && npm run build)    # the console and these docs, into ui/dist
 cargo build --release -p marco-load -p marco-server
-(cd ui && npm ci && npm run build)    # the console and these docs; the server reads ui/dist at start
 ```
 
 That gives `target/release/marco-load` (the bulk loader) and `target/release/marco` (the server).
-Without the UI build the server still runs and answers the API, and `/docs` and `/admin` show a
-page saying how to build them. The binary doesn't embed the UI. It reads `ui/dist` from the source
-tree it was compiled in, so a binary copied to another host or into an image needs
-`--ui-dir /path/to/dist` (or `MARCO_UI_DIR`) to serve them.
+A release build embeds `ui/dist`, so the binary serves the console and the docs wherever it's
+copied. Build the UI first: without it the server still runs and answers the API, and `/docs` and
+`/admin` show a page saying how to build them. `--ui-dir /path/to/dist` (or `MARCO_UI_DIR`)
+serves another build instead of the embedded one. A debug build reads `ui/dist` from the source
+tree at start, so a UI rebuild shows up after a restart.
 
 ## The input format
 

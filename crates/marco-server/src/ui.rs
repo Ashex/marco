@@ -1,7 +1,7 @@
-//! The console and the docs, one build (`ui/` into `ui/dist`), read whole
-//! at start from `--ui-dir` or this source tree's build. Serving only the
-//! names read here rules out traversal. `/admin/*` and `/docs/*` get
-//! index.html, `/assets/*`, `/favicon.svg` and the standalone pages
+//! The console and the docs, one build (`ui/` into `ui/dist`), built into
+//! the binary and read whole at start, or from `--ui-dir` instead. Serving
+//! only the names read here rules out traversal. `/admin/*` and `/docs/*`
+//! get index.html, `/assets/*`, `/favicon.svg` and the standalone pages
 //! (`/docs/<name>.html`: design and results) are files. The docs and the
 //! files are public: the console's page is static, and its data comes from
 //! the Admin RPCs behind the token.
@@ -16,10 +16,18 @@ use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
 use axum::Router;
 use http::{header, HeaderValue, StatusCode};
+use rust_embed::RustEmbed;
+
+// A checkout without `npm run build` still compiles; the page then says so.
+// Debug builds read the folder from disk, so a UI rebuild needs no cargo build.
+#[derive(RustEmbed)]
+#[folder = "../../ui/dist"]
+#[allow_missing = true]
+struct Embedded;
 
 const PLACEHOLDER: &str = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>marco</title></head>\
-<body><p>This marco runs without its console and docs. Build them (<code>cd ui &amp;&amp; npm ci &amp;&amp; npm run build</code>), \
-or point <code>--ui-dir</code> at a built <code>ui/dist</code>, then restart.</p></body></html>";
+<body><p>This marco was built without its console and docs. Build them (<code>cd ui &amp;&amp; npm ci &amp;&amp; npm run build</code>) \
+and then marco, or point <code>--ui-dir</code> at a built <code>ui/dist</code>, then restart.</p></body></html>";
 
 /// Same-origin only. Inline style attributes set through the CSSOM (React
 /// `style`) aren't governed by style-src.
@@ -61,15 +69,17 @@ impl Ui {
             anyhow::ensure!(ui.files.contains_key("index.html"), "--ui-dir {}: no index.html", d.display());
             return Ok(ui);
         }
-        let dev = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ui/dist");
-        if dev.join("index.html").is_file() {
-            return Ui::read(&dev);
-        }
         let mut files = HashMap::new();
-        files.insert(
-            "index.html".into(),
-            File { data: PLACEHOLDER.into(), mime: HeaderValue::from_static("text/html; charset=utf-8") },
-        );
+        for name in Embedded::iter() {
+            if let Some(f) = Embedded::get(&name) {
+                let mime = HeaderValue::from_static(mime(Path::new(name.as_ref())));
+                files.insert(name.into_owned(), File { data: f.data.into_owned().into(), mime });
+            }
+        }
+        files.entry("index.html".into()).or_insert_with(|| File {
+            data: PLACEHOLDER.into(),
+            mime: HeaderValue::from_static("text/html; charset=utf-8"),
+        });
         Ok(Ui { files })
     }
 

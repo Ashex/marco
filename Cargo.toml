@@ -34,6 +34,7 @@ tracing = "0.1"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 rustc-hash = "2"
 arc-swap = "1"
+rust-embed = "8"
 prometheus = { version = "0.14", default-features = false }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query"] }
 tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros"] }

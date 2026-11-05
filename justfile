@@ -26,7 +26,7 @@ check: check-private check-gen
     cd ui && npm run typecheck
     cd ui && npm run check-docs
 
-# The console and the docs: build into ui/dist (the server reads it at start), dev servers, screenshots
+# The console and the docs: build into ui/dist (a release build of the server embeds it), dev servers, screenshots
 ui:
     cd ui && npm ci && npm run build
 

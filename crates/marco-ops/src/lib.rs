@@ -6,11 +6,14 @@
 //! GET  /debug/pprof/profile?seconds  CPU profile, pprof protobuf (feature cpu-profile)
 //! GET  /debug/pprof/heap             jemalloc heap in use, pprof (feature jemalloc)
 //! GET  /debug/tracing                the trace ratio; POST ?ratio=0.01 sets it
-//! POST /v1/traces                    an OTLP sink that drops what it gets (benches)
+//! POST /v1/traces                    an OTLP sink that drops what it gets (serve only)
 //! ```
 //!
-//! Paths match vlpds and vlRelay, so the same scrapers can pull from it. Bind
-//! it to loopback: none of these routes check who's asking.
+//! Paths match vlpds and vlRelay, so the same scrapers can pull from it.
+//! [`router`] has no auth of its own: marco-server mounts it behind the
+//! admin token. [`serve`], marco-load's endpoint, checks no one, so bind it
+//! to loopback. Only it has the sink, which `marco-load bench --otlp`
+//! exports its spans to.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, LazyLock};
@@ -64,7 +67,8 @@ pub fn serve(addr: &str, refresh: Option<Refresh>) -> Result<SocketAddr> {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("ops runtime");
         rt.block_on(async move {
             let listener = tokio::net::TcpListener::from_std(std_listener).expect("ops listener");
-            axum::serve(listener, router(refresh)).await.expect("ops server");
+            let app = router(refresh).route("/v1/traces", axum::routing::post(sink));
+            axum::serve(listener, app).await.expect("ops server");
         });
     })?;
     Ok(local)
@@ -76,7 +80,6 @@ pub fn router(refresh: Option<Refresh>) -> Router {
         .route("/debug/pprof/profile", get(profile))
         .route("/debug/pprof/heap", get(heap))
         .route("/debug/tracing", get(get_tracing).post(set_tracing))
-        .route("/v1/traces", axum::routing::post(sink))
 }
 
 /// The default registry as Prometheus text.

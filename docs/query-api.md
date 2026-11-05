@@ -112,9 +112,10 @@ feed's hydration make. 50 others × 2 relations take ~30 µs in the engine and ~
 | `limit` | default 50, at most 1,000 | default 50, at most 1,000 |
 | Extra | `distinct`: one record per subject, its oldest | |
 
-Pass the last response's `cursor` to get the next page. An empty cursor means the last page. A
-page can hold fewer than `limit` items before the end, since hidden actors are dropped after the
-page is cut, so page until the cursor is empty. Records whose rkey isn't a TID sort as newest.
+Pass the last response's `cursor` to get the next page. A full page always carries a cursor, so a
+last page that's exactly full has one too, and the call after it returns an empty page with no
+cursor. A page can hold fewer than `limit` items before the end, since hidden actors are dropped
+after the page is cut, so page until the cursor is empty. Records whose rkey isn't a TID sort as newest.
 Neither call rejects a bad cursor (Intersect does), so pass back only cursors marco gave you.
 
 ## Counts

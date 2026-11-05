@@ -87,4 +87,6 @@ async fn docs_are_public() {
     assert_eq!(get(admin, "/metrics", &[]).0, 401);
     let bearer = format!("Bearer {TOKEN}");
     assert_eq!(get(admin, "/metrics", &[("authorization", &bearer)]).0, 200);
+    // the bench OTLP sink is marco-load's, not the server's
+    assert_eq!(post(admin, "/v1/traces"), 404);
 }

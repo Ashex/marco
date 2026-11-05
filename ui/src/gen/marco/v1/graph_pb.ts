@@ -292,7 +292,8 @@ export type ListOutResponse = Message<"marco.v1.ListOutResponse"> & {
   edges: OutEdge[];
 
   /**
-   * Empty on the last page.
+   * Set on a full page, the last one too when it's exactly full (the next
+   * call then returns nothing); empty when nothing follows.
    *
    * @generated from field: string cursor = 2;
    */
@@ -372,6 +373,9 @@ export type ListInResponse = Message<"marco.v1.ListInResponse"> & {
   actors: string[];
 
   /**
+   * Set on a full page, the last one too when it's exactly full (the next
+   * call then returns nothing); empty when nothing follows.
+   *
    * @generated from field: string cursor = 2;
    */
   cursor: string;
@@ -592,7 +596,8 @@ export type IntersectResponse = Message<"marco.v1.IntersectResponse"> & {
   bLen: bigint;
 
   /**
-   * Empty on the last page.
+   * Set on a full page, the last one too when it's exactly full (the next
+   * call then returns nothing); empty when nothing follows.
    *
    * @generated from field: string cursor = 4;
    */

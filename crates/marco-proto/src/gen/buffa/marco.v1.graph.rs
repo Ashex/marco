@@ -2089,7 +2089,8 @@ pub struct ListOutResponse {
         deserialize_with = "::buffa::json_helpers::null_as_default"
     )]
     pub edges: ::buffa::alloc::vec::Vec<OutEdge>,
-    /// Empty on the last page.
+    /// Set on a full page, the last one too when it's exactly full (the next
+    /// call then returns nothing); empty when nothing follows.
     ///
     /// Field 2: `cursor`
     #[serde(
@@ -2596,6 +2597,9 @@ pub struct ListInResponse {
         deserialize_with = "::buffa::json_helpers::null_as_default"
     )]
     pub actors: ::buffa::alloc::vec::Vec<::buffa::alloc::string::String>,
+    /// Set on a full page, the last one too when it's exactly full (the next
+    /// call then returns nothing); empty when nothing follows.
+    ///
     /// Field 2: `cursor`
     #[serde(
         rename = "cursor",
@@ -3905,7 +3909,8 @@ pub struct IntersectResponse {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
     )]
     pub b_len: u64,
-    /// Empty on the last page.
+    /// Set on a full page, the last one too when it's exactly full (the next
+    /// call then returns nothing); empty when nothing follows.
     ///
     /// Field 4: `cursor`
     #[serde(

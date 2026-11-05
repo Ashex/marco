@@ -77,7 +77,7 @@ struct Serve {
     /// Refuse every write: Graph writes, actor statuses and snapshot writes.
     #[arg(long, env = "MARCO_READ_ONLY")]
     read_only: bool,
-    /// A built console (ui/dist). Default: this source tree's, if built.
+    /// A built console (ui/dist) to serve instead of the one built into the binary.
     #[arg(long, env = "MARCO_UI_DIR")]
     ui_dir: Option<PathBuf>,
     /// Seconds between change segments: the writes a kill -9 can lose, for a source to replay.

@@ -3064,7 +3064,8 @@ impl ::serde::Serialize for ListOutRequestOwnedView {
 pub struct ListOutResponseView<'a> {
     /// Field 1: `edges`
     pub edges: ::buffa::RepeatedView<'a, super::super::__buffa::view::OutEdgeView<'a>>,
-    /// Empty on the last page.
+    /// Set on a full page, the last one too when it's exactly full (the next
+    /// call then returns nothing); empty when nothing follows.
     ///
     /// Field 2: `cursor`
     pub cursor: &'a str,
@@ -3324,7 +3325,8 @@ impl ListOutResponseOwnedView {
     ) -> &::buffa::RepeatedView<'_, super::super::__buffa::view::OutEdgeView<'_>> {
         &self.0.reborrow().edges
     }
-    /// Empty on the last page.
+    /// Set on a full page, the last one too when it's exactly full (the next
+    /// call then returns nothing); empty when nothing follows.
     ///
     /// Field 2: `cursor`
     #[must_use]
@@ -3958,6 +3960,9 @@ impl ::serde::Serialize for ListInRequestOwnedView {
 pub struct ListInResponseView<'a> {
     /// Field 1: `actors`
     pub actors: ::buffa::RepeatedView<'a, &'a str>,
+    /// Set on a full page, the last one too when it's exactly full (the next
+    /// call then returns nothing); empty when nothing follows.
+    ///
     /// Field 2: `cursor`
     pub cursor: &'a str,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
@@ -4193,6 +4198,9 @@ impl ListInResponseOwnedView {
     pub fn actors(&self) -> &::buffa::RepeatedView<'_, &'_ str> {
         &self.0.reborrow().actors
     }
+    /// Set on a full page, the last one too when it's exactly full (the next
+    /// call then returns nothing); empty when nothing follows.
+    ///
     /// Field 2: `cursor`
     #[must_use]
     pub fn cursor(&self) -> &'_ str {
@@ -6234,7 +6242,8 @@ pub struct IntersectResponseView<'a> {
     pub a_len: u64,
     /// Field 3: `b_len`
     pub b_len: u64,
-    /// Empty on the last page.
+    /// Set on a full page, the last one too when it's exactly full (the next
+    /// call then returns nothing); empty when nothing follows.
     ///
     /// Field 4: `cursor`
     pub cursor: &'a str,
@@ -6576,7 +6585,8 @@ impl IntersectResponseOwnedView {
     pub fn b_len(&self) -> u64 {
         self.0.reborrow().b_len
     }
-    /// Empty on the last page.
+    /// Set on a full page, the last one too when it's exactly full (the next
+    /// call then returns nothing); empty when nothing follows.
     ///
     /// Field 4: `cursor`
     #[must_use]

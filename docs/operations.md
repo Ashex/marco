@@ -47,7 +47,6 @@ before it deletes the old ones), and RAM for the hot part of the snapshot in pag
 | `/metrics`, `/debug/*` | no | token or proxy login |
 | `/admin` (console) | no | the page is open, its data needs a login |
 | `/docs`, `/healthz`, `/readyz` | open | open |
-| `POST /v1/traces` (a bench OTLP sink that counts bytes and drops them) | no | open |
 
 The token is the contents of `--admin-token-file`, at least 16 characters, sent as
 `Authorization: Bearer <token>`. Without a token file or a proxy header, Admin and Graph writes
@@ -88,7 +87,7 @@ console's Settings page shows each one's value and where it came from.
 | `--no-prefault` | `MARCO_NO_PREFAULT` | off | Don't map the snapshot's pages in after open. |
 | `--trace-ratio` | `MARCO_TRACE_RATIO` | 0 | The share of ops that get a span, 0 to 1. |
 | `--otlp URL` | `MARCO_OTLP` | | An OTLP/HTTP collector's base URL for spans. |
-| `--ui-dir` | `MARCO_UI_DIR` | the build tree's `ui/dist` | A built console and docs. Set it anywhere but the source tree: the default is the absolute path the binary was compiled in. |
+| `--ui-dir` | `MARCO_UI_DIR` | the embedded build | A built console and docs (`ui/dist`) to serve instead of the ones built into the binary. |
 
 `marco synth --out DIR [--actors N] [--shards N]` writes a synthetic snapshot with fake DIDs, for
 trying the console and the API without data.

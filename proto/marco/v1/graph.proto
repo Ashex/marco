@@ -138,7 +138,8 @@ message ListOutRequest {
 
 message ListOutResponse {
   repeated OutEdge edges = 1;
-  // Empty on the last page.
+  // Set on a full page, the last one too when it's exactly full (the next
+  // call then returns nothing); empty when nothing follows.
   string cursor = 2;
 }
 
@@ -157,6 +158,8 @@ message ListInRequest {
 
 message ListInResponse {
   repeated string actors = 1;
+  // Set on a full page, the last one too when it's exactly full (the next
+  // call then returns nothing); empty when nothing follows.
   string cursor = 2;
 }
 
@@ -220,7 +223,8 @@ message IntersectResponse {
   // The two sides' lengths.
   uint64 a_len = 2;
   uint64 b_len = 3;
-  // Empty on the last page.
+  // Set on a full page, the last one too when it's exactly full (the next
+  // call then returns nothing); empty when nothing follows.
   string cursor = 4;
   // With count: the result's size, or count_limit when total_capped. It
   // counts accounts the page leaves out as taken down or deleted.
