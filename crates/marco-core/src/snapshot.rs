@@ -244,6 +244,18 @@ impl std::ops::Deref for Bytes {
     }
 }
 
+static MMAP_RANDOM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Snapshots opened after this call map their files with MADV_RANDOM, so a
+/// fault reads its own page and no readahead around it. Off by default.
+pub fn set_mmap_random(on: bool) {
+    MMAP_RANDOM.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn mmap_random() -> bool {
+    MMAP_RANDOM.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub struct Snapshot {
     bytes: Bytes,
     pub kind: String,
@@ -258,6 +270,10 @@ impl Snapshot {
         // SAFETY: snapshot files are written once and renamed into place; nothing
         // writes to one after that.
         let map = unsafe { memmap2::Mmap::map(&f)? };
+        #[cfg(unix)]
+        if mmap_random() {
+            map.advise(memmap2::Advice::Random).context("madvise(MADV_RANDOM)")?;
+        }
         Snapshot::from_bytes(Bytes::Map(map))
     }
 

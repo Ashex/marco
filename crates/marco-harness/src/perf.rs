@@ -35,6 +35,7 @@ use serde_json::{json, Value};
 
 use crate::hist::Hist;
 use crate::mixfile;
+use crate::skew::{self, Skew};
 use crate::Rng;
 
 // ------------------------------------------------------------------ inputs
@@ -74,6 +75,17 @@ pub struct Inputs {
     /// List URIs, drawn about as often as they have members (empty without lists).
     #[serde(default)]
     pub lists: Vec<String>,
+    /// Weighted pools (`perf-inputs --viewer-weights/--subject-weights`): viewers
+    /// and DIDs drawn with replacement in proportion to their weights.
+    #[serde(default)]
+    pub viewers_skew: Vec<Viewer>,
+    #[serde(default)]
+    pub authors_skew: Vec<String>,
+    #[serde(default)]
+    pub skew: Option<Skew>,
+    /// The seed these were drawn with.
+    #[serde(default)]
+    pub seed: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -112,7 +124,26 @@ fn top(g: &Graph, k: usize, count: impl Fn(u32) -> u64 + Sync) -> Vec<(u32, u64)
 }
 
 /// P0's bench inputs (marco-load bench), in its order of draws, as DIDs.
-pub fn make_inputs(snapshot: &Path, seed: u64) -> Result<Inputs> {
+/// What `perf-inputs` adds to P0's draws.
+#[derive(Clone, Debug)]
+pub struct InputOpts {
+    /// Viewers in the `active` and `viewer_skew` pools; the `popular` and
+    /// `author_skew` pools hold ten times as many DIDs. 2,000 is P0's.
+    pub pool_size: usize,
+    pub viewer_weights: Option<PathBuf>,
+    /// Follows kept per viewer (the subjects a mix draws from a viewer's follows); 100 is P0's.
+    pub follows: usize,
+    /// A weight file, or `followers` for each actor's follower count in the snapshot.
+    pub subject_weights: Option<String>,
+}
+
+impl Default for InputOpts {
+    fn default() -> Self {
+        InputOpts { pool_size: 2000, viewer_weights: None, follows: 100, subject_weights: None }
+    }
+}
+
+pub fn make_inputs(snapshot: &Path, seed: u64, o: &InputOpts) -> Result<Inputs> {
     let g = Graph::open(snapshot)?;
     let f = g.relations().by_name("follow").context("no follow relation")?;
     let n = g.n_ids();
@@ -161,15 +192,16 @@ pub fn make_inputs(snapshot: &Path, seed: u64) -> Result<Inputs> {
     let mut r2 = Rng((seed ^ 0x6d69_785f_706f_6f6c) | 1);
     let viewer = |rng: &mut Rng, x: u32| {
         let page = g.read(|cx| g.out_page(cx, f, x, 1 << 20, None)).unwrap();
-        let follows = (0..page.len().min(100)).map(|_| did(page[rng.below(page.len() as u64) as usize].1)).collect();
+        let follows =
+            (0..page.len().min(o.follows)).map(|_| did(page[rng.below(page.len() as u64) as usize].1)).collect();
         Viewer { did: did(x), follows }
     };
-    let viewers_random = actors.iter().take(2000).map(|&x| viewer(&mut r2, x)).collect();
+    let viewers_random: Vec<Viewer> = actors.iter().take(2000).map(|&x| viewer(&mut r2, x)).collect();
     let mut viewers_active = Vec::new();
     // a cap on draws, so a graph with few such actors (a test's) stops early
     let tries = (n as u64 * 64).min(100_000_000);
     for _ in 0..tries {
-        if viewers_active.len() == 2000 {
+        if viewers_active.len() == o.pool_size {
             break;
         }
         let x = r2.below(n as u64) as u32;
@@ -177,8 +209,8 @@ pub fn make_inputs(snapshot: &Path, seed: u64) -> Result<Inputs> {
             viewers_active.push(viewer(&mut r2, x));
         }
     }
-    let viewers_heavy = hot_out.iter().map(|&(x, _)| viewer(&mut r2, x)).collect();
-    let popular = (0..20_000)
+    let viewers_heavy: Vec<Viewer> = hot_out.iter().map(|&(x, _)| viewer(&mut r2, x)).collect();
+    let popular: Vec<String> = (0..o.pool_size * 10)
         .map(|_| {
             let x = actors[r2.below(actors.len() as u64) as usize];
             let page = g.read(|cx| g.out_page(cx, f, x, 1 << 20, None)).unwrap();
@@ -209,6 +241,25 @@ pub fn make_inputs(snapshot: &Path, seed: u64) -> Result<Inputs> {
             (h, c.unwrap_or_default())
         })
         .collect();
+    let (viewers_skew, authors_skew, skew) = skew_pools(&g, seed, o, &viewer)?;
+    let skew = skew.map(|(mut k, vflags, sflags)| {
+        if let Some(f) = &vflags {
+            for (name, v) in [
+                ("viewers_random", &viewers_random),
+                ("viewers_active", &viewers_active),
+                ("viewer_skew", &viewers_skew),
+            ] {
+                k.pools.insert(name.into(), skew::pool_stat(&g, f, v.iter().map(|x| x.did.as_str())));
+            }
+        }
+        if let Some(f) = &sflags {
+            let uniform = misses.iter().map(|m| m.1.as_str());
+            k.pools.insert("popular".into(), skew::pool_stat(&g, f, popular.iter().map(String::as_str)));
+            k.pools.insert("author_skew".into(), skew::pool_stat(&g, f, authors_skew.iter().map(String::as_str)));
+            k.pools.insert("uniform".into(), skew::pool_stat(&g, f, uniform));
+        }
+        k
+    });
     Ok(Inputs {
         actors: actors.iter().map(|&x| did(x)).collect(),
         hits,
@@ -225,7 +276,54 @@ pub fn make_inputs(snapshot: &Path, seed: u64) -> Result<Inputs> {
         viewers_heavy,
         popular,
         lists,
+        viewers_skew,
+        authors_skew,
+        skew,
+        seed,
     })
+}
+
+type Flags = Option<Vec<u8>>;
+type SkewPools = (Vec<Viewer>, Vec<String>, Option<(Skew, Flags, Flags)>);
+
+/// The weighted pools, from the weight files: draws with replacement in
+/// proportion to weight (the viewers with up to 100 of their follows, as the
+/// uniform ones have), and the top-share flags the pools' stats are made with.
+fn skew_pools(g: &Graph, seed: u64, o: &InputOpts, viewer: &impl Fn(&mut Rng, u32) -> Viewer) -> Result<SkewPools> {
+    if o.viewer_weights.is_none() && o.subject_weights.is_none() {
+        return Ok((Vec::new(), Vec::new(), None));
+    }
+    let mut rng = Rng((seed ^ 0x7765_6967_6874_7321) | 1);
+    let mut sk = Skew {
+        viewer_weights: o.viewer_weights.as_ref().map(|p| p.display().to_string()),
+        subject_weights: o.subject_weights.clone(),
+        ..Default::default()
+    };
+    let (mut viewers, mut authors) = (Vec::new(), Vec::new());
+    let (mut vflags, mut sflags) = (None, None);
+    if let Some(p) = &o.viewer_weights {
+        let w = skew::read_weights(g, p)?;
+        sk.viewer_rows = w.rows;
+        sk.viewer_found = w.found;
+        let s = skew::Sampler::new(&w.w);
+        viewers = (0..o.pool_size)
+            .map(|_| {
+                let id = w.ids[s.draw(&mut rng)];
+                viewer(&mut rng, id)
+            })
+            .collect();
+        vflags = Some(skew::rank_flags(g.n_ids(), &w));
+    }
+    if let Some(p) = &o.subject_weights {
+        let w = if p == "followers" { skew::follower_weights(g)? } else { skew::read_weights(g, Path::new(p))? };
+        sk.subject_rows = w.rows;
+        sk.subject_found = w.found;
+        let s = skew::Sampler::new(&w.w);
+        let did = |id: u32| g.did_of(id).expect("a weighted id has a DID");
+        authors = (0..o.pool_size * 10).map(|_| did(w.ids[s.draw(&mut rng)])).collect();
+        sflags = Some(skew::rank_flags(g.n_ids(), &w));
+    }
+    Ok((viewers, authors, Some((sk, vflags, sflags))))
 }
 
 // ------------------------------------------------------------------ shapes
@@ -379,6 +477,7 @@ impl Inputs {
         match p {
             mixfile::Pool::Active => &self.viewers_active,
             mixfile::Pool::Heavy => &self.viewers_heavy,
+            mixfile::Pool::ViewerSkew => &self.viewers_skew,
             mixfile::Pool::Heaviest => &self.viewers_heavy[..self.viewers_heavy.len().min(1)],
             _ => &self.viewers_random,
         }
@@ -712,7 +811,7 @@ pub fn raw_bodies(inp: &Inputs, mixes: &[Mix]) -> BTreeMap<Shape, (&'static str,
         for &(s, _) in &m.weights {
             out.entry(s).or_insert_with(|| {
                 let path = Req::of(inp, s, 0).path();
-                let n = if matches!(s, Shape::File(_)) { mixfile::DRAWS } else { CYCLE };
+                let n = if let Shape::File(k) = s { mixfile::draws_of(k) } else { CYCLE };
                 (path, (0..n).map(|i| Req::of(inp, s, i).encode()).collect())
             });
         }
@@ -959,6 +1058,9 @@ fn step_json(mode: &str, mix: &Mix, rec: &Rec, secs: f64, extra: Value) -> Value
     });
     if let (Value::Object(a), Value::Object(b)) = (&mut v, extra) {
         a.extend(b);
+    }
+    if let Some(n) = mixfile::distinct_per_min(mix, all.len() as f64 / secs) {
+        v["distinct_dids_per_min"] = json!(n);
     }
     v
 }
@@ -1248,6 +1350,15 @@ pub struct Args {
     /// file (JSON, as internal/read_mix.py writes) when the value is a file's path.
     #[arg(long)]
     pub mix: Option<String>,
+    /// Requests drawn for a mix file in all, split among its shapes by rate (0: 4,096
+    /// per shape). A run cycles through them, so more take longer to repeat.
+    #[arg(long, default_value_t = 0)]
+    pub draws: usize,
+    /// Seed of the mix file's draws (0: the one P0's runs used). With `perf-inputs`' seed, the mix
+    /// file and `--draws` it fixes every request: request i is the shape `mix.pick(i)` and its
+    /// draw i % that shape's count; an open-loop step sends 0..n in order.
+    #[arg(long, default_value_t = 0)]
+    pub mix_seed: u64,
     /// Closed loop: requests in flight (engine: threads), one step each.
     #[arg(long, value_delimiter = ',', default_value = "1")]
     pub concurrency: Vec<usize>,
@@ -1298,7 +1409,7 @@ pub struct Args {
 fn shapes_of(a: &Args, inp: &Inputs) -> Result<(Vec<Mix>, Vec<String>)> {
     if let Some(m) = &a.mix {
         if Path::new(m).is_file() {
-            let (mix, skipped) = mixfile::load(Path::new(m), inp)?;
+            let (mix, skipped) = mixfile::load(Path::new(m), inp, a.draws, a.mix_seed)?;
             for s in &skipped {
                 eprintln!("{s}: left out, the inputs have no pool for it");
             }
@@ -1347,9 +1458,9 @@ fn save(out: &Path, meta: &Value, steps: &[Value]) -> Result<()> {
     Ok(())
 }
 
-pub fn inputs_cmd(snapshot: &Path, out: &Path, seed: u64) -> Result<()> {
+pub fn inputs_cmd(snapshot: &Path, out: &Path, seed: u64, o: &InputOpts) -> Result<()> {
     let t = Instant::now();
-    let inp = make_inputs(snapshot, seed)?;
+    let inp = make_inputs(snapshot, seed, o)?;
     std::fs::write(out, serde_json::to_vec(&inp)?)?;
     eprintln!(
         "{} actors, hot followed {} ({}), hot following {} ({}) in {:.1} s",
@@ -1360,6 +1471,17 @@ pub fn inputs_cmd(snapshot: &Path, out: &Path, seed: u64) -> Result<()> {
         inp.hot_out[0].1,
         t.elapsed().as_secs_f64()
     );
+    if let Some(sk) = &inp.skew {
+        for (name, p) in &sk.pools {
+            eprintln!(
+                "pool {name}: {} draws, {} distinct, top 1% of weights {:.1}% of draws, top 10% {:.1}%",
+                p.draws,
+                p.distinct,
+                p.top1 * 100.0,
+                p.top10 * 100.0
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1385,7 +1507,9 @@ pub fn run(a: Args) -> Result<()> {
     let meta = json!({"target": format!("{:?}", a.target).to_lowercase(), "mode": format!("{:?}", a.mode).to_lowercase(),
                       "label": a.label, "client_threads": a.threads, "conns": a.conns, "cpus_allowed": cpus,
                       "secs": a.secs, "warmup": a.warmup, "writes_per_s": a.writes, "client": if a.raw { "raw" } else { "generated" },
-                      "mix": a.mix, "mix_skipped": skipped});
+                      "mix": a.mix, "mix_skipped": skipped, "draws": a.draws, "mix_seed": a.mix_seed, "inputs_seed": inp.seed,
+                      "inputs_file": a.inputs.display().to_string(), "mix_hash": a.mix.as_deref().and_then(|m| mixfile::file_hash(Path::new(m)).ok()),
+                      "skew": inp.skew});
     let mut steps: Vec<Value> = Vec::new();
 
     if a.target == Target::Engine {
@@ -1572,7 +1696,9 @@ mod tests {
         {"name": "on_list", "call": "has", "rate": 0.01, "actor": "lists", "rels": ["listitem"], "subjects": {"pool": "random"}},
         {"name": "mutes", "call": "filter", "rate": 0.05, "actor": "active", "subjects": {"pool": "popular"}, "batch": [[20, 1]],
          "drop": ["block:out", "block:in"], "member_of": [[1, 1], [2, 1]]},
-        {"name": "off", "call": "has", "rate": 0, "actor": "random", "subjects": {"pool": "uniform"}}
+        {"name": "off", "call": "has", "rate": 0, "actor": "random", "subjects": {"pool": "uniform"}},
+        {"name": "skewed", "call": "relationships", "rate": 0.01, "actor": "viewer_skew", "rels": ["follow"],
+         "subjects": {"pool": "author_skew", "followed": 0.5}, "batch": [[5, 1]]}
     ]}"#;
 
     fn file_index(s: Shape) -> u16 {
@@ -1586,7 +1712,31 @@ mod tests {
     fn mix_file_runs_on_the_engine() {
         let dir = tempfile::tempdir().unwrap();
         let snap = small_snapshot(dir.path());
-        let inp = make_inputs(&snap, 42).unwrap();
+        // weights 1..=400 by actor number: the viewers' file, and the subjects' reversed
+        let (vw, sw) = (dir.path().join("viewers.tsv"), dir.path().join("subjects.tsv"));
+        let tsv = |f: &dyn Fn(u32) -> u32| (0..400u32).map(|i| format!("{}\t{}\n", did(i), f(i))).collect::<String>();
+        std::fs::write(&vw, tsv(&|i| i + 1) + "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa\t9\n").unwrap();
+        std::fs::write(&sw, tsv(&|i| 400 - i)).unwrap();
+        let opts = InputOpts {
+            viewer_weights: Some(vw),
+            subject_weights: Some(sw.display().to_string()),
+            ..Default::default()
+        };
+        let inp = make_inputs(&snap, 42, &opts).unwrap();
+        assert_eq!(inp.viewers_skew.len(), 2000);
+        assert_eq!(inp.authors_skew.len(), 20_000);
+        assert!(inp.viewers_skew.iter().all(|v| v.follows.len() == 60));
+        let sk = inp.skew.as_ref().unwrap();
+        assert_eq!((sk.viewer_rows, sk.viewer_found, sk.subject_rows, sk.subject_found), (401, 400, 400, 400));
+        // top 1% of 400 weights 1..=400 hold 4 x 398.5 of 80,200 (2%), the top 10% 40 x 380.5 (19%)
+        let (v, a) = (&sk.pools["viewer_skew"], &sk.pools["author_skew"]);
+        assert!((0.0..0.04).contains(&v.top1) && (0.15..0.25).contains(&v.top10), "{v:?}");
+        assert!((0.01..0.04).contains(&a.top1) && (0.17..0.22).contains(&a.top10), "{a:?}");
+        assert!(
+            sk.pools["viewers_active"].draws > 0
+                && sk.pools["popular"].draws == 20_000
+                && sk.pools["uniform"].draws == 10_000
+        );
         assert_eq!(inp.viewers_random.len(), 2000);
         assert!(!inp.viewers_active.is_empty() && inp.viewers_active.iter().all(|v| v.follows.len() == 60));
         assert_eq!(inp.viewers_heavy.len(), 20);
@@ -1595,11 +1745,20 @@ mod tests {
 
         let file = dir.path().join("mix.json");
         std::fs::write(&file, SMALL_MIX).unwrap();
-        let (mix, skipped) = mixfile::load(&file, &inp).unwrap();
+        let (mix, skipped) = mixfile::load(&file, &inp, 0, 0).unwrap();
         assert!(skipped.is_empty());
-        assert_eq!(mix.weights.len(), 8, "a zero rate is left out");
+        assert_eq!(mix.weights.len(), 9, "a zero rate is left out");
         let total: u32 = mix.weights.iter().map(|w| w.1).sum();
-        assert_eq!(mix.weights[0].1 * 100 / total, 50, "rel is 0.3 of 0.59");
+        assert_eq!(mix.weights[0].1 * 100 / total, 50, "rel is 0.3 of 0.6");
+        match mixfile::req(8, 5) {
+            Req::Relationships(r) => {
+                assert_eq!(r.others.len(), 5);
+                assert!(r.actor.starts_with("did:plc:"));
+            }
+            _ => panic!("skewed is a Relationships"),
+        }
+        let per_min = mixfile::distinct_per_min(&mix, 1000.0).unwrap();
+        assert!(per_min > 100 && per_min <= 402, "400 DIDs and two lists in the snapshot: {per_min}");
         assert_eq!(mix.weights[0].0.name(), "rel");
 
         let e = Engine::new(read_only_app(&snap).unwrap()).unwrap();
@@ -1616,7 +1775,7 @@ mod tests {
         }
         assert_eq!(sizes.keys().filter(|k| k.0 == "rel").map(|k| k.1).collect::<Vec<_>>(), [1, 30]);
         assert_eq!(sizes.keys().filter(|k| k.0 == "pairs").map(|k| k.1).collect::<Vec<_>>(), [2]);
-        assert_eq!(answered, 2 * mixfile::DRAWS, "every relationships call answers each other");
+        assert_eq!(answered, 3 * mixfile::DRAWS, "every relationships call answers each other");
         match mixfile::req(4, 0) {
             Req::ListOut(r) => assert!(r.actor.starts_with("did:plc:") && r.limit == 10),
             _ => panic!("page is a ListOut"),

@@ -35,6 +35,8 @@ pub enum Call {
 /// Where an argument comes from: a viewer pool (`random`, `active`,
 /// `heavy`, `heaviest` (the most-following actor alone), which carry their
 /// follows), a DID pool (`popular`, `uniform`, `hot_in`) or `lists` (list URIs).
+/// `viewer_skew` (viewers) and `author_skew` (DIDs) are drawn in proportion to
+/// the weight files `perf-inputs` was given.
 #[derive(Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "snake_case")]
 pub enum Pool {
@@ -42,9 +44,11 @@ pub enum Pool {
     Active,
     Heavy,
     Heaviest,
+    ViewerSkew,
     Popular,
     Uniform,
     HotIn,
+    AuthorSkew,
     Lists,
 }
 
@@ -108,7 +112,8 @@ pub struct FileShape {
     pub member_of: Vec<(u32, f64)>,
 }
 
-/// Requests drawn per shape; request i of a shape is number i % this.
+/// Requests drawn per shape unless a run gives a total; request i of a shape
+/// is number i % the count.
 pub const DRAWS: usize = 4096;
 
 struct Loaded {
@@ -120,6 +125,11 @@ static LOADED: OnceLock<Loaded> = OnceLock::new();
 
 pub fn name(k: u16) -> &'static str {
     LOADED.get().map_or("file?", |l| l.names[k as usize])
+}
+
+/// Requests drawn for shape `k` of the loaded file.
+pub fn draws_of(k: u16) -> usize {
+    LOADED.get().map_or(DRAWS, |l| l.reqs[k as usize].len())
 }
 
 pub fn req(k: u16, i: usize) -> &'static Req {
@@ -147,12 +157,13 @@ fn uniform01(rng: &mut Rng) -> f64 {
 fn draw<'a>(inp: &'a Inputs, rng: &mut Rng, p: Pool) -> (&'a str, &'a [String]) {
     let pick = |v: &'a [String], rng: &mut Rng| v[rng.below(v.len() as u64) as usize].as_str();
     match p {
-        Pool::Random | Pool::Active | Pool::Heavy | Pool::Heaviest => {
+        Pool::Random | Pool::Active | Pool::Heavy | Pool::Heaviest | Pool::ViewerSkew => {
             let v = inp.viewers(p);
             let x = &v[rng.below(v.len() as u64) as usize];
             (x.did.as_str(), &x.follows[..])
         }
         Pool::Popular => (pick(&inp.popular, rng), &[]),
+        Pool::AuthorSkew => (pick(&inp.authors_skew, rng), &[]),
         Pool::Uniform => (inp.misses[rng.below(inp.misses.len() as u64) as usize].1.as_str(), &[]),
         Pool::HotIn => (inp.hot_in[rng.below(inp.hot_in.len() as u64) as usize].0.as_str(), &[]),
         Pool::Lists => (pick(&inp.lists, rng), &[]),
@@ -277,7 +288,8 @@ fn pools_of(s: &FileShape) -> Vec<Pool> {
 
 fn pool_empty(inp: &Inputs, p: Pool) -> bool {
     match p {
-        Pool::Random | Pool::Active | Pool::Heavy | Pool::Heaviest => inp.viewers(p).is_empty(),
+        Pool::Random | Pool::Active | Pool::Heavy | Pool::Heaviest | Pool::ViewerSkew => inp.viewers(p).is_empty(),
+        Pool::AuthorSkew => inp.authors_skew.is_empty(),
         Pool::Popular => inp.popular.is_empty(),
         Pool::Uniform => inp.misses.is_empty(),
         Pool::HotIn => inp.hot_in.is_empty(),
@@ -285,16 +297,37 @@ fn pool_empty(inp: &Inputs, p: Pool) -> bool {
     }
 }
 
+/// A shape's share of `total` requests by its rate, at least 1,024 so a rare shape still cycles.
+fn draws_for(total: usize, rate: f64, rate_sum: f64) -> usize {
+    ((total as f64 * rate / rate_sum).round() as usize).max(1024)
+}
+
+/// FNV-1a of a file's bytes, to say which mix a result ran.
+pub fn file_hash(path: &Path) -> Result<String> {
+    Ok(format!(
+        "{:016x}",
+        std::fs::read(path)?
+            .iter()
+            .fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3))
+    ))
+}
+
 /// The file as a Mix of `Shape::File` shapes, their requests drawn. A
 /// shape whose pool the inputs lack (lists, on a snapshot without them) is
 /// left out, and named in the second value.
-pub fn load(path: &Path, inp: &Inputs) -> Result<(Mix, Vec<String>)> {
+pub fn load(path: &Path, inp: &Inputs, total_draws: usize, seed: u64) -> Result<(Mix, Vec<String>)> {
     let f: MixFile = serde_json::from_slice(&std::fs::read(path).with_context(|| format!("read {}", path.display()))?)
         .with_context(|| format!("parse {}", path.display()))?;
     let mut names = Vec::new();
     let mut reqs = Vec::new();
     let mut rates = Vec::new();
     let mut skipped = Vec::new();
+    let rate_sum: f64 = f
+        .shapes
+        .iter()
+        .filter(|s| s.rate > 0.0 && !pools_of(s).into_iter().any(|p| pool_empty(inp, p)))
+        .map(|s| s.rate)
+        .sum();
     for (k, s) in f.shapes.iter().enumerate() {
         if s.rate <= 0.0 {
             continue;
@@ -303,8 +336,9 @@ pub fn load(path: &Path, inp: &Inputs) -> Result<(Mix, Vec<String>)> {
             skipped.push(s.name.clone());
             continue;
         }
-        let mut rng = Rng(0x6d69_7866_696c_6531 ^ (k as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-        let drawn = (0..DRAWS).map(|_| make(inp, s, &mut rng)).collect::<Result<Vec<_>>>()?;
+        let draws = if total_draws == 0 { DRAWS } else { draws_for(total_draws, s.rate, rate_sum) };
+        let mut rng = Rng((0x6d69_7866_696c_6531 ^ seed) ^ (k as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        let drawn = (0..draws).map(|_| make(inp, s, &mut rng)).collect::<Result<Vec<_>>>()?;
         names.push(&*Box::leak(s.name.clone().into_boxed_str()));
         reqs.push(drawn);
         rates.push(s.rate);
@@ -323,4 +357,72 @@ pub fn load(path: &Path, inp: &Inputs) -> Result<(Mix, Vec<String>)> {
         .map(|(k, r)| (Shape::File(k as u16), ((r / total * 10_000.0).round() as u32).max(1)))
         .collect();
     Ok((Mix::from_weights(weights, Some(f.name))?, skipped))
+}
+
+fn fnv(s: &str) -> u64 {
+    s.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3))
+}
+
+fn req_dids(r: &Req, f: &mut impl FnMut(&str)) {
+    match r {
+        Req::Has(x) => {
+            f(&x.from);
+            f(&x.to);
+        }
+        Req::Relationships(x) => {
+            f(&x.actor);
+            x.others.iter().for_each(|o| f(o));
+        }
+        Req::ListOut(x) => f(&x.actor),
+        Req::ListIn(x) => f(&x.subject),
+        Req::Counts(x) => x.actors.iter().for_each(|a| f(a)),
+        Req::Intersect(x) => {
+            for side in [&x.a, &x.b] {
+                if let Some(s) = side.as_option() {
+                    f(&s.actor);
+                }
+            }
+        }
+        Req::Filter(x) => {
+            f(&x.viewer);
+            x.actors.iter().for_each(|a| f(a));
+        }
+        Req::BlockPairs(x) => x.pairs.iter().for_each(|p| {
+            f(&p.a);
+            f(&p.b);
+        }),
+    }
+}
+
+/// Most requests one count walks: 12M covers a minute at 200k requests/s.
+const DISTINCT_CAP: usize = 12_000_000;
+
+/// How many different DIDs (actors, whose lists the calls open) the loaded
+/// file's calls name in a minute at `rps`: its requests in the order a run
+/// sends them, first the file's own. Past the file's cycle the count stops
+/// growing, so a short cycle caps it.
+pub fn distinct_per_min(mix: &Mix, rps: f64) -> Option<usize> {
+    let l = LOADED.get()?;
+    let n = ((rps * 60.0) as usize).min(DISTINCT_CAP);
+    let mut seen = std::collections::HashSet::new();
+    for i in 0..n {
+        if let Shape::File(k) = mix.pick(i) {
+            let r = &l.reqs[k as usize];
+            req_dids(&r[i % r.len()], &mut |d| {
+                seen.insert(fnv(d));
+            });
+        }
+    }
+    Some(seen.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn draws_split_by_rate() {
+        assert_eq!(draws_for(1_000_000, 0.25, 1.0), 250_000);
+        assert_eq!(draws_for(1_000_000, 0.000_001, 1.0), 1024, "a rare shape still cycles");
+    }
 }

@@ -8,7 +8,8 @@
 //! marco-harness bench --snapshot DIR --capture F --work DIR                    consumer + App throughput on a capture
 //! marco-harness lag --snapshot DIR --jetstream URL --work DIR --seconds S      live tail lag
 //! marco-harness retention --jetstream URL | --firehose URL                     how far back a source replays
-//! marco-harness perf-inputs --snapshot DIR --out F.json                        read inputs for perf, as DIDs
+//! marco-harness perf-inputs --snapshot DIR --out F.json [--viewer-weights F --subject-weights F|followers]
+//!                                                                              read inputs for perf, as DIDs, plus weighted pools
 //! marco-harness perf --inputs F --target engine|stack|h2 --out F.json          Graph read throughput and latency
 //! marco-harness checkpoint-day --snapshot DIR --ops F.jsonl.zst --work DIR     a recorded day's checkpoint: R, P_new, garbage
 //! ```
@@ -20,6 +21,7 @@ mod hist;
 mod killtest;
 mod mixfile;
 mod perf;
+mod skew;
 mod synth;
 
 use std::net::SocketAddr;
@@ -202,6 +204,19 @@ enum Cmd {
         out: PathBuf,
         #[arg(long, default_value_t = 42)]
         seed: u64,
+        /// Viewers in the `active` and `viewer_skew` pools (10x as many DIDs in `popular` and `author_skew`).
+        #[arg(long, default_value_t = 2000)]
+        pool_size: usize,
+        /// Follows kept per viewer, for the subjects a mix draws from them.
+        #[arg(long, default_value_t = 100)]
+        follows: usize,
+        /// `did<TAB>weight` lines: who reads. Adds the `viewer_skew` pool, drawn in proportion to weight.
+        #[arg(long)]
+        viewer_weights: Option<PathBuf>,
+        /// `did<TAB>weight` lines (or `followers`: follower counts from the snapshot): who is read about.
+        /// Adds the `author_skew` pool.
+        #[arg(long)]
+        subject_weights: Option<String>,
     },
     /// Graph read throughput and latency per query shape: in-process, through
     /// the RPC stack in-process, or over HTTP/2; closed or open loop.
@@ -211,7 +226,14 @@ enum Cmd {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let cmd = match cli.cmd {
-        Cmd::PerfInputs { snapshot, out, seed } => return perf::inputs_cmd(&snapshot, &out, seed),
+        Cmd::PerfInputs { snapshot, out, seed, pool_size, follows, viewer_weights, subject_weights } => {
+            return perf::inputs_cmd(
+                &snapshot,
+                &out,
+                seed,
+                &perf::InputOpts { pool_size, follows, viewer_weights, subject_weights },
+            )
+        }
         Cmd::Perf(a) => return perf::run(*a),
         c => c,
     };

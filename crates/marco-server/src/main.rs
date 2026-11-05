@@ -39,6 +39,12 @@ enum Cmd {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum MmapAdvice {
+    Default,
+    Random,
+}
+
 #[derive(Args)]
 struct Serve {
     /// The snapshot directory (marco-load build's --out).
@@ -152,6 +158,9 @@ struct Serve {
     /// for tests that want a starved cache.
     #[arg(long, env = "MARCO_MAX_FRAMES", hide = true)]
     max_frames: Option<u32>,
+    /// madvise for the snapshot's mappings (--storage mmap): `random` turns off the kernel's readahead around a fault.
+    #[arg(long, env = "MARCO_MMAP_ADVICE", value_enum, default_value = "default")]
+    mmap_advice: MmapAdvice,
     /// Follow a Jetstream instance (wss://host or wss://host/subscribe) for the relations' collections.
     #[arg(long, env = "MARCO_JETSTREAM", conflicts_with = "firehose")]
     jetstream: Option<String>,
@@ -204,6 +213,7 @@ fn flags(m: &ArgMatches, s: &Serve) -> Vec<FlagInfo> {
         ("storage", s.storage.clone()),
         ("memory", s.memory.clone().unwrap_or_else(|| "—".into())),
         ("miss_threads", s.miss_threads.to_string()),
+        ("mmap_advice", format!("{:?}", s.mmap_advice).to_lowercase()),
         ("jetstream", s.jetstream.clone().unwrap_or_else(|| "—".into())),
         ("firehose", s.firehose.clone().unwrap_or_else(|| "—".into())),
         ("source_retention_hours", s.source_retention_hours.to_string()),
@@ -347,8 +357,10 @@ fn main() -> Result<()> {
                 handle_resolver: origin("--handle-resolver", s.handle_resolver.as_deref())?,
             };
             let ui = Arc::new(marco_server::ui::Ui::load_with(s.ui_dir.as_deref(), site)?);
+            let random = s.mmap_advice == MmapAdvice::Random;
             let rt = marco_server::runtime(None)?;
             rt.block_on(async move {
+                marco_core::snapshot::set_mmap_random(random);
                 let app = App::open(cfg)?;
                 let (api, admin) = marco_server::serve(app.clone(), ui).await?;
                 if let Some(ops) = marco_server::serve_ops(&app).await? {

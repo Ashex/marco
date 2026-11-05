@@ -172,6 +172,10 @@ impl MappedFile {
         // SAFETY: snapshot files are written once and renamed into place; nothing
         // writes to one after that.
         let map = unsafe { memmap2::Mmap::map(&f)? };
+        #[cfg(unix)]
+        if crate::snapshot::mmap_random() {
+            map.advise(memmap2::Advice::Random).context("madvise(MADV_RANDOM)")?;
+        }
         let footer = PagedFooter::read(&map).with_context(|| path.display().to_string())?;
         let name = path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
         Ok(MappedFile { name, footer, map: Arc::new(map) })
