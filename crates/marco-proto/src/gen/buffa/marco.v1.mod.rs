@@ -40,6 +40,9 @@ pub mod __buffa {
         reg.register_json_any(super::__RELATIONSHIPS_RESPONSE_JSON_ANY);
         reg.register_json_any(super::__RELATIONSHIP_JSON_ANY);
         reg.register_json_any(super::__RELATIONSHIP_EDGE_JSON_ANY);
+        reg.register_json_any(super::__BLOCK_PAIR_JSON_ANY);
+        reg.register_json_any(super::__BLOCK_PAIRS_REQUEST_JSON_ANY);
+        reg.register_json_any(super::__BLOCK_PAIRS_RESPONSE_JSON_ANY);
         reg.register_json_any(super::__LIST_OUT_REQUEST_JSON_ANY);
         reg.register_json_any(super::__LIST_OUT_RESPONSE_JSON_ANY);
         reg.register_json_any(super::__OUT_EDGE_JSON_ANY);
@@ -143,6 +146,18 @@ pub use self::__buffa::view::RelationshipOwnedView;
 pub use self::__buffa::view::RelationshipEdgeView;
 #[doc(inline)]
 pub use self::__buffa::view::RelationshipEdgeOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::BlockPairView;
+#[doc(inline)]
+pub use self::__buffa::view::BlockPairOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::BlockPairsRequestView;
+#[doc(inline)]
+pub use self::__buffa::view::BlockPairsRequestOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::BlockPairsResponseView;
+#[doc(inline)]
+pub use self::__buffa::view::BlockPairsResponseOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::ListOutRequestView;
 #[doc(inline)]

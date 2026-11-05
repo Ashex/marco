@@ -14,6 +14,14 @@ pub type OwnedRelationshipsRequestView = ::buffa::view::OwnedView<
 pub type OwnedRelationshipsResponseView = ::buffa::view::OwnedView<
     crate::proto::marco::v1::__buffa::view::RelationshipsResponseView<'static>,
 >;
+///Shorthand for `OwnedView<BlockPairsRequestView<'static>>`.
+pub type OwnedBlockPairsRequestView = ::buffa::view::OwnedView<
+    crate::proto::marco::v1::__buffa::view::BlockPairsRequestView<'static>,
+>;
+///Shorthand for `OwnedView<BlockPairsResponseView<'static>>`.
+pub type OwnedBlockPairsResponseView = ::buffa::view::OwnedView<
+    crate::proto::marco::v1::__buffa::view::BlockPairsResponseView<'static>,
+>;
 ///Shorthand for `OwnedView<ListOutRequestView<'static>>`.
 pub type OwnedListOutRequestView = ::buffa::view::OwnedView<
     crate::proto::marco::v1::__buffa::view::ListOutRequestView<'static>,
@@ -116,6 +124,40 @@ for crate::proto::marco::v1::__buffa::view::RelationshipsResponseView<'_> {
 impl ::connectrpc::Encodable<crate::proto::marco::v1::RelationshipsResponse>
 for ::buffa::view::OwnedView<
     crate::proto::marco::v1::__buffa::view::RelationshipsResponseView<'static>,
+> {
+    fn encode(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body(self.reborrow(), codec)
+    }
+    /// An `OwnedView` still holds the buffer it was decoded from, so
+    /// its large fields can be handed to the response body by
+    /// reference count instead of copied. The bare view impl above
+    /// cannot do this: it has borrows but no buffer to name.
+    fn encode_segments(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::connectrpc::EncodedBody, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body_segments(
+            self.reborrow(),
+            self.bytes(),
+            codec,
+        )
+    }
+}
+impl ::connectrpc::Encodable<crate::proto::marco::v1::BlockPairsResponse>
+for crate::proto::marco::v1::__buffa::view::BlockPairsResponseView<'_> {
+    fn encode(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body(self, codec)
+    }
+}
+impl ::connectrpc::Encodable<crate::proto::marco::v1::BlockPairsResponse>
+for ::buffa::view::OwnedView<
+    crate::proto::marco::v1::__buffa::view::BlockPairsResponseView<'static>,
 > {
     fn encode(
         &self,
@@ -390,6 +432,12 @@ pub const GRAPH_RELATIONSHIPS_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::ser
         ::connectrpc::StreamType::Unary,
     )
     .with_idempotency_level(::connectrpc::IdempotencyLevel::NoSideEffects);
+/// Static [`Spec`](::connectrpc::Spec) for the `BlockPairs` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
+pub const GRAPH_BLOCK_PAIRS_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
+        "/marco.v1.Graph/BlockPairs",
+        ::connectrpc::StreamType::Unary,
+    )
+    .with_idempotency_level(::connectrpc::IdempotencyLevel::NoSideEffects);
 /// Static [`Spec`](::connectrpc::Spec) for the `ListOut` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
 pub const GRAPH_LIST_OUT_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
         "/marco.v1.Graph/ListOut",
@@ -537,6 +585,30 @@ pub trait Graph: Send + Sync + 'static {
         Output = ::connectrpc::ServiceResult<
             impl ::connectrpc::Encodable<
                 crate::proto::marco::v1::RelationshipsResponse,
+            > + Send + use<'a, Self>,
+        >,
+    > + Send;
+    /// Per (a, b) pair: whether a blocks b and whether b blocks a
+    /// (getBlockExistence over a response's author pairs). At most 1000 pairs.
+    ///
+    /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
+    ///
+    /// `request` is borrowed from the request body and is valid for the
+    /// duration of the call; message fields are read directly on it
+    /// (zero-copy). The response cannot borrow from `request` — use
+    /// `.to_owned_message()` (or copy the specific fields) for anything
+    /// returned, stored, or moved into `tokio::spawn`.
+    fn block_pairs<'a>(
+        &'a self,
+        ctx: ::connectrpc::RequestContext,
+        request: ::connectrpc::ServiceRequest<
+            '_,
+            crate::proto::marco::v1::BlockPairsRequest,
+        >,
+    ) -> impl ::std::future::Future<
+        Output = ::connectrpc::ServiceResult<
+            impl ::connectrpc::Encodable<
+                crate::proto::marco::v1::BlockPairsResponse,
             > + Send + use<'a, Self>,
         >,
     > + Send;
@@ -778,6 +850,35 @@ impl<S: Graph> GraphExt for S {
                 },
             )
             .with_spec(GRAPH_RELATIONSHIPS_SPEC)
+            .route_view_idempotent(
+                GRAPH_SERVICE_NAME,
+                "BlockPairs",
+                {
+                    let svc = ::std::sync::Arc::clone(&self);
+                    ::connectrpc::view_handler_fn(move |
+                        ctx,
+                        req: ::buffa::view::OwnedView<
+                            crate::proto::marco::v1::__buffa::view::BlockPairsRequestView<
+                                'static,
+                            >,
+                        >,
+                        format|
+                    {
+                        let svc = ::std::sync::Arc::clone(&svc);
+                        async move {
+                            let sreq = ::connectrpc::ServiceRequest::<
+                                crate::proto::marco::v1::BlockPairsRequest,
+                            >::from_parts(req.reborrow(), req.bytes());
+                            svc.block_pairs(ctx, sreq)
+                                .await?
+                                .encode::<
+                                    crate::proto::marco::v1::BlockPairsResponse,
+                                >(format)
+                        }
+                    })
+                },
+            )
+            .with_spec(GRAPH_BLOCK_PAIRS_SPEC)
             .route_view_idempotent(
                 GRAPH_SERVICE_NAME,
                 "ListOut",
@@ -1029,6 +1130,12 @@ impl<T: Graph> ::connectrpc::Dispatcher for GraphServer<T> {
                         .with_spec(GRAPH_RELATIONSHIPS_SPEC),
                 )
             }
+            "BlockPairs" => {
+                Some(
+                    ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(true)
+                        .with_spec(GRAPH_BLOCK_PAIRS_SPEC),
+                )
+            }
             "ListOut" => {
                 Some(
                     ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(true)
@@ -1124,6 +1231,26 @@ impl<T: Graph> ::connectrpc::Dispatcher for GraphServer<T> {
                     svc.relationships(ctx, req)
                         .await?
                         .encode::<crate::proto::marco::v1::RelationshipsResponse>(format)
+                })
+            }
+            "BlockPairs" => {
+                let svc = ::std::sync::Arc::clone(&self.inner);
+                Box::pin(async move {
+                    let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<
+                        crate::proto::marco::v1::BlockPairsRequest,
+                    >(request.encoded()?, format)?;
+                    let req: crate::proto::marco::v1::__buffa::view::BlockPairsRequestView<
+                        '_,
+                    > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
+                        &body,
+                        ctx.decode_options(),
+                    )?;
+                    let req = ::connectrpc::ServiceRequest::<
+                        crate::proto::marco::v1::BlockPairsRequest,
+                    >::from_parts(&req, &body);
+                    svc.block_pairs(ctx, req)
+                        .await?
+                        .encode::<crate::proto::marco::v1::BlockPairsResponse>(format)
                 })
             }
             "ListOut" => {
@@ -1461,6 +1588,46 @@ where
                 &self.transport,
                 &self.config,
                 GRAPH_RELATIONSHIPS_SPEC.with_origin(::connectrpc::SpecOrigin::Client),
+                request,
+                options,
+            )
+            .await
+    }
+    /// Call the BlockPairs RPC. Sends a request to /marco.v1.Graph/BlockPairs.
+    pub async fn block_pairs(
+        &self,
+        request: crate::proto::marco::v1::BlockPairsRequest,
+    ) -> Result<
+        ::connectrpc::client::UnaryResponse<
+            ::buffa::view::OwnedView<
+                crate::proto::marco::v1::__buffa::view::BlockPairsResponseView<'static>,
+            >,
+        >,
+        ::connectrpc::ConnectError,
+    > {
+        self.block_pairs_with_options(
+                request,
+                ::connectrpc::client::CallOptions::default(),
+            )
+            .await
+    }
+    /// Call the BlockPairs RPC with explicit per-call options. Options override [`ClientConfig`](::connectrpc::client::ClientConfig) defaults.
+    pub async fn block_pairs_with_options(
+        &self,
+        request: crate::proto::marco::v1::BlockPairsRequest,
+        options: ::connectrpc::client::CallOptions,
+    ) -> Result<
+        ::connectrpc::client::UnaryResponse<
+            ::buffa::view::OwnedView<
+                crate::proto::marco::v1::__buffa::view::BlockPairsResponseView<'static>,
+            >,
+        >,
+        ::connectrpc::ConnectError,
+    > {
+        ::connectrpc::client::call_unary(
+                &self.transport,
+                &self.config,
+                GRAPH_BLOCK_PAIRS_SPEC.with_origin(::connectrpc::SpecOrigin::Client),
                 request,
                 options,
             )

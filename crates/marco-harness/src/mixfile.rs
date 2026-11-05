@@ -29,6 +29,7 @@ pub enum Call {
     Counts,
     Intersect,
     Filter,
+    BlockPairs,
 }
 
 /// Where an argument comes from: a viewer pool (`random`, `active`,
@@ -79,10 +80,11 @@ pub struct FileShape {
     pub actor: Pool,
     #[serde(default)]
     pub rels: Vec<String>,
-    /// relationships, filter, counts (the actors), has (`to`), intersect (the subject).
+    /// relationships, filter, counts (the actors), has (`to`), intersect (the
+    /// subject), block_pairs (each pair's b; a is from `actor`).
     #[serde(default)]
     pub subjects: Option<Subjects>,
-    /// (size, weight): how many subjects (relationships, filter, counts).
+    /// (size, weight): how many subjects (relationships, filter, counts) or pairs (block_pairs).
     #[serde(default)]
     pub batch: Vec<(u32, f64)>,
     #[serde(default)]
@@ -215,6 +217,17 @@ fn make(inp: &Inputs, s: &FileShape, rng: &mut Rng) -> Result<Req> {
                 limit: s.limit,
                 ..Default::default()
             })
+        }
+        Call::BlockPairs => {
+            let n = pick_weighted(rng, &s.batch);
+            let sub = subj()?;
+            let mut pairs = Vec::with_capacity(n as usize);
+            for k in 0..n {
+                let a = if k == 0 { actor } else { draw(inp, rng, s.actor).0 };
+                let b = subjects(inp, rng, &sub, &[], 1).remove(0);
+                pairs.push(BlockPair { a: a.into(), b, ..Default::default() });
+            }
+            Req::BlockPairs(BlockPairsRequest { pairs, rels: s.rels.clone(), ..Default::default() })
         }
         Call::Filter => {
             let n = pick_weighted(rng, &s.batch);

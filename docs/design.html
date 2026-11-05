@@ -420,6 +420,7 @@ list = "list"     # the edge starts at this record, which must be in the same re
 <tr><td><code>Write</code> (client stream) / <code>WriteBatch</code></td><td>ops: add <code>{uri, subject}</code> or delete <code>{uri}</code>, cursor?. The relation comes from the URI's collection.</td><td>per op: added | exists | removed subject | not-found; the applied cursor</td></tr>
 <tr><td><code>Has</code></td><td>rel, from, to</td><td>the edge's URI or empty</td></tr>
 <tr><td><code>Relationships</code></td><td>actor, others (≤100), rels</td><td>per other and relation: out URI, in URI (getRelationships)</td></tr>
+<tr><td><code>BlockPairs</code></td><td>(a, b) pairs (≤1000), rels (default block)</td><td>per pair: a blocks b, b blocks a, either (getBlockExistence)</td></tr>
 <tr><td><code>ListOut</code>, <code>ListIn</code></td><td>rel, actor, limit, cursor</td><td>DIDs + URIs. Out: newest first, cursor an rkey. In: id order, cursor a DID</td></tr>
 <tr><td><code>Counts</code></td><td>actors, rels</td><td>out and in counts</td></tr>
 <tr><td><code>Intersect</code></td><td>two (rel, dir, actor) sides, limit</td><td>mutuals, "followed by people you follow"</td></tr>
@@ -430,6 +431,59 @@ list = "list"     # the edge starts at this record, which must be in the same re
   -H 'content-type: application/json' \
   -d '{"ops":[{"delete":{"uri":"at://did:plc:a/app.bsky.graph.follow/3lab2xyz7qk2c"}}]}'
 {"results":[{"removed":"did:plc:b"}]}</pre>
+
+<h3 id="block-pairs">Block pairs</h3>
+<div class="fig">
+<svg viewBox="0 0 900 250" role="img" aria-label="A response's author pairs go to marco in one BlockPairs call and come back as three lists of bools">
+  <g font-size="13">
+  <text x="10" y="16" class="m" font-size="12">AppView: one hydrated response</text>
+  <rect class="box" x="10" y="28" width="250" height="150" rx="6"/>
+  <text x="22" y="52" class="mono" font-size="12">post 1: A replies to P in R</text>
+  <text x="22" y="72" class="mono" font-size="12">post 2: B quotes Q</text>
+  <text x="22" y="92" class="mono" font-size="12">post 3: C replies to A in R</text>
+  <text x="22" y="112" class="mono" font-size="12">…</text>
+  <text x="22" y="140" class="m" font-size="12">pairs: (A,P) (A,R) (B,Q) (C,A) (C,R) …</text>
+  <text x="22" y="160" class="m" font-size="12">mix: mean 7.2 a response, up to ~200</text>
+  <path class="aline" d="M260,100 L330,100"/><path class="aline" d="M322,95 L330,100 L322,105"/>
+  <text x="270" y="90" font-size="12">one call</text>
+  <rect class="acc" x="330" y="28" width="290" height="150" rx="6"/>
+  <text x="344" y="52">BlockPairs: ≤ 1000 pairs, rels</text>
+  <text x="344" y="80" class="mono" font-size="12">for each (a, b), each rel:</text>
+  <text x="344" y="100" class="mono" font-size="12">  a ∈ in(rel, b)  → a blocks b</text>
+  <text x="344" y="120" class="mono" font-size="12">  b ∈ in(rel, a)  → b blocks a</text>
+  <text x="344" y="148" class="m" font-size="12">two Elias-Fano membership tests a rel,</text>
+  <text x="344" y="166" class="m" font-size="12">unknown or hidden DID: false</text>
+  <path class="aline" d="M620,100 L690,100"/><path class="aline" d="M682,95 L690,100 L682,105"/>
+  <rect class="box" x="690" y="28" width="200" height="150" rx="6"/>
+  <text x="704" y="52">per pair, in order</text>
+  <text x="704" y="80" class="mono" font-size="12">a_blocks_b  [f t f f …]</text>
+  <text x="704" y="100" class="mono" font-size="12">b_blocks_a  [f f f t …]</text>
+  <text x="704" y="120" class="mono" font-size="12">blocked     [f t f t …]</text>
+  <text x="704" y="148" class="m" font-size="12">packed bools: 3 bytes</text>
+  <text x="704" y="166" class="m" font-size="12">a pair</text>
+  <text x="10" y="210" class="m" font-size="12">before: one Relationships(a, [b…], [block]) per first actor, 2.4 pairs a call, 40% of the mix's calls and 25% of its CPU, nearly all per-call cost</text>
+  <text x="10" y="230" class="m" font-size="12">after: one call per response, 0.062 calls/s per active user instead of 0.18 (internal/read-mix.json against read-mix-v1.json)</text>
+  </g>
+</svg>
+</div>
+<p>Every post the AppView hydrates checks blocks between its author and the parent's, root's and quoted post's authors, all of a response's pairs in one getBlockExistence. Relationships answers one actor against many others, so the read mix had to split those pairs by first actor: 2.4 pairs a call, and the call's fixed cost was most of the price. BlockPairs takes the response's pairs as they are.</p>
+<div class="tw"><table>
+<tr><th></th><th>BlockPairs (new call)</th><th>A flag on Relationships</th></tr>
+<tr><td>Request</td><td>(a, b) pairs with unrelated a's</td><td>one actor, so the pairs still split by first actor</td></tr>
+<tr><td>Per pair</td><td>two membership tests a relation</td><td>the in-set intersection and out-log scan built for one actor's many others</td></tr>
+<tr><td>Answer</td><td>three bools, 3 bytes a pair</td><td>the other's DID, the rel's name and two URIs per other</td></tr>
+<tr><td>Default rels</td><td>block</td><td>every relation (follow too)</td></tr>
+<tr><td>Cap</td><td>1000 pairs</td><td>100 others</td></tr>
+</table></div>
+<p>A flag would keep Relationships' actor and change everything else about it, so it's a call of its own. <code>rels</code> names the relations that count as a block, a record of any of them in either direction. Empty means <code>block</code>. A list relation is refused: its in sets hold lists, not actors. A DID marco doesn't know, or one taken down or deleted, blocks nobody and isn't blocked, the way Relationships hides its edges. The cap is 1000 pairs: the sampled threads hydrate at most 71, suggested follows about 200, and 1000 pairs is 2000 membership tests, tens of microseconds. List blocks (listblock) stay out, as for every other call.</p>
+<div class="tw"><table>
+<tr><th>One response's block pairs (7.2 on average)</th><th class="n">calls</th><th class="n">in-process µs</th><th class="n">RPC stack µs</th><th class="n">server CPU µs</th></tr>
+<tr class="pick"><td>BlockPairs, one call</td><td class="n">1</td><td class="n">1.9</td><td class="n">5.5</td><td class="n">11.6</td></tr>
+<tr><td>Relationships per first actor (the old mix)</td><td class="n">2.9</td><td class="n">2.5</td><td class="n">12.6</td><td class="n">30.2</td></tr>
+<tr><td>Relationships, one pair a call</td><td class="n">7.2</td><td class="n">4.2</td><td class="n">27.1</td><td class="n">69.3</td></tr>
+<tr><td>BlockPairs, one pair a call</td><td class="n">7.2</td><td class="n">2.8</td><td class="n">25.0</td><td class="n">67.5</td></tr>
+</table></div>
+<p class="cap">The mix's block-pair shape four ways (internal/block-pairs-bench.json) on a 1M-actor synthetic snapshot, medians of three runs: in-process and through the RPC stack on one thread, wall time; through <code>marco serve</code> on two threads at saturation, its CPU per call. A call costs about 9.4 µs of server CPU and a pair 0.3 µs more, so one call per response is 2.6× cheaper than a call per first actor. internal/run-synth-bench.sh, internal/synth_bench.py, internal/raw-synth/. The whole network's numbers are in read-mix.html's measured section.</p>
 
 <h2>Writes, durability and ingest</h2>
 <div class="fig">

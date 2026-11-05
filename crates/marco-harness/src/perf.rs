@@ -487,6 +487,12 @@ impl Engine {
                     _ => 0,
                 }
             }
+            Req::BlockPairs(r) => {
+                let rels: Vec<RelId> =
+                    if r.rels.is_empty() { vec![rel("block")] } else { r.rels.iter().map(|n| rel(n)).collect() };
+                let pairs: Vec<(&str, &str)> = r.pairs.iter().map(|p| (p.a.as_str(), p.b.as_str())).collect();
+                g.block_pairs(&pairs, &rels).into_iter().filter(|x| x.0 || x.1).count()
+            }
             Req::Filter(r) => {
                 let Some(v) = g.id_of(&r.viewer) else { return 0 };
                 let mut drops = Vec::new();
@@ -524,6 +530,7 @@ pub enum Req {
     Counts(CountsRequest),
     Intersect(IntersectRequest),
     Filter(FilterRequest),
+    BlockPairs(BlockPairsRequest),
 }
 
 impl Req {
@@ -607,6 +614,7 @@ impl Req {
             Req::Counts(_) => "/marco.v1.Graph/Counts",
             Req::Intersect(_) => "/marco.v1.Graph/Intersect",
             Req::Filter(_) => "/marco.v1.Graph/Filter",
+            Req::BlockPairs(_) => "/marco.v1.Graph/BlockPairs",
         }
     }
 
@@ -620,6 +628,7 @@ impl Req {
             Req::Counts(r) => r.encode_to_bytes(),
             Req::Intersect(r) => r.encode_to_bytes(),
             Req::Filter(r) => r.encode_to_bytes(),
+            Req::BlockPairs(r) => r.encode_to_bytes(),
         }
     }
 }
@@ -653,6 +662,7 @@ where
         Req::Counts(r) => c.counts(r).await?.view().counts.len(),
         Req::Intersect(r) => c.intersect(r).await?.view().actors.len(),
         Req::Filter(r) => c.filter(r).await?.view().actors.len(),
+        Req::BlockPairs(r) => c.block_pairs(r).await?.view().blocked.iter().filter(|&&x| x).count(),
     })
 }
 
@@ -1204,7 +1214,8 @@ pub struct Args {
     pub url: Option<String>,
     #[arg(long, value_enum, default_value = "closed")]
     pub mode: Mode,
-    /// Shapes, each run on its own ("all" for every one).
+    /// Shapes, each run on its own ("all" for every one). With a mix file,
+    /// the file's shapes to run each on its own instead of the mix.
     #[arg(long, value_delimiter = ',')]
     pub shapes: Vec<String>,
     /// A weighted mix run as one workload: "has:30,counts:10,…", or a mix
@@ -1265,7 +1276,23 @@ fn shapes_of(a: &Args, inp: &Inputs) -> Result<(Vec<Mix>, Vec<String>)> {
             for s in &skipped {
                 eprintln!("{s}: left out, the inputs have no pool for it");
             }
-            return Ok((vec![mix], skipped));
+            if a.shapes.is_empty() {
+                return Ok((vec![mix], skipped));
+            }
+            // the file's shapes each on their own: a step per shape
+            let all = a.shapes.iter().any(|s| s == "all");
+            let mut each = Vec::new();
+            for &(s, _) in &mix.weights {
+                if all || a.shapes.iter().any(|n| n == s.name()) {
+                    each.push(Mix::one(s));
+                }
+            }
+            for n in a.shapes.iter().filter(|n| *n != "all") {
+                if !mix.weights.iter().any(|(s, _)| s.name() == n) {
+                    bail!("{m} has no shape {n:?} (or the inputs can't draw it)");
+                }
+            }
+            return Ok((each, skipped));
         }
         return Ok((vec![Mix::parse(m)?], Vec::new()));
     }

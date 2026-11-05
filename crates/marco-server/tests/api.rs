@@ -265,6 +265,34 @@ async fn graph_reads() {
     assert_eq!(f.dropped.len(), 1);
     assert_eq!(f.dropped[0].actor, a2);
     assert_eq!(f.dropped[0].rel, "block");
+
+    let unknown = "did:plc:unknownunknownunknownxx".to_string();
+    let pair = |a: &str, b: &str| BlockPair { a: a.into(), b: b.into(), ..Default::default() };
+    let bp = g
+        .block_pairs(BlockPairsRequest {
+            pairs: vec![pair(&a0, &a2), pair(&a2, &a0), pair(&a1, &a2), pair(&unknown, &a0)],
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_owned();
+    assert_eq!(bp.a_blocks_b, [true, false, false, false]);
+    assert_eq!(bp.b_blocks_a, [false, true, false, false]);
+    assert_eq!(bp.blocked, [true, true, false, false]);
+    let named = g
+        .block_pairs(BlockPairsRequest {
+            pairs: vec![pair(&a2, &a1)],
+            rels: vec!["follow".into(), "block".into()],
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_owned();
+    assert_eq!(named.a_blocks_b, [true], "any of rels: a2 follows a1");
+    let many = BlockPairsRequest { pairs: (0..1001).map(|k| pair(&did(k), &a0)).collect(), ..Default::default() };
+    assert_eq!(g.block_pairs(many).await.unwrap_err().code, ErrorCode::InvalidArgument);
+    let list = BlockPairsRequest { pairs: vec![pair(&a0, &a2)], rels: vec!["listitem".into()], ..Default::default() };
+    assert_eq!(g.block_pairs(list).await.unwrap_err().code, ErrorCode::InvalidArgument);
 }
 
 /// A page of edges over HTTP/2 goes out as two frames; without TCP_NODELAY
@@ -684,12 +712,23 @@ async fn admin_rpcs() {
     let set = |st: &str| SetActorStatusRequest { did: a6.clone(), status: st.into(), ..Default::default() };
     a.set_actor_status(set("takendown")).await.unwrap();
     assert_eq!(has(&a5, &a6).await, "", "hidden as a subject");
+    let follows = |a: &str, b: &str| {
+        let g = graph(s.api, None);
+        let req = BlockPairsRequest {
+            pairs: vec![BlockPair { a: a.into(), b: b.into(), ..Default::default() }],
+            rels: vec!["follow".into()],
+            ..Default::default()
+        };
+        async move { g.block_pairs(req).await.unwrap().into_owned().blocked }
+    };
+    assert_eq!(follows(&a5, &a6).await, [false], "a hidden side names nobody");
     assert_eq!(
         a.get_actor(GetActorRequest { actor: a6.clone(), ..Default::default() }).await.unwrap().into_owned().status,
         "takendown"
     );
     a.set_actor_status(set("active")).await.unwrap();
     assert!(!has(&a5, &a6).await.is_empty());
+    assert_eq!(follows(&a5, &a6).await, [true]);
     assert_eq!(a.set_actor_status(set("gone")).await.unwrap_err().code, ErrorCode::InvalidArgument);
     let before =
         a.get_actor(GetActorRequest { actor: a5.clone(), ..Default::default() }).await.unwrap().into_owned().rels[0]

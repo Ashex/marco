@@ -26,6 +26,7 @@
 //! everything a snapshot holds is shared, so the server keeps two copies and
 //! applies each write to both.
 
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 use std::path::Path;
@@ -1142,15 +1143,19 @@ impl Graph {
 
     /// The members of sorted `probes` in side `s`, up to `limit`.
     fn side_intersect(&self, s: ListRef, probes: &[u32], limit: usize) -> Vec<u32> {
+        self.side_intersect_in(s, probes, limit, &OnceCell::new())
+    }
+
+    /// `side_intersect`, keeping a decoded out side in `whole` for the next call.
+    fn side_intersect_in(&self, s: ListRef, probes: &[u32], limit: usize, whole: &OnceCell<Vec<u32>>) -> Vec<u32> {
         match s.dir {
             Dir::In => self.in_intersect(s.rel, s.actor, probes, limit),
             Dir::Out if self.side_len(s) > probes.len() as u64 * PROBE_RATIO => {
                 probes.iter().copied().filter(|&x| self.side_contains(s, x)).take(limit).collect()
             }
             Dir::Out => {
-                let other = self.side_set(s);
                 let mut out = Vec::new();
-                inset::merge_intersect(probes, &other, limit, &mut out);
+                inset::merge_intersect(probes, whole.get_or_init(|| self.side_set(s)), limit, &mut out);
                 out
             }
         }
@@ -1291,6 +1296,32 @@ impl Graph {
         let r = self.combine_(a, b, op, limit, after);
         self.obs.done(g, r.len());
         r
+    }
+
+    /// Per (a, b) pair: whether a's record of any of `rels` names b, and
+    /// whether b's names a. Each is one membership test in an in set; a DID
+    /// not in the graph blocks nobody.
+    pub fn block_pairs(&self, pairs: &[(&str, &str)], rels: &[RelId]) -> Vec<(bool, bool)> {
+        let g = self.obs.op(Op::BlockPairs, self.obs.multi(), pairs.len());
+        let mut hits = 0;
+        let out: Vec<(bool, bool)> = pairs
+            .iter()
+            .map(|&(a, b)| {
+                let r = match (self.id_of(a), self.id_of(b)) {
+                    (Some(x), Some(y)) => self.block_pair_id(x, y, rels),
+                    _ => (false, false),
+                };
+                hits += (r.0 || r.1) as usize;
+                r
+            })
+            .collect();
+        self.obs.done(g, hits);
+        out
+    }
+
+    pub fn block_pair_id(&self, a: u32, b: u32, rels: &[RelId]) -> (bool, bool) {
+        let named = |from: u32, to: u32| rels.iter().any(|&r| self.in_contains(r, to, from));
+        (named(a, b), named(b, a))
     }
 
     /// `actors` without those any of `drop` hits: (rel, Out) drops the

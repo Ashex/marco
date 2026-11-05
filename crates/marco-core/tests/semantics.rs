@@ -540,6 +540,16 @@ fn run_model(subj_index: usize) {
                     }
                 }
             }
+            let ds: Vec<String> = (0..12).map(|_| did(rnd(actors) as u32)).collect();
+            let pairs: Vec<(&str, &str)> = ds.chunks(2).map(|p| (p[0].as_str(), p[1].as_str())).collect();
+            let got = g.block_pairs(&pairs, &[BLOCK]);
+            for (&(a, b), r) in pairs.iter().zip(got) {
+                let (x, y) = (g.id_of(a), g.id_of(b));
+                let named = |from: Option<u32>, to: Option<u32>| {
+                    from.zip(to).is_some_and(|(f, t)| g.has_id(BLOCK, f, t).is_some())
+                };
+                assert_eq!(r, (named(x, y), named(y, x)), "block pairs step {step}");
+            }
         }
     }
 }

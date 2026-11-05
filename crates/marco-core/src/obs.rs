@@ -21,12 +21,23 @@ pub enum Op {
     Counts,
     Intersect,
     Filter,
+    BlockPairs,
     Add,
     Delete,
 }
 
-pub const OPS: [Op; 9] =
-    [Op::Has, Op::Relationships, Op::OutList, Op::InList, Op::Counts, Op::Intersect, Op::Filter, Op::Add, Op::Delete];
+pub const OPS: [Op; 10] = [
+    Op::Has,
+    Op::Relationships,
+    Op::OutList,
+    Op::InList,
+    Op::Counts,
+    Op::Intersect,
+    Op::Filter,
+    Op::BlockPairs,
+    Op::Add,
+    Op::Delete,
+];
 
 impl Op {
     pub fn name(self) -> &'static str {
@@ -38,6 +49,7 @@ impl Op {
             Op::Counts => "counts",
             Op::Intersect => "intersect",
             Op::Filter => "filter",
+            Op::BlockPairs => "block_pairs",
             Op::Add => "add",
             Op::Delete => "delete",
         }

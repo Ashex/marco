@@ -49,6 +49,10 @@ pub fn dir_pb(d: Dir) -> buffa::EnumValue<marco_proto::v1::Dir> {
     }
 }
 
+/// Pairs a BlockPairs call takes: a thread's hydration is under 100, so
+/// this only stops a runaway caller.
+pub const MAX_BLOCK_PAIRS: usize = 1000;
+
 fn limit(l: u32, def: u32, max: u32) -> usize {
     (if l == 0 { def } else { l.min(max) }) as usize
 }
@@ -157,6 +161,41 @@ impl svc::Graph for GraphApi {
             })
             .collect();
         Response::ok(RelationshipsResponse { relationships, ..Default::default() })
+    }
+
+    async fn block_pairs(
+        &self,
+        _: RequestContext,
+        req: ServiceRequest<'_, BlockPairsRequest>,
+    ) -> ServiceResult<BlockPairsResponse> {
+        self.readable()?;
+        if req.pairs.len() > MAX_BLOCK_PAIRS {
+            return Err(bad(format!("at most {MAX_BLOCK_PAIRS} pairs")));
+        }
+        let g = self.0.graph();
+        let rels = if req.rels.is_empty() {
+            vec![g.relations().by_name("block").ok_or_else(|| bad("no relation \"block\": name rels"))?]
+        } else {
+            req.rels.iter().map(|n| rel_id(&g, n)).collect::<Result<Vec<_>, _>>()?
+        };
+        if let Some(&r) = rels.iter().find(|&&r| g.relations().is_list(r)) {
+            return Err(bad(format!("{:?} is a list relation", g.relations().get(r).name)));
+        }
+        let pairs: Vec<(&str, &str)> = req.pairs.iter().map(|p| (p.a, p.b)).collect();
+        let mut res = g.block_pairs(&pairs, &rels);
+        if g.any_status() {
+            for (r, (a, b)) in res.iter_mut().zip(&pairs) {
+                if (r.0 || r.1) && (g.hidden(a) || g.hidden(b)) {
+                    *r = (false, false);
+                }
+            }
+        }
+        Response::ok(BlockPairsResponse {
+            a_blocks_b: res.iter().map(|r| r.0).collect(),
+            b_blocks_a: res.iter().map(|r| r.1).collect(),
+            blocked: res.iter().map(|r| r.0 || r.1).collect(),
+            ..Default::default()
+        })
     }
 
     async fn list_out(

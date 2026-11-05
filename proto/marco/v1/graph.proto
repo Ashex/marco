@@ -26,6 +26,11 @@ service Graph {
   rpc Relationships(RelationshipsRequest) returns (RelationshipsResponse) {
     option idempotency_level = NO_SIDE_EFFECTS;
   }
+  // Per (a, b) pair: whether a blocks b and whether b blocks a
+  // (getBlockExistence over a response's author pairs). At most 1000 pairs.
+  rpc BlockPairs(BlockPairsRequest) returns (BlockPairsResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
   // An actor's records, newest first. The cursor is an rkey: pass the last
   // response's to get the records older than it.
   rpc ListOut(ListOutRequest) returns (ListOutResponse) {
@@ -94,6 +99,29 @@ message RelationshipEdge {
   string out_uri = 2;
   // The other's record naming the actor.
   string in_uri = 3;
+}
+
+message BlockPair {
+  string a = 1;
+  string b = 2;
+}
+
+message BlockPairsRequest {
+  // At most 1000. An unknown DID, or one taken down or deleted, blocks
+  // nobody and is blocked by nobody.
+  repeated BlockPair pairs = 1;
+  // The relations that count as a block: a record of any of them naming the
+  // other side. Empty is "block".
+  repeated string rels = 2;
+}
+
+message BlockPairsResponse {
+  // One each per pair, in the request's order: a's record names b.
+  repeated bool a_blocks_b = 1;
+  // b's record names a.
+  repeated bool b_blocks_a = 2;
+  // Either way: the two can't interact.
+  repeated bool blocked = 3;
 }
 
 message ListOutRequest {
