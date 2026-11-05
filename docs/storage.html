@@ -1118,6 +1118,32 @@ match app.engine.pass(&amp;mut Hold::none(), &amp;work) {           // on the to
 <tr><td>Compaction against checkpoints</td><td>They never run at once, so only one thing writes <code>manifest.json</code>. A checkpoint that comes due stops the compaction after the shard it's on, and starts when the thread ends. A verify job, which reads the files by name, stops it the same way, and none starts while one runs. Shutdown aborts the shard being written (its temp file deleted) and joins the thread before the writer returns.</td><td><code>writer</code></td></tr>
 <tr><td>Reporting</td><td>A checkpoint returns <code>CheckpointReport</code>: R (the patches' paged bytes), P_new (their pinned bytes), new bases' bytes, file bytes and blocks written and kept. The server logs them, keeps them in <code>Durability</code> and exports <code>marco_store_checkpoint_bytes{part=patch|pinned|base}</code>. Compactions export <code>marco_store_compaction_{shards,bytes,garbage_bytes}_total</code> and <code>marco_store_compaction_seconds</code>, and failures count in <code>marco_checkpoint_errors_total{stage="compaction"}</code>. The admin proto is phase 5's.</td><td><code>marco-server/src/{writer,metrics}.rs</code></td></tr>
 <tr><td>Kill tests</td><td><code>marco-harness killtest --compaction</code> adds kills within 500 ms of a forced checkpoint's commit, when the compaction it starts runs. Serve with <code>--compaction-ratio=1 --compaction-min-garbage-mb=0</code> and a low <code>--compaction-rate-mb</code> so the kills land inside one.</td><td><code>marco-harness/src/killtest.rs</code></td></tr>
+<tr><td>Shards in parallel</td><td>A checkpoint writes up to 8 shards' files at once (<code>CHECKPOINT_THREADS</code>), on scoped threads over the replay copy. The work is reading and re-encoding the changed lists, so one thread took 53 s of the whole network's 64 s checkpoint and eight take 9 s.</td><td><code>Graph::write_checkpoint</code></td></tr>
+<tr><td>R, measured</td><td>
+On the load box, the whole-network FORMAT 6 snapshot (44.1 GB, 64 shards, follows, blocks and list items) took the archive's day after its cut: 2.75M ops, 1.90M follow creates and 0.34M deletes, 0.44M block creates. The checkpoint wrote <b>R = 3.66 GB</b> and <b>P_new = 1.19 GB</b> in 65 files. It took 20 s warm and 64 s cold, of which 11 s replaying the day. R is the same on every run.
+<table class="small">
+<tr><th>Section</th><th>Measured</th><th>§11's estimate</th></tr>
+<tr><td>follow in.blocks (sets over 128)</td><td>1.67 GB</td><td>0.58 GB</td></tr>
+<tr><td>follow out.bysubj (lists of 4,096 or more)</td><td>1.22 GB</td><td>0.14 GB</td></tr>
+<tr><td>block out.bysubj</td><td>0.20 GB</td><td rowspan="2">~0.15 GB (blocks, list items)</td></tr>
+<tr><td>block, other paged</td><td>0.13 GB</td></tr>
+<tr><td>follow out.subj + out.rkey</td><td>0.33 GB</td><td>0.27 GB (tails 0.14, deletes 0.13)</td></tr>
+<tr><td>follow out.small, in.small</td><td>0.10 GB</td><td>0.08 GB</td></tr>
+<tr><td>list items</td><td>&lt; 0.01 GB</td><td>(in blocks' row)</td></tr>
+<tr><td><b>R</b></td><td><b>3.66 GB</b></td><td><b>~1.2 GB</b></td></tr>
+<tr><td>P_new</td><td>1.19 GB</td><td>~1.2 GB</td></tr>
+</table>
+<b>3c's test "R matches §11 within 30%" fails: R is 3.0× the estimate.</b> P_new matches.
+<br>Small lists and out-list tails come out as estimated. The difference is the two indexes whose blocks are positional in an order that inserts land in the middle of:
+<ul>
+<li>A new follower's id is anywhere in the subject's in set.</li>
+<li>A new follow's subject is anywhere in a long list's by-subject order.</li>
+</ul>
+So one insert rewrites every block after it, and a popular set or long list that changes several times a day is rewritten nearly whole. §11 assumed by-subject suffixes were small, and its in-set row undercounts how far the first change sits from the end.
+<br><b>What that does to the gates:</b> P_new + R = 4.85 GB, which is over Fits' 3.4 GB headroom. Compaction would also have to clear about 3.7 GB of garbage a day; this checkpoint left 3.67 GB across the shards. So at full residency the switch gate (§11) doesn't hold with this layout.
+<br><b>What would bring it down:</b> blocks that don't have to hold 128, so an insert rewrites the block it lands in (split when full) and the head carries each block's count. That's §4's slack leaves, applied to in sets and by-subject blocks only, a FORMAT 6 codec change. A bound from the day's changes: about 2.2M changed pairs at about 200 B a set block, which puts in.blocks under ~0.45 GB. The alternative was more headroom at Fits. <b>Decided by the lead: slack blocks</b> (B-tree-style leaves for in sets and by-subject blocks: an insert rewrites only its own block, split when full), not more headroom, since R also sets the daily garbage and compaction volume that decision 67 sized at about 1.2 GB. Task 1011 builds it and measures R again on this day.
+<br>List items: the list-item export was taken after the day (2026-11-05 16:39 UTC), so the day's list-item creates were already in the snapshot. §11 puts them at a few MB, so it doesn't change R.
+</td><td><code>internal/raw-p3c/</code></td></tr>
 <tr><td>Measuring R</td><td><code>marco-harness checkpoint-day</code> replays a day of record ops (an export of the archive's <code>repo_records</code>) into an App over hard links to a snapshot, checkpoints once, and reports R, P_new, the garbage left and two unpaced compactions. The day is the 24 h after the snapshot's export (2026-11-04 07:20 to 2026-11-05 07:20 UTC), so its deletes find their records.</td><td><code>marco-harness/src/day.rs</code></td></tr>
 </table>
 

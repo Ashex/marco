@@ -101,10 +101,10 @@ lists, at most `--compaction-rate-mb` (200 MB/s), one shard at a time after each
 manifest rename is its commit, and the served copies swap the shard in place. A checkpoint that
 comes due stops it, and a crash leaves either the old files or the new base, never a mix.
 
-On the whole network a checkpoint took 29 s and wrote 37.71 GB (63 of 64 shards, since 3M ops
-touch nearly every shard). Reads stay up, but `Relationships` p99 roughly triples for those 30 s
-while the rewrite streams through the page cache, and `Has` barely moves. At today's write rate
-that's about once a day ([Durability and restarts, measured](p1-results.html)).
+On the whole network, a day of the archive's follows, blocks and list items (2.75M ops) made a
+checkpoint of 20 s on a warm page cache: 11 s replaying the day, 9 s writing 65 patches. They held
+3.66 GB of changed lists and blocks and 1.19 GB of indexes and heads, against the 44 GB snapshot. At
+today's write rate that's about once a day. Compacting a shard (about 0.73 GB) took 2.2 s unpaced.
 
 ## Restart
 

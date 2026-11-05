@@ -57,6 +57,19 @@ fn link_dir(snapshot: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
+/// marco_snapshot_seconds' sums by `what`: the checkpoint's write and the
+/// opens, apart from its replay.
+fn snapshot_seconds() -> std::collections::BTreeMap<String, f64> {
+    let mut m = std::collections::BTreeMap::new();
+    for f in prometheus::gather().iter().filter(|f| f.name() == "marco_snapshot_seconds") {
+        for x in f.get_metric() {
+            let what = x.get_label().iter().find(|l| l.name() == "what").map_or("", |l| l.value());
+            m.insert(what.to_string(), x.get_histogram().get_sample_sum());
+        }
+    }
+    m
+}
+
 fn rss_bytes() -> u64 {
     std::fs::read_to_string("/proc/self/statm")
         .ok()
@@ -149,6 +162,7 @@ pub async fn run(a: Args) -> Result<serde_json::Value> {
     let t = Instant::now();
     app.checkpoint().await?;
     let ckpt_s = t.elapsed().as_secs_f64();
+    let timed = snapshot_seconds();
     let d = app.durability.lock().unwrap().clone();
     if !d.checkpoint_error.is_empty() {
         bail!("checkpoint: {}", d.checkpoint_error);
@@ -161,6 +175,22 @@ pub async fn run(a: Args) -> Result<serde_json::Value> {
         store.shards.iter().enumerate().filter_map(|(k, f)| f.as_ref().map(|f| (k, f.garbage(si)))).collect();
     let (disk, live): (u64, u64) = garbage.iter().fold((0, 0), |(d, l), (_, g)| (d + g.disk, l + g.live));
     let due = g.shared_snapshot().unwrap().compaction_due(&CompactPolicy::default()).len();
+    // what the patches hold, by section, before any compaction replaces them
+    let mut patch_sections: std::collections::BTreeMap<String, u64> = Default::default();
+    for f in store.shards.iter().flatten() {
+        for p in f.parts.iter().skip(1) {
+            for s in p.file.sections() {
+                let name = match s.name.split_once('.') {
+                    Some((r, rest)) if r.starts_with('r') && r[1..].parse::<usize>().is_ok() => {
+                        let rel = rels.list.get(r[1..].parse::<usize>().unwrap()).map_or(r, |x| x.name.as_str());
+                        format!("{rel}.{rest}")
+                    }
+                    _ => s.name.clone(),
+                };
+                *patch_sections.entry(name).or_default() += s.len();
+            }
+        }
+    }
     garbage.sort_by_key(|g| std::cmp::Reverse(g.1.bytes()));
     let mut compactions = Vec::new();
     let snapshot = g.shared_snapshot().unwrap();
@@ -186,9 +216,11 @@ pub async fn run(a: Args) -> Result<serde_json::Value> {
             "seconds_wall": ckpt_s, "seconds": d.checkpoint_seconds, "shards": d.checkpoint_shards,
             "file_bytes": d.checkpoint_bytes, "patch_bytes_r": d.checkpoint_patch_bytes,
             "pinned_bytes_p_new": d.checkpoint_pinned_bytes,
+            "snapshot_seconds": timed,
         },
         "after": { "disk": disk, "live": live, "garbage": disk.saturating_sub(live), "due_by_default_policy": due },
         "compactions": compactions,
+        "patch_sections": patch_sections,
     });
     drop(snapshot);
     app.shutdown().await?;

@@ -1739,6 +1739,7 @@ dependencies = [
  "marco-ops",
  "marco-proto",
  "marco-server",
+ "prometheus",
  "serde",
  "serde_json",
  "tempfile",

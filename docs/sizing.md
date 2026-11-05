@@ -131,7 +131,8 @@ API at that rate should size for it.
 | Open a snapshot, caches dropped | 11 ms |
 | kill -9 to `/readyz` 200, p50 by run | 381-595 ms |
 | Restart with a day of segments | 10.9-11.7 s warm, 13.3 s of replay alone with the page cache dropped |
-| Checkpoint | 29 s, 37.71 GB written |
+| Checkpoint of a day (2.75M ops) | 20 s, 4.85 GB written (3.66 GB of changed lists, 1.19 GB of indexes and heads) |
+| Compaction of one shard | 2.2 s for 0.73 GB, unpaced |
 
 ## Growth
 

@@ -34,6 +34,7 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 libc = { workspace = true }
+prometheus = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "process", "fs", "io-util"] }

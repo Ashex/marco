@@ -91,6 +91,20 @@ pub(super) struct ShardBody {
     pub(super) statuses: u64,
 }
 
+/// Shards a checkpoint writes at once.
+const CHECKPOINT_THREADS: usize = 8;
+
+/// One shard's file, written.
+struct ShardOut {
+    shard: usize,
+    files: ShardFiles,
+    patch: bool,
+    footer: PagedFooter,
+    /// A base's file bytes.
+    bytes: u64,
+    blocks: BlockCounts,
+}
+
 #[derive(Default)]
 struct BlockCounts {
     written: u64,
@@ -150,7 +164,6 @@ impl Graph {
             bail!("checkpoint {checkpoint} isn't past the committed {}", store.manifest.checkpoint);
         }
         let dirty = self.dirty_shards();
-        let w = self.width;
         let mut rep = CheckpointReport::default();
         let mut m = Manifest {
             format: PAGED_FORMAT,
@@ -161,91 +174,121 @@ impl Graph {
             shards: BTreeMap::new(),
             cursors,
         };
+        let mut todo = Vec::new();
         for (k, &is_dirty) in dirty.iter().enumerate() {
             let old = store.shards.get(k).and_then(|f| f.as_deref());
-            if !is_dirty {
-                if let Some(f) = old {
-                    m.shards.insert(k as u32, f.files());
+            if is_dirty {
+                let name = shard_file(k, checkpoint);
+                if store.manifest.shards.values().flat_map(ShardFiles::files).any(|n| n == name) {
+                    bail!("{name} is in the committed manifest: checkpoint {checkpoint} was used before");
                 }
-                continue;
+                todo.push(k);
+            } else if let Some(f) = old {
+                m.shards.insert(k as u32, f.files());
             }
-            let lo = k as u32 * w;
-            let hi = ((k as u64 + 1) * w as u64).min(self.n_ids() as u64) as u32;
-            let name = shard_file(k, checkpoint);
-            if store.manifest.shards.values().flat_map(ShardFiles::files).any(|n| n == name) {
-                bail!("{name} is in the committed manifest: checkpoint {checkpoint} was used before");
-            }
-            let file = path.join(&name);
-            // a shard a bulk write clamped to the directory's end has another lo
-            // than k * width: it gets a base, never a patch
-            let mut patch_over = old.filter(|f| f.meta.lo == lo && f.fullest_space().1 < SPACE_FILL);
-            let meta = |body: ShardBody| ShardMeta {
-                format: PAGED_FORMAT,
-                build: store.dir.meta.build,
-                shard: k as u32,
-                lo,
-                hi,
-                live_lo: lo.max(self.base_n).min(hi),
-                checkpoint,
-                written_ms: now_ms(),
-                statuses: body.statuses,
-                stats: body.stats,
-            };
-            let mut patched = None;
-            if let Some(f) = patch_over {
-                let mut wr = PagedWriter::create(&file, FileKind::Patch { base: f.base().file.footer().salt })?;
-                let mut blocks = BlockCounts::default();
-                match self.write_shard_patch(&mut wr, lo, hi, f, &mut blocks) {
-                    Ok(body) => {
-                        rep.blocks_written += blocks.written;
-                        rep.blocks_kept += blocks.kept;
-                        patched = Some(wr.finish("shard", &meta(body))?);
-                    }
-                    // a patch that would pass a space's cap: the shard gets a base
-                    Err(e) if format!("{e:#}").contains(CAP_ERROR) => {
-                        wr.abandon();
-                        patch_over = None;
-                    }
-                    Err(e) => {
-                        wr.abandon();
-                        return Err(e.context(format!("shard {k}'s patch")));
-                    }
-                }
-            }
-            let footer = match patched {
-                Some(footer) => footer,
-                None => {
-                    let mut wr = PagedWriter::create(&file, FileKind::Base)?;
-                    match self.write_shard_body(&mut wr, lo, hi, old, true) {
-                        Ok(body) => wr.finish("shard", &meta(body))?,
-                        Err(e) => {
-                            wr.abandon();
-                            return Err(e.context(format!("shard {k}'s base")));
+        }
+        // shards are independent: a few at a time, most of the work being reads
+        // and re-encoding of the changed lists
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let threads = CHECKPOINT_THREADS.min(todo.len()).max(1);
+        let outs: Vec<Result<Vec<ShardOut>>> = std::thread::scope(|sc| {
+            let hs: Vec<_> = (0..threads)
+                .map(|_| {
+                    sc.spawn(|| {
+                        let mut v = Vec::new();
+                        loop {
+                            let i = next.fetch_add(1, Ordering::Relaxed);
+                            let Some(&k) = todo.get(i) else { return Ok(v) };
+                            v.push(self.write_shard_file(path, store, k, checkpoint)?);
                         }
-                    }
-                }
-            };
-            match patch_over {
-                Some(f) => {
-                    rep.add_file(&footer, &file);
-                    rep.patches += 1;
-                    let mut files = f.files();
-                    files.patches.push(name);
-                    m.shards.insert(k as u32, files);
-                }
-                None => {
-                    rep.base_bytes += std::fs::metadata(&file).map_or(0, |x| x.len());
-                    rep.file_bytes += std::fs::metadata(&file).map_or(0, |x| x.len());
-                    rep.bases += 1;
-                    m.shards.insert(k as u32, ShardFiles::base(name));
-                }
+                    })
+                })
+                .collect();
+            hs.into_iter()
+                .map(|h| h.join().unwrap_or_else(|_| Err(anyhow::anyhow!("a checkpoint shard writer panicked"))))
+                .collect()
+        });
+        let mut done = Vec::new();
+        for o in outs {
+            done.extend(o?);
+        }
+        done.sort_by_key(|o| o.shard);
+        for o in done {
+            if o.patch {
+                rep.add_file(&o.footer, &path.join(o.files.patches.last().expect("a patch")));
+                rep.patches += 1;
+            } else {
+                rep.base_bytes += o.bytes;
+                rep.file_bytes += o.bytes;
+                rep.bases += 1;
             }
+            rep.blocks_written += o.blocks.written;
+            rep.blocks_kept += o.blocks.kept;
+            m.shards.insert(o.shard as u32, o.files);
         }
         crate::store::sync_dir(path)?;
         m.write(path)?;
         obs::snapshot_timed("checkpoint", t.elapsed().as_secs_f64());
         rep.manifest = m;
         Ok(rep)
+    }
+
+    /// Shard `k`'s file for `checkpoint`: a patch over its files, or a base.
+    fn write_shard_file(&self, path: &Path, store: &Store, k: usize, checkpoint: u64) -> Result<ShardOut> {
+        let w = self.width;
+        let old = store.shards.get(k).and_then(|f| f.as_deref());
+        let lo = k as u32 * w;
+        let hi = ((k as u64 + 1) * w as u64).min(self.n_ids() as u64) as u32;
+        let name = shard_file(k, checkpoint);
+        let file = path.join(&name);
+        // a shard a bulk write clamped to the directory's end has another lo
+        // than k * width: it gets a base, never a patch
+        let mut patch_over = old.filter(|f| f.meta.lo == lo && f.fullest_space().1 < SPACE_FILL);
+        let meta = |body: ShardBody| ShardMeta {
+            format: PAGED_FORMAT,
+            build: store.dir.meta.build,
+            shard: k as u32,
+            lo,
+            hi,
+            live_lo: lo.max(self.base_n).min(hi),
+            checkpoint,
+            written_ms: now_ms(),
+            statuses: body.statuses,
+            stats: body.stats,
+        };
+        let mut blocks = BlockCounts::default();
+        if let Some(f) = patch_over {
+            let mut wr = PagedWriter::create(&file, FileKind::Patch { base: f.base().file.footer().salt })?;
+            match self.write_shard_patch(&mut wr, lo, hi, f, &mut blocks) {
+                Ok(body) => {
+                    let footer = wr.finish("shard", &meta(body))?;
+                    let mut files = f.files();
+                    files.patches.push(name);
+                    return Ok(ShardOut { shard: k, files, patch: true, footer, bytes: 0, blocks });
+                }
+                // a patch that would pass a space's cap: the shard gets a base
+                Err(e) if format!("{e:#}").contains(CAP_ERROR) => {
+                    wr.abandon();
+                    patch_over = None;
+                    blocks = BlockCounts::default();
+                }
+                Err(e) => {
+                    wr.abandon();
+                    return Err(e.context(format!("shard {k}'s patch")));
+                }
+            }
+        }
+        debug_assert!(patch_over.is_none());
+        let mut wr = PagedWriter::create(&file, FileKind::Base)?;
+        let footer = match self.write_shard_body(&mut wr, lo, hi, old, true) {
+            Ok(body) => wr.finish("shard", &meta(body))?,
+            Err(e) => {
+                wr.abandon();
+                return Err(e.context(format!("shard {k}'s base")));
+            }
+        };
+        let bytes = std::fs::metadata(&file).map_or(0, |x| x.len());
+        Ok(ShardOut { shard: k, files: ShardFiles::base(name), patch: false, footer, bytes, blocks })
     }
 
     /// A shard's sections for ids lo..hi, every list re-encoded from what
