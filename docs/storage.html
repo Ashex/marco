@@ -148,7 +148,7 @@ At the archive day's rate that comes to about 1.1 GB of deltas (2.48M delta entr
 <br><span class="rec">Recommend:</span> build it as an option in phase 6, and adopt it only if the skewed runs at Tight and Half both show at least 20% fewer misses (E8).</div>
 
 <div class="q"><b>Q5. Compaction when everything fits.</b> Old versions of changed lists stay in memory inside pages that still hold live lists. When the budget holds everything, compaction has to clear about a day's changes (R ≈ 1.2 GB) of that garbage every day so the next checkpoint fits its headroom. With garbage spread evenly over 64 shards, that comes close to rewriting every shard daily: about 40 GB a day, one shard at a time, rate-limited. That is the same volume a checkpoint writes today, spread out and never over budget. Below full residency, garbage pages drop out of the cache on their own, and compaction runs only for disk space: a few shards a day.
-<br><span class="rec">Recommend:</span> accept it. If the volume matters, the alternative is more headroom: about 3 GB more budget would halve it.</div>
+<br><span class="rec">Decided (decision 67):</span> accept it. At full residency compaction rewrites close to every shard daily, about 40 GB a day of rate-limited writes, and Fits gets no extra headroom.</div>
 
 <!-- ============================================================== -->
 <h2 id="changes">2. Changes after review</h2>
@@ -948,6 +948,23 @@ match app.engine.pass(&amp;mut Hold::none(), &amp;work) {           // on the to
 <li><b>Leaves:</b> the types phases 2 and 3 build against.</li>
 </ul>
 
+<p><b>Phase 0 decisions.</b> Where this doc left the contract open, phase 0 decided, and phases 2 and 3a build on these:</p>
+<table class="small">
+<tr><th>Point</th><th>Decided</th><th>Where</th></tr>
+<tr><td>Page seed</td><td><code>seed = salt ^ section_tag(name) ^ page</code>. The tag is xxh3_64 of the section's name with its low 32 bits cleared, so no two (section, page) pairs in a file share a seed. <code>page</code> is the page's number in its file (byte offset / 4096). The salt is a random u64 per file, kept in the footer. The sum is the low 32 bits of <code>xxh3_64_with_seed(page, seed)</code>. Golden values in the tests were also computed with python-xxhash.</td><td><code>store::page</code></td></tr>
+<tr><td>Where sums live</td><td>Paged section <code>X</code> keeps its sums in the pinned section <code>X.sums</code>: a u32 LE per page, in order. Names ending in <code>.sums</code> are reserved for them.</td><td><code>snapshot::SectionKind</code></td></tr>
+<tr><td>File layout</td><td>A FORMAT 6 file is a whole number of pages. Pinned sections start on 64 bytes and paged ones on 4096. Zero padding goes before the footer's JSON, so the 16-byte trailer (u64 JSON length, then <code>MARCOSN1</code>, the same as FORMAT 5's) ends the last page. An <code>O_DIRECT</code> reader reads the last page first. FORMAT 5's reader refuses these files with "snapshot format 6".</td><td><code>snapshot::PagedFooter</code></td></tr>
+<tr><td>Footer</td><td>JSON fields: <code>format</code> (6), <code>kind</code> ("dir" or "shard"), <code>file</code> (<code>"base"</code> or <code>{"patch": {"base": &lt;the base's salt&gt;}}</code>), <code>salt</code>, <code>meta</code> and <code>sections</code>. Each section is <code>{name, off, kind: "pinned", len, xxh3}</code> or <code>{name, off, kind: "paged", pages, first}</code>. <code>first</code> is the section's first page in its shard's space for that section name, counted in pages. A base's <code>first</code> is always 0. The parser checks order, overlap, alignment, sums, unique names and tags, and <code>first</code> on bases. The directory file is a base with only pinned sections.</td><td><code>snapshot::PagedFooter::validate</code></td></tr>
+<tr><td>Ids</td><td><code>FileId(u32)</code>, assigned by the engine and never reused while a page of the file can be cached. <code>PageId { file, page }</code> counts pages from the start of the file, not of the section.</td><td><code>store::page</code></td></tr>
+<tr><td>Manifest</td><td><code>Manifest.shards</code> maps a shard to <code>ShardFiles { base, patches }</code>, patches in write order. In JSON, a shard with no patches is its base's name, so FORMAT 5 manifests read and write byte for byte as before. A shard with patches is <code>{"base", "patches"}</code>. FORMAT 5's <code>Store::open</code> refuses patches, and <code>remove_unlisted</code> keeps them.</td><td><code>store::ShardFiles</code></td></tr>
+<tr><td><code>pass</code> before phase 2</td><td><code>Engine</code>, <code>pass</code>, <code>read_blocking</code>, <code>fetch_blocking</code>, <code>Hold</code>, <code>Misses</code> and <code>StorageError</code> exist from phase 0. The engine keeps whole files resident, owned or mapped (<code>Engine::open</code>), so phase 3b can run every caller through <code>pass</code> over mmap without waiting for phase 2. Phase 2 moves <code>Engine</code> to <code>store/engine.rs</code>, adds the page cache behind the same methods, and gives <code>fetch_blocking</code> real I/O. They're methods (<code>engine.pass(&amp;mut hold, f)</code>), not the free functions §7 sketches. Guards come from <code>Engine::pin</code>, so phase 2 can give the engine its own collector.</td><td><code>read</code></td></tr>
+<tr><td>Touched pages</td><td>A <code>ReadCx</code> records the pages it serves only when its <code>Hold</code> keeps pins (<code>Hold::new</code>: the miss pool, the writer, admin jobs). The fast pass on a tokio worker uses <code>Hold::none()</code>, records nothing and pins nothing, because a request that misses there starts over on the pool.</td><td><code>read::Hold</code></td></tr>
+<tr><td>Errors in a pass</td><td>Inside a pass, a bad page or a page past its file's end is just missing (<code>Pending</code>). The fetch says why: <code>StorageError::{Checksum, Eio, Short}</code> name the file, section and page. <code>NoPage</code> is the bug case of <code>Pending</code> with nothing recorded, which would otherwise loop forever.</td><td><code>read::StorageError</code></td></tr>
+<tr><td><code>Blocks</code></td><td><code>need</code> has a default that calls <code>block</code> on every block in the range and doesn't stop at the first miss. <code>PageBlocks</code> over <code>BlockAt { page, off, len }</code> is the reference paged implementation. A block number past the end is a caller's bug and may panic.</td><td><code>read::Blocks</code></td></tr>
+<tr><td>Dependencies</td><td>crossbeam-epoch comes in with phase 0, because <code>ReadCx</code> borrows its <code>Guard</code>. The compile-fail tests are rustdoc <code>compile_fail</code> doctests (no trybuild), and each one has a twin that compiles.</td><td><code>marco-core/Cargo.toml</code></td></tr>
+<tr><td>Open for 3a</td><td>Small-list index entries are u31 offsets into a section's space, which caps a space at 2 GiB if they count bytes. The compaction trigger "its space passes 3 GiB" (§11) can't fire under that cap. Phase 3a picks the offset unit and the trigger so they agree.</td><td>§4, §11</td></tr>
+</table>
+
 <h3>Phase 1 · Baseline and skew harness <span class="tag c">parallel from the start</span></h3>
 <ul>
 <li>An internal export script for the viewer and subject weights.</li>
@@ -1070,9 +1087,9 @@ match app.engine.pass(&amp;mut Hold::none(), &amp;work) {           // on the to
 <h3>What each phase touches</h3>
 <table class="small">
 <tr><th>Phase</th><th>Files (under <code>crates/</code>)</th></tr>
-<tr><td>0</td><td><code>marco-core/src/{snapshot,store}.rs</code>, new <code>marco-core/src/read.rs</code> and <code>store/page.rs</code></td></tr>
+<tr><td>0</td><td><code>marco-core/src/{snapshot,store}.rs</code>, new <code>marco-core/src/read.rs</code> and <code>store/page.rs</code>; <code>Cargo.toml</code> (crossbeam-epoch); the manifest's callers for <code>ShardFiles</code>: <code>marco-core/src/graph.rs</code>, <code>marco-server/src/writer.rs</code>, tests <code>semantics.rs</code>, <code>durability.rs</code></td></tr>
 <tr><td>1</td><td><code>marco-harness/src/{perf,mixfile}.rs</code>; <code>marco-server/src/{main,app}.rs</code> and <code>marco-core/src/snapshot.rs</code> (<code>--mmap-advice</code>); <code>internal/</code> scripts and results</td></tr>
-<tr><td>2</td><td>new <code>marco-core/src/store/{io,cache,engine}.rs</code> (<code>store.rs</code> becomes <code>store/mod.rs</code>); <code>Cargo.toml</code> (crossbeam-epoch, libc)</td></tr>
+<tr><td>2</td><td>new <code>marco-core/src/store/{io,cache,engine}.rs</code> (<code>store.rs</code> becomes <code>store/mod.rs</code>); <code>read.rs</code> (<code>Engine</code> moves out); <code>Cargo.toml</code> (libc)</td></tr>
 <tr><td>3a</td><td><code>marco-core/src/{outlog,inset,snapshot,store}.rs</code>; <code>marco-load/src/build.rs</code>; codec tests</td></tr>
 <tr><td>3b</td><td>
 <ul>

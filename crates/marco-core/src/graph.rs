@@ -47,7 +47,7 @@ use crate::snapshot::{
     encode_statuses, encode_tombs, rel_section, write_directory, BaseDir, DidAt, DirParts, Index, Meta, RelStats,
     ShardMeta, Side, Writer, FORMAT,
 };
-use crate::store::{now_ms, shard_file, Manifest, SetWriter, ShardFile, Store, DEFAULT_SHARDS};
+use crate::store::{now_ms, shard_file, Manifest, SetWriter, ShardFile, ShardFiles, Store, DEFAULT_SHARDS};
 use crate::varint::u32_at;
 
 /// Out logs at least this long get a by-subject index in a snapshot.
@@ -1889,14 +1889,14 @@ impl Graph {
             let old = store.shards.get(k).and_then(|f| f.as_deref());
             if !is_dirty {
                 if let Some(f) = old {
-                    m.shards.insert(k as u32, f.name.clone());
+                    m.shards.insert(k as u32, ShardFiles::base(f.name.clone()));
                 }
                 continue;
             }
             let lo = k as u32 * w;
             let hi = ((k as u64 + 1) * w as u64).min(self.n_ids() as u64) as u32;
             let name = shard_file(k, checkpoint);
-            if store.manifest.shards.values().any(|n| *n == name) {
+            if store.manifest.shards.values().flat_map(ShardFiles::files).any(|n| n == name) {
                 bail!("{name} is in the committed manifest: checkpoint {checkpoint} was used before");
             }
             let mut wr = Writer::create(&path.join(&name))?;
@@ -1914,7 +1914,7 @@ impl Graph {
                 stats: body.stats,
             };
             wr.finish("shard", &meta)?;
-            m.shards.insert(k as u32, name);
+            m.shards.insert(k as u32, ShardFiles::base(name));
         }
         crate::store::sync_dir(path)?;
         m.write(path)?;

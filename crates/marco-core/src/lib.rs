@@ -10,6 +10,7 @@ pub mod obs;
 #[cfg(feature = "metrics")]
 mod obs_hist;
 pub mod outlog;
+pub mod read;
 pub mod relation;
 pub mod rkey;
 pub mod segment;

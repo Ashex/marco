@@ -4,6 +4,10 @@
 //! query touches it. A snapshot is a set of them (store.rs): one directory
 //! file and a shard file per id range.
 //!
+//! FORMAT 6 files ([`PagedFooter`], [`PagedWriter`]) end the same way, but
+//! each section is either pinned (read whole at open) or paged (4 KiB pages,
+//! each with a seeded sum), and a shard is a base file plus patch files.
+//!
 //! Sections (the dir.* in the directory file, the r{i}.* in each shard, for
 //! the shard's ids):
 //!
@@ -35,6 +39,7 @@ use serde::{Deserialize, Serialize};
 use crate::did::{plc_from_bytes, plc_to_bytes, PACKED_LEN};
 use crate::outlog::OutBytes;
 use crate::relation::Relation;
+use crate::store::page::{page_align, page_seed, page_sum, section_tag, PAGE};
 use crate::varint::{self, u32_at, u64_at};
 
 pub const MAGIC: &[u8; 8] = b"MARCOSN1";
@@ -138,10 +143,7 @@ pub struct Writer {
 impl Writer {
     /// Writes to a temp file beside `path`; `finish` renames it into place.
     pub fn create(path: &Path) -> Result<Writer> {
-        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
-        let mut name = path.file_name().context("snapshot path has no file name")?.to_os_string();
-        name.push(format!(".tmp.{}.{nanos}", std::process::id()));
-        let tmp = path.with_file_name(name);
+        let tmp = temp_path(path)?;
         let f = File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
         Ok(Writer {
             f: BufWriter::with_capacity(8 << 20, f),
@@ -200,13 +202,27 @@ impl Writer {
         self.f.write_all(&footer)?;
         self.f.write_all(&(footer.len() as u64).to_le_bytes())?;
         self.f.write_all(MAGIC)?;
-        let f = self.f.into_inner().map_err(|e| e.into_error())?;
-        f.sync_all()?;
-        std::fs::rename(&self.tmp, &self.path)?;
-        let parent = self.path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
-        File::open(parent)?.sync_all()?;
+        commit(self.f, &self.tmp, &self.path)?;
         Ok(self.sections)
     }
+}
+
+/// A temp file name beside `path`, unique to this process and moment.
+fn temp_path(path: &Path) -> Result<PathBuf> {
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let mut name = path.file_name().context("snapshot path has no file name")?.to_os_string();
+    name.push(format!(".tmp.{}.{nanos}", std::process::id()));
+    Ok(path.with_file_name(name))
+}
+
+/// Flushes and fsyncs `f`, renames `tmp` to `path` and fsyncs the directory.
+fn commit(f: BufWriter<File>, tmp: &Path, path: &Path) -> Result<()> {
+    let f = f.into_inner().map_err(|e| e.into_error())?;
+    f.sync_all()?;
+    std::fs::rename(tmp, path)?;
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    File::open(parent)?.sync_all()?;
+    Ok(())
 }
 
 pub enum Bytes {
@@ -918,4 +934,555 @@ pub fn decode_live(b: &[u8]) -> Result<Vec<crate::did::DidKey>> {
         }
     }
     Ok(v)
+}
+
+// ---------------------------------------------------------------- FORMAT 6 files
+
+/// The format of paged files ([`PagedFooter`]). [`FORMAT`] stays the one the
+/// server reads and writes until FORMAT 6 has readers.
+pub const PAGED_FORMAT: u32 = 6;
+
+/// Pinned sections start on a multiple of this, as FORMAT 5's sections do.
+pub const PINNED_ALIGN: u64 = 64;
+
+/// The trailer every snapshot file ends with: the footer's length as u64,
+/// then [`MAGIC`].
+pub const TRAILER: usize = 16;
+
+/// What a FORMAT 6 file is to its shard. The directory file is a base with
+/// only pinned sections.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FileKind {
+    /// A shard's base: each paged section's pages start that section's space
+    /// in the shard, so every `first` is 0.
+    Base,
+    /// A patch over the base whose salt is `base`. Its paged sections
+    /// continue the shard's spaces after the base's and earlier patches'
+    /// pages, at the `first` each one names.
+    Patch { base: u64 },
+}
+
+/// How a section is read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum SectionKind {
+    /// Read whole at open and kept in memory; `xxh3` (xxh3_64 of its `len`
+    /// bytes) is checked then. Starts on a multiple of [`PINNED_ALIGN`].
+    Pinned { len: u64, xxh3: u64 },
+    /// `pages` whole pages starting on a page boundary, read and cached one
+    /// page at a time, each checked against its sum on every read from disk.
+    /// The sums are the pinned section [`sums_section`] of this one's name: a
+    /// u32 per page, in order, from [`page_sum`] and [`page_seed`] with the
+    /// page's number in the file. `first` is the section's first page in its
+    /// shard's space for this section name: the base's pages, then each
+    /// patch's, so a list can move to a patch without its neighbours moving.
+    Paged { pages: u32, first: u32 },
+}
+
+/// A section in a FORMAT 6 footer.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PagedSection {
+    pub name: String,
+    /// Byte offset in the file.
+    pub off: u64,
+    #[serde(flatten)]
+    pub kind: SectionKind,
+}
+
+impl PagedSection {
+    /// Bytes in the file: a pinned section's length, or its pages' bytes.
+    pub fn len(&self) -> u64 {
+        match self.kind {
+            SectionKind::Pinned { len, .. } => len,
+            SectionKind::Paged { pages, .. } => pages as u64 * PAGE as u64,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn range(&self) -> Range<u64> {
+        self.off..self.off + self.len()
+    }
+
+    pub fn is_paged(&self) -> bool {
+        matches!(self.kind, SectionKind::Paged { .. })
+    }
+
+    /// The file page number of a paged section's first page.
+    pub fn first_page(&self) -> u32 {
+        (self.off / PAGE as u64) as u32
+    }
+
+    /// Its share of each page's seed ([`section_tag`]).
+    pub fn tag(&self) -> u64 {
+        section_tag(&self.name)
+    }
+}
+
+/// The pinned section holding the page sums of the paged section `name`.
+/// Section names ending in `.sums` are reserved for them.
+pub fn sums_section(name: &str) -> String {
+    format!("{name}.sums")
+}
+
+/// The footer of a FORMAT 6 file, base or patch, shard or directory.
+///
+/// The file is laid out as its sections, zero padding, the footer's JSON and
+/// the [`TRAILER`], and its length is a whole number of pages: the padding
+/// sits before the JSON so the trailer ends the last page. An `O_DIRECT`
+/// reader reads the last page, gets the footer's range from
+/// [`PagedFooter::footer_range`], reads the pages that hold it and calls
+/// [`PagedFooter::parse`]. FORMAT 5's reader takes the same trailer, so it
+/// fails on a FORMAT 6 file with "snapshot format 6".
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PagedFooter {
+    /// Always [`PAGED_FORMAT`].
+    pub format: u32,
+    /// "dir" or "shard", as in FORMAT 5.
+    pub kind: String,
+    pub file: FileKind,
+    /// Random per file: seeds its page sums, and names the base a patch is
+    /// for.
+    pub salt: u64,
+    /// The file's meta (the directory's [`Meta`], a shard's [`ShardMeta`]),
+    /// left to the caller to parse.
+    pub meta: serde_json::Value,
+    /// In file order, not overlapping.
+    pub sections: Vec<PagedSection>,
+}
+
+impl PagedFooter {
+    /// The byte range of the footer's JSON, from the file's length and its
+    /// last [`TRAILER`] bytes. Fails on a file that isn't whole pages or
+    /// doesn't end in [`MAGIC`].
+    pub fn footer_range(file_len: u64, trailer: &[u8]) -> Result<Range<u64>> {
+        if file_len < PAGE as u64 || !file_len.is_multiple_of(PAGE as u64) {
+            bail!("not a FORMAT 6 file: {file_len} bytes isn't whole pages");
+        }
+        let Some(t) = trailer.last_chunk::<TRAILER>().filter(|_| trailer.len() == TRAILER) else {
+            bail!("the trailer is {} bytes, not {TRAILER}", trailer.len());
+        };
+        if &t[8..] != MAGIC {
+            bail!("not a marco snapshot");
+        }
+        let flen = u64_at(t, 0);
+        if flen > file_len - TRAILER as u64 {
+            bail!("snapshot footer out of range");
+        }
+        let end = file_len - TRAILER as u64;
+        Ok(end - flen..end)
+    }
+
+    /// Parses and checks a footer whose JSON starts at byte `footer_off` of
+    /// its file: every section must end by then (see [`PagedFooter::validate`]).
+    pub fn parse(json: &[u8], footer_off: u64) -> Result<PagedFooter> {
+        let v: serde_json::Value = serde_json::from_slice(json).context("snapshot footer")?;
+        let format = v.get("format").and_then(|f| f.as_u64()).unwrap_or(0);
+        if format != PAGED_FORMAT as u64 {
+            bail!("snapshot format {format}, expected {PAGED_FORMAT}");
+        }
+        let f: PagedFooter = serde_json::from_value(v).context("snapshot footer")?;
+        f.validate(footer_off)?;
+        Ok(f)
+    }
+
+    /// The footer of a whole file in memory.
+    pub fn read(file: &[u8]) -> Result<PagedFooter> {
+        let r = PagedFooter::footer_range(file.len() as u64, &file[file.len().saturating_sub(TRAILER)..])?;
+        PagedFooter::parse(&file[r.start as usize..r.end as usize], r.start)
+    }
+
+    /// The checks [`PagedFooter::parse`] makes, for sections that end by
+    /// `body_end`: the format; sections in order, unique, not overlapping;
+    /// pinned ones aligned to [`PINNED_ALIGN`], paged ones to [`PAGE`]; every
+    /// paged section has its sums section, pinned and 4 bytes a page, and
+    /// every `.sums` section belongs to a paged one; no two paged sections
+    /// share a [`section_tag`]; a base's paged sections start their spaces.
+    pub fn validate(&self, body_end: u64) -> Result<()> {
+        if self.format != PAGED_FORMAT {
+            bail!("snapshot format {}, expected {PAGED_FORMAT}", self.format);
+        }
+        let mut end = 0u64;
+        let mut by_name: HashMap<&str, &PagedSection> = HashMap::new();
+        let mut tags: HashMap<u64, &str> = HashMap::new();
+        for s in &self.sections {
+            if s.off < end {
+                bail!("section {} overlaps the one before it", s.name);
+            }
+            match s.kind {
+                SectionKind::Pinned { .. } if !s.off.is_multiple_of(PINNED_ALIGN) => {
+                    bail!("pinned section {} at {} isn't {PINNED_ALIGN}-byte aligned", s.name, s.off)
+                }
+                SectionKind::Pinned { .. } => {}
+                SectionKind::Paged { pages, first } => {
+                    if !s.off.is_multiple_of(PAGE as u64) {
+                        bail!("paged section {} at {} isn't page aligned", s.name, s.off);
+                    }
+                    if s.name.ends_with(".sums") {
+                        bail!("paged section {} has a name reserved for sums", s.name);
+                    }
+                    if first.checked_add(pages).is_none() {
+                        bail!("paged section {} runs past the space's 2^32 pages", s.name);
+                    }
+                    if self.file == FileKind::Base && first != 0 {
+                        bail!("paged section {} of a base starts at page {first} of its space, not 0", s.name);
+                    }
+                    if let Some(other) = tags.insert(s.tag(), &s.name) {
+                        bail!("paged sections {other} and {} share a seed tag", s.name);
+                    }
+                }
+            }
+            end = s.off.checked_add(s.len()).context("section end overflows")?;
+            if end > body_end {
+                bail!("section {} out of range", s.name);
+            }
+            if by_name.insert(&s.name, s).is_some() {
+                bail!("two sections named {}", s.name);
+            }
+        }
+        for s in &self.sections {
+            match s.kind {
+                SectionKind::Paged { pages, .. } => match by_name.get(sums_section(&s.name).as_str()) {
+                    Some(PagedSection { kind: SectionKind::Pinned { len, .. }, .. }) if *len == 4 * pages as u64 => {}
+                    Some(_) => bail!("{} isn't a pinned u32 per page of {}", sums_section(&s.name), s.name),
+                    None => bail!("paged section {} has no sums", s.name),
+                },
+                SectionKind::Pinned { .. } => {
+                    if let Some(paged) = s.name.strip_suffix(".sums") {
+                        if !by_name.get(paged).is_some_and(|p| p.is_paged()) {
+                            bail!("{} is sums for no paged section", s.name);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The footer's bytes when it's written at byte `pos` of its file:
+    /// padding, the JSON and the trailer, ending on a page boundary.
+    pub fn encode(&self, pos: u64) -> Result<Vec<u8>> {
+        let json = serde_json::to_vec(self)?;
+        let used = json.len() as u64 + TRAILER as u64;
+        let pad = page_align(pos + used) - pos - used;
+        let mut out = Vec::with_capacity((pad + used) as usize);
+        out.resize(pad as usize, 0);
+        out.extend_from_slice(&json);
+        out.extend_from_slice(&(json.len() as u64).to_le_bytes());
+        out.extend_from_slice(MAGIC);
+        Ok(out)
+    }
+
+    pub fn section(&self, name: &str) -> Option<&PagedSection> {
+        self.sections.iter().find(|s| s.name == name)
+    }
+
+    /// The paged section holding page `page` of the file, if any.
+    pub fn page_at(&self, page: u32) -> Option<&PagedSection> {
+        let off = page as u64 * PAGE as u64;
+        let i = self.sections.partition_point(|s| s.off <= off).checked_sub(1)?;
+        let s = &self.sections[i];
+        (s.is_paged() && s.range().contains(&off)).then_some(s)
+    }
+
+    /// The seed of page `page` of the file, which `section` holds.
+    pub fn seed(&self, section: &PagedSection, page: u32) -> u64 {
+        page_seed(self.salt, section.tag(), page)
+    }
+
+    /// A pinned section's bytes in the whole file `file`.
+    pub fn pinned<'a>(&self, file: &'a [u8], name: &str) -> Option<&'a [u8]> {
+        let s = self.section(name).filter(|s| !s.is_paged())?;
+        file.get(s.off as usize..(s.off + s.len()) as usize)
+    }
+
+    /// Checks every pinned section's xxh3 and every page's sum in the whole
+    /// file `file`, naming the first that fails.
+    pub fn verify(&self, file: &[u8]) -> Result<()> {
+        for s in &self.sections {
+            let bytes = file.get(s.off as usize..(s.off + s.len()) as usize).context("section out of range")?;
+            match s.kind {
+                SectionKind::Pinned { xxh3, .. } => {
+                    let h = xxhash_rust::xxh3::xxh3_64(bytes);
+                    if h != xxh3 {
+                        bail!("section {} checksum {h:016x}, footer says {xxh3:016x}", s.name);
+                    }
+                }
+                SectionKind::Paged { .. } => {
+                    let sums = self.pinned(file, &sums_section(&s.name)).context("no sums")?;
+                    for (i, p) in bytes.as_chunks::<PAGE>().0.iter().enumerate() {
+                        let page = s.first_page() + i as u32;
+                        if page_sum(p, self.seed(s, page)) != u32_at(sums, 4 * i) {
+                            bail!("section {} page {page}: checksum", s.name);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Writes one FORMAT 6 file through a temp file, buffered: what tests and
+/// test fixtures use to make files the reader and the engine can open. It
+/// computes the page sums and writes their sections itself, and checks the
+/// footer before writing it, so a file it finishes always parses.
+pub struct PagedWriter {
+    f: BufWriter<File>,
+    pos: u64,
+    file: FileKind,
+    salt: u64,
+    sections: Vec<PagedSection>,
+    sums: Vec<(String, Vec<u8>)>,
+    tmp: PathBuf,
+    path: PathBuf,
+}
+
+impl PagedWriter {
+    /// A file at `path`, with a random salt; [`PagedWriter::finish`] renames it
+    /// into place.
+    pub fn create(path: &Path, file: FileKind) -> Result<PagedWriter> {
+        use std::hash::{BuildHasher, RandomState};
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+        PagedWriter::with_salt(path, file, RandomState::new().hash_one((nanos, std::process::id())))
+    }
+
+    /// A file with a chosen salt, for tests that need the same bytes twice.
+    pub fn with_salt(path: &Path, file: FileKind, salt: u64) -> Result<PagedWriter> {
+        let tmp = temp_path(path)?;
+        let f = File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+        Ok(PagedWriter {
+            f: BufWriter::with_capacity(8 << 20, f),
+            pos: 0,
+            file,
+            salt,
+            sections: Vec::new(),
+            sums: Vec::new(),
+            tmp,
+            path: path.to_path_buf(),
+        })
+    }
+
+    pub fn salt(&self) -> u64 {
+        self.salt
+    }
+
+    fn pad_to(&mut self, align: u64) -> Result<()> {
+        let pad = self.pos.next_multiple_of(align) - self.pos;
+        self.f.write_all(&vec![0u8; pad as usize])?;
+        self.pos += pad;
+        Ok(())
+    }
+
+    /// A pinned section of `bytes`.
+    pub fn pinned(&mut self, name: &str, bytes: &[u8]) -> Result<()> {
+        self.pad_to(PINNED_ALIGN)?;
+        let len = bytes.len() as u64;
+        let xxh3 = xxhash_rust::xxh3::xxh3_64(bytes);
+        self.sections.push(PagedSection { name: name.into(), off: self.pos, kind: SectionKind::Pinned { len, xxh3 } });
+        self.f.write_all(bytes)?;
+        self.pos += len;
+        Ok(())
+    }
+
+    /// A paged section of `bytes`, the last page padded with zeros, starting
+    /// at page `first` of its space. Returns its pages.
+    pub fn paged(&mut self, name: &str, first: u32, bytes: &[u8]) -> Result<u32> {
+        self.pad_to(PAGE as u64)?;
+        let pages = u32::try_from(bytes.len().div_ceil(PAGE)).context("a paged section over 2^32 pages")?;
+        let s = PagedSection { name: name.into(), off: self.pos, kind: SectionKind::Paged { pages, first } };
+        let mut sums = Vec::with_capacity(4 * pages as usize);
+        for (i, chunk) in bytes.chunks(PAGE).enumerate() {
+            let mut p = [0u8; PAGE];
+            p[..chunk.len()].copy_from_slice(chunk);
+            let page = s.first_page() + i as u32;
+            sums.extend_from_slice(&page_sum(&p, page_seed(self.salt, s.tag(), page)).to_le_bytes());
+            self.f.write_all(&p)?;
+        }
+        self.pos += pages as u64 * PAGE as u64;
+        self.sections.push(s);
+        self.sums.push((sums_section(name), sums));
+        Ok(pages)
+    }
+
+    /// Writes the sums sections and the footer, fsyncs and renames the file
+    /// into place. Returns the footer as written.
+    pub fn finish(mut self, kind: &str, meta: &impl Serialize) -> Result<PagedFooter> {
+        for (name, sums) in std::mem::take(&mut self.sums) {
+            self.pinned(&name, &sums)?;
+        }
+        let footer = PagedFooter {
+            format: PAGED_FORMAT,
+            kind: kind.into(),
+            file: self.file,
+            salt: self.salt,
+            meta: serde_json::to_value(meta)?,
+            sections: std::mem::take(&mut self.sections),
+        };
+        footer.validate(self.pos)?;
+        self.f.write_all(&footer.encode(self.pos)?)?;
+        commit(self.f, &self.tmp, &self.path)?;
+        Ok(footer)
+    }
+}
+
+#[cfg(test)]
+mod paged_tests {
+    use super::*;
+
+    fn ramp(n: usize, k: u8) -> Vec<u8> {
+        (0..n).map(|i| (i as u8).wrapping_mul(31).wrapping_add(k)).collect()
+    }
+
+    fn write(dir: &Path, name: &str, file: FileKind, f: impl FnOnce(&mut PagedWriter)) -> (Vec<u8>, PagedFooter) {
+        let p = dir.join(name);
+        let mut w = PagedWriter::with_salt(&p, file, 0x5eed).unwrap();
+        f(&mut w);
+        let footer = w.finish("shard", &serde_json::json!({"shard": 3})).unwrap();
+        (std::fs::read(&p).unwrap(), footer)
+    }
+
+    #[test]
+    fn footers_round_trip() {
+        let d = tempfile::tempdir().unwrap();
+        let (bytes, footer) = write(d.path(), "base", FileKind::Base, |w| {
+            w.pinned("r0.out.idx", &ramp(1000, 1)).unwrap();
+            assert_eq!(w.paged("r0.out.small", 0, &ramp(3 * PAGE + 17, 2)).unwrap(), 4);
+            w.pinned("r0.out.head", &ramp(5, 3)).unwrap();
+            assert_eq!(w.paged("r0.in.blocks", 0, &[]).unwrap(), 0);
+            assert_eq!(w.paged("r0.in.small", 0, &ramp(PAGE, 4)).unwrap(), 1);
+        });
+        assert!(bytes.len().is_multiple_of(PAGE));
+        assert_eq!(PagedFooter::read(&bytes).unwrap(), footer);
+        footer.verify(&bytes).unwrap();
+        assert_eq!((footer.salt, footer.file, footer.meta["shard"].as_u64()), (0x5eed, FileKind::Base, Some(3)));
+        for s in &footer.sections {
+            let a = if s.is_paged() { PAGE as u64 } else { PINNED_ALIGN };
+            assert!(s.off.is_multiple_of(a), "{} at {}", s.name, s.off);
+        }
+        assert_eq!(footer.pinned(&bytes, "r0.out.idx").unwrap(), ramp(1000, 1));
+        assert_eq!(footer.pinned(&bytes, "r0.out.small"), None, "a paged section isn't pinned");
+        let small = footer.section("r0.out.small").unwrap();
+        assert_eq!(small.kind, SectionKind::Paged { pages: 4, first: 0 });
+        let first = small.first_page();
+        let page3 = &bytes[(first as usize + 3) * PAGE..][..PAGE];
+        assert_eq!(&page3[..17], &ramp(3 * PAGE + 17, 2)[3 * PAGE..], "the last page is padded");
+        assert!(page3[17..].iter().all(|&b| b == 0));
+        for p in first..first + 4 {
+            assert_eq!(footer.page_at(p).unwrap().name, "r0.out.small");
+        }
+        assert_eq!(footer.page_at(0), None, "a pinned section's page");
+        assert_eq!(footer.page_at(u32::MAX), None);
+        let sums = footer.pinned(&bytes, "r0.out.small.sums").unwrap();
+        assert_eq!(
+            u32_at(sums, 4),
+            page_sum(bytes[(first as usize + 1) * PAGE..][..PAGE].try_into().unwrap(), footer.seed(small, first + 1))
+        );
+
+        // FORMAT 5's reader refuses it by format
+        let e = Snapshot::from_bytes(Bytes::Owned(bytes.clone())).err().unwrap().to_string();
+        assert!(e.contains("snapshot format 6"), "{e}");
+        let mut flipped = bytes.clone();
+        flipped[(first as usize + 2) * PAGE + 100] ^= 1;
+        let e = footer.verify(&flipped).unwrap_err().to_string();
+        assert_eq!(e, format!("section r0.out.small page {}: checksum", first + 2));
+        let mut flipped = bytes.clone();
+        flipped[footer.section("r0.out.head").unwrap().off as usize] ^= 1;
+        assert!(footer.verify(&flipped).unwrap_err().to_string().contains("section r0.out.head checksum"));
+    }
+
+    #[test]
+    fn patches_and_long_footers_round_trip() {
+        let d = tempfile::tempdir().unwrap();
+        let (bytes, footer) = write(d.path(), "patch", FileKind::Patch { base: 0xba5e }, |w| {
+            for i in 0..300 {
+                w.paged(&format!("r{i}.out.small"), 40 + i, &ramp(10, i as u8)).unwrap();
+            }
+        });
+        assert!(serde_json::to_vec(&footer).unwrap().len() > 2 * PAGE, "the footer spans pages");
+        assert_eq!(PagedFooter::read(&bytes).unwrap(), footer);
+        footer.verify(&bytes).unwrap();
+        assert_eq!(footer.file, FileKind::Patch { base: 0xba5e });
+        assert_eq!(footer.section("r7.out.small").unwrap().kind, SectionKind::Paged { pages: 1, first: 47 });
+        let json = serde_json::to_value(&footer).unwrap();
+        assert_eq!(json["file"], serde_json::json!({"patch": {"base": 0xba5e}}));
+        assert_eq!(
+            json["sections"][0],
+            serde_json::json!({"name": "r0.out.small", "off": 0, "kind": "paged", "pages": 1, "first": 40})
+        );
+    }
+
+    #[test]
+    fn a_bad_trailer_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let (bytes, _) = write(d.path(), "f", FileKind::Base, |w| w.pinned("a", b"x").unwrap());
+        let n = bytes.len();
+        let r = PagedFooter::footer_range(n as u64, &bytes[n - TRAILER..]).unwrap();
+        assert_eq!(r.end, n as u64 - TRAILER as u64);
+        assert!(PagedFooter::read(&bytes[..n - 1]).unwrap_err().to_string().contains("whole pages"));
+        assert!(PagedFooter::footer_range(n as u64, &bytes[n - 15..]).is_err());
+        let mut b = bytes.clone();
+        b[n - 1] ^= 1;
+        assert!(PagedFooter::read(&b).unwrap_err().to_string().contains("not a marco snapshot"));
+        let mut b = bytes.clone();
+        b[n - TRAILER..n - 8].copy_from_slice(&(n as u64).to_le_bytes());
+        assert!(PagedFooter::read(&b).unwrap_err().to_string().contains("out of range"));
+        let five = r.start as usize;
+        let mut b = bytes.clone();
+        let at = five + b[five..].windows(10).position(|w| w == b"\"format\":6").unwrap();
+        b[at + 9] = b'5';
+        assert!(PagedFooter::read(&b).unwrap_err().to_string().contains("snapshot format 5, expected 6"));
+    }
+
+    #[test]
+    fn validate_refuses_malformed_footers() {
+        let pinned = |name: &str, off: u64, len: u64| PagedSection {
+            name: name.into(),
+            off,
+            kind: SectionKind::Pinned { len, xxh3: 0 },
+        };
+        let paged = |name: &str, off: u64, pages: u32, first: u32| PagedSection {
+            name: name.into(),
+            off,
+            kind: SectionKind::Paged { pages, first },
+        };
+        let footer = |file, sections| PagedFooter {
+            format: PAGED_FORMAT,
+            kind: "shard".into(),
+            file,
+            salt: 1,
+            meta: serde_json::Value::Null,
+            sections,
+        };
+        let ok = vec![paged("a", 0, 2, 0), pinned("a.sums", 8192, 8)];
+        footer(FileKind::Base, ok.clone()).validate(8200).unwrap();
+        let cases: Vec<(&str, FileKind, Vec<PagedSection>, u64)> = vec![
+            ("out of range", FileKind::Base, ok.clone(), 8199),
+            ("isn't page aligned", FileKind::Base, vec![paged("a", 64, 1, 0), pinned("a.sums", 4160, 4)], 9000),
+            ("isn't 64-byte aligned", FileKind::Base, vec![pinned("x", 3, 1)], 9000),
+            ("overlaps", FileKind::Base, vec![paged("a", 0, 2, 0), pinned("a.sums", 4096, 8)], 9000),
+            ("has no sums", FileKind::Base, vec![paged("a", 0, 2, 0)], 9000),
+            ("isn't a pinned u32 per page", FileKind::Base, vec![paged("a", 0, 2, 0), pinned("a.sums", 8192, 4)], 9000),
+            ("sums for no paged section", FileKind::Base, vec![pinned("b.sums", 0, 4)], 9000),
+            ("reserved for sums", FileKind::Base, vec![paged("a.sums", 0, 0, 0)], 9000),
+            ("not 0", FileKind::Base, vec![paged("a", 0, 2, 5), pinned("a.sums", 8192, 8)], 9000),
+            (
+                "2^32 pages",
+                FileKind::Patch { base: 1 },
+                vec![paged("a", 0, 2, u32::MAX), pinned("a.sums", 8192, 8)],
+                9000,
+            ),
+            ("two sections named", FileKind::Base, vec![pinned("x", 0, 1), pinned("x", 64, 1)], 9000),
+        ];
+        for (want, file, sections, end) in cases {
+            let e = footer(file, sections).validate(end).unwrap_err().to_string();
+            assert!(e.contains(want), "{want}: {e}");
+        }
+        footer(FileKind::Patch { base: 1 }, vec![paged("a", 0, 2, 5), pinned("a.sums", 8192, 8)])
+            .validate(9000)
+            .unwrap();
+    }
 }

@@ -636,11 +636,11 @@ fn a_checkpoint_id_is_never_written_twice() {
     let m = g.write_checkpoint(&p, 1, 0, Default::default()).unwrap();
     let mut g = Graph::open(&p).unwrap();
     g.add(&follow(&did(1), &tid(3)), &did(4)).unwrap();
-    let before: Vec<Vec<u8>> = m.shards.values().map(|n| std::fs::read(p.join(n)).unwrap()).collect();
+    let before: Vec<Vec<u8>> = m.shards.values().map(|f| std::fs::read(p.join(&f.base)).unwrap()).collect();
     for id in [0, 1] {
         assert!(g.write_checkpoint(&p, id, 0, Default::default()).is_err(), "id {id}");
     }
-    let after: Vec<Vec<u8>> = m.shards.values().map(|n| std::fs::read(p.join(n)).unwrap()).collect();
+    let after: Vec<Vec<u8>> = m.shards.values().map(|f| std::fs::read(p.join(&f.base)).unwrap()).collect();
     assert!(before == after, "the committed files are untouched");
     g.write_checkpoint(&p, 2, 0, Default::default()).unwrap();
 }

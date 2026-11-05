@@ -1585,6 +1585,7 @@ name = "marco-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "crossbeam-epoch",
  "memmap2",
  "prometheus",
  "rustc-hash",

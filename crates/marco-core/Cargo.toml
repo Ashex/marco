@@ -22,6 +22,7 @@ toml = { workspace = true }
 tracing = { workspace = true }
 xxhash-rust = { workspace = true }
 rustc-hash = { workspace = true }
+crossbeam-epoch = { workspace = true }
 prometheus = { workspace = true, optional = true }
 
 [dev-dependencies]

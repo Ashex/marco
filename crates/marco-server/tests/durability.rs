@@ -221,7 +221,8 @@ async fn a_crash_on_either_side_of_a_checkpoints_commit() {
     let r = marco_server::app::open_replayed(&ccfg, None).unwrap();
     let m = r.graph.write_checkpoint(&copy, 1, r.last, r.cursors.clone()).unwrap();
     drop(r);
-    let new_files: Vec<String> = m.shards.values().filter(|n| n.ends_with("-00000001.marco")).cloned().collect();
+    let new_files: Vec<String> =
+        m.shards.values().map(|f| f.base.clone()).filter(|n| n.ends_with("-00000001.marco")).collect();
     assert!(!new_files.is_empty());
 
     // 1: the shard files were written, the manifest wasn't renamed

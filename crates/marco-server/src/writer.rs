@@ -497,7 +497,8 @@ fn rewrite(app: &App, id: u64, upto: u64, cursors: BTreeMap<String, String>) -> 
     let g = open_replayed(cfg, Some(upto))?.graph;
     let manifest = g.write_checkpoint(&cfg.snapshot, id, upto, cursors)?;
     drop(g);
-    let new: Vec<&String> = manifest.shards.values().filter(|n| n.ends_with(&format!("-{id:08}.marco"))).collect();
+    let new: Vec<&String> =
+        manifest.shards.values().map(|f| &f.base).filter(|n| n.ends_with(&format!("-{id:08}.marco"))).collect();
     let bytes = new.iter().map(|n| std::fs::metadata(cfg.snapshot.join(n)).map_or(0, |x| x.len())).sum();
     let shards = new.len() as u32;
     let cleanup = remove_unlisted(&cfg.snapshot, &manifest, false).err().map(|e| format!("{e:#}"));

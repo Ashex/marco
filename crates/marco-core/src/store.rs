@@ -21,6 +21,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::snapshot::{rel_section, DirRanges, Meta, ShardMeta, Snapshot, Writer, FORMAT};
 
+pub mod page;
+
 pub const DIR_FILE: &str = "directory.marco";
 pub const MANIFEST: &str = "manifest.json";
 pub const DEFAULT_SHARDS: usize = 64;
@@ -47,10 +49,62 @@ pub struct Manifest {
     pub written_ms: i64,
     /// The last change segment folded into the shards; replay starts after it.
     pub segment: u64,
-    /// Shard number to file name.
-    pub shards: BTreeMap<u32, String>,
+    /// Shard number to its files.
+    pub shards: BTreeMap<u32, ShardFiles>,
     /// Per source, the cursor the snapshot's state covers: resume after it.
     pub cursors: BTreeMap<String, String>,
+}
+
+/// One shard's files in a manifest: its base, then its patches in the order
+/// they were written, which is the order their pages follow the base's in
+/// each of the shard's spaces. A reader opens all of them: the newest file's
+/// pinned sections (index, heads) describe the whole shard, and their offsets
+/// point into any of the files' pages. FORMAT 5 shards are a base alone.
+///
+/// In `manifest.json` a shard with no patches is its base's name, so FORMAT 5
+/// manifests read and write unchanged; one with patches is
+/// `{"base": name, "patches": [names]}`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ShardFiles {
+    pub base: String,
+    pub patches: Vec<String>,
+}
+
+impl ShardFiles {
+    pub fn base(name: impl Into<String>) -> ShardFiles {
+        ShardFiles { base: name.into(), patches: Vec::new() }
+    }
+
+    /// The base, then the patches.
+    pub fn files(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.base.as_str()).chain(self.patches.iter().map(String::as_str))
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum ShardFilesJson {
+    Base(String),
+    Patched { base: String, patches: Vec<String> },
+}
+
+impl Serialize for ShardFiles {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        if self.patches.is_empty() {
+            s.serialize_str(&self.base)
+        } else {
+            ShardFilesJson::Patched { base: self.base.clone(), patches: self.patches.clone() }.serialize(s)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ShardFiles {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<ShardFiles, D::Error> {
+        Ok(match ShardFilesJson::deserialize(d)? {
+            ShardFilesJson::Base(base) => ShardFiles::base(base),
+            ShardFilesJson::Patched { base, patches } => ShardFiles { base, patches },
+        })
+    }
 }
 
 pub fn sync_dir(dir: &Path) -> Result<()> {
@@ -198,7 +252,11 @@ impl Store {
         let base_shards = (dir.meta.n_ids as u64).div_ceil(w) as usize;
         let n = manifest.shards.keys().next_back().map_or(0, |&k| k as usize + 1).max(base_shards);
         let mut shards: Vec<Option<Arc<ShardFile>>> = (0..n).map(|_| None).collect();
-        for (&k, name) in &manifest.shards {
+        for (&k, files) in &manifest.shards {
+            if !files.patches.is_empty() {
+                bail!("shard {k} has patches, which FORMAT {FORMAT} doesn't have");
+            }
+            let name = &files.base;
             let f = ShardFile::open(path, name, &dir.meta)?;
             if f.meta.shard != k {
                 bail!("{name} is shard {}, the manifest says {k}", f.meta.shard);
@@ -267,7 +325,7 @@ impl Store {
 /// what a checkpoint leaves behind, committed or not. `temps` deletes temp
 /// files too, which only a process with no writer running may do (open).
 pub fn remove_unlisted(path: &Path, m: &Manifest, temps: bool) -> Result<usize> {
-    let keep: std::collections::HashSet<&str> = m.shards.values().map(String::as_str).collect();
+    let keep: std::collections::HashSet<&str> = m.shards.values().flat_map(ShardFiles::files).collect();
     let mut n = 0;
     for e in std::fs::read_dir(path)? {
         let name = e?.file_name().to_string_lossy().to_string();
@@ -361,7 +419,7 @@ impl SetWriter {
             checkpoint: 0,
             written_ms: now_ms(),
             segment: 0,
-            shards: (0..self.shards.len()).map(|k| (k as u32, shard_file(k, 0))).collect(),
+            shards: (0..self.shards.len()).map(|k| (k as u32, ShardFiles::base(shard_file(k, 0)))).collect(),
             cursors,
         };
         m.write(&self.tmp)?;
@@ -377,5 +435,56 @@ impl SetWriter {
         let parent = self.path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
         sync_dir(parent)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shard_files_keep_format_5_manifests_unchanged() {
+        let json = r#"{"format":5,"build":7,"checkpoint":2,"written_ms":1,"segment":9,"shards":{"0":"shard-000-00000002.marco","1":"shard-001-00000000.marco"},"cursors":{"jetstream":"42"}}"#;
+        let m: Manifest = serde_json::from_str(json).unwrap();
+        assert_eq!(m.shards[&0], ShardFiles::base("shard-000-00000002.marco"));
+        assert_eq!(serde_json::to_string(&m).unwrap(), json);
+    }
+
+    #[test]
+    fn shard_files_with_patches_round_trip() {
+        let mut m = Manifest { format: 6, ..Manifest::default() };
+        let f = ShardFiles { base: "b".into(), patches: vec!["p1".into(), "p2".into()] };
+        m.shards.insert(3, f.clone());
+        m.shards.insert(4, ShardFiles::base("c"));
+        let v = serde_json::to_value(&m).unwrap();
+        assert_eq!(v["shards"], serde_json::json!({"3": {"base": "b", "patches": ["p1", "p2"]}, "4": "c"}));
+        let back: Manifest = serde_json::from_value(v).unwrap();
+        assert_eq!(back, m);
+        assert_eq!(f.files().collect::<Vec<_>>(), ["b", "p1", "p2"]);
+        assert!(
+            serde_json::from_str::<ShardFiles>(r#"{"base": "b"}"#).is_err(),
+            "patches are required in the object form"
+        );
+    }
+
+    #[test]
+    fn remove_unlisted_keeps_patches() {
+        let d = tempfile::tempdir().unwrap();
+        let names = [
+            "shard-000-00000001.marco",
+            "shard-000-00000002.marco",
+            "shard-000-00000003.marco",
+            "shard-001-00000000.marco",
+        ];
+        for n in names {
+            std::fs::write(d.path().join(n), b"").unwrap();
+        }
+        let mut m = Manifest::default();
+        m.shards.insert(0, ShardFiles { base: names[0].into(), patches: vec![names[2].into()] });
+        assert_eq!(remove_unlisted(d.path(), &m, false).unwrap(), 2);
+        let mut left: Vec<String> =
+            std::fs::read_dir(d.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into()).collect();
+        left.sort();
+        assert_eq!(left, [names[0], names[2]]);
     }
 }
