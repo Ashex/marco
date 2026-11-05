@@ -77,9 +77,10 @@ impl Rows {
 }
 
 /// Appends one op row in the input format: three Strings (LEB128 length,
-/// bytes), Int64 time_us, UInt8 op.
-pub fn put_row(out: &mut Vec<u8>, repo: &[u8], rkey: &[u8], subject: &[u8], time_us: i64, op: u8) {
-    for s in [repo, rkey, subject] {
+/// bytes), a fourth (the list's URI) in a list relation's files, Int64
+/// time_us, UInt8 op.
+pub fn put_row(out: &mut Vec<u8>, repo: &[u8], rkey: &[u8], subject: &[u8], list: Option<&[u8]>, time_us: i64, op: u8) {
+    for s in [repo, rkey, subject].into_iter().chain(list) {
         marco_core::varint::put(out, s.len() as u64);
         out.extend_from_slice(s);
     }

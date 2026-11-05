@@ -116,11 +116,12 @@ the build and deletes its output.
 
 ```text
   Scylla                   scan-scylla                       build                marco serve
-  ┌───────────────┐   token ranges, each   ┌──────────────┐   ┌──────────┐   ┌────────────────────┐
-  │ follows       │── routed to the shard ─▶ DIR/follow/  │──▶│ snapshot │──▶│ --jetstream: start  │
-  │ blocks        │   that owns it, paged   │ DIR/block/   │   │ + cursor │   │ at scan start − 5 m │
-  └───────────────┘   BYPASS CACHE, CL ONE  │ cursors.json │   └──────────┘   └────────────────────┘
-                                             └──────────────┘
+  ┌───────────────┐   token ranges, each   ┌───────────────┐   ┌──────────┐   ┌────────────────────┐
+  │ follows       │── routed to the shard ─▶ DIR/follow/   │──▶│ snapshot │──▶│ --jetstream: start  │
+  │ blocks        │   that owns it, paged   │ DIR/block/    │   │ + cursor │   │ at scan start − 5 m │
+  │ list_items    │   BYPASS CACHE, CL ONE  │ DIR/listitem/ │   └──────────┘   └────────────────────┘
+  └───────────────┘                         │ cursors.json  │
+                                             └───────────────┘
 ```
 
 **How it reads.** For each table it asks the cluster who owns what.
@@ -146,9 +147,17 @@ set. With replication factor 3, ranges spread over all three replicas.
 tables name, in that order: a relation left out would start empty and then
 fill only from the catch-up. `--relations` is where their definitions come
 from. The scan writes them to `DIR/relations.toml`, so a build of a kept
-scan is `marco-load build --input DIR --relations DIR/relations.toml`. List
-relations (listitem) aren't scanned: their tables would need the list
-column, and the scan refuses them.
+scan is `marco-load build --input DIR --relations DIR/relations.toml`.
+
+**List items.** A list relation's table (listitem) has a `list` column on
+top of actor, rkey and subject: the list's AT URI. The scan reads it into
+the `list` column of the input's rows, and the snapshot gets the relation
+and its companion, `listitem.owner`: a list's members, an actor's items and
+the lists a DID is on. marco keeps an item only on a list in the item's own
+repo, as the live path does, so the scan drops an item whose list URI names
+another repo, counts it (`cross_repo_rows` in the report's table) and says
+so at the end. A row with a null column is skipped and counted as
+`null_rows`, for any table.
 
 **Where rows go.** Token order isn't DID order, so rows are bucketed by repo
 DID prefix as they arrive. Each range buffers `--chunk-rows` (262144) rows,
@@ -164,7 +173,11 @@ a connection per shard per node, and raises its soft open-file limit to the
 hard one; it stops with a message if that's still too few. The output
 takes about as much disk as the rows compressed with zstd: the whole
 network's follows and blocks (2.97B rows) took 66 GB, 22 B a row
-(docs/scylla-results.html).
+(docs/scylla-results.html). A list item's row adds its list's URI, about
+70 bytes before compression. zstd takes most of it back, since an actor's
+items name a few lists and their URIs start with the actor's DID. The
+test's synthetic items (`tests/scylla.rs`, 73k rows) took 27 B a row,
+against 22 B for the network's follows.
 
 **Resume.** A checkpoint every `--checkpoint-secs` (10) fsyncs the bucket
 files and records each file's length and each range's position (its last
@@ -226,12 +239,19 @@ subject = "target_did"        # the subject DID (default target_did)
 [[table]]
 relation = "block"
 name = "blocks"
+
+[[table]]
+relation = "listitem"         # a list relation: the table needs a list column
+name = "list_items"
+subject = "subject"
+list = "list"                 # the column with the list's AT URI (default list)
 ```
 
 Column and table names that aren't plain lower-case identifiers are quoted
 for you. The partition key comes from the schema, and the token bounds use
 all of its columns, so any partition key works. The scan needs `SELECT` on
-the tables, `system_schema` and `system.tablets`.
+the tables, `system_schema` and `system.tablets`. A `list` column is only
+for a list relation's table, and a list relation's table always has one.
 
 **Primary keys.** With `((actor_did), rkey)`, each record is its own row
 and the snapshot holds exactly the table's records. With `((actor_did),
@@ -308,7 +328,10 @@ instead, and resumes when run again.
 `fill-scylla` loads build input into the config's tables as current state:
 `--create actor-rkey|actor-subject` makes the keyspace and tables
 (`--tablets false` for vnodes, `--replication-factor N`), and `--from`/`--to`
-limit it to a range of file names, which is a set of whole actors. `diff`
+limit it to a range of file names, which is a set of whole actors. A list
+table gets its `list` column and is keyed `((actor), rkey)` either way. It
+loads every list item, the cross-repo ones too, as a real table would hold
+them. `--relations` says which relations are list relations, as for the scan. `diff`
 compares two snapshots by DID, so a snapshot built from Scylla can be
 checked against one built straight from the same input.
 
@@ -321,6 +344,11 @@ MARCO_SCYLLA=127.0.0.1:9042 cargo test -p marco-load --test scylla --test scylla
 `scylla` writes synthetic ops, builds them directly, fills Scylla three
 ways (tablets, vnodes, and a `((actor), subject)` key), scans each back and
 diffs the snapshots, then aborts a scan after a checkpoint and resumes it.
+Its list items are spread over a few lists per owner, with items moved
+between lists, a list of 7,500 members and items naming another repo's
+list; each rebuilt snapshot must answer every list's members, every
+owner's items and the lists a DID is on as the direct build does, and drop
+exactly the cross-repo items.
 `scylla_kill` SIGKILLs scans at random moments until one finishes, and
 checks the raw spill holds every row exactly once (the build would hide a
 row committed twice). `MARCO_SCYLLA_OPS` sets their size,

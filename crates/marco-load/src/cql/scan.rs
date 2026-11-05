@@ -25,7 +25,7 @@ use serde_json::{json, Value};
 use super::config::{ident, Config};
 use super::plan::{self, width, Plan, Range};
 use super::spill::{bucket_of, Pos, Spill, State, BUCKETS, PLAN, STATE};
-use crate::build::{CURSORS, SNAPSHOT_TIME, START_MARGIN};
+use crate::build::{own_list, CURSORS, SNAPSHOT_TIME, START_MARGIN};
 use crate::rows::put_row;
 use crate::sys;
 
@@ -117,6 +117,8 @@ static SPILL: LazyLock<IntGaugeVec> = LazyLock::new(|| {
 
 /// A buffered row's bytes, about: two DIDs, an rkey, lengths, time and op.
 const ROW_BYTES: usize = 100;
+/// What a list item's row adds: the list's AT URI.
+const LIST_BYTES: usize = 80;
 
 fn now_us() -> i64 {
     marco_core::store::now_ms() * 1000
@@ -157,8 +159,11 @@ struct Buf {
     rows: u64,
     bytes: u64,
     nulls: u64,
+    cross_repo: u64,
     cur: Vec<u8>,
     cur_rows: Vec<(u16, u64)>,
+    /// The current partition's rows skipped: (null column, list in another repo).
+    cur_skipped: (u64, u64),
     cur_token: Option<i64>,
 }
 
@@ -169,16 +174,39 @@ impl Buf {
             rows: 0,
             bytes: 0,
             nulls: 0,
+            cross_repo: 0,
             cur: Vec::new(),
             cur_rows: Vec::new(),
+            cur_skipped: (0, 0),
             cur_token: None,
         }
     }
 
-    fn push(&mut self, actor: &str, rkey: &str, subject: &str) {
-        put_row(&mut self.cur, actor.as_bytes(), rkey.as_bytes(), subject.as_bytes(), 0, 1);
+    /// One row of the partition being read. `list` is the list column, on a
+    /// list table. Returns the bytes kept.
+    fn push(&mut self, a: Option<&str>, k: Option<&str>, s: Option<&str>, list: Option<Option<&str>>) -> u64 {
+        let (Some(actor), Some(rkey), Some(subject)) = (a, k, s) else {
+            self.cur_skipped.0 += 1;
+            return 0;
+        };
+        let list = match list {
+            None => None,
+            Some(None) => {
+                self.cur_skipped.0 += 1;
+                return 0;
+            }
+            // the build would refuse it too: a list item counts only on its owner's list
+            Some(Some(l)) if own_list(actor.as_bytes(), l.as_bytes()).is_none() => {
+                self.cur_skipped.1 += 1;
+                return 0;
+            }
+            Some(Some(l)) => Some(l),
+        };
+        put_row(&mut self.cur, actor.as_bytes(), rkey.as_bytes(), subject.as_bytes(), list.map(str::as_bytes), 0, 1);
         self.cur_rows.push((bucket_of(actor) as u16, self.cur.len() as u64));
-        self.bytes += (actor.len() + rkey.len() + subject.len()) as u64;
+        let n = (actor.len() + rkey.len() + subject.len() + list.map_or(0, str::len)) as u64;
+        self.bytes += n;
+        n
     }
 
     /// The current partition is whole: into the buckets.
@@ -190,6 +218,9 @@ impl Buf {
             at = end as usize;
         }
         self.rows += self.cur_rows.len() as u64;
+        self.nulls += self.cur_skipped.0;
+        self.cross_repo += self.cur_skipped.1;
+        self.cur_skipped = (0, 0);
         self.cur.clear();
         self.cur_rows.clear();
         // a big partition's buffer isn't kept for the next: the budget counts chunks
@@ -233,6 +264,7 @@ impl Ctx {
             c.rows[t] += buf.rows;
             c.row_bytes[t] += buf.bytes;
             c.null_rows[t] += buf.nulls;
+            c.cross_repo_rows[t] += buf.cross_repo;
             c.commits += 1;
             SPILL.with_label_values(&[&self.rels[t]]).set(c.lens[t].iter().sum::<u64>() as i64);
             c.commits
@@ -256,6 +288,7 @@ impl Ctx {
         buf.rows = 0;
         buf.bytes = 0;
         buf.nulls = 0;
+        buf.cross_repo = 0;
         Ok(())
     }
 
@@ -327,6 +360,21 @@ impl Ctx {
         }
     }
 
+    /// A row of partition `tok`: if it starts a new one, the last is whole,
+    /// and a full chunk commits.
+    fn boundary(&self, ri: usize, pi: usize, buf: &mut Buf, tok: i64) -> Result<()> {
+        if buf.cur_token != Some(tok) {
+            if let Some(prev) = buf.cur_token {
+                buf.seal(self.bucket_cap.max(1 << 20));
+                if buf.rows >= self.chunk_rows as u64 {
+                    self.commit(ri, buf, Pos { piece: pi as u32, after: Some(prev), done: false })?;
+                }
+            }
+            buf.cur_token = Some(tok);
+        }
+        Ok(())
+    }
+
     async fn range(&self, ri: usize) -> Result<()> {
         let r = &self.plan.ranges[ri];
         let start = self.commit.lock().unwrap().pos[ri];
@@ -336,6 +384,7 @@ impl Ctx {
         let rel = &self.rels[r.table];
         let (rows_c, bytes_c, pages_c) =
             (ROWS.with_label_values(&[rel]), BYTES.with_label_values(&[rel]), PAGES.with_label_values(&[rel]));
+        let listed = self.plan.tables[r.table].list.is_some();
         let mut stmt = self.statement(r, true);
         let mut buf = Buf::new();
         for pi in start.piece as usize..r.pieces.len() {
@@ -354,24 +403,19 @@ impl Ctx {
                 pages_c.inc();
                 self.pages.fetch_add(1, Relaxed);
                 let (mut n, mut nb) = (0u64, 0u64);
-                for row in rows.rows::<(i64, Option<&str>, Option<&str>, Option<&str>)>()? {
-                    let (tok, a, k, s) = row?;
-                    n += 1;
-                    if buf.cur_token != Some(tok) {
-                        if let Some(prev) = buf.cur_token {
-                            buf.seal(self.bucket_cap.max(1 << 20));
-                            if buf.rows >= self.chunk_rows as u64 {
-                                self.commit(ri, &mut buf, Pos { piece: pi as u32, after: Some(prev), done: false })?;
-                            }
-                        }
-                        buf.cur_token = Some(tok);
+                if listed {
+                    for row in rows.rows::<(i64, Option<&str>, Option<&str>, Option<&str>, Option<&str>)>()? {
+                        let (tok, a, k, s, l) = row?;
+                        n += 1;
+                        self.boundary(ri, pi, &mut buf, tok)?;
+                        nb += buf.push(a, k, s, Some(l));
                     }
-                    match (a, k, s) {
-                        (Some(a), Some(k), Some(s)) => {
-                            nb += (a.len() + k.len() + s.len()) as u64;
-                            buf.push(a, k, s);
-                        }
-                        _ => buf.nulls += 1,
+                } else {
+                    for row in rows.rows::<(i64, Option<&str>, Option<&str>, Option<&str>)>()? {
+                        let (tok, a, k, s) = row?;
+                        n += 1;
+                        self.boundary(ri, pi, &mut buf, tok)?;
+                        nb += buf.push(a, k, s, None);
                     }
                 }
                 rows_c.inc_by(n);
@@ -425,8 +469,9 @@ fn select(plan: &Plan, t: usize, bypass: bool) -> String {
     let tb = &plan.tables[t];
     let pk: Vec<String> = plan.partition_keys[t].iter().map(|c| ident(c)).collect();
     let tok = format!("token({})", pk.join(", "));
+    let list = tb.list.as_deref().map_or(String::new(), |l| format!(", {}", ident(l)));
     format!(
-        "SELECT {tok}, {}, {}, {} FROM {}.{} WHERE {tok} > ? AND {tok} <= ?{}",
+        "SELECT {tok}, {}, {}, {}{list} FROM {}.{} WHERE {tok} > ? AND {tok} <= ?{}",
         ident(&tb.actor),
         ident(&tb.rkey),
         ident(&tb.subject),
@@ -482,20 +527,12 @@ pub fn run(a: &Args) -> Result<Value> {
         Some(p) => marco_core::Relations::parse_toml(&std::fs::read_to_string(p)?)?,
         None => marco_core::Relations::bsky_default(),
     };
+    cfg.resolve(&relations)?;
     let rels: Vec<String> = cfg.tables.iter().map(|t| t.relation.clone()).collect();
-    // the snapshot holds the relations scanned, in the config's order: one
-    // left out would be empty and then half-filled by the catch-up
-    let mut scanned = Vec::new();
-    for r in &rels {
-        match relations.by_name(r) {
-            // its rows would need the list column the scan doesn't read
-            Some(id) if relations.get(id).list.is_some() => {
-                bail!("{r:?} is a list relation; scan-scylla reads follow-shaped tables only")
-            }
-            Some(id) => scanned.push(relations.get(id).clone()),
-            None => bail!("table relation {r:?} isn't in the relations config"),
-        }
-    }
+    // the snapshot holds the relations scanned (a list relation's companion
+    // too), in the config's order: one left out would be empty and then
+    // half-filled by the catch-up
+    let scanned = rels.iter().filter_map(|r| relations.by_name(r)).map(|id| relations.get(id).clone()).collect();
     let relations = marco_core::Relations::new(scanned)?;
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     let mut report = rt.block_on(scan(a, cfg, rels.clone()))?;
@@ -555,6 +592,8 @@ async fn scan(a: &Args, cfg: Config, rels: Vec<String>) -> Result<Value> {
             if st.pos.len() != plan.ranges.len() {
                 bail!("{}: the scan state doesn't match its plan; --fresh to start over", dir.display());
             }
+            let mut st = st;
+            st.cross_repo_rows.resize(plan.tables.len(), 0);
             eprintln!(
                 "resuming the scan in {} (begun {:.1} h ago, {:.1}% of tokens done)",
                 dir.display(),
@@ -630,8 +669,9 @@ async fn scan(a: &Args, cfg: Config, rels: Vec<String>) -> Result<Value> {
     let already_done = total - queues.values().map(|q| q.len()).sum::<usize>();
     let finished_before = state.finished_us.is_some();
     let workers = queues.len() * cfg.in_flight_per_shard;
+    let row_bytes = ROW_BYTES + if plan.tables.iter().any(|t| t.list.is_some()) { LIST_BYTES } else { 0 };
     // a worker's buckets, their slack, and the compressed frames: ~3 bytes per row byte
-    let budget_rows = ((a.memory_gb * 1e9) as usize / (workers.max(1) * 3 * ROW_BYTES)).max(1024);
+    let budget_rows = ((a.memory_gb * 1e9) as usize / (workers.max(1) * 3 * row_bytes)).max(1024);
     let chunk_rows = a.chunk_rows.clamp(1, budget_rows);
     if chunk_rows < a.chunk_rows {
         eprintln!("{workers} ranges in flight: {chunk_rows} rows a chunk to stay in --memory-gb {}", a.memory_gb);
@@ -642,7 +682,7 @@ async fn scan(a: &Args, cfg: Config, rels: Vec<String>) -> Result<Value> {
         crash_after: a.crash_after_commits,
         crash_armed: AtomicBool::new(false),
         poisoned: AtomicBool::new(false),
-        bucket_cap: (chunk_rows * ROW_BYTES / 64).max(64 << 10),
+        bucket_cap: (chunk_rows * row_bytes / 64).max(64 << 10),
         dir: dir.clone(),
         ck: Mutex::new(()),
         commit: Mutex::new(state),
@@ -807,6 +847,7 @@ async fn scan(a: &Args, cfg: Config, rels: Vec<String>) -> Result<Value> {
                 "pieces": ctx.plan.ranges.iter().filter(|r| r.table == t).map(|r| r.pieces.len()).sum::<usize>(),
                 "rows": st.rows[t],
                 "null_rows": st.null_rows[t],
+                "cross_repo_rows": st.cross_repo_rows[t],
                 "row_bytes": st.row_bytes[t],
                 "spill_bytes": st.lens[t].iter().sum::<u64>(),
             })
@@ -818,6 +859,14 @@ async fn scan(a: &Args, cfg: Config, rels: Vec<String>) -> Result<Value> {
             "warning: the cursor is {age_h:.1} h old, within 2 h of the {:.0} h retention: the build refuses it without --allow-gap",
             a.retention_hours
         );
+    }
+    for (t, tb) in ctx.plan.tables.iter().enumerate() {
+        if st.cross_repo_rows[t] > 0 {
+            eprintln!(
+                "{}.{}: {} list items name a list in another repo; dropped, as marco never keeps them",
+                ctx.plan.keyspace, tb.name, st.cross_repo_rows[t]
+            );
+        }
     }
     let total_rows: u64 = st.rows.iter().sum();
     eprintln!(
@@ -861,4 +910,65 @@ async fn scan(a: &Args, cfg: Config, rels: Vec<String>) -> Result<Value> {
         "client_cores_busy": cpu / run_secs,
         "peak_rss_gb": sys::peak_rss_gb(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rows::Rows;
+
+    #[test]
+    fn list_items_keep_their_list_and_drop_other_repos() {
+        let (a, b) = ("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb");
+        let own = format!("at://{a}/app.bsky.graph.list/l1");
+        let theirs = format!("at://{b}/app.bsky.graph.list/l1");
+        let mut buf = Buf::new();
+        assert!(buf.push(Some(a), Some("3kaaaaaaaaa22"), Some(b), Some(Some(&own))) > 0);
+        assert_eq!(buf.push(Some(a), Some("3kaaaaaaaaa23"), Some(b), Some(Some(&theirs))), 0);
+        assert_eq!(buf.push(Some(a), Some("3kaaaaaaaaa24"), Some(b), Some(None)), 0);
+        assert_eq!(buf.push(Some(a), Some("3kaaaaaaaaa25"), None, None), 0);
+        // counted with their partition, so a resume that rereads it doesn't count them twice
+        assert_eq!((buf.nulls, buf.cross_repo), (0, 0));
+        buf.seal(1 << 20);
+        assert_eq!((buf.rows, buf.nulls, buf.cross_repo), (1, 2, 1));
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("p-aa.rb.zst");
+        std::fs::write(&f, zstd::bulk::compress(&buf.buckets[bucket_of(a)], 1).unwrap()).unwrap();
+        let mut rows = Rows::open(&f).unwrap();
+        let mut cols = vec![Vec::new(); 4];
+        assert!(rows.next(&mut cols).unwrap());
+        assert_eq!((rows.i64().unwrap(), rows.u8().unwrap()), (0, 1));
+        assert_eq!(cols[3], own.as_bytes());
+        assert!(!rows.next(&mut cols).unwrap());
+    }
+
+    #[test]
+    fn a_list_table_selects_its_list_column() {
+        let t = |list: Option<&str>| super::super::config::Table {
+            relation: "listitem".into(),
+            name: "list_items".into(),
+            actor: "actor_did".into(),
+            rkey: "rkey".into(),
+            subject: "subject".into(),
+            list: list.map(String::from),
+        };
+        let plan = Plan {
+            keyspace: "bsky".into(),
+            datacenter: None,
+            tables: vec![t(Some("list")), t(None)],
+            modes: vec![],
+            keys: vec![],
+            partition_keys: vec![vec!["actor_did".into()]; 2],
+            clustering_keys: vec![vec!["rkey".into()]; 2],
+            shards: 0,
+            nodes: 0,
+            ranges: vec![],
+        };
+        assert_eq!(
+            select(&plan, 0, true),
+            "SELECT token(actor_did), actor_did, rkey, subject, list FROM bsky.list_items \
+             WHERE token(actor_did) > ? AND token(actor_did) <= ? BYPASS CACHE"
+        );
+        assert!(!select(&plan, 1, false).contains("list,") && !select(&plan, 1, false).contains(", list "));
+    }
 }

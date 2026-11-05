@@ -66,6 +66,9 @@ pub struct State {
     pub rows: Vec<u64>,
     pub row_bytes: Vec<u64>,
     pub null_rows: Vec<u64>,
+    /// Per table: list items skipped because their list is in another repo.
+    #[serde(default)]
+    pub cross_repo_rows: Vec<u64>,
     pub commits: u64,
 }
 
@@ -78,6 +81,7 @@ impl State {
             rows: vec![0; tables],
             row_bytes: vec![0; tables],
             null_rows: vec![0; tables],
+            cross_repo_rows: vec![0; tables],
             ..Default::default()
         }
     }
@@ -227,7 +231,7 @@ mod tests {
         let s = Spill::open(tmp.path(), &rels, &st.lens).unwrap();
         let frame = |actor: &str, rkey: &str| {
             let mut raw = Vec::new();
-            put_row(&mut raw, actor.as_bytes(), rkey.as_bytes(), b"did:plc:bbbbbbbbbbbbbbbbbbbbbbbb", 0, 1);
+            put_row(&mut raw, actor.as_bytes(), rkey.as_bytes(), b"did:plc:bbbbbbbbbbbbbbbbbbbbbbbb", None, 0, 1);
             zstd::bulk::compress(&raw, 1).unwrap()
         };
         let a = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";

@@ -390,7 +390,7 @@ fn widen(span: &mut RepoSpan, v: &[u8]) {
 type RelFiles = (Mode, Vec<(PathBuf, u32, u32)>);
 
 /// A list column's URI if it names a record in `repo`'s own repo.
-fn own_list<'a>(repo: &[u8], list: &'a [u8]) -> Option<&'a str> {
+pub(crate) fn own_list<'a>(repo: &[u8], list: &'a [u8]) -> Option<&'a str> {
     let l = std::str::from_utf8(list).ok()?;
     let (owner, _, _) = marco_core::relation::parse_uri(l)?;
     (owner.as_bytes() == repo).then_some(l)

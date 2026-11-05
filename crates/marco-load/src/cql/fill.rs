@@ -27,7 +27,11 @@ pub struct Args {
     /// Build input: <relation>/*.rb.zst op rows.
     #[arg(long)]
     pub input: PathBuf,
+    /// Relations config (TOML) the tables' relations come from; default the built-in one.
+    #[arg(long)]
+    pub relations: Option<PathBuf>,
     /// Create the keyspace and tables first, keyed ((actor), rkey) or ((actor), subject).
+    /// A list relation's table is keyed ((actor), rkey) either way.
     #[arg(long, value_parser = ["actor-rkey", "actor-subject"])]
     pub create: Option<String>,
     #[arg(long, default_value_t = 1)]
@@ -51,17 +55,23 @@ pub struct Args {
     pub to: Option<String>,
 }
 
-/// A file's current state: (actor, rkey, subject), by actor then rkey.
-fn reduce(f: &Path) -> Result<Vec<(String, String, String)>> {
+/// A row's columns: actor, rkey, subject, and the list's URI (empty
+/// outside a list relation).
+type Rec = [String; 4];
+
+/// A file's current state, by actor then rkey. A list item is written
+/// whatever repo its list is in: the scan is what drops the others.
+fn reduce(f: &Path, listed: bool) -> Result<Vec<Rec>> {
     let mut rows = Rows::open(f)?;
-    let mut cols = [Vec::new(), Vec::new(), Vec::new()];
-    let mut ops: Vec<(String, String, i64, u8, String)> = Vec::new();
+    let mut cols = vec![Vec::new(); if listed { 4 } else { 3 }];
+    let mut ops: Vec<(String, String, i64, u8, String, String)> = Vec::new();
     while rows.next(&mut cols)? {
         let us = rows.i64()?;
         let op = rows.u8()?;
-        let s = |b: &Vec<u8>| String::from_utf8(b.clone()).ok();
-        let (Some(a), Some(k), Some(s)) = (s(&cols[0]), s(&cols[1]), s(&cols[2])) else { continue };
-        ops.push((a, k, us, op, s));
+        let utf8 = |b: &Vec<u8>| String::from_utf8(b.clone()).ok();
+        let (Some(a), Some(k), Some(s)) = (utf8(&cols[0]), utf8(&cols[1]), utf8(&cols[2])) else { continue };
+        let Some(l) = cols.get(3).map_or(Some(String::new()), utf8) else { continue };
+        ops.push((a, k, us, op, s, l));
     }
     // the build's rule: the latest op per key wins, a delete winning a tie
     ops.sort_unstable_by(|x, y| (&x.0, &x.1, x.2, x.3).cmp(&(&y.0, &y.1, y.2, y.3)));
@@ -73,8 +83,9 @@ fn reduce(f: &Path) -> Result<Vec<(String, String, String)>> {
             j += 1;
         }
         let last = &mut ops[j];
-        if last.3 != 3 && !last.4.is_empty() {
-            out.push((std::mem::take(&mut last.0), std::mem::take(&mut last.1), std::mem::take(&mut last.4)));
+        if last.3 != 3 && !last.4.is_empty() && (!listed || !last.5.is_empty()) {
+            let t = std::mem::take;
+            out.push([t(&mut last.0), t(&mut last.1), t(&mut last.4), t(&mut last.5)]);
         }
         i = j + 1;
     }
@@ -94,9 +105,14 @@ async fn create(session: &Session, cfg: &Config, a: &Args, key: &str) -> Result<
     session.query_unpaged(q.as_str(), ()).await.with_context(|| q.clone())?;
     for t in &cfg.tables {
         let (actor, rkey, subject) = (ident(&t.actor), ident(&t.rkey), ident(&t.subject));
-        let pk = if key == "actor-rkey" { format!("(({actor}), {rkey})") } else { format!("(({actor}), {subject})") };
+        let pk = if key == "actor-rkey" || t.list.is_some() {
+            format!("(({actor}), {rkey})")
+        } else {
+            format!("(({actor}), {subject})")
+        };
+        let list = t.list.as_deref().map_or(String::new(), |l| format!(", {} text", ident(l)));
         let q = format!(
-            "CREATE TABLE IF NOT EXISTS {}.{} ({actor} text, {rkey} text, {subject} text, PRIMARY KEY {pk})",
+            "CREATE TABLE IF NOT EXISTS {}.{} ({actor} text, {rkey} text, {subject} text{list}, PRIMARY KEY {pk})",
             ident(&cfg.keyspace),
             ident(&t.name)
         );
@@ -116,18 +132,17 @@ async fn write(
     session: &Session,
     ins: &PreparedStatement,
     batches: &[Batch],
-    rows: &[(String, String, String)],
+    rows: &[Rec],
+    cols: usize,
     c: &Counters,
 ) -> Result<()> {
     let mut attempt = 0;
     loop {
         attempt += 1;
         let r = if rows.len() == 1 {
-            let (a, k, s) = &rows[0];
-            session.execute_unpaged(ins, (a, k, s)).await.map(|_| ())
+            session.execute_unpaged(ins, &rows[0][..cols]).await.map(|_| ())
         } else {
-            let vals: Vec<(&str, &str, &str)> =
-                rows.iter().map(|(a, k, s)| (a.as_str(), k.as_str(), s.as_str())).collect();
+            let vals: Vec<&[String]> = rows.iter().map(|r| &r[..cols]).collect();
             session.batch(&batches[rows.len()], vals).await.map(|_| ())
         };
         match r {
@@ -156,13 +171,15 @@ async fn fill_table(
     a: &Args,
     c: Arc<Counters>,
 ) -> Result<()> {
+    let names: Vec<String> = [&t.actor, &t.rkey, &t.subject].into_iter().chain(&t.list).map(|c| ident(c)).collect();
+    let cols = names.len();
+    let listed = t.list.is_some();
     let q = format!(
-        "INSERT INTO {}.{} ({}, {}, {}) VALUES (?, ?, ?)",
+        "INSERT INTO {}.{} ({}) VALUES ({})",
         ident(&cfg.keyspace),
         ident(&t.name),
-        ident(&t.actor),
-        ident(&t.rkey),
-        ident(&t.subject)
+        names.join(", "),
+        vec!["?"; cols].join(", ")
     );
     let mut ins = session.prepare(q.as_str()).await.with_context(|| q.clone())?;
     ins.set_consistency(cfg.consistency()?);
@@ -184,14 +201,13 @@ async fn fill_table(
             .collect(),
     );
     let sem = Arc::new(Semaphore::new(a.concurrency.max(1)));
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<(String, String, String)>>(a.files_at_once.max(1));
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<Rec>>(a.files_at_once.max(1));
     let reader = tokio::task::spawn_blocking({
         let files_at_once = a.files_at_once.max(1);
         move || -> Result<()> {
             use rayon::prelude::*;
             for group in files.chunks(files_at_once) {
-                let reduced: Vec<Vec<(String, String, String)>> =
-                    group.par_iter().map(|f| reduce(f)).collect::<Result<_>>()?;
+                let reduced: Vec<Vec<Rec>> = group.par_iter().map(|f| reduce(f, listed)).collect::<Result<_>>()?;
                 for r in reduced {
                     if tx.blocking_send(r).is_err() {
                         return Ok(());
@@ -207,13 +223,13 @@ async fn fill_table(
         let mut i = 0;
         while i < rows.len() {
             let mut j = i + 1;
-            while j < rows.len() && j - i < max && rows[j].0 == rows[i].0 {
+            while j < rows.len() && j - i < max && rows[j][0] == rows[i][0] {
                 j += 1;
             }
             let permit = sem.clone().acquire_owned().await?;
             let (s, ins, b, r, c) = (session.clone(), ins.clone(), batches.clone(), rows.clone(), c.clone());
             tasks.spawn(async move {
-                let out = write(&s, &ins, &b, &r[i..j], &c).await;
+                let out = write(&s, &ins, &b, &r[i..j], cols, &c).await;
                 drop(permit);
                 out
             });
@@ -231,7 +247,12 @@ async fn fill_table(
 }
 
 pub fn run(a: &Args) -> Result<Value> {
-    let cfg = Config::read(&a.config)?;
+    let mut cfg = Config::read(&a.config)?;
+    let relations = match &a.relations {
+        Some(p) => marco_core::Relations::parse_toml(&std::fs::read_to_string(p)?)?,
+        None => marco_core::Relations::bsky_default(),
+    };
+    cfg.resolve(&relations)?;
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     rt.block_on(async {
         let session = Arc::new(cfg.connect().await?);

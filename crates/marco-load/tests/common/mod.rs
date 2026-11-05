@@ -1,7 +1,7 @@
 //! What the Scylla tests share: synthetic build input, the binary, configs.
 #![allow(dead_code)]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -85,12 +85,19 @@ pub fn write_input(dir: &Path, rel: &str, n: u64, actors: u64, seed: u64) -> u64
         }
     }
     let dupes = pairs.values().map(|&k| k - 1).sum();
+    write_files(dir, rel, ops.iter().map(|(a, k, s, us, op)| (vec![a.as_str(), k, s], *us, *op)));
+    dupes
+}
+
+/// Rows (string columns, time_us, op) as build input files, bucketed by the
+/// first column, the repo.
+fn write_files<'a>(dir: &Path, rel: &str, rows: impl Iterator<Item = (Vec<&'a str>, i64, u8)>) {
     let mut files: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-    for (a, k, s, us, op) in &ops {
-        let plc = a.strip_prefix("did:plc:").filter(|r| r.len() == 24);
+    for (cols, us, op) in rows {
+        let plc = cols[0].strip_prefix("did:plc:").filter(|r| r.len() == 24);
         let name = plc.map_or("z-other".to_string(), |r| format!("p-{}", &r[..2]));
         let out = files.entry(name).or_default();
-        for x in [a, k, s] {
+        for x in cols {
             let mut l = x.len() as u64;
             loop {
                 let b = (l & 0x7f) as u8;
@@ -103,13 +110,137 @@ pub fn write_input(dir: &Path, rel: &str, n: u64, actors: u64, seed: u64) -> u64
             out.extend_from_slice(x.as_bytes());
         }
         out.extend_from_slice(&us.to_le_bytes());
-        out.push(*op);
+        out.push(op);
     }
     std::fs::create_dir_all(dir.join(rel)).unwrap();
     for (name, raw) in files {
         std::fs::write(dir.join(rel).join(format!("{name}.rb.zst")), zstd::encode_all(&raw[..], 1).unwrap()).unwrap();
     }
-    dupes
+}
+
+pub fn list_uri(owner: &str, l: &str) -> String {
+    format!("at://{owner}/app.bsky.graph.list/{l}")
+}
+
+/// What a listitem input holds once reduced to current state.
+pub struct ListInput {
+    pub owners: Vec<String>,
+    /// Every list an item was written to, the other repos' ones included.
+    pub lists: BTreeSet<String>,
+    /// Live items whose list is in another repo: the scan and the build drop them.
+    pub cross_repo: u64,
+    /// One owner's list with many members, and its live items.
+    pub big: String,
+    pub big_records: u64,
+    /// A subject only cross-repo items name: on no list after a build.
+    pub stray: String,
+    /// Subjects to look up the lists of.
+    pub subjects: Vec<String>,
+}
+
+/// listitem ops: owners with several lists each, deletes, items moved to
+/// another list under one rkey, items naming a list in another repo, and
+/// one list of `n / 10` members.
+pub fn write_list_input(dir: &Path, rel: &str, n: u64, owners: u64, seed: u64) -> ListInput {
+    let mut rng = Rng(seed | 1);
+    let stray = did(9_000_000);
+    // (repo, rkey, subject, list, time_us, op)
+    let mut ops: Vec<(String, String, String, String, i64, u8)> = Vec::new();
+    let rkey = |rng: &mut Rng| tid(1_700_000_000_000_000 + rng.below(1 << 40), rng.below(1024));
+    for t in 0..n {
+        let a = did(rng.below(owners));
+        let k = rkey(&mut rng);
+        let (s, l, op) = match rng.below(40) {
+            0..=3 => (String::new(), String::new(), 3),
+            // repos past `owners` own no items, so never the item's own
+            4 => {
+                let s = if rng.below(4) == 0 { stray.clone() } else { did(rng.below(owners * 3)) };
+                (s, list_uri(&did(owners + rng.below(owners)), "l0"), 1)
+            }
+            _ => (did(rng.below(owners * 3)), list_uri(&a, &format!("l{}", rng.below(4))), 1),
+        };
+        ops.push((a, k, s, l, 1_000 + t as i64, op));
+    }
+    for i in 0..n / 1000 {
+        let a = did(i % owners);
+        let k = tid(1_800_000_000_000_000 + i, 3);
+        ops.push((a.clone(), k.clone(), did(i), list_uri(&a, "l0"), 10, 1));
+        ops.push((a.clone(), k, did(i), list_uri(&a, "l1"), 11, 2));
+    }
+    let owner = did(0);
+    let big = list_uri(&owner, "big");
+    for i in 0..n / 10 {
+        ops.push((owner.clone(), tid(1_900_000_000_000_000 + i, 0), did(1_000_000 + i), big.clone(), 5, 1));
+    }
+    let mut latest: BTreeMap<(String, String), (i64, u8, String, String)> = BTreeMap::new();
+    for (a, k, s, l, us, op) in &ops {
+        let e = latest.entry((a.clone(), k.clone())).or_insert((*us, *op, s.clone(), l.clone()));
+        if (*us, *op) >= (e.0, e.1) {
+            *e = (*us, *op, s.clone(), l.clone());
+        }
+    }
+    let (mut cross_repo, mut big_records) = (0, 0);
+    for ((a, _), (_, op, _, l)) in &latest {
+        if *op == 3 {
+            continue;
+        }
+        if !l.starts_with(&format!("at://{a}/")) {
+            cross_repo += 1;
+        }
+        if *l == big {
+            big_records += 1;
+        }
+    }
+    write_files(dir, rel, ops.iter().map(|(a, k, s, l, us, op)| (vec![a.as_str(), k, s, l], *us, *op)));
+    ListInput {
+        owners: (0..owners).map(did).collect(),
+        lists: ops.iter().filter(|o| !o.3.is_empty()).map(|o| o.3.clone()).collect(),
+        cross_repo,
+        big,
+        big_records,
+        stray,
+        subjects: (0..owners * 3).map(did).chain([did(1_000_000), did(1_000_000 + n / 20)]).collect(),
+    }
+}
+
+/// The rebuilt snapshot answers list queries as the direct build does:
+/// each list's members, each owner's items, the lists a DID is on, counts.
+pub fn check_lists(direct: &Path, snap: &Path, li: &ListInput) {
+    let (a, b) = (marco_core::Graph::open(direct).unwrap(), marco_core::Graph::open(snap).unwrap());
+    let ids = |g: &marco_core::Graph| {
+        let r = g.relations();
+        (r.by_name("listitem").unwrap(), r.by_name("listitem.owner").unwrap())
+    };
+    let ((la, oa), (lb, ob)) = (ids(&a), ids(&b));
+    let all = 10_000_000;
+    let mut lists_with_members = 0;
+    for l in &li.lists {
+        assert_eq!(a.counts(la, l), b.counts(lb, l), "{l}");
+        assert_eq!(a.out_list(la, l, all, None).0, b.out_list(lb, l, all, None).0, "members of {l}");
+        lists_with_members += (b.counts(lb, l).0 > 0) as u64;
+    }
+    let mut owners_of_two = 0;
+    for o in &li.owners {
+        assert_eq!(a.counts(oa, o), b.counts(ob, o), "{o}");
+        let items = b.out_list(ob, o, all, None).0;
+        assert_eq!(a.out_list(oa, o, all, None).0, items, "items of {o}");
+        owners_of_two += (items.iter().map(|x| &x.1).collect::<BTreeSet<_>>().len() > 1) as u64;
+    }
+    for s in &li.subjects {
+        let (mut x, mut y) = (a.in_list(la, s, all, None).0, b.in_list(lb, s, all, None).0);
+        x.sort();
+        y.sort();
+        assert_eq!(x, y, "the lists {s} is on");
+    }
+    assert_eq!(b.counts(lb, &li.big).0, li.big_records);
+    assert!(li.big_records > 1000, "{}", li.big_records);
+    assert_eq!(b.in_list(ob, &li.big, all, None).0, vec![li.owners[0].clone()], "the big list's owner");
+    assert_eq!(
+        b.in_list(lb, &li.stray, all, None).0,
+        Vec::<String>::new(),
+        "a cross-repo item's subject is on no list"
+    );
+    assert!(li.cross_repo > 0 && lists_with_members > li.owners.len() as u64 && owners_of_two > 0);
 }
 
 pub fn run(args: &[&str]) -> Value {
@@ -136,6 +267,11 @@ name = "follows"
 [[table]]
 relation = "block"
 name = "blocks"
+
+[[table]]
+relation = "listitem"
+name = "list_items"
+subject = "subject"
 "#
         ),
     )
@@ -162,13 +298,14 @@ pub async fn drop_keyspaces(node: &str, names: &[String]) {
     }
 }
 
-/// A relations config of follow and block, the relations the input has.
+/// A relations config of follow, block and listitem, the relations the input has.
 pub fn relations(dir: &Path) -> PathBuf {
     let p = dir.join("relations.toml");
     std::fs::write(
         &p,
         "[[relation]]\nname = \"follow\"\ncollection = \"app.bsky.graph.follow\"\nsubject = \"subject\"\n\n\
-         [[relation]]\nname = \"block\"\ncollection = \"app.bsky.graph.block\"\nsubject = \"subject\"\n",
+         [[relation]]\nname = \"block\"\ncollection = \"app.bsky.graph.block\"\nsubject = \"subject\"\n\n\
+         [[relation]]\nname = \"listitem\"\ncollection = \"app.bsky.graph.listitem\"\nsubject = \"subject\"\nlist = \"list\"\n",
     )
     .unwrap();
     p

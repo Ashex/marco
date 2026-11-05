@@ -70,7 +70,14 @@ pub struct Table {
     /// The column holding the subject DID.
     #[serde(default = "default_subject")]
     pub subject: String,
+    /// A list relation's table: the column holding the list's AT URI
+    /// (default list). Only a list relation's table has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub list: Option<String>,
 }
+
+/// A list table's list column when its config leaves it out.
+pub const DEFAULT_LIST: &str = "list";
 
 fn default_page_size() -> i32 {
     5000
@@ -202,6 +209,32 @@ impl Config {
         b.build().await.with_context(|| format!("connect to {:?}", self.nodes))
     }
 
+    /// Fills in each list relation's list column, and refuses a list column
+    /// on a table whose relation has no list, or a relation not in `rels`.
+    pub fn resolve(&mut self, rels: &marco_core::Relations) -> Result<()> {
+        for t in &mut self.tables {
+            let Some(id) = rels.by_name(&t.relation) else {
+                bail!("table relation {:?} isn't in the relations config", t.relation)
+            };
+            let r = rels.get(id);
+            if r.owner_of.is_some() {
+                bail!(
+                    "{:?} is a companion; scan its list relation, {:?}",
+                    t.relation,
+                    r.owner_of.as_deref().unwrap_or("")
+                );
+            }
+            match (&r.list, &t.list) {
+                (Some(_), None) => t.list = Some(DEFAULT_LIST.into()),
+                (None, Some(_)) => {
+                    bail!("table {:?} names a list column, but {:?} isn't a list relation", t.name, t.relation)
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     pub fn timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs_f64(self.request_timeout_secs.max(0.1))
     }
@@ -242,6 +275,30 @@ mod tests {
         assert_eq!(c.tables[1].subject, "subject");
         assert_eq!(ident(&c.tables[1].name), "\"Blocks\"");
         assert_eq!(ident("target_did"), "target_did");
+        let mut l = Config::parse(
+            r#"
+            nodes = ["127.0.0.1:9042"]
+            keyspace = "bsky"
+            [[table]]
+            relation = "follow"
+            name = "follows"
+            [[table]]
+            relation = "listitem"
+            name = "list_items"
+            subject = "subject"
+            "#,
+        )
+        .unwrap();
+        let rels = marco_core::Relations::bsky_default();
+        l.resolve(&rels).unwrap();
+        assert_eq!((l.tables[0].list.as_deref(), l.tables[1].list.as_deref()), (None, Some("list")));
+        let mut bad = l.clone();
+        bad.tables[0].list = Some("list".into());
+        assert!(bad.resolve(&rels).is_err(), "a follow table has no list column");
+        bad.tables[0] = Table { relation: "listitem.owner".into(), ..l.tables[1].clone() };
+        assert!(bad.resolve(&rels).is_err(), "a companion isn't scanned");
+        bad.tables[0].relation = "repost".into();
+        assert!(bad.resolve(&rels).is_err());
         assert!(Config::parse("nodes = []\nkeyspace = \"k\"\n[[table]]\nrelation = \"a\"\nname = \"b\"").is_err());
         assert!(Config::parse(
             "nodes = [\"x\"]\nkeyspace = \"k\"\nbogus = 1\n[[table]]\nrelation = \"a\"\nname = \"b\""

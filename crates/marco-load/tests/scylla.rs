@@ -2,6 +2,8 @@
 //! a snapshot, loaded into tables as current state (fill-scylla), scanned
 //! back and built again; the two snapshots must hold the same records.
 //! Also a scan killed mid-way and resumed, and the ((actor), subject) key.
+//! The list items table holds items in several lists, a list of many
+//! members, and items naming a list in another repo, which the scan drops.
 //!
 //! Needs a Scylla: MARCO_SCYLLA=127.0.0.1:9042 cargo test -p marco-load --test scylla -- --ignored
 //! MARCO_SCYLLA_OPS sets the ops written per relation (default 300000).
@@ -23,6 +25,7 @@ fn scan_then_build_matches_the_direct_build() {
     let input = tmp.path().join("input");
     let dupes_f = write_input(&input, "follow", n, n / 40, 1);
     let dupes_b = write_input(&input, "block", n / 10, n / 200, 2);
+    let li = write_list_input(&input, "listitem", n / 4, n / 200, 3);
     let direct = tmp.path().join("direct");
     let built = run(&[
         "build",
@@ -86,7 +89,20 @@ fn scan_then_build_matches_the_direct_build() {
         );
         assert!(!out.exists(), "--snapshot without --keep-spill removes the scan");
         let collapsed = if key == "actor-rkey" { 0 } else { dupes_f + dupes_b };
-        assert_eq!(r["rows"].as_u64().unwrap(), f["rows"].as_u64().unwrap() - collapsed);
+        assert_eq!(r["rows"].as_u64().unwrap(), f["rows"].as_u64().unwrap() - collapsed - li.cross_repo);
+        let lt = &r["tables"][2];
+        assert_eq!(
+            (lt["relation"].as_str(), lt["primary_key"].as_str()),
+            (Some("listitem"), Some("((actor_did), rkey)"))
+        );
+        assert_eq!(lt["cross_repo_rows"].as_u64().unwrap(), li.cross_repo, "{lt:#}");
+        eprintln!(
+            "  list items: {} rows, {} cross-repo dropped, spill {} B, {:.1} B a row",
+            lt["rows"],
+            lt["cross_repo_rows"],
+            lt["spill_bytes"],
+            lt["spill_bytes"].as_f64().unwrap() / lt["rows"].as_f64().unwrap()
+        );
         // the cursor: the scan's start less the 5 min margin
         let cursor = r["cursor_us"].as_i64().unwrap();
         assert!(
@@ -105,7 +121,12 @@ fn scan_then_build_matches_the_direct_build() {
             assert_eq!(fo["only_b"], 0);
             assert_eq!(bl["only_b"], 0);
             assert!(dupes_f > 0);
+            for r in ["listitem", "listitem.owner"] {
+                let x = rel(&d, r);
+                assert_eq!((x["only_a"].as_u64(), x["only_b"].as_u64()), (Some(0), Some(0)), "{x:#}");
+            }
         }
+        check_lists(&direct, &snap, &li);
     }
 
     // killed after a few commits, then resumed: the same records, none twice
@@ -142,6 +163,7 @@ fn scan_then_build_matches_the_direct_build() {
     run(&["build", "--input", s(&out), "--out", s(&snap), "--relations", s(&rels)]);
     let d = diff(&direct, &snap);
     assert_eq!(d["equal"], true, "{d:#}");
+    check_lists(&direct, &snap, &li);
 
     // a finished scan run again is a no-op; --fresh starts over
     let again = run(&["scan-scylla", "--config", s(&cfg), "--out", s(&out)]);

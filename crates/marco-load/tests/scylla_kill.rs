@@ -28,10 +28,11 @@ fn varint(b: &[u8], i: &mut usize) -> u64 {
     }
 }
 
-/// Every (relation, actor, rkey, subject) row in a scan's spill, in file order.
-fn spill_rows(out: &Path, rels: &[&str]) -> Vec<(String, String, String, String)> {
+/// Every (relation, actor, rkey, subject) row in a scan's spill, in file
+/// order. `rels`: each relation and its string columns.
+fn spill_rows(out: &Path, rels: &[(&str, usize)]) -> Vec<(String, String, String, String)> {
     let mut v = Vec::new();
-    for rel in rels {
+    for &(rel, ncols) in rels {
         let d = out.join(rel);
         if !d.exists() {
             continue;
@@ -43,7 +44,7 @@ fn spill_rows(out: &Path, rels: &[&str]) -> Vec<(String, String, String, String)
             let mut i = 0;
             while i < raw.len() {
                 let mut cols = Vec::new();
-                for _ in 0..3 {
+                for _ in 0..ncols {
                     let n = varint(&raw, &mut i) as usize;
                     cols.push(String::from_utf8(raw[i..i + n].to_vec()).unwrap());
                     i += n;
@@ -82,6 +83,7 @@ fn random_kills_then_resume_hold_every_row_once() {
     let input = tmp.path().join("input");
     write_input(&input, "follow", n, n / 40, 1);
     write_input(&input, "block", n / 10, n / 200, 2);
+    let li = write_list_input(&input, "listitem", n / 10, n / 200, 3);
     let direct = tmp.path().join("direct");
     run(&[
         "build",
@@ -107,7 +109,7 @@ fn random_kills_then_resume_hold_every_row_once() {
         "--concurrency",
         "256",
     ]);
-    let filled = f["rows"].as_u64().unwrap();
+    let filled = f["rows"].as_u64().unwrap() - li.cross_repo;
     let mut rng = Rng(0x5eed ^ std::process::id() as u64);
     let mut all_kills = 0;
     for round in 0..rounds {
@@ -148,7 +150,7 @@ fn random_kills_then_resume_hold_every_row_once() {
             }
         };
         all_kills += kills;
-        let rows = spill_rows(&out, &["follow", "block"]);
+        let rows = spill_rows(&out, &[("follow", 3), ("block", 3), ("listitem", 4)]);
         let mut keys: Vec<_> = rows.iter().map(|r| (r.0.clone(), r.1.clone(), r.2.clone())).collect();
         keys.sort();
         let before = keys.len();
@@ -160,6 +162,7 @@ fn random_kills_then_resume_hold_every_row_once() {
         );
         assert_eq!(before, keys.len(), "round {round}: rows twice in the spill");
         assert_eq!(keys.len() as u64, filled, "round {round}: rows missing");
+        assert_eq!(r["tables"][2]["cross_repo_rows"].as_u64().unwrap(), li.cross_repo, "round {round}");
         assert_eq!(r["rows"].as_u64().unwrap(), filled, "round {round}: the state's row count");
         let snap = tmp.path().join(format!("snap-{round}"));
         run(&["build", "--input", s(&out), "--out", s(&snap), "--relations", s(&out.join("relations.toml"))]);

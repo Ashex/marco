@@ -242,7 +242,7 @@ pub async fn make(session: &Session, cfg: &Config) -> Result<Plan> {
     let mut shards = std::collections::BTreeSet::new();
     for (ti, t) in cfg.tables.iter().enumerate() {
         let meta = keyspace.tables.get(&t.name).with_context(|| format!("no table {}.{}", cfg.keyspace, t.name))?;
-        for c in [&t.actor, &t.rkey, &t.subject] {
+        for c in [&t.actor, &t.rkey, &t.subject].into_iter().chain(&t.list) {
             if !meta.columns.contains_key(c) {
                 let mut have: Vec<&String> = meta.columns.keys().collect();
                 have.sort();
