@@ -37,11 +37,11 @@ pub fn write(snapshot: &Path, out: &Path, events: u32, seed: u64, writes_after_d
         for _ in 0..20 {
             let a = rng.below(n as u64) as u32;
             let rel = rec_rels[rng.below(rec_rels.len() as u64) as usize];
-            let c = g.out_count(rel, a) as usize;
+            let c = g.read(|cx| g.out_count(cx, rel, a)).unwrap() as usize;
             if c == 0 {
                 continue;
             }
-            let page = g.out_page(rel, a, c.min(64), None);
+            let page = g.read(|cx| g.out_page(cx, rel, a, c.min(64), None)).unwrap();
             let (k, s) = page[rng.below(page.len() as u64) as usize];
             return Some((g.uri(rel, a, k)?, g.did_of(s)?));
         }

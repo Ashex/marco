@@ -117,30 +117,31 @@ pub fn make_inputs(snapshot: &Path, seed: u64) -> Result<Inputs> {
     let f = g.relations().by_name("follow").context("no follow relation")?;
     let n = g.n_ids();
     let did = |id: u32| g.did_of(id).expect("an id below n_ids has a DID");
-    let hot_in = top(&g, 20, |id| g.in_count(f, id));
-    let hot_out = top(&g, 20, |id| g.out_count(f, id));
+    let hot_in = top(&g, 20, |id| g.read(|cx| g.in_count(cx, f, id)).unwrap());
+    let hot_out = top(&g, 20, |id| g.read(|cx| g.out_count(cx, f, id)).unwrap());
     let mut rng = Rng(seed | 1);
     let mut actors = Vec::new();
     while actors.len() < 10_000 {
         let id = rng.below(n as u64) as u32;
-        if g.out_count(f, id) > 0 {
+        if g.read(|cx| g.out_count(cx, f, id)).unwrap() > 0 {
             actors.push(id);
         }
     }
     let mut hits = Vec::new();
     for &x in &actors {
-        let page = g.out_page(f, x, 1 << 20, None);
+        let page = g.read(|cx| g.out_page(cx, f, x, 1 << 20, None)).unwrap();
         hits.push((did(x), did(page[rng.below(page.len() as u64) as usize].1)));
     }
     let misses: Vec<(String, String)> = actors.iter().map(|&x| (did(x), did(rng.below(n as u64) as u32))).collect();
     // P0 drew its engine-only (id) relationship inputs here
     for &x in actors.iter().take(2000) {
-        for _ in g.out_page(f, x, 25, None).len()..50 {
+        for _ in g.read(|cx| g.out_page(cx, f, x, 25, None)).unwrap().len()..50 {
             rng.below(n as u64);
         }
     }
     let fill = |rng: &mut Rng, x: u32| {
-        let mut o: Vec<String> = g.out_page(f, x, 25, None).iter().map(|&(_, s)| did(s)).collect();
+        let mut o: Vec<String> =
+            g.read(|cx| g.out_page(cx, f, x, 25, None)).unwrap().iter().map(|&(_, s)| did(s)).collect();
         while o.len() < 50 {
             o.push(did(rng.below(n as u64) as u32));
         }
@@ -153,13 +154,13 @@ pub fn make_inputs(snapshot: &Path, seed: u64) -> Result<Inputs> {
     let hot_hits = hot_out
         .iter()
         .map(|&(x, _)| {
-            let page = g.out_page(f, x, 1 << 20, None);
+            let page = g.read(|cx| g.out_page(cx, f, x, 1 << 20, None)).unwrap();
             (did(x), did(page[rng.below(page.len() as u64) as usize].1))
         })
         .collect();
     let mut r2 = Rng((seed ^ 0x6d69_785f_706f_6f6c) | 1);
     let viewer = |rng: &mut Rng, x: u32| {
-        let page = g.out_page(f, x, 1 << 20, None);
+        let page = g.read(|cx| g.out_page(cx, f, x, 1 << 20, None)).unwrap();
         let follows = (0..page.len().min(100)).map(|_| did(page[rng.below(page.len() as u64) as usize].1)).collect();
         Viewer { did: did(x), follows }
     };
@@ -172,7 +173,7 @@ pub fn make_inputs(snapshot: &Path, seed: u64) -> Result<Inputs> {
             break;
         }
         let x = r2.below(n as u64) as u32;
-        if (50..=5000).contains(&g.out_count(f, x)) {
+        if (50..=5000).contains(&g.read(|cx| g.out_count(cx, f, x)).unwrap()) {
             viewers_active.push(viewer(&mut r2, x));
         }
     }
@@ -180,7 +181,7 @@ pub fn make_inputs(snapshot: &Path, seed: u64) -> Result<Inputs> {
     let popular = (0..20_000)
         .map(|_| {
             let x = actors[r2.below(actors.len() as u64) as usize];
-            let page = g.out_page(f, x, 1 << 20, None);
+            let page = g.read(|cx| g.out_page(cx, f, x, 1 << 20, None)).unwrap();
             did(page[r2.below(page.len() as u64) as usize].1)
         })
         .collect();
@@ -191,10 +192,10 @@ pub fn make_inputs(snapshot: &Path, seed: u64) -> Result<Inputs> {
                 break;
             }
             let x = r2.below(n as u64) as u32;
-            if g.in_count(li, x) == 0 {
+            if g.read(|cx| g.in_count(cx, li, x)).unwrap() == 0 {
                 continue;
             }
-            let on = g.in_page(li, x, 1 << 20, None);
+            let on = g.read(|cx| g.in_page(cx, li, x, 1 << 20, None)).unwrap();
             if let Some(l) = g.did_of(on[r2.below(on.len() as u64) as usize]) {
                 lists.push(l);
             }
@@ -204,7 +205,7 @@ pub fn make_inputs(snapshot: &Path, seed: u64) -> Result<Inputs> {
         .iter()
         .map(|&(x, _)| {
             let h = did(x);
-            let (_, c) = g.in_list(f, &h, 1000, None);
+            let (_, c) = g.read(|cx| g.in_list(cx, f, &h, 1000, None)).unwrap();
             (h, c.unwrap_or_default())
         })
         .collect();
@@ -409,46 +410,56 @@ impl Engine {
         match s {
             Shape::Has | Shape::HasHit | Shape::HasMiss | Shape::HasHotHit => {
                 let (x, y) = inp.has_pair(s, i);
-                g.has(f, x, y).is_some() as usize
+                g.read(|cx| g.has(cx, f, x, y)).unwrap().is_some() as usize
             }
             Shape::Relationships | Shape::RelationshipsHot => {
                 let (a, o) = inp.rel_input(s, i);
                 let o: Vec<&str> = o.iter().map(String::as_str).collect();
-                g.relationships(a, &o, &[f, b]).len()
+                g.read(|cx| g.relationships(cx, a, &o, &[f, b])).unwrap().len()
             }
-            Shape::OutPage => g.out_list(f, inp.actor(i), 50, None).0.len(),
-            Shape::OutPageHot => g.out_list(f, &inp.hot_out[i % inp.hot_out.len()].0, 50, None).0.len(),
-            Shape::InPage => g.in_list(f, inp.actor(i), 50, None).0.len(),
-            Shape::InPageHot => g.in_list(f, &inp.hot_in[i % inp.hot_in.len()].0, 50, None).0.len(),
+            Shape::OutPage => g.read(|cx| g.out_list(cx, f, inp.actor(i), 50, None)).unwrap().0.len(),
+            Shape::OutPageHot => {
+                g.read(|cx| g.out_list(cx, f, &inp.hot_out[i % inp.hot_out.len()].0, 50, None)).unwrap().0.len()
+            }
+            Shape::InPage => g.read(|cx| g.in_list(cx, f, inp.actor(i), 50, None)).unwrap().0.len(),
+            Shape::InPageHot => {
+                g.read(|cx| g.in_list(cx, f, &inp.hot_in[i % inp.hot_in.len()].0, 50, None)).unwrap().0.len()
+            }
             Shape::InPageHotCursor => {
                 let (h, c) = &inp.cursors[i % inp.cursors.len()];
-                g.in_list(f, h, 50, Some(c)).0.len()
+                g.read(|cx| g.in_list(cx, f, h, 50, Some(c))).unwrap().0.len()
             }
             Shape::Counts => {
-                std::hint::black_box(g.counts(f, inp.actor(i)));
+                std::hint::black_box(g.read(|cx| g.counts(cx, f, inp.actor(i))).unwrap());
                 1
             }
             Shape::MutualsRandom | Shape::MutualsHot => {
                 let a = if s == Shape::MutualsHot { &inp.hot_out[0].0 } else { inp.actor(i) };
                 let Some(v) = g.id_of(a) else { return 0 };
                 let side = |dir| ListRef { rel: f, dir, actor: v };
-                dids(g.intersect(side(Dir::Out), side(Dir::In), 100))
+                dids(g.read(|cx| g.intersect(cx, side(Dir::Out), side(Dir::In), 100)).unwrap())
             }
             Shape::FollowedByYouFollow => {
                 let x = g.id_of(&inp.hot_in[i % inp.hot_in.len()].0);
                 let v = g.id_of(inp.actor(i));
                 let (Some(x), Some(v)) = (x, v) else { return 0 };
-                dids(g.intersect(
-                    ListRef { rel: f, dir: Dir::In, actor: x },
-                    ListRef { rel: f, dir: Dir::Out, actor: v },
-                    100,
-                ))
+                dids(
+                    g.read(|cx| {
+                        g.intersect(
+                            cx,
+                            ListRef { rel: f, dir: Dir::In, actor: x },
+                            ListRef { rel: f, dir: Dir::Out, actor: v },
+                            100,
+                        )
+                    })
+                    .unwrap(),
+                )
             }
             Shape::Filter => {
                 let Some(v) = g.id_of(inp.actor(i)) else { return 0 };
                 let ids: Vec<u32> =
                     inp.filter_pages[i % inp.filter_pages.len()].iter().filter_map(|a| g.id_of(a)).collect();
-                dids(g.filter_id(v, &ids, &[(b, Dir::Out), (b, Dir::In)]))
+                dids(g.read(|cx| g.filter_id(cx, v, &ids, &[(b, Dir::Out), (b, Dir::In)])).unwrap())
             }
             Shape::File(k) => self.call_req(mixfile::req(k, i)),
         }
@@ -464,18 +475,22 @@ impl Engine {
         };
         let dids = |ids: Vec<u32>| ids.into_iter().filter_map(|x| g.did_of(x)).count();
         match r {
-            Req::Has(r) => g.has(rel(&r.rel), &r.from, &r.to).is_some() as usize,
+            Req::Has(r) => g.read(|cx| g.has(cx, rel(&r.rel), &r.from, &r.to)).unwrap().is_some() as usize,
             Req::Relationships(r) => {
                 let rels: Vec<RelId> = r.rels.iter().map(|n| rel(n)).collect();
                 let o: Vec<&str> = r.others.iter().map(String::as_str).collect();
-                g.relationships(&r.actor, &o, &rels).len()
+                g.read(|cx| g.relationships(cx, &r.actor, &o, &rels)).unwrap().len()
             }
-            Req::ListOut(r) => g.out_list(rel(&r.rel), &r.actor, r.limit as usize, None).0.len(),
-            Req::ListIn(r) => g.in_list(rel(&r.rel), &r.subject, r.limit as usize, None).0.len(),
+            Req::ListOut(r) => {
+                g.read(|cx| g.out_list(cx, rel(&r.rel), &r.actor, r.limit as usize, None)).unwrap().0.len()
+            }
+            Req::ListIn(r) => {
+                g.read(|cx| g.in_list(cx, rel(&r.rel), &r.subject, r.limit as usize, None)).unwrap().0.len()
+            }
             Req::Counts(r) => {
                 for a in &r.actors {
                     for n in &r.rels {
-                        std::hint::black_box(g.counts(rel(n), a));
+                        std::hint::black_box(g.read(|cx| g.counts(cx, rel(n), a)).unwrap());
                     }
                 }
                 r.actors.len()
@@ -490,7 +505,8 @@ impl Engine {
                 };
                 match (side(&r.a), side(&r.b)) {
                     (Some(a), Some(b)) => {
-                        let (ids, total) = g.combine_counted(a, b, SetOp::And, r.limit as usize, None, cap);
+                        let (ids, total) =
+                            g.read(|cx| g.combine_counted(cx, a, b, SetOp::And, r.limit as usize, None, cap)).unwrap();
                         std::hint::black_box(total);
                         dids(ids)
                     }
@@ -501,7 +517,7 @@ impl Engine {
                 let rels: Vec<RelId> =
                     if r.rels.is_empty() { vec![rel("block")] } else { r.rels.iter().map(|n| rel(n)).collect() };
                 let pairs: Vec<(&str, &str)> = r.pairs.iter().map(|p| (p.a.as_str(), p.b.as_str())).collect();
-                g.block_pairs(&pairs, &rels).into_iter().filter(|x| x.0 || x.1).count()
+                g.read(|cx| g.block_pairs(cx, &pairs, &rels)).unwrap().into_iter().filter(|x| x.0 || x.1).count()
             }
             Req::Filter(r) => {
                 let Some(v) = g.id_of(&r.viewer) else { return 0 };
@@ -518,7 +534,7 @@ impl Engine {
                     }
                 }
                 let ids: Vec<u32> = r.actors.iter().filter_map(|a| g.id_of(a)).collect();
-                dids(g.filter_sets(v, &ids, &drops, &sets))
+                dids(g.read(|cx| g.filter_sets(cx, v, &ids, &drops, &sets)).unwrap())
             }
         }
     }

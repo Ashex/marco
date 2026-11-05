@@ -4,6 +4,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use connectrpc::{ConnectError, RequestContext, Response, ServiceRequest, ServiceResult};
+use marco_core::read::{ReadCx, R};
 use marco_core::relation::parse_uri;
 use marco_core::rkey::{is_tid, key_of};
 use marco_core::{Dir, Graph, RelId, Stored};
@@ -12,7 +13,7 @@ use marco_proto::v1::*;
 
 use crate::app::{App, JobState, Status, Verify};
 use crate::auth::Caller;
-use crate::graph_svc::{bad, dir_of, dir_pb, rel_id};
+use crate::graph_svc::{bad, dir_of, dir_pb, rel_id, run};
 
 pub struct AdminApi(pub Arc<App>);
 
@@ -442,20 +443,30 @@ impl svc::Admin for AdminApi {
             .into_iter()
             .map(|(name, (b, files))| Section { rel: rel_of(&name), name, size_bytes: b, files, ..Default::default() })
             .collect();
-        let mut lists: Vec<(f64, u64, RelId, Dir, u32, u64, u64)> = Vec::new();
+        let mut changed: Vec<(RelId, Dir, u32, u64, u64)> = Vec::new();
         for r in 0..g.relations().len() as RelId {
             for dir in [Dir::Out, Dir::In] {
-                g.for_each_delta(r, dir, |id, a, d| {
-                    let now = match dir {
-                        Dir::Out => g.out_count(r, id),
-                        Dir::In => g.in_count(r, id),
-                    };
-                    let base = (now + d as u64).saturating_sub(a as u64);
-                    let n = (a + d) as u64;
-                    lists.push((n as f64 / base.max(1) as f64, n, r, dir, id, a as u64, d as u64));
-                });
+                g.for_each_delta(r, dir, |id, a, d| changed.push((r, dir, id, a as u64, d as u64)));
             }
         }
+        let now = run(&g, |cx| {
+            changed
+                .iter()
+                .map(|&(r, dir, id, _, _)| match dir {
+                    Dir::Out => g.out_count(cx, r, id),
+                    Dir::In => g.in_count(cx, r, id),
+                })
+                .collect::<R<Vec<u64>>>()
+        })?;
+        // (changed / base, changed, the list, its base length)
+        let mut lists: Vec<_> = changed
+            .into_iter()
+            .zip(now)
+            .map(|(l @ (_, _, _, a, d), now)| {
+                let base = (now + d).saturating_sub(a);
+                ((a + d) as f64 / base.max(1) as f64, a + d, l, base)
+            })
+            .collect();
         let delta_lists = lists.len() as u32;
         if by_size {
             lists.sort_unstable_by_key(|x| std::cmp::Reverse(x.1));
@@ -465,20 +476,14 @@ impl svc::Admin for AdminApi {
         let deltas = lists
             .iter()
             .take(20)
-            .map(|&(_, _, r, dir, id, a, d)| {
-                let now = match dir {
-                    Dir::Out => g.out_count(r, id),
-                    Dir::In => g.in_count(r, id),
-                };
-                DeltaList {
-                    did: g.did_of(id).unwrap_or_default(),
-                    rel: g.relations().get(r).name.clone(),
-                    dir: dir_pb(dir),
-                    base: (now + d).saturating_sub(a),
-                    adds: a,
-                    dels: d,
-                    ..Default::default()
-                }
+            .map(|&(_, _, (r, dir, id, a, d), base)| DeltaList {
+                did: g.did_of(id).unwrap_or_default(),
+                rel: g.relations().get(r).name.clone(),
+                dir: dir_pb(dir),
+                base,
+                adds: a,
+                dels: d,
+                ..Default::default()
             })
             .collect();
         Response::ok(GetStorageResponse { sections, deltas, delta_lists, ..Default::default() })
@@ -621,38 +626,38 @@ impl svc::Admin for AdminApi {
             return Response::ok(GetActorResponse { did, status, list, ..Default::default() });
         };
         let w = g.shard_width().max(1);
-        let rels = (0..g.relations().len() as RelId)
-            .map(|r| {
-                let out = g.out_count(r, id);
-                let inn = g.in_count(r, id);
-                let mutual = if out.min(inn) == 0 || out.min(inn) > 1_000_000 {
-                    0
-                } else {
-                    g.intersect(
-                        marco_core::ListRef { rel: r, dir: Dir::Out, actor: id },
-                        marco_core::ListRef { rel: r, dir: Dir::In, actor: id },
-                        usize::MAX,
-                    )
-                    .len() as u64
-                };
-                let first_us = if out > 0 && out <= SCAN_CAP {
-                    g.out_page(r, id, out as usize, None).last().map_or(0, |&(k, _)| created_us(k))
-                } else {
-                    0
-                };
-                ActorRelation {
-                    rel: g.relations().get(r).name.clone(),
-                    out,
-                    r#in: inn,
-                    mutual,
-                    first_us,
-                    out_stored: stored(g.list_stored(r, Dir::Out, id)),
-                    in_stored: stored(g.list_stored(r, Dir::In, id)),
-                    out_subjects: if out == 0 { 0 } else { g.out_distinct(r, id) },
-                    ..Default::default()
-                }
+        let rel = |cx: &ReadCx<'_>, r: RelId| -> R<ActorRelation> {
+            let out = g.out_count(cx, r, id)?;
+            let inn = g.in_count(cx, r, id)?;
+            let mutual = if out.min(inn) == 0 || out.min(inn) > 1_000_000 {
+                0
+            } else {
+                g.intersect(
+                    cx,
+                    marco_core::ListRef { rel: r, dir: Dir::Out, actor: id },
+                    marco_core::ListRef { rel: r, dir: Dir::In, actor: id },
+                    usize::MAX,
+                )?
+                .len() as u64
+            };
+            let first_us = if out > 0 && out <= SCAN_CAP {
+                g.out_page(cx, r, id, out as usize, None)?.last().map_or(0, |&(k, _)| created_us(k))
+            } else {
+                0
+            };
+            Ok(ActorRelation {
+                rel: g.relations().get(r).name.clone(),
+                out,
+                r#in: inn,
+                mutual,
+                first_us,
+                out_stored: stored(g.list_stored(r, Dir::Out, id)),
+                in_stored: stored(g.list_stored(r, Dir::In, id)),
+                out_subjects: if out == 0 { 0 } else { g.out_distinct(cx, r, id)? },
+                ..Default::default()
             })
-            .collect();
+        };
+        let rels = run(&g, |cx| (0..g.relations().len() as RelId).map(|r| rel(cx, r)).collect::<R<Vec<_>>>())?;
         Response::ok(GetActorResponse { did, known: true, id, shard: id / w, status, rels, list, ..Default::default() })
     }
 
@@ -666,56 +671,55 @@ impl svc::Admin for AdminApi {
         let dir = dir_of(&req.dir)?;
         let lim = if req.limit == 0 { 50 } else { req.limit.min(500) } as usize;
         let Some(id) = g.id_of(req.actor) else { return Response::ok(ListEdgesResponse::default()) };
-        let mut edges = Vec::new();
-        let mut cursor = String::new();
-        let total = match dir {
-            Dir::Out => {
-                let before = (!req.cursor.is_empty()).then(|| key_of(req.cursor).0);
-                let page = g.out_page(rel, id, lim, before);
-                if page.len() == lim {
-                    cursor = page.last().and_then(|&(k, _)| g.rkey_string(rel, id, k)).unwrap_or_default();
-                }
-                for (k, s) in page {
-                    edges.push(Edge {
-                        did: g.did_of(s).unwrap_or_default(),
-                        id: s,
-                        rkey: g.rkey_string(rel, id, k).unwrap_or_default(),
-                        uri: g.uri(rel, id, k).unwrap_or_default(),
-                        created_us: created_us(k),
-                        stored: stored(g.out_stored(rel, id, k)),
-                        ..Default::default()
-                    });
-                }
-                g.out_count(rel, id)
-            }
-            Dir::In => {
-                let after = if req.cursor.is_empty() {
-                    None
-                } else {
-                    match g.id_of(req.cursor) {
-                        Some(x) => Some(x),
-                        None => return Err(bad("cursor isn't a DID in this graph")),
-                    }
-                };
-                let page = g.in_page(rel, id, lim, after);
-                if page.len() == lim {
-                    cursor = page.last().and_then(|&x| g.did_of(x)).unwrap_or_default();
-                }
-                for x in page {
-                    let k = g.out_find_subject(rel, x, id);
-                    edges.push(Edge {
-                        did: g.did_of(x).unwrap_or_default(),
-                        id: x,
-                        rkey: k.and_then(|k| g.rkey_string(rel, x, k)).unwrap_or_default(),
-                        uri: k.and_then(|k| g.uri(rel, x, k)).unwrap_or_default(),
-                        created_us: k.map_or(0, created_us),
-                        stored: k.map_or_else(String::new, |k| stored(g.out_stored(rel, x, k))),
-                        ..Default::default()
-                    });
-                }
-                g.in_count(rel, id)
-            }
+        let after = match (dir, req.cursor) {
+            (Dir::In, c) if !c.is_empty() => Some(g.id_of(c).ok_or_else(|| bad("cursor isn't a DID in this graph"))?),
+            _ => None,
         };
+        let (edges, cursor, total) = run(&g, |cx| {
+            let mut edges = Vec::new();
+            let mut cursor = String::new();
+            let total = match dir {
+                Dir::Out => {
+                    let before = (!req.cursor.is_empty()).then(|| key_of(req.cursor).0);
+                    let page = g.out_page(cx, rel, id, lim, before)?;
+                    if page.len() == lim {
+                        cursor = page.last().and_then(|&(k, _)| g.rkey_string(rel, id, k)).unwrap_or_default();
+                    }
+                    for (k, s) in page {
+                        edges.push(Edge {
+                            did: g.did_of(s).unwrap_or_default(),
+                            id: s,
+                            rkey: g.rkey_string(rel, id, k).unwrap_or_default(),
+                            uri: g.uri(rel, id, k).unwrap_or_default(),
+                            created_us: created_us(k),
+                            stored: stored(g.out_stored(rel, id, k)),
+                            ..Default::default()
+                        });
+                    }
+                    g.out_count(cx, rel, id)?
+                }
+                Dir::In => {
+                    let page = g.in_page(cx, rel, id, lim, after)?;
+                    if page.len() == lim {
+                        cursor = page.last().and_then(|&x| g.did_of(x)).unwrap_or_default();
+                    }
+                    for x in page {
+                        let k = g.out_find_subject(cx, rel, x, id)?;
+                        edges.push(Edge {
+                            did: g.did_of(x).unwrap_or_default(),
+                            id: x,
+                            rkey: k.and_then(|k| g.rkey_string(rel, x, k)).unwrap_or_default(),
+                            uri: k.and_then(|k| g.uri(rel, x, k)).unwrap_or_default(),
+                            created_us: k.map_or(0, created_us),
+                            stored: k.map_or_else(String::new, |k| stored(g.out_stored(rel, x, k))),
+                            ..Default::default()
+                        });
+                    }
+                    g.in_count(cx, rel, id)?
+                }
+            };
+            Ok((edges, cursor, total))
+        })?;
         Response::ok(ListEdgesResponse { edges, cursor, total, ..Default::default() })
     }
 
@@ -742,31 +746,36 @@ impl svc::Admin for AdminApi {
         let Some(owner) = g.id_of(did) else { return Response::ok(r) };
         r.actor_id = owner;
         r.shard = owner / w;
-        // a list relation's record is its owner's; its edge is in the list's log
-        let rec = g.relations().owner_rel(rel).unwrap_or(rel);
-        r.out_count = g.out_count(rec, owner);
-        r.tombstoned = g.is_tombstoned(rec, owner, key);
-        let a = if rec == rel {
-            owner
-        } else {
-            let Some(l) = g.out_get(rec, owner, key) else { return Response::ok(r) };
-            r.list = g.did_of(l).unwrap_or_default();
-            l
-        };
-        let Some(s) = g.out_get(rel, a, key) else { return Response::ok(r) };
-        r.subject = g.did_of(s).unwrap_or_default();
-        r.subject_id = s;
-        r.subject_shard = s / w;
-        r.stored = stored(g.out_stored(rel, a, key));
-        let n = g.out_count(rel, a);
-        if n <= SCAN_CAP {
-            let page = g.out_page(rel, a, n as usize, None);
-            r.position = page.iter().position(|e| e.0 == key).map_or(0, |p| p as u64 + 1);
-        }
-        r.pair_records = g.records_naming(rel, a, s) as u64;
-        r.in_contains = g.in_contains(rel, s, a);
-        r.subject_in_count = g.in_count(rel, s);
-        r.subject_in_stored = stored(g.list_stored(rel, Dir::In, s));
+        let base = r;
+        let r = run(&g, |cx| {
+            let mut r = base.clone();
+            // a list relation's record is its owner's; its edge is in the list's log
+            let rec = g.relations().owner_rel(rel).unwrap_or(rel);
+            r.out_count = g.out_count(cx, rec, owner)?;
+            r.tombstoned = g.is_tombstoned(rec, owner, key);
+            let a = if rec == rel {
+                owner
+            } else {
+                let Some(l) = g.out_get(cx, rec, owner, key)? else { return Ok(r) };
+                r.list = g.did_of(l).unwrap_or_default();
+                l
+            };
+            let Some(s) = g.out_get(cx, rel, a, key)? else { return Ok(r) };
+            r.subject = g.did_of(s).unwrap_or_default();
+            r.subject_id = s;
+            r.subject_shard = s / w;
+            r.stored = stored(g.out_stored(rel, a, key));
+            let n = g.out_count(cx, rel, a)?;
+            if n <= SCAN_CAP {
+                let page = g.out_page(cx, rel, a, n as usize, None)?;
+                r.position = page.iter().position(|e| e.0 == key).map_or(0, |p| p as u64 + 1);
+            }
+            r.pair_records = g.records_naming(cx, rel, a, s)? as u64;
+            r.in_contains = g.in_contains(cx, rel, s, a)?;
+            r.subject_in_count = g.in_count(cx, rel, s)?;
+            r.subject_in_stored = stored(g.list_stored(rel, Dir::In, s));
+            Ok(r)
+        })?;
         Response::ok(r)
     }
 

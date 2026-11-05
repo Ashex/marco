@@ -1572,15 +1572,23 @@ mod tests {
             assert_eq!(st.out_records, rep.rels[rel as usize].out_records);
             for i in 0..400 {
                 let d = did(i);
-                assert_eq!(b.counts(rel, &d), g.counts(rel, &d), "{rel} {d}");
-                assert_eq!(b.out_list(rel, &d, 100_000, None).0, g.out_list(rel, &d, 100_000, None).0, "{rel} {d}");
-                let mut x = b.in_list(rel, &d, 100_000, None).0;
-                let mut y = g.in_list(rel, &d, 100_000, None).0;
+                assert_eq!(
+                    b.read(|cx| b.counts(cx, rel, &d)).unwrap(),
+                    g.read(|cx| g.counts(cx, rel, &d)).unwrap(),
+                    "{rel} {d}"
+                );
+                assert_eq!(
+                    b.read(|cx| b.out_list(cx, rel, &d, 100_000, None)).unwrap().0,
+                    g.read(|cx| g.out_list(cx, rel, &d, 100_000, None)).unwrap().0,
+                    "{rel} {d}"
+                );
+                let mut x = b.read(|cx| b.in_list(cx, rel, &d, 100_000, None)).unwrap().0;
+                let mut y = g.read(|cx| g.in_list(cx, rel, &d, 100_000, None)).unwrap().0;
                 x.sort();
                 y.sort();
                 assert_eq!(x, y, "in {rel} {d}");
                 let e = did(rng.below(400));
-                assert_eq!(b.has(rel, &d, &e), g.has(rel, &d, &e));
+                assert_eq!(b.read(|cx| b.has(cx, rel, &d, &e)).unwrap(), g.read(|cx| g.has(cx, rel, &d, &e)).unwrap());
             }
         }
         let (li, lo) = (2u8, 3u8);
@@ -1591,21 +1599,37 @@ mod tests {
         }
         for i in 0..120 {
             let d = did(i);
-            assert_eq!(b.counts(lo, &d), g.counts(lo, &d), "owner {d}");
-            assert_eq!(b.out_list(lo, &d, 100_000, None).0, g.out_list(lo, &d, 100_000, None).0, "owner {d}");
-            let mut x = b.in_list(li, &d, 100_000, None).0;
-            let mut y = g.in_list(li, &d, 100_000, None).0;
+            assert_eq!(
+                b.read(|cx| b.counts(cx, lo, &d)).unwrap(),
+                g.read(|cx| g.counts(cx, lo, &d)).unwrap(),
+                "owner {d}"
+            );
+            assert_eq!(
+                b.read(|cx| b.out_list(cx, lo, &d, 100_000, None)).unwrap().0,
+                g.read(|cx| g.out_list(cx, lo, &d, 100_000, None)).unwrap().0,
+                "owner {d}"
+            );
+            let mut x = b.read(|cx| b.in_list(cx, li, &d, 100_000, None)).unwrap().0;
+            let mut y = g.read(|cx| g.in_list(cx, li, &d, 100_000, None)).unwrap().0;
             x.sort();
             y.sort();
             assert_eq!(x, y, "lists {d} is on");
             for l in 0..4 {
                 let lu = list_uri(&d, l);
-                assert_eq!(b.counts(li, &lu), g.counts(li, &lu), "{lu}");
-                assert_eq!(b.out_list(li, &lu, 100_000, None).0, g.out_list(li, &lu, 100_000, None).0, "{lu}");
+                assert_eq!(
+                    b.read(|cx| b.counts(cx, li, &lu)).unwrap(),
+                    g.read(|cx| g.counts(cx, li, &lu)).unwrap(),
+                    "{lu}"
+                );
+                assert_eq!(
+                    b.read(|cx| b.out_list(cx, li, &lu, 100_000, None)).unwrap().0,
+                    g.read(|cx| g.out_list(cx, li, &lu, 100_000, None)).unwrap().0,
+                    "{lu}"
+                );
                 let ids = (b.id_of(&lu), g.id_of(&lu));
                 assert_eq!(
-                    ids.0.map_or(0, |x| b.out_distinct(li, x)),
-                    ids.1.map_or(0, |x| g.out_distinct(li, x)),
+                    ids.0.map_or(0, |x| b.read(|cx| b.out_distinct(cx, li, x)).unwrap()),
+                    ids.1.map_or(0, |x| g.read(|cx| g.out_distinct(cx, li, x)).unwrap()),
                     "{lu}"
                 );
             }
@@ -1724,7 +1748,12 @@ mod tests {
             vec![(o.clone(), rk.clone(), x.clone(), l1.clone(), 1, 1), (o.clone(), rk, x.clone(), l2.clone(), 2, 2)];
         let (_, b) = build_lists(tmp.path(), &lops, 1);
         let g = live_graph(&lops);
-        let on = |g: &Graph| (g.has(2, &l1, &x).is_some(), g.has(2, &l2, &x).is_some());
+        let on = |g: &Graph| {
+            (
+                g.read(|cx| g.has(cx, 2, &l1, &x)).unwrap().is_some(),
+                g.read(|cx| g.has(cx, 2, &l2, &x)).unwrap().is_some(),
+            )
+        };
         assert_eq!((on(&b), on(&g)), ((false, true), (false, true)), "bulk, live");
     }
 
@@ -1739,7 +1768,9 @@ mod tests {
         ];
         let (_, b) = build_lists(tmp.path(), &lops, 1);
         let g = live_graph(&lops);
-        let n = |g: &Graph| (g.counts(3, &o).0, g.counts(2, &list_uri(&o, 1)).0);
+        let n = |g: &Graph| {
+            (g.read(|cx| g.counts(cx, 3, &o)).unwrap().0, g.read(|cx| g.counts(cx, 2, &list_uri(&o, 1))).unwrap().0)
+        };
         assert_eq!((n(&b), n(&g)), ((0, 0), (0, 0)), "bulk, live");
     }
 
@@ -1756,7 +1787,11 @@ mod tests {
         let (_, b) = build_lists(tmp.path(), &lops, 1);
         let g = live_graph(&lops);
         for l in [list_uri(&k, 1), list_uri(&did(1), 1)] {
-            assert_eq!((b.counts(2, &l).0, g.counts(2, &l).0), (1, 1), "{l}");
+            assert_eq!(
+                (b.read(|cx| b.counts(cx, 2, &l)).unwrap().0, g.read(|cx| g.counts(cx, 2, &l)).unwrap().0),
+                (1, 1),
+                "{l}"
+            );
         }
     }
 

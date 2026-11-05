@@ -107,26 +107,31 @@ fn resume(app: &App) -> usize {
 }
 
 /// Everything a read can see, for every DID the stream names.
+fn has(app: &App, rel: marco_core::RelId, a: &str, b: &str) -> Option<String> {
+    let g = app.graph();
+    g.read(|cx| g.has(cx, rel, a, b)).unwrap()
+}
+
 fn dump(g: &Graph) -> Vec<String> {
     let mut dids: Vec<String> = (0..N + 20).map(did).collect();
     dids.extend((0..30).map(|i| format!("did:web:n{i}.example")));
     let mut out = Vec::new();
     let lists: Vec<String> = dids.iter().flat_map(|d| (0..3).map(move |l| list_uri(d, l))).collect();
     for l in &lists {
-        let (page, _) = g.out_list(2, l, 100_000, None);
+        let (page, _) = g.read(|cx| g.out_list(cx, 2, l, 100_000, None)).unwrap();
         out.push(format!(
             "{l} members {page:?} counts {:?} distinct {:?}",
-            g.counts(2, l),
-            g.id_of(l).map(|i| g.out_distinct(2, i))
+            g.read(|cx| g.counts(cx, 2, l)).unwrap(),
+            g.id_of(l).map(|i| g.read(|cx| g.out_distinct(cx, 2, i)).unwrap())
         ));
     }
     for d in &dids {
         out.push(format!("{d} status {:?}", g.status_of(d)));
         for rel in [0u8, 1, 2, 3] {
-            let (page, _) = g.out_list(rel, d, 100_000, None);
+            let (page, _) = g.read(|cx| g.out_list(cx, rel, d, 100_000, None)).unwrap();
             out.push(format!("{d} {rel} out {page:?}"));
-            out.push(format!("{d} {rel} counts {:?}", g.counts(rel, d)));
-            let (inn, _) = g.in_list(rel, d, 100_000, None);
+            out.push(format!("{d} {rel} counts {:?}", g.read(|cx| g.counts(cx, rel, d)).unwrap()));
+            let (inn, _) = g.read(|cx| g.in_list(cx, rel, d, 100_000, None)).unwrap();
             out.push(format!("{d} {rel} in {inn:?}"));
         }
     }
@@ -297,7 +302,7 @@ async fn a_new_sources_first_cursor_is_durable_on_return() {
     drop(app);
     let app = App::open(cfg(&snap)).unwrap();
     assert_eq!(app.source_cursor("relay").as_deref(), Some("start"));
-    assert!(app.graph().has(0, &did(1), &did(2)).is_some(), "the first call's ops came back with its cursor");
+    assert!(has(&app, 0, &did(1), &did(2)).is_some(), "the first call's ops came back with its cursor");
     // the operator's status is durable on return too
     app.set_status(&did(3), Some(Status::Takendown)).await.unwrap();
     drop(app);
@@ -366,7 +371,7 @@ async fn a_replayed_account_deletion_keeps_its_own_time() {
         app.apply_from(SRC, "3", &[Op::Add { uri: later.clone(), subject: did(2), list: None, time_us: t + 2_000 }])
             .await
             .unwrap();
-        assert!(app.graph().has(0, a, &did(2)).is_some(), "the create after the deletion stays");
+        assert!(has(&app, 0, a, &did(2)).is_some(), "the create after the deletion stays");
     }
 }
 
@@ -528,7 +533,7 @@ async fn a_listitem_delete_before_its_create_holds_through_a_restart() {
     assert!(matches!(&out[..], [marco_server::app::Outcome::Added]), "a later re-create lands");
     app.shutdown().await.unwrap();
     let app = App::open(cfg(&snap)).unwrap();
-    assert!(app.graph().has(2, &list_uri(&o, 0), &did(9)).is_some());
+    assert!(has(&app, 2, &list_uri(&o, 0), &did(9)).is_some());
 }
 
 /// A replace's stamp, and its source, survive a kill with or without a
@@ -555,7 +560,7 @@ async fn a_replaces_stamp_survives_a_kill() {
         assert!(matches!(&out[..], [marco_server::app::Outcome::NotFound]), "checkpoint {checkpoint}: {out:?}");
         let out = app.apply_from("backfill", "2", &[add(7, t + 5)]).await.unwrap();
         assert!(matches!(&out[..], [marco_server::app::Outcome::Exists]), "checkpoint {checkpoint}: {out:?}");
-        assert!(app.graph().has(0, &a, &did(8)).is_some());
+        assert!(has(&app, 0, &a, &did(8)).is_some());
         app.shutdown().await.unwrap();
     }
 }

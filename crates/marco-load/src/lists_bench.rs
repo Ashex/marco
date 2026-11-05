@@ -105,34 +105,34 @@ pub fn run(a: &Args) -> Result<Value> {
 
     // inputs, drawn once
     let mut rng = Rng::new(a.seed);
-    let lists: Vec<u32> = nodes.iter().copied().filter(|&l| g.out_count(li, l) > 0).collect();
+    let lists: Vec<u32> = nodes.iter().copied().filter(|&l| g.read(|cx| g.out_count(cx, li, l)).unwrap() > 0).collect();
     if lists.is_empty() {
         bail!("no list has items");
     }
-    let big = top(&lists, 20, |l| g.out_count(li, l));
+    let big = top(&lists, 20, |l| g.read(|cx| g.out_count(cx, li, l)).unwrap());
     let mut members: Vec<u32> = Vec::new();
     let mut rand_lists = Vec::new();
     while rand_lists.len() < 10_000 {
         let l = lists[rng.below(lists.len() as u64) as usize];
-        let page = g.out_page(li, l, 1 << 20, None);
+        let page = g.read(|cx| g.out_page(cx, li, l, 1 << 20, None)).unwrap();
         members.push(page[rng.below(page.len() as u64) as usize].1);
         rand_lists.push(l);
     }
-    let hot_members = top(&members, 20, |m| g.in_count(li, m));
+    let hot_members = top(&members, 20, |m| g.read(|cx| g.in_count(cx, li, m)).unwrap());
     let mut actors = Vec::new();
     while actors.len() < 10_000 {
         let id = rng.below(n_ids as u64) as u32;
-        if g.out_count(FOLLOW, id) > 0 {
+        if g.read(|cx| g.out_count(cx, FOLLOW, id)).unwrap() > 0 {
             actors.push(id);
         }
     }
-    let hot_followed = top(&actors, 20, |x| g.in_count(FOLLOW, x));
+    let hot_followed = top(&actors, 20, |x| g.read(|cx| g.in_count(cx, FOLLOW, x)).unwrap());
     let did = |id: u32| g.did_of(id).unwrap();
     out.insert(
         "inputs".into(),
         json!({
             "lists_with_items": lists.len(),
-            "big_lists": big.iter().take(5).map(|&(l, n)| (n, g.out_distinct(li, l))).collect::<Vec<_>>(),
+            "big_lists": big.iter().take(5).map(|&(l, n)| (n, g.read(|cx| g.out_distinct(cx, li, l)).unwrap())).collect::<Vec<_>>(),
             "hot_members_lists": hot_members.iter().take(5).map(|&(_, n)| n).collect::<Vec<_>>(),
         }),
     );
@@ -150,29 +150,55 @@ pub fn run(a: &Args) -> Result<Value> {
         let mut r = BTreeMap::new();
         let rl = |i: usize| rand_lists[i % rand_lists.len()];
         let bl = |i: usize| big[i % big.len()].0;
-        r.insert("members_page_50_random", json!(time(n, |i| g.out_list(li, &rl_did[i % rl_did.len()], 50, None))));
-        r.insert("members_page_50_big", json!(time(n, |i| g.out_list(li, &big_did[i % big_did.len()], 50, None))));
+        r.insert(
+            "members_page_50_random",
+            json!(time(n, |i| g.read(|cx| g.out_list(cx, li, &rl_did[i % rl_did.len()], 50, None)).unwrap())),
+        );
+        r.insert(
+            "members_page_50_big",
+            json!(time(n, |i| g.read(|cx| g.out_list(cx, li, &big_did[i % big_did.len()], 50, None)).unwrap())),
+        );
         r.insert(
             "members_distinct_page_50_random",
-            json!(time(n, |i| g.out_list_opts(li, &rl_did[i % rl_did.len()], 50, None, true))),
+            json!(time(n, |i| g
+                .read(|cx| g.out_list_opts(cx, li, &rl_did[i % rl_did.len()], 50, None, true))
+                .unwrap())),
         );
         r.insert(
             "members_distinct_page_50_big",
-            json!(time(n.min(2000), |i| g.out_list_opts(li, &big_did[i % big_did.len()], 50, None, true))),
+            json!(time(n.min(2000), |i| g
+                .read(|cx| g.out_list_opts(cx, li, &big_did[i % big_did.len()], 50, None, true))
+                .unwrap())),
         );
-        r.insert("lists_on_page_50_random", json!(time(n, |i| g.in_list(li, &mem_did[i % mem_did.len()], 50, None))));
+        r.insert(
+            "lists_on_page_50_random",
+            json!(time(n, |i| g.read(|cx| g.in_list(cx, li, &mem_did[i % mem_did.len()], 50, None)).unwrap())),
+        );
         r.insert(
             "lists_on_page_50_hot",
-            json!(time(n, |i| g.in_list(li, &hot_mem_did[i % hot_mem_did.len()], 50, None))),
+            json!(time(n, |i| g.read(|cx| g.in_list(cx, li, &hot_mem_did[i % hot_mem_did.len()], 50, None)).unwrap())),
         );
-        r.insert("has_hit", json!(time(n, |i| g.has(li, &rl_did[i % rl_did.len()], &mem_did[i % mem_did.len()]))));
-        r.insert("has_miss", json!(time(n, |i| g.has(li, &rl_did[i % rl_did.len()], &miss_did[i % miss_did.len()]))));
-        r.insert("counts_list", json!(time(n, |i| g.counts(li, &rl_did[i % rl_did.len()]))));
-        r.insert("distinct_list", json!(time(n, |i| g.out_distinct(li, rl(i)))));
-        r.insert("counts_member", json!(time(n, |i| g.counts(li, &mem_did[i % mem_did.len()]))));
+        r.insert(
+            "has_hit",
+            json!(time(n, |i| g
+                .read(|cx| g.has(cx, li, &rl_did[i % rl_did.len()], &mem_did[i % mem_did.len()]))
+                .unwrap())),
+        );
+        r.insert(
+            "has_miss",
+            json!(time(n, |i| g
+                .read(|cx| g.has(cx, li, &rl_did[i % rl_did.len()], &miss_did[i % miss_did.len()]))
+                .unwrap())),
+        );
+        r.insert("counts_list", json!(time(n, |i| g.read(|cx| g.counts(cx, li, &rl_did[i % rl_did.len()])).unwrap())));
+        r.insert("distinct_list", json!(time(n, |i| g.read(|cx| g.out_distinct(cx, li, rl(i))).unwrap())));
+        r.insert(
+            "counts_member",
+            json!(time(n, |i| g.read(|cx| g.counts(cx, li, &mem_did[i % mem_did.len()])).unwrap())),
+        );
         let op = |i: usize, a: ListRef, b: ListRef, o: SetOp| {
             std::hint::black_box(i);
-            g.combine(a, b, o, 100, None)
+            g.read(|cx| g.combine(cx, a, b, o, 100, None)).unwrap()
         };
         r.insert(
             "list_and_list_random",
@@ -237,38 +263,50 @@ pub fn run(a: &Args) -> Result<Value> {
         );
         r.insert(
             "filter_50_minus_random_list",
-            json!(time(n, |i| g.filter_sets(
-                actors[i % actors.len()],
-                &pages[i % pages.len()],
-                &[],
-                &[side(li, Dir::Out, rl(i))]
-            ))),
+            json!(time(n, |i| g
+                .read(|cx| g.filter_sets(
+                    cx,
+                    actors[i % actors.len()],
+                    &pages[i % pages.len()],
+                    &[],
+                    &[side(li, Dir::Out, rl(i))]
+                ))
+                .unwrap())),
         );
         r.insert(
             "filter_50_minus_big_list",
-            json!(time(n, |i| g.filter_sets(
-                actors[i % actors.len()],
-                &pages[i % pages.len()],
-                &[],
-                &[side(li, Dir::Out, bl(i))]
-            ))),
+            json!(time(n, |i| g
+                .read(|cx| g.filter_sets(
+                    cx,
+                    actors[i % actors.len()],
+                    &pages[i % pages.len()],
+                    &[],
+                    &[side(li, Dir::Out, bl(i))]
+                ))
+                .unwrap())),
         );
         r.insert(
             "filter_50_blocks_and_big_list",
-            json!(time(n, |i| g.filter_sets(
-                actors[i % actors.len()],
-                &pages[i % pages.len()],
-                &[(BLOCK, Dir::Out), (BLOCK, Dir::In)],
-                &[side(li, Dir::Out, bl(i))]
-            ))),
+            json!(time(n, |i| g
+                .read(|cx| g.filter_sets(
+                    cx,
+                    actors[i % actors.len()],
+                    &pages[i % pages.len()],
+                    &[(BLOCK, Dir::Out), (BLOCK, Dir::In)],
+                    &[side(li, Dir::Out, bl(i))]
+                ))
+                .unwrap())),
         );
         r.insert(
             "filter_50_blocks",
-            json!(time(n, |i| g.filter_id(
-                actors[i % actors.len()],
-                &pages[i % pages.len()],
-                &[(BLOCK, Dir::Out), (BLOCK, Dir::In)]
-            ))),
+            json!(time(n, |i| g
+                .read(|cx| g.filter_id(
+                    cx,
+                    actors[i % actors.len()],
+                    &pages[i % pages.len()],
+                    &[(BLOCK, Dir::Out), (BLOCK, Dir::In)]
+                ))
+                .unwrap())),
         );
         r
     };
@@ -295,7 +333,7 @@ pub fn run(a: &Args) -> Result<Value> {
     let mut items: Vec<(String, String, String)> = Vec::new();
     while items.len() < n.min(20_000) {
         let l = lists[rng.below(lists.len() as u64) as usize];
-        let page = g.out_page(li, l, 1 << 20, None);
+        let page = g.read(|cx| g.out_page(cx, li, l, 1 << 20, None)).unwrap();
         let (k, m) = page[rng.below(page.len() as u64) as usize];
         if let (Some(u), Some(lu), Some(md)) = (g.uri(li, l, k), g.did_of(l), g.did_of(m)) {
             items.push((u, lu, md));

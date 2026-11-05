@@ -50,7 +50,7 @@ pub fn open(path: &Path) -> Result<Value> {
     let open_ms = t.elapsed().as_secs_f64() * 1e3;
     let mut id = g.n_ids() / 2;
     let t = Instant::now();
-    while g.out_count(FOLLOW, id) == 0 {
+    while g.read(|cx| g.out_count(cx, FOLLOW, id)).unwrap() == 0 {
         id += 1;
         if id >= g.n_ids() {
             bail!("no actor with follows above the midpoint");
@@ -60,14 +60,14 @@ pub fn open(path: &Path) -> Result<Value> {
     let find_us = t.elapsed().as_secs_f64() * 1e6;
     let a = g.did_of(id).unwrap();
     let t = Instant::now();
-    let (page, _) = g.out_list(FOLLOW, &a, 50, None);
+    let (page, _) = g.read(|cx| g.out_list(cx, FOLLOW, &a, 50, None)).unwrap();
     let first_out_us = t.elapsed().as_secs_f64() * 1e6;
     let b = page[0].1.clone();
     let t = Instant::now();
-    let uri = g.has(FOLLOW, &a, &b);
+    let uri = g.read(|cx| g.has(cx, FOLLOW, &a, &b)).unwrap();
     let first_has_us = t.elapsed().as_secs_f64() * 1e6;
     let t = Instant::now();
-    let (followers, _) = g.in_list(FOLLOW, &b, 50, None);
+    let (followers, _) = g.read(|cx| g.in_list(cx, FOLLOW, &b, 50, None)).unwrap();
     let first_in_us = t.elapsed().as_secs_f64() * 1e6;
     Ok(json!({
         "open_ms": open_ms,
@@ -137,8 +137,8 @@ pub fn run(a: &Args) -> Result<Value> {
     let n_ids = g.n_ids();
 
     let t = Instant::now();
-    let hot_in = top(&g, 20, |id| g.in_count(FOLLOW, id));
-    let hot_out = top(&g, 20, |id| g.out_count(FOLLOW, id));
+    let hot_in = top(&g, 20, |id| g.read(|cx| g.in_count(cx, FOLLOW, id)).unwrap());
+    let hot_out = top(&g, 20, |id| g.read(|cx| g.out_count(cx, FOLLOW, id)).unwrap());
     out.insert("scan_secs".into(), json!(t.elapsed().as_secs_f64()));
     let did = |id: u32| g.did_of(id).unwrap();
     out.insert("hot_followed".into(), json!(hot_in.iter().take(5).map(|&(x, n)| (did(x), n)).collect::<Vec<_>>()));
@@ -148,13 +148,13 @@ pub fn run(a: &Args) -> Result<Value> {
     let mut actors = Vec::new();
     while actors.len() < 10_000 {
         let id = rng.below(n_ids as u64) as u32;
-        if g.out_count(FOLLOW, id) > 0 {
+        if g.read(|cx| g.out_count(cx, FOLLOW, id)).unwrap() > 0 {
             actors.push(id);
         }
     }
     let mut hits = Vec::new();
     for &x in &actors {
-        let page = g.out_page(FOLLOW, x, 1 << 20, None);
+        let page = g.read(|cx| g.out_page(cx, FOLLOW, x, 1 << 20, None)).unwrap();
         let (_, s) = page[rng.below(page.len() as u64) as usize];
         hits.push((x, s));
     }
@@ -169,18 +169,25 @@ pub fn run(a: &Args) -> Result<Value> {
     let mut found = 0usize;
     for i in 0..n * 10 {
         let (x, y) = pairs[i % pairs.len()];
-        found += g.has_id(FOLLOW, x, y).is_some() as usize;
+        found += g.read(|cx| g.has_id(cx, FOLLOW, x, y)).unwrap().is_some() as usize;
     }
     engine.insert("has_id_batch_mean_ns", json!(tb.elapsed().as_nanos() as f64 / (n * 10) as f64));
     engine.insert("has_id_hit_rate", json!(found as f64 / (n * 10) as f64));
-    engine.insert("has_id_hit", json!(time(n, |i| g.has_id(FOLLOW, hits[i % hits.len()].0, hits[i % hits.len()].1))));
+    engine.insert(
+        "has_id_hit",
+        json!(time(n, |i| g.read(|cx| g.has_id(cx, FOLLOW, hits[i % hits.len()].0, hits[i % hits.len()].1)).unwrap())),
+    );
     engine.insert(
         "has_id_miss",
-        json!(time(n, |i| g.has_id(FOLLOW, misses[i % misses.len()].0, misses[i % misses.len()].1))),
+        json!(time(n, |i| g
+            .read(|cx| g.has_id(cx, FOLLOW, misses[i % misses.len()].0, misses[i % misses.len()].1))
+            .unwrap())),
     );
     engine.insert(
         "in_contains",
-        json!(time(n, |i| g.in_contains(FOLLOW, pairs[i % pairs.len()].1, pairs[i % pairs.len()].0))),
+        json!(time(n, |i| g
+            .read(|cx| g.in_contains(cx, FOLLOW, pairs[i % pairs.len()].1, pairs[i % pairs.len()].0))
+            .unwrap())),
     );
     engine.insert("did_to_id", json!(time(n, |i| g.id_of(&pairs_did[i % pairs_did.len()].0))));
     engine.insert("id_to_did", json!(time(n, |i| g.did_of(pairs[i % pairs.len()].1))));
@@ -188,7 +195,8 @@ pub fn run(a: &Args) -> Result<Value> {
         .iter()
         .take(2000)
         .map(|&x| {
-            let mut o: Vec<u32> = g.out_page(FOLLOW, x, 25, None).iter().map(|&(_, s)| s).collect();
+            let mut o: Vec<u32> =
+                g.read(|cx| g.out_page(cx, FOLLOW, x, 25, None)).unwrap().iter().map(|&(_, s)| s).collect();
             while o.len() < 50 {
                 o.push(rng.below(n_ids as u64) as u32);
             }
@@ -198,7 +206,10 @@ pub fn run(a: &Args) -> Result<Value> {
     engine.insert(
         "relationships_id_50x2",
         json!(time(n.min(20_000), |i| {
-            g.relationships_id(actors[i % other_ids.len()], &other_ids[i % other_ids.len()], &[FOLLOW, BLOCK])
+            g.read(|cx| {
+                g.relationships_id(cx, actors[i % other_ids.len()], &other_ids[i % other_ids.len()], &[FOLLOW, BLOCK])
+            })
+            .unwrap()
         })),
     );
     out.insert("engine".into(), json!(engine));
@@ -207,7 +218,7 @@ pub fn run(a: &Args) -> Result<Value> {
         .iter()
         .take(2000)
         .map(|&x| {
-            let follows = g.out_page(FOLLOW, x, 25, None);
+            let follows = g.read(|cx| g.out_page(cx, FOLLOW, x, 25, None)).unwrap();
             let mut o: Vec<String> = follows.iter().map(|&(_, s)| did(s)).collect();
             while o.len() < 50 {
                 o.push(did(rng.below(n_ids as u64) as u32));
@@ -229,7 +240,7 @@ pub fn run(a: &Args) -> Result<Value> {
     let hot_others: Vec<Vec<String>> = hot_out
         .iter()
         .map(|&(x, _)| {
-            let follows = g.out_page(FOLLOW, x, 25, None);
+            let follows = g.read(|cx| g.out_page(cx, FOLLOW, x, 25, None)).unwrap();
             let mut o: Vec<String> = follows.iter().map(|&(_, s)| did(s)).collect();
             while o.len() < 50 {
                 o.push(did(rng.below(n_ids as u64) as u32));
@@ -240,14 +251,14 @@ pub fn run(a: &Args) -> Result<Value> {
     let hot_hits: Vec<(String, String)> = hot_out
         .iter()
         .map(|&(x, _)| {
-            let page = g.out_page(FOLLOW, x, 1 << 20, None);
+            let page = g.read(|cx| g.out_page(cx, FOLLOW, x, 1 << 20, None)).unwrap();
             (did(x), did(page[rng.below(page.len() as u64) as usize].1))
         })
         .collect();
     let cursors: Vec<(String, String)> = hot_in_did
         .iter()
         .map(|h| {
-            let (_, c) = g.in_list(FOLLOW, h, 1000, None);
+            let (_, c) = g.read(|cx| g.in_list(cx, FOLLOW, h, 1000, None)).unwrap();
             (h.clone(), c.unwrap_or_default())
         })
         .collect();
@@ -260,63 +271,77 @@ pub fn run(a: &Args) -> Result<Value> {
             "has",
             json!(time(m, |i| {
                 let (x, y) = &pairs_did[i % pairs_did.len()];
-                g.has(FOLLOW, x, y)
+                g.read(|cx| g.has(cx, FOLLOW, x, y)).unwrap()
             })),
         );
         r.insert(
             "has_hot_actor_hit",
             json!(time(n, |i| {
                 let (x, y) = &hot_hits[i % hot_hits.len()];
-                g.has(FOLLOW, x, y)
+                g.read(|cx| g.has(cx, FOLLOW, x, y)).unwrap()
             })),
         );
         r.insert(
             "relationships_50x2",
             json!(time(n.min(20_000), |i| {
                 let o: Vec<&str> = others[i % others.len()].iter().map(String::as_str).collect();
-                g.relationships(&actors_did[i % others.len()], &o, &rels)
+                g.read(|cx| g.relationships(cx, &actors_did[i % others.len()], &o, &rels)).unwrap()
             })),
         );
         r.insert(
             "relationships_50x2_hot",
             json!(time(n.min(5_000), |i| {
                 let o: Vec<&str> = hot_others[i % hot_others.len()].iter().map(String::as_str).collect();
-                g.relationships(&hot_out_did[i % hot_out_did.len()], &o, &rels)
+                g.read(|cx| g.relationships(cx, &hot_out_did[i % hot_out_did.len()], &o, &rels)).unwrap()
             })),
         );
         r.insert(
             "out_page_50_random",
-            json!(time(n, |i| g.out_list(FOLLOW, &actors_did[i % actors_did.len()], 50, None))),
+            json!(time(n, |i| g
+                .read(|cx| g.out_list(cx, FOLLOW, &actors_did[i % actors_did.len()], 50, None))
+                .unwrap())),
         );
         r.insert(
             "out_page_50_hot",
-            json!(time(n, |i| g.out_list(FOLLOW, &hot_out_did[i % hot_out_did.len()], 50, None))),
+            json!(time(n, |i| g
+                .read(|cx| g.out_list(cx, FOLLOW, &hot_out_did[i % hot_out_did.len()], 50, None))
+                .unwrap())),
         );
         r.insert(
             "in_page_50_random",
-            json!(time(n, |i| g.in_list(FOLLOW, &actors_did[i % actors_did.len()], 50, None))),
+            json!(time(n, |i| g
+                .read(|cx| g.in_list(cx, FOLLOW, &actors_did[i % actors_did.len()], 50, None))
+                .unwrap())),
         );
-        r.insert("in_page_50_hot", json!(time(n, |i| g.in_list(FOLLOW, &hot_in_did[i % hot_in_did.len()], 50, None))));
+        r.insert(
+            "in_page_50_hot",
+            json!(time(n, |i| g
+                .read(|cx| g.in_list(cx, FOLLOW, &hot_in_did[i % hot_in_did.len()], 50, None))
+                .unwrap())),
+        );
         r.insert(
             "in_page_50_hot_cursor",
             json!(time(n, |i| {
                 let (h, c) = &cursors[i % cursors.len()];
-                g.in_list(FOLLOW, h, 50, Some(c))
+                g.read(|cx| g.in_list(cx, FOLLOW, h, 50, Some(c))).unwrap()
             })),
         );
-        r.insert("counts", json!(time(n, |i| g.counts(FOLLOW, &actors_did[i % actors_did.len()]))));
+        r.insert(
+            "counts",
+            json!(time(n, |i| g.read(|cx| g.counts(cx, FOLLOW, &actors_did[i % actors_did.len()])).unwrap())),
+        );
         r.insert(
             "mutuals_random",
             json!(time(n.min(10_000), |i| {
                 let v = actors[i % actors.len()];
-                g.intersect(side(FOLLOW, Dir::Out, v), side(FOLLOW, Dir::In, v), 100)
+                g.read(|cx| g.intersect(cx, side(FOLLOW, Dir::Out, v), side(FOLLOW, Dir::In, v), 100)).unwrap()
             })),
         );
         r.insert(
             "mutuals_hot",
             json!(time(100, |i| {
                 let v = hot_out[i % hot_out.len()].0;
-                g.intersect(side(FOLLOW, Dir::Out, v), side(FOLLOW, Dir::In, v), 100)
+                g.read(|cx| g.intersect(cx, side(FOLLOW, Dir::Out, v), side(FOLLOW, Dir::In, v), 100)).unwrap()
             })),
         );
         r.insert(
@@ -324,31 +349,35 @@ pub fn run(a: &Args) -> Result<Value> {
             json!(time(n.min(10_000), |i| {
                 let x = hot_in[i % hot_in.len()].0;
                 let v = actors[i % actors.len()];
-                g.intersect(side(FOLLOW, Dir::In, x), side(FOLLOW, Dir::Out, v), 100)
+                g.read(|cx| g.intersect(cx, side(FOLLOW, Dir::In, x), side(FOLLOW, Dir::Out, v), 100)).unwrap()
             })),
         );
         r.insert(
             "filter_50_blocks",
             json!(time(n.min(10_000), |i| {
-                g.filter_id(
-                    actors[i % actors.len()],
-                    &filter_pages[i % filter_pages.len()],
-                    &[(BLOCK, Dir::Out), (BLOCK, Dir::In)],
-                )
+                g.read(|cx| {
+                    g.filter_id(
+                        cx,
+                        actors[i % actors.len()],
+                        &filter_pages[i % filter_pages.len()],
+                        &[(BLOCK, Dir::Out), (BLOCK, Dir::In)],
+                    )
+                })
+                .unwrap()
             })),
         );
         let total = 2_000_000usize;
         let t = Instant::now();
         (0..total).into_par_iter().for_each(|i| {
             let (x, y) = &pairs_did[i % pairs_did.len()];
-            std::hint::black_box(g.has(FOLLOW, x, y));
+            std::hint::black_box(g.read(|cx| g.has(cx, FOLLOW, x, y)).unwrap());
         });
         r.insert("has_per_s_all_threads", json!(total as f64 / t.elapsed().as_secs_f64()));
         let total = 200_000usize;
         let t = Instant::now();
         (0..total).into_par_iter().for_each(|i| {
             let o: Vec<&str> = others[i % others.len()].iter().map(String::as_str).collect();
-            std::hint::black_box(g.relationships(&actors_did[i % others.len()], &o, &rels));
+            std::hint::black_box(g.read(|cx| g.relationships(cx, &actors_did[i % others.len()], &o, &rels)).unwrap());
         });
         r.insert("relationships_per_s_all_threads", json!(total as f64 / t.elapsed().as_secs_f64()));
         r

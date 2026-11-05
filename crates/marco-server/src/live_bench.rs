@@ -215,7 +215,7 @@ fn sample(g: &Graph, rng: &mut Rng) -> Sample {
     let mut s = Sample { has: Vec::new(), rel: Vec::new(), dids: Vec::new() };
     while s.has.len() < 20_000 {
         let a = rng.below(n) as u32;
-        let page = g.out_page(0, a, 64, None);
+        let page = g.read(|cx| g.out_page(cx, 0, a, 64, None)).unwrap();
         if page.is_empty() {
             continue;
         }
@@ -227,7 +227,7 @@ fn sample(g: &Graph, rng: &mut Rng) -> Sample {
     }
     while s.rel.len() < 2000 {
         let a = rng.below(n) as u32;
-        let page = g.out_page(0, a, 25, None);
+        let page = g.read(|cx| g.out_page(cx, 0, a, 25, None)).unwrap();
         if page.len() < 25 {
             continue;
         }
@@ -247,14 +247,16 @@ fn reads(app: &App, s: &Sample, secs: f64) -> Value {
         for _ in 0..20 {
             let (a, b) = &s.has[i % s.has.len()];
             let t0 = Instant::now();
-            std::hint::black_box(app.graph().has(0, a, b));
+            let g = app.graph();
+            std::hint::black_box(g.read(|cx| g.has(cx, 0, a, b)).unwrap());
             has.push(t0.elapsed().as_nanos() as u64);
             i += 1;
         }
         let (a, o) = &s.rel[i % s.rel.len()];
         let others: Vec<&str> = o.iter().map(String::as_str).collect();
         let t0 = Instant::now();
-        std::hint::black_box(app.graph().relationships(a, &others, &[0, 1]));
+        let g = app.graph();
+        std::hint::black_box(g.read(|cx| g.relationships(cx, a, &others, &[0, 1])).unwrap());
         rel.push(t0.elapsed().as_nanos() as u64);
     }
     json!({"has": pct(has), "relationships_50x2": pct(rel)})
@@ -533,7 +535,7 @@ fn deletes(path: &std::path::Path, n: usize, populate: bool, seed: u64, prefill:
     let mut uris = Vec::with_capacity(n);
     while uris.len() < n {
         let a = rng.below(ids) as u32;
-        let page = g.out_page(0, a, 4096, None);
+        let page = g.read(|cx| g.out_page(cx, 0, a, 4096, None)).unwrap();
         if page.is_empty() {
             continue;
         }

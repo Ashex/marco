@@ -215,28 +215,39 @@ pub fn check_lists(direct: &Path, snap: &Path, li: &ListInput) {
     let all = 10_000_000;
     let mut lists_with_members = 0;
     for l in &li.lists {
-        assert_eq!(a.counts(la, l), b.counts(lb, l), "{l}");
-        assert_eq!(a.out_list(la, l, all, None).0, b.out_list(lb, l, all, None).0, "members of {l}");
-        lists_with_members += (b.counts(lb, l).0 > 0) as u64;
+        assert_eq!(a.read(|cx| a.counts(cx, la, l)).unwrap(), b.read(|cx| b.counts(cx, lb, l)).unwrap(), "{l}");
+        assert_eq!(
+            a.read(|cx| a.out_list(cx, la, l, all, None)).unwrap().0,
+            b.read(|cx| b.out_list(cx, lb, l, all, None)).unwrap().0,
+            "members of {l}"
+        );
+        lists_with_members += (b.read(|cx| b.counts(cx, lb, l)).unwrap().0 > 0) as u64;
     }
     let mut owners_of_two = 0;
     for o in &li.owners {
-        assert_eq!(a.counts(oa, o), b.counts(ob, o), "{o}");
-        let items = b.out_list(ob, o, all, None).0;
-        assert_eq!(a.out_list(oa, o, all, None).0, items, "items of {o}");
+        assert_eq!(a.read(|cx| a.counts(cx, oa, o)).unwrap(), b.read(|cx| b.counts(cx, ob, o)).unwrap(), "{o}");
+        let items = b.read(|cx| b.out_list(cx, ob, o, all, None)).unwrap().0;
+        assert_eq!(a.read(|cx| a.out_list(cx, oa, o, all, None)).unwrap().0, items, "items of {o}");
         owners_of_two += (items.iter().map(|x| &x.1).collect::<BTreeSet<_>>().len() > 1) as u64;
     }
     for s in &li.subjects {
-        let (mut x, mut y) = (a.in_list(la, s, all, None).0, b.in_list(lb, s, all, None).0);
+        let (mut x, mut y) = (
+            a.read(|cx| a.in_list(cx, la, s, all, None)).unwrap().0,
+            b.read(|cx| b.in_list(cx, lb, s, all, None)).unwrap().0,
+        );
         x.sort();
         y.sort();
         assert_eq!(x, y, "the lists {s} is on");
     }
-    assert_eq!(b.counts(lb, &li.big).0, li.big_records);
+    assert_eq!(b.read(|cx| b.counts(cx, lb, &li.big)).unwrap().0, li.big_records);
     assert!(li.big_records > 1000, "{}", li.big_records);
-    assert_eq!(b.in_list(ob, &li.big, all, None).0, vec![li.owners[0].clone()], "the big list's owner");
     assert_eq!(
-        b.in_list(lb, &li.stray, all, None).0,
+        b.read(|cx| b.in_list(cx, ob, &li.big, all, None)).unwrap().0,
+        vec![li.owners[0].clone()],
+        "the big list's owner"
+    );
+    assert_eq!(
+        b.read(|cx| b.in_list(cx, lb, &li.stray, all, None)).unwrap().0,
         Vec::<String>::new(),
         "a cross-repo item's subject is on no list"
     );

@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use connectrpc::{ConnectError, InboundStream, RequestContext, Response, ServiceRequest, ServiceResult};
 use futures::StreamExt;
+use marco_core::read::{ReadCx, StorageError, R};
 use marco_core::{Dir, Graph, ListRef, RelId, SetOp, COUNT_EXACT};
 use marco_proto::connect::marco::v1 as svc;
 use marco_proto::v1::__buffa::oneof::{write_op, write_result};
@@ -112,6 +113,23 @@ impl GraphApi {
     }
 }
 
+/// A read's error as an RPC's: a page that failed its sum is data loss,
+/// one the disk couldn't give is unavailable.
+pub fn storage_error(e: StorageError) -> ConnectError {
+    match e {
+        StorageError::Checksum(_) => ConnectError::data_loss(e.to_string()),
+        _ => ConnectError::unavailable(e.to_string()),
+    }
+}
+
+/// Runs a request's read, response building included, in passes over
+/// `g`'s store: the first on this worker, never waiting. The store keeps
+/// whole files, so only a bad page misses, and the passes after it read
+/// nothing from disk.
+pub fn run<T>(g: &Graph, f: impl Fn(&ReadCx<'_>) -> R<T>) -> Result<T, ConnectError> {
+    g.read(f).map_err(storage_error)
+}
+
 #[allow(refining_impl_trait)]
 impl svc::Graph for GraphApi {
     async fn has(&self, _: RequestContext, req: ServiceRequest<'_, HasRequest>) -> ServiceResult<HasResponse> {
@@ -119,8 +137,11 @@ impl svc::Graph for GraphApi {
         let g = self.0.graph();
         let rel = rel_id(&g, req.rel)?;
         let hidden = g.hidden(req.from) || g.hidden(req.to);
-        let uri = if hidden { None } else { g.has(rel, req.from, req.to) };
-        Response::ok(HasResponse { uri: uri.unwrap_or_default(), ..Default::default() })
+        let resp = run(&g, |cx| {
+            let uri = if hidden { None } else { g.has(cx, rel, req.from, req.to)? };
+            Ok(HasResponse { uri: uri.unwrap_or_default(), ..Default::default() })
+        })?;
+        Response::ok(resp)
     }
 
     async fn relationships(
@@ -136,31 +157,34 @@ impl svc::Graph for GraphApi {
         let g = self.0.graph();
         let rels = if req.rels.is_empty() { g.relations().actor_rels() } else { rel_ids(&g, &req.rels)? };
         let others: Vec<&str> = req.others.iter().map(String::as_str).collect();
-        let rows = g.relationships(&req.actor, &others, &rels);
-        let actor_hidden = g.hidden(&req.actor);
-        let relationships = req
-            .others
-            .iter()
-            .zip(rows)
-            .map(|(o, per)| {
-                let hide = actor_hidden || g.hidden(o);
-                Relationship {
-                    other: o.clone(),
-                    rels: rels
-                        .iter()
-                        .zip(per)
-                        .map(|(&r, x)| RelationshipEdge {
-                            rel: g.relations().get(r).name.clone(),
-                            out_uri: if hide { String::new() } else { x.out.unwrap_or_default() },
-                            in_uri: if hide { String::new() } else { x.inn.unwrap_or_default() },
-                            ..Default::default()
-                        })
-                        .collect(),
-                    ..Default::default()
-                }
-            })
-            .collect();
-        Response::ok(RelationshipsResponse { relationships, ..Default::default() })
+        let resp = run(&g, |cx| {
+            let rows = g.relationships(cx, &req.actor, &others, &rels)?;
+            let actor_hidden = g.hidden(&req.actor);
+            let relationships = req
+                .others
+                .iter()
+                .zip(rows)
+                .map(|(o, per)| {
+                    let hide = actor_hidden || g.hidden(o);
+                    Relationship {
+                        other: o.clone(),
+                        rels: rels
+                            .iter()
+                            .zip(per)
+                            .map(|(&r, x)| RelationshipEdge {
+                                rel: g.relations().get(r).name.clone(),
+                                out_uri: if hide { String::new() } else { x.out.unwrap_or_default() },
+                                in_uri: if hide { String::new() } else { x.inn.unwrap_or_default() },
+                                ..Default::default()
+                            })
+                            .collect(),
+                        ..Default::default()
+                    }
+                })
+                .collect();
+            Ok(RelationshipsResponse { relationships, ..Default::default() })
+        })?;
+        Response::ok(resp)
     }
 
     async fn block_pairs(
@@ -182,20 +206,23 @@ impl svc::Graph for GraphApi {
             return Err(bad(format!("{:?} is a list relation", g.relations().get(r).name)));
         }
         let pairs: Vec<(&str, &str)> = req.pairs.iter().map(|p| (p.a, p.b)).collect();
-        let mut res = g.block_pairs(&pairs, &rels);
-        if g.any_status() {
-            for (r, (a, b)) in res.iter_mut().zip(&pairs) {
-                if (r.0 || r.1) && (g.hidden(a) || g.hidden(b)) {
-                    *r = (false, false);
+        let resp = run(&g, |cx| {
+            let mut res = g.block_pairs(cx, &pairs, &rels)?;
+            if g.any_status() {
+                for (r, (a, b)) in res.iter_mut().zip(&pairs) {
+                    if (r.0 || r.1) && (g.hidden(a) || g.hidden(b)) {
+                        *r = (false, false);
+                    }
                 }
             }
-        }
-        Response::ok(BlockPairsResponse {
-            a_blocks_b: res.iter().map(|r| r.0).collect(),
-            b_blocks_a: res.iter().map(|r| r.1).collect(),
-            blocked: res.iter().map(|r| r.0 || r.1).collect(),
-            ..Default::default()
-        })
+            Ok(BlockPairsResponse {
+                a_blocks_b: res.iter().map(|r| r.0).collect(),
+                b_blocks_a: res.iter().map(|r| r.1).collect(),
+                blocked: res.iter().map(|r| r.0 || r.1).collect(),
+                ..Default::default()
+            })
+        })?;
+        Response::ok(resp)
     }
 
     async fn list_out(
@@ -210,13 +237,17 @@ impl svc::Graph for GraphApi {
             return Response::ok(ListOutResponse::default());
         }
         let cursor = (!req.cursor.is_empty()).then_some(req.cursor);
-        let (items, next) = g.out_list_opts(rel, req.actor, limit(req.limit, 50, 1000), cursor, req.distinct);
-        let edges = items
-            .into_iter()
-            .filter(|(_, s)| !g.hidden(s))
-            .map(|(uri, subject)| OutEdge { uri, subject, ..Default::default() })
-            .collect();
-        Response::ok(ListOutResponse { edges, cursor: next.unwrap_or_default(), ..Default::default() })
+        let lim = limit(req.limit, 50, 1000);
+        let resp = run(&g, |cx| {
+            let (items, next) = g.out_list_opts(cx, rel, req.actor, lim, cursor, req.distinct)?;
+            let edges = items
+                .into_iter()
+                .filter(|(_, s)| !g.hidden(s))
+                .map(|(uri, subject)| OutEdge { uri, subject, ..Default::default() })
+                .collect();
+            Ok(ListOutResponse { edges, cursor: next.unwrap_or_default(), ..Default::default() })
+        })?;
+        Response::ok(resp)
     }
 
     async fn list_in(
@@ -231,9 +262,13 @@ impl svc::Graph for GraphApi {
             return Response::ok(ListInResponse::default());
         }
         let cursor = (!req.cursor.is_empty()).then_some(req.cursor);
-        let (actors, next) = g.in_list(rel, req.subject, limit(req.limit, 50, 1000), cursor);
-        let actors = actors.into_iter().filter(|a| !g.hidden(a)).collect();
-        Response::ok(ListInResponse { actors, cursor: next.unwrap_or_default(), ..Default::default() })
+        let lim = limit(req.limit, 50, 1000);
+        let resp = run(&g, |cx| {
+            let (actors, next) = g.in_list(cx, rel, req.subject, lim, cursor)?;
+            let actors = actors.into_iter().filter(|a| !g.hidden(a)).collect();
+            Ok(ListInResponse { actors, cursor: next.unwrap_or_default(), ..Default::default() })
+        })?;
+        Response::ok(resp)
     }
 
     async fn counts(&self, _: RequestContext, req: ServiceRequest<'_, CountsRequest>) -> ServiceResult<CountsResponse> {
@@ -244,32 +279,30 @@ impl svc::Graph for GraphApi {
         }
         let g = self.0.graph();
         let rels = rel_ids(&g, &req.rels)?;
-        let counts = req
-            .actors
-            .iter()
-            .map(|a| {
+        let resp = run(&g, |cx| {
+            let mut counts = Vec::with_capacity(req.actors.len());
+            for a in &req.actors {
                 let hide = g.hidden(a);
-                ActorCounts {
-                    actor: a.clone(),
-                    rels: rels
-                        .iter()
-                        .map(|&r| {
-                            let (o, i) = if hide { (0, 0) } else { g.counts(r, a) };
-                            let subjects = if o == 0 { 0 } else { g.id_of(a).map_or(0, |id| g.out_distinct(r, id)) };
-                            RelCounts {
-                                rel: g.relations().get(r).name.clone(),
-                                out_records: o,
-                                in_actors: i,
-                                out_subjects: subjects,
-                                ..Default::default()
-                            }
-                        })
-                        .collect(),
-                    ..Default::default()
+                let mut per = Vec::with_capacity(rels.len());
+                for &r in &rels {
+                    let (o, i) = if hide { (0, 0) } else { g.counts(cx, r, a)? };
+                    let subjects = match g.id_of(a) {
+                        Some(id) if o > 0 => g.out_distinct(cx, r, id)?,
+                        _ => 0,
+                    };
+                    per.push(RelCounts {
+                        rel: g.relations().get(r).name.clone(),
+                        out_records: o,
+                        in_actors: i,
+                        out_subjects: subjects,
+                        ..Default::default()
+                    });
                 }
-            })
-            .collect();
-        Response::ok(CountsResponse { counts, ..Default::default() })
+                counts.push(ActorCounts { actor: a.clone(), rels: per, ..Default::default() });
+            }
+            Ok(CountsResponse { counts, ..Default::default() })
+        })?;
+        Response::ok(resp)
     }
 
     async fn intersect(
@@ -289,12 +322,6 @@ impl svc::Graph for GraphApi {
             Ok(g.id_of(&s.actor).map(|actor| ListRef { rel, dir, actor }))
         };
         let (a, b) = (side(&req.a)?, side(&req.b)?);
-        let len = |s: Option<ListRef>| {
-            s.map_or(0, |s| match s.dir {
-                Dir::Out => g.out_count(s.rel, s.actor),
-                Dir::In => g.in_count(s.rel, s.actor),
-            })
-        };
         let op = match req.op.as_known() {
             Some(marco_proto::v1::SetOp::SET_OP_AND_NOT) => SetOp::AndNot,
             Some(_) => SetOp::And,
@@ -311,33 +338,43 @@ impl svc::Graph for GraphApi {
             (true, 0) => COUNT_EXACT,
             (true, l) => limit(l, 0, 10_000),
         };
-        let (ids, total) = match (a, b, op) {
-            (Some(x), Some(y), _) => g.combine_counted(x, y, op, lim, after, cap),
-            // a without a missing (or hidden) b is all of a
-            (Some(x), None, SetOp::AndNot) => {
-                let mut v = match x.dir {
-                    Dir::Out => g.out_set(x.rel, x.actor),
-                    Dir::In => g.in_set(x.rel, x.actor),
-                };
-                let total = (cap > 0).then(|| (v.len().min(cap) as u64, v.len() > cap));
-                v.retain(|&i| after.is_none_or(|a| i > a));
-                v.truncate(lim);
-                (v, total)
-            }
-            _ => (Vec::new(), (cap > 0).then_some((0, false))),
-        };
-        let (total, total_capped) = total.unwrap_or_default();
-        let cursor = if ids.len() == lim { ids.last().and_then(|&i| g.did_of(i)) } else { None };
-        let actors = ids.into_iter().filter_map(|id| g.did_of(id)).filter(|d| !g.hidden(d)).collect();
-        Response::ok(IntersectResponse {
-            actors,
-            a_len: len(a),
-            b_len: len(b),
-            cursor: cursor.unwrap_or_default(),
-            total,
-            total_capped,
-            ..Default::default()
-        })
+        let resp = run(&g, |cx| {
+            let len = |s: Option<ListRef>| match s {
+                None => Ok(0),
+                Some(s) => match s.dir {
+                    Dir::Out => g.out_count(cx, s.rel, s.actor),
+                    Dir::In => g.in_count(cx, s.rel, s.actor),
+                },
+            };
+            let (ids, total) = match (a, b, op) {
+                (Some(x), Some(y), _) => g.combine_counted(cx, x, y, op, lim, after, cap)?,
+                // a without a missing (or hidden) b is all of a
+                (Some(x), None, SetOp::AndNot) => {
+                    let mut v = match x.dir {
+                        Dir::Out => g.out_set(cx, x.rel, x.actor)?,
+                        Dir::In => g.in_set(cx, x.rel, x.actor)?,
+                    };
+                    let total = (cap > 0).then(|| (v.len().min(cap) as u64, v.len() > cap));
+                    v.retain(|&i| after.is_none_or(|a| i > a));
+                    v.truncate(lim);
+                    (v, total)
+                }
+                _ => (Vec::new(), (cap > 0).then_some((0, false))),
+            };
+            let (total, total_capped) = total.unwrap_or_default();
+            let cursor = if ids.len() == lim { ids.last().and_then(|&i| g.did_of(i)) } else { None };
+            let actors = ids.into_iter().filter_map(|id| g.did_of(id)).filter(|d| !g.hidden(d)).collect();
+            Ok(IntersectResponse {
+                actors,
+                a_len: len(a)?,
+                b_len: len(b)?,
+                cursor: cursor.unwrap_or_default(),
+                total,
+                total_capped,
+                ..Default::default()
+            })
+        })?;
+        Response::ok(resp)
     }
 
     async fn filter(&self, _: RequestContext, req: ServiceRequest<'_, FilterRequest>) -> ServiceResult<FilterResponse> {
@@ -364,40 +401,55 @@ impl svc::Graph for GraphApi {
         let viewer = g.id_of(&req.viewer);
         let ids: Vec<Option<u32>> = req.actors.iter().map(|a| g.id_of(a)).collect();
         let known: Vec<u32> = ids.iter().flatten().copied().collect();
-        let kept: std::collections::HashSet<u32> = match viewer {
-            Some(v) => g.filter_sets(v, &known, &drops, &sets).into_iter().collect(),
-            None => g.filter_sets(u32::MAX, &known, &[], &sets).into_iter().collect(),
-        };
-        let mut actors = Vec::new();
-        let mut dropped = Vec::new();
-        for (a, id) in req.actors.iter().zip(&ids) {
-            if g.hidden(a) {
-                dropped.push(Dropped { actor: a.clone(), rel: "status".into(), ..Default::default() });
-                continue;
-            }
-            match id {
-                Some(x) if !kept.contains(x) => {
-                    let v = viewer.unwrap_or_default();
-                    let hit = drops.iter().copied().find(|&(r, d)| {
-                        viewer.is_some()
-                            && match d {
-                                Dir::Out => g.has_id(r, v, *x).is_some(),
-                                Dir::In => g.in_contains(r, v, *x),
-                            }
-                    });
-                    let set = sets.iter().find(|&&s| g.side_contains(s, *x)).map(|s| (s.rel, s.dir));
-                    let (r, d) = hit.or(set).unwrap_or((0, Dir::Out));
-                    dropped.push(Dropped {
-                        actor: a.clone(),
-                        rel: g.relations().get(r).name.clone(),
-                        dir: dir_pb(d),
-                        ..Default::default()
-                    });
+        let resp = run(&g, |cx| {
+            let kept: std::collections::HashSet<u32> = match viewer {
+                Some(v) => g.filter_sets(cx, v, &known, &drops, &sets)?.into_iter().collect(),
+                None => g.filter_sets(cx, u32::MAX, &known, &[], &sets)?.into_iter().collect(),
+            };
+            let mut actors = Vec::new();
+            let mut dropped = Vec::new();
+            for (a, id) in req.actors.iter().zip(&ids) {
+                if g.hidden(a) {
+                    dropped.push(Dropped { actor: a.clone(), rel: "status".into(), ..Default::default() });
+                    continue;
                 }
-                _ => actors.push(a.clone()),
+                match id {
+                    Some(x) if !kept.contains(x) => {
+                        let mut hit = None;
+                        if let Some(v) = viewer {
+                            for &(r, d) in &drops {
+                                let yes = match d {
+                                    Dir::Out => g.has_id(cx, r, v, *x)?.is_some(),
+                                    Dir::In => g.in_contains(cx, r, v, *x)?,
+                                };
+                                if yes {
+                                    hit = Some((r, d));
+                                    break;
+                                }
+                            }
+                        }
+                        if hit.is_none() {
+                            for s in &sets {
+                                if g.side_contains(cx, *s, *x)? {
+                                    hit = Some((s.rel, s.dir));
+                                    break;
+                                }
+                            }
+                        }
+                        let (r, d) = hit.unwrap_or((0, Dir::Out));
+                        dropped.push(Dropped {
+                            actor: a.clone(),
+                            rel: g.relations().get(r).name.clone(),
+                            dir: dir_pb(d),
+                            ..Default::default()
+                        });
+                    }
+                    _ => actors.push(a.clone()),
+                }
             }
-        }
-        Response::ok(FilterResponse { actors, dropped, ..Default::default() })
+            Ok(FilterResponse { actors, dropped, ..Default::default() })
+        })?;
+        Response::ok(resp)
     }
 
     async fn write(&self, _: RequestContext, mut reqs: InboundStream<WriteRequest>) -> ServiceResult<WriteResponse> {

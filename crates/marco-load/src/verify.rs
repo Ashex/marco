@@ -70,12 +70,12 @@ pub fn verify(a: &VerifyArgs) -> Result<Value> {
         let t = Instant::now();
         let (recs, pairs, bad) = (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));
         (0..n).into_par_iter().with_min_len(4096).for_each(|id| {
-            let o = g.out_page(rel, id, usize::MAX, None);
+            let o = g.read(|cx| g.out_page(cx, rel, id, usize::MAX, None)).unwrap();
             recs.fetch_add(o.len() as u64, Relaxed);
             if o.windows(2).any(|w| w[0].0 <= w[1].0) || o.iter().any(|&(_, s)| s >= n) {
                 bad.fetch_add(1, Relaxed);
             }
-            let i = g.in_set(rel, id);
+            let i = g.read(|cx| g.in_set(cx, rel, id)).unwrap();
             pairs.fetch_add(i.len() as u64, Relaxed);
             if i.windows(2).any(|w| w[0] >= w[1]) || i.last().is_some_and(|&x| x >= n) {
                 bad.fetch_add(1, Relaxed);
@@ -94,13 +94,13 @@ pub fn verify(a: &VerifyArgs) -> Result<Value> {
             let t = Instant::now();
             let (no_in, no_out) = (AtomicU64::new(0), AtomicU64::new(0));
             (0..n).into_par_iter().with_min_len(4096).for_each(|id| {
-                for (_, s) in g.out_page(rel, id, usize::MAX, None) {
-                    if !g.in_contains(rel, s, id) {
+                for (_, s) in g.read(|cx| g.out_page(cx, rel, id, usize::MAX, None)).unwrap() {
+                    if !g.read(|cx| g.in_contains(cx, rel, s, id)).unwrap() {
                         no_in.fetch_add(1, Relaxed);
                     }
                 }
-                for x in g.in_set(rel, id) {
-                    if g.out_find_subject(rel, x, id).is_none() {
+                for x in g.read(|cx| g.in_set(cx, rel, id)).unwrap() {
+                    if g.read(|cx| g.out_find_subject(cx, rel, x, id)).unwrap().is_none() {
                         no_out.fetch_add(1, Relaxed);
                     }
                 }
@@ -142,7 +142,7 @@ fn sample(g: &Graph, rel: RelId, path: &Path) -> Result<Value> {
             no_actor += 1;
             continue;
         };
-        match g.out_get(rel, a, key_of(&rkey).0) {
+        match g.read(|cx| g.out_get(cx, rel, a, key_of(&rkey).0))? {
             None => {
                 no_record += 1;
                 if examples.len() < 10 {
@@ -151,7 +151,7 @@ fn sample(g: &Graph, rel: RelId, path: &Path) -> Result<Value> {
             }
             Some(s) if Some(s) == g.id_of(&subj) => {
                 ok += 1;
-                if g.has(rel, &repo, &subj).is_none() {
+                if g.read(|cx| g.has(cx, rel, &repo, &subj))?.is_none() {
                     no_pair += 1;
                 }
             }
@@ -175,7 +175,7 @@ fn counts(g: &Graph, rel: RelId, path: &Path) -> Result<Value> {
             missing += 1;
             continue;
         };
-        let got = g.out_count(rel, a);
+        let got = g.read(|cx| g.out_count(cx, rel, a))?;
         if got == want {
             eq += 1;
         } else {
@@ -241,7 +241,7 @@ pub fn replay(a: &ReplayArgs) -> Result<Value> {
     let mut base: HashMap<(RelId, u32), u64> = HashMap::new();
     for d in &dels {
         if let Some(id) = marco_core::relation::parse_uri(&d.uri).and_then(|(did, _, _)| g.id_of(did)) {
-            base.entry((d.rel, id)).or_insert_with(|| g.out_count(d.rel, id));
+            base.entry((d.rel, id)).or_insert_with(|| g.read(|cx| g.out_count(cx, d.rel, id)).unwrap());
         }
     }
     let mut existed: HashSet<(RelId, String)> = HashSet::new();
@@ -295,7 +295,7 @@ pub fn replay(a: &ReplayArgs) -> Result<Value> {
                 unresolved += 1;
                 *unresolved_by_week.entry(week).or_default() += 1;
                 let (did, _, _) = marco_core::relation::parse_uri(&d.uri).unwrap();
-                if g.id_of(did).is_some_and(|id| g.out_count(d.rel, id) > 0) {
+                if g.id_of(did).is_some_and(|id| g.read(|cx| g.out_count(cx, d.rel, id)).unwrap() > 0) {
                     unresolved_actor_known += 1;
                 }
                 if examples.len() < 10 {
@@ -306,9 +306,12 @@ pub fn replay(a: &ReplayArgs) -> Result<Value> {
         }
     }
     let del_secs = t.elapsed().as_secs_f64();
-    let back = base.iter().filter(|&(&(rel, id), &n)| g.out_count(rel, id) == n).count();
-    let off: Vec<(RelId, u32)> =
-        base.iter().filter(|&(&(rel, id), &n)| g.out_count(rel, id) != n).map(|(&k, _)| k).collect();
+    let back = base.iter().filter(|&(&(rel, id), &n)| g.read(|cx| g.out_count(cx, rel, id)).unwrap() == n).count();
+    let off: Vec<(RelId, u32)> = base
+        .iter()
+        .filter(|&(&(rel, id), &n)| g.read(|cx| g.out_count(cx, rel, id)).unwrap() != n)
+        .map(|(&k, _)| k)
+        .collect();
     let off_existed =
         off.iter().filter(|&&(rel, id)| g.did_of(id).is_some_and(|d| existed.contains(&(rel, d)))).count();
     g.refresh_gauges();

@@ -32,13 +32,14 @@ use std::ops::Bound;
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::did::{classify, unpack_plc, DidKey, DidRef};
-use crate::inset::{self, InList};
+use crate::inset::{self, InList, PagedIn};
 use crate::obs::{self, Applied, Op};
-use crate::outlog::{self, OutBytes, OutList};
+use crate::outlog::{self, OutBytes, OutList, PagedOut};
+use crate::read::{Engine, Hold, ReadCx, StorageError, R};
 use crate::relation::{parse_uri, RelId, Relations};
 use crate::rkey::{self, is_tid, key_of};
 use crate::segment::Status;
@@ -101,6 +102,15 @@ pub enum SetOp {
     And,
     AndNot,
 }
+
+/// A page of out records, (URI, subject DID), and the cursor for the next.
+pub type OutPage = (Vec<(String, String)>, Option<String>);
+
+/// A page of ids, and the whole result's size up to a cap (true when it's bigger).
+pub type Counted = (Vec<u32>, Option<(u64, bool)>);
+
+/// The actor's record naming the other, and the other's naming the actor.
+pub type KeyPair = (Option<u64>, Option<u64>);
 
 /// Probing a big out side member by member through the in sets beats
 /// decoding it once it's this many times the other side.
@@ -204,6 +214,8 @@ impl std::ops::Deref for SharedSnapshot {
 #[derive(Clone)]
 pub struct Graph {
     base: Option<Arc<Base>>,
+    /// The page store every read of the base goes through.
+    engine: Arc<Engine>,
     width: u32,
     /// Shard files `write_snapshot` writes.
     pub shards: usize,
@@ -240,6 +252,7 @@ impl Graph {
         let n = rels.len();
         Graph {
             base: None,
+            engine: Arc::new(Engine::new()),
             width: 1,
             shards: DEFAULT_SHARDS,
             rels,
@@ -330,6 +343,21 @@ impl Graph {
 
     pub fn relations(&self) -> &Relations {
         &self.rels
+    }
+
+    /// The page store the snapshot is read through: reads of lists run in
+    /// its passes ([`Engine::pass`]), with a [`ReadCx`] from it.
+    pub fn engine(&self) -> &Engine {
+        &self.engine
+    }
+
+    /// Runs passes of `f` until one is clean, waiting on disk between them:
+    /// for tools, tests, admin jobs and checkpoints, never a tokio worker.
+    pub fn read<T>(&self, f: impl Fn(&ReadCx<'_>) -> R<T>) -> Result<T, StorageError> {
+        match self.engine.pass(&mut Hold::none(), &f) {
+            Ok(t) => Ok(t),
+            Err(_) => self.engine.read_blocking(&mut Hold::new(), f),
+        }
     }
 
     pub fn snapshot(&self) -> Option<&Store> {
@@ -536,16 +564,18 @@ impl Graph {
                     continue;
                 }
                 let list_rel = self.rels.list_rel(rel);
-                for (k, _) in self.out_all(rel, a) {
-                    // an account's deletion takes every record, whenever it was stamped
-                    let gone = match list_rel {
-                        Some(p) => self.delete_key_(p, a, k, time_us, true),
-                        None => self.delete_id_(rel, a, k, time_us, true),
-                    };
-                    if gone.is_some() {
-                        removed += 1;
+                removed += self.write(|me, cx| {
+                    let mut n = 0;
+                    for (k, _) in me.out_all(cx, rel, a)? {
+                        // an account's deletion takes every record, whenever it was stamped
+                        let gone = match list_rel {
+                            Some(p) => me.delete_key_(cx, p, a, k, time_us, true)?,
+                            None => me.delete_id_(cx, rel, a, k, time_us, true)?,
+                        };
+                        n += gone.is_some() as u64;
                     }
-                }
+                    Ok(n)
+                })?;
             }
         }
         self.status.insert(a, status);
@@ -663,36 +693,41 @@ impl Graph {
 
     // ------------------------------------------------------------ base lists
 
-    fn base_out(&self, rel: RelId, id: u32) -> Option<OutList<'_>> {
+    fn base_out<'a>(&'a self, _cx: &ReadCx<'a>, rel: RelId, id: u32) -> R<Option<PagedOut<'a>>> {
         let st = &self.state[rel as usize];
         if !st.out_over.is_empty() {
             if let Some(b) = st.out_over.get(&id) {
-                return Some(OutList::parse(b, self.subj_index));
+                return Ok(Some(PagedOut::Whole(OutList::parse(b, self.subj_index))));
             }
         }
-        let (f, r, local, n) = self.shard(rel, id)?;
+        let Some((f, r, local, n)) = self.shard(rel, id) else { return Ok(None) };
         if r.out_idx.is_empty() {
-            return None;
+            return Ok(None);
         }
         let b = f.bytes();
-        let range = Index::parse(&b[r.out_idx.clone()], n)?.range(local)?;
-        Some(OutList::parse(&b[r.out_dat.start + range.start..r.out_dat.start + range.end], self.subj_index))
+        let Some(range) = Index::parse(&b[r.out_idx.clone()], n).and_then(|ix| ix.range(local)) else {
+            return Ok(None);
+        };
+        let l = OutList::parse(&b[r.out_dat.start + range.start..r.out_dat.start + range.end], self.subj_index);
+        Ok(Some(PagedOut::Whole(l)))
     }
 
-    fn base_in(&self, rel: RelId, id: u32) -> Option<InList<'_>> {
+    fn base_in<'a>(&'a self, _cx: &ReadCx<'a>, rel: RelId, id: u32) -> R<Option<PagedIn<'a>>> {
         let st = &self.state[rel as usize];
         if !st.in_over.is_empty() {
             if let Some(b) = st.in_over.get(&id) {
-                return Some(InList::parse(b));
+                return Ok(Some(PagedIn::Whole(InList::parse(b))));
             }
         }
-        let (f, r, local, n) = self.shard(rel, id)?;
+        let Some((f, r, local, n)) = self.shard(rel, id) else { return Ok(None) };
         if r.in_idx.is_empty() {
-            return None;
+            return Ok(None);
         }
         let b = f.bytes();
-        let range = Index::parse(&b[r.in_idx.clone()], n)?.range(local)?;
-        Some(InList::parse(&b[r.in_dat.start + range.start..r.in_dat.start + range.end]))
+        let Some(range) = Index::parse(&b[r.in_idx.clone()], n).and_then(|ix| ix.range(local)) else {
+            return Ok(None);
+        };
+        Ok(Some(PagedIn::Whole(InList::parse(&b[r.in_dat.start + range.start..r.in_dat.start + range.end]))))
     }
 
     fn base_side(&self, rel: RelId, actor: u32) -> Option<Side<'_>> {
@@ -722,226 +757,271 @@ impl Graph {
     // ------------------------------------------------------------ out log
 
     /// The subject of `actor`'s record `key`, if it's live.
-    pub fn out_get(&self, rel: RelId, actor: u32, key: u64) -> Option<u32> {
+    pub fn out_get(&self, cx: &ReadCx<'_>, rel: RelId, actor: u32, key: u64) -> R<Option<u32>> {
         if let Some(d) = self.state[rel as usize].out.get(&actor) {
             if let Some(&s) = d.adds.get(&key) {
-                return Some(s);
+                return Ok(Some(s));
             }
             if d.dels.contains_key(&key) {
-                return None;
+                return Ok(None);
             }
         }
-        let l = self.base_out(rel, actor)?;
-        l.find_key(key).map(|p| l.subject(p))
+        let Some(l) = self.base_out(cx, rel, actor)? else { return Ok(None) };
+        match l.find_key(cx, key)? {
+            Some(p) => l.subject(cx, p).map(Some),
+            None => Ok(None),
+        }
     }
 
     /// Whether a live record of `actor` other than base position `skip`
     /// names `subject`: what a delete asks before it drops the pair.
-    fn out_names_other(&self, rel: RelId, actor: u32, subject: u32, skip: Option<usize>) -> bool {
+    fn out_names_other(&self, cx: &ReadCx<'_>, rel: RelId, actor: u32, subject: u32, skip: Option<usize>) -> R<bool> {
         let d = self.state[rel as usize].out.get(&actor);
         if d.is_some_and(|d| d.adds_naming(subject).next().is_some()) {
-            return true;
+            return Ok(true);
         }
-        let Some(l) = self.base_out(rel, actor) else { return false };
+        self.base_names(cx, rel, actor, subject, skip)
+    }
+
+    /// Whether a base record of `actor` the delta didn't delete, other than
+    /// position `skip`, names `subject`.
+    fn base_names(&self, cx: &ReadCx<'_>, rel: RelId, actor: u32, subject: u32, skip: Option<usize>) -> R<bool> {
+        let Some(l) = self.base_out(cx, rel, actor)? else { return Ok(false) };
+        let d = self.state[rel as usize].out.get(&actor);
         let dels = d.filter(|d| d.dels_name(subject)).map(|d| &d.dels);
         let mut hit = false;
-        l.for_subject(subject, |p| {
-            if Some(p) == skip || dels.is_some_and(|m| m.contains_key(&l.key_at(p))) {
+        let mut pend = Ok(());
+        l.for_subject(cx, subject, |p| {
+            if Some(p) == skip {
                 return true;
+            }
+            if let Some(m) = dels {
+                match l.key_at(cx, p) {
+                    Ok(k) if m.contains_key(&k) => return true,
+                    Ok(_) => {}
+                    Err(e) => {
+                        pend = Err(e);
+                        return true;
+                    }
+                }
             }
             hit = true;
             false
-        });
-        hit
+        })?;
+        pend.map(|()| hit)
     }
 
     /// Live records of `actor` naming `subject`. Every delta delete is of a
     /// base record, so the base's count less those is the base's live count.
-    fn out_count_subject(&self, rel: RelId, actor: u32, subject: u32) -> usize {
+    fn out_count_subject(&self, cx: &ReadCx<'_>, rel: RelId, actor: u32, subject: u32) -> R<usize> {
         let d = self.state[rel as usize].out.get(&actor);
         let mut n = 0;
-        if let Some(l) = self.base_out(rel, actor) {
-            l.for_subject(subject, |_| {
+        if let Some(l) = self.base_out(cx, rel, actor)? {
+            l.for_subject(cx, subject, |_| {
                 n += 1;
                 true
-            });
+            })?;
         }
         if let Some(d) = d {
             n -= d.dels_s.range((subject, 0)..=(subject, u64::MAX)).count();
             n += d.adds_naming(subject).count();
         }
-        n
+        Ok(n)
+    }
+
+    /// The live base record naming `subject` that `asc` (oldest first) or
+    /// newest first meets first, skipping those the delta deleted.
+    fn base_naming(&self, cx: &ReadCx<'_>, rel: RelId, actor: u32, subject: u32, asc: bool) -> R<Option<u64>> {
+        let Some(l) = self.base_out(cx, rel, actor)? else { return Ok(None) };
+        let d = self.state[rel as usize].out.get(&actor);
+        let dels = d.filter(|d| d.dels_name(subject)).map(|d| &d.dels);
+        let mut found = None;
+        let mut pend = Ok(());
+        let f = |p| match l.key_at(cx, p) {
+            Ok(k) if dels.is_some_and(|m| m.contains_key(&k)) => true,
+            Ok(k) => {
+                found = Some(k);
+                false
+            }
+            // carry on, so the pass names every rkey page it would read
+            Err(e) => {
+                pend = Err(e);
+                true
+            }
+        };
+        if asc {
+            l.for_subject_asc(cx, subject, f)?;
+        } else {
+            l.for_subject(cx, subject, f)?;
+        }
+        pend.map(|()| found)
     }
 
     /// The newest live record of `actor` naming `subject`.
-    pub fn out_find_subject(&self, rel: RelId, actor: u32, subject: u32) -> Option<u64> {
-        let d = self.state[rel as usize].out.get(&actor);
-        let mut best = d.and_then(|d| d.adds_naming(subject).next_back());
-        if let Some(l) = self.base_out(rel, actor) {
-            let dels = d.filter(|d| d.dels_name(subject)).map(|d| &d.dels);
-            l.for_subject(subject, |p| {
-                let k = l.key_at(p);
-                if dels.is_some_and(|m| m.contains_key(&k)) {
-                    return true;
-                }
-                best = Some(best.map_or(k, |b: u64| b.max(k)));
-                false
-            });
-        }
-        best
+    pub fn out_find_subject(&self, cx: &ReadCx<'_>, rel: RelId, actor: u32, subject: u32) -> R<Option<u64>> {
+        let added = self.state[rel as usize].out.get(&actor).and_then(|d| d.adds_naming(subject).next_back());
+        let base = self.base_naming(cx, rel, actor, subject, false)?;
+        Ok(added.max(base))
     }
 
     /// Distinct subjects of `actor`'s live records: a list's members.
-    pub fn out_distinct(&self, rel: RelId, actor: u32) -> u64 {
-        let base = self.base_out(rel, actor).map_or(0, |l| l.distinct()) as i64;
+    pub fn out_distinct(&self, cx: &ReadCx<'_>, rel: RelId, actor: u32) -> R<u64> {
+        let base = self.base_out(cx, rel, actor)?.map_or(0, |l| l.distinct()) as i64;
         let d = self.state[rel as usize].out.get(&actor).map_or(0, |d| d.pairs);
-        (base + d).max(0) as u64
+        Ok((base + d).max(0) as u64)
     }
 
     /// The oldest live record of `actor` naming `subject`: the one a list
     /// keeps for a member, as the appview does.
-    pub fn out_first_subject(&self, rel: RelId, actor: u32, subject: u32) -> Option<u64> {
-        let d = self.state[rel as usize].out.get(&actor);
-        let added = d.and_then(|d| d.adds_naming(subject).next());
-        let mut base = None;
-        if let Some(l) = self.base_out(rel, actor) {
-            let dels = d.filter(|d| d.dels_name(subject)).map(|d| &d.dels);
-            // positions are rkey order, so the first live one is the oldest
-            l.for_subject_asc(subject, |p| {
-                let k = l.key_at(p);
-                if dels.is_some_and(|m| m.contains_key(&k)) {
-                    return true;
-                }
-                base = Some(k);
-                false
-            });
-        }
-        match (added, base) {
+    pub fn out_first_subject(&self, cx: &ReadCx<'_>, rel: RelId, actor: u32, subject: u32) -> R<Option<u64>> {
+        let added = self.state[rel as usize].out.get(&actor).and_then(|d| d.adds_naming(subject).next());
+        // positions are rkey order, so the first live one is the oldest
+        let base = self.base_naming(cx, rel, actor, subject, true)?;
+        Ok(match (added, base) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
-        }
+        })
     }
 
-    pub fn out_count(&self, rel: RelId, actor: u32) -> u64 {
-        let base = self.base_out(rel, actor).map_or(0, |l| l.len()) as u64;
-        match self.state[rel as usize].out.get(&actor) {
+    pub fn out_count(&self, cx: &ReadCx<'_>, rel: RelId, actor: u32) -> R<u64> {
+        let base = self.base_out(cx, rel, actor)?.map_or(0, |l| l.len()) as u64;
+        Ok(match self.state[rel as usize].out.get(&actor) {
             Some(d) => base + d.adds.len() as u64 - d.dels.len() as u64,
             None => base,
-        }
+        })
     }
 
     /// Records with rkey below `before`, newest first.
-    pub fn out_page(&self, rel: RelId, actor: u32, limit: usize, before: Option<u64>) -> Vec<(u64, u32)> {
+    pub fn out_page(
+        &self,
+        cx: &ReadCx<'_>,
+        rel: RelId,
+        actor: u32,
+        limit: usize,
+        before: Option<u64>,
+    ) -> R<Vec<(u64, u32)>> {
         let d = self.state[rel as usize].out.get(&actor);
         let hi = before.map_or(Bound::Unbounded, Bound::Excluded);
         let adds: Vec<(u64, u32)> = d
             .map(|d| d.adds.range((Bound::Unbounded, hi)).rev().take(limit).map(|(&k, &s)| (k, s)).collect())
             .unwrap_or_default();
         let mut base = Vec::with_capacity(limit.min(1024));
-        if let Some(l) = self.base_out(rel, actor) {
-            l.for_each_desc(before, |k, s| {
+        if let Some(l) = self.base_out(cx, rel, actor)? {
+            // base records the delta masks don't count toward the page
+            let want = limit.saturating_add(d.map_or(0, |d| d.dels.len() + d.adds.len()));
+            l.for_each_desc(cx, before, want, |k, s| {
                 if !d.is_some_and(|d| d.dels.contains_key(&k) || d.adds.contains_key(&k)) {
                     base.push((k, s));
                 }
                 base.len() < limit
-            });
+            })?;
         }
-        merge_by(base, adds, limit, |a, b| a.0 > b.0)
+        Ok(merge_by(base, adds, limit, |a, b| a.0 > b.0))
     }
 
     /// Every live record of `actor`, by rkey.
-    pub fn out_all(&self, rel: RelId, actor: u32) -> Vec<(u64, u32)> {
-        let mut v = self.base_out(rel, actor).map(|l| l.to_vec()).unwrap_or_default();
+    pub fn out_all(&self, cx: &ReadCx<'_>, rel: RelId, actor: u32) -> R<Vec<(u64, u32)>> {
+        let mut v = match self.base_out(cx, rel, actor)? {
+            Some(l) => l.to_vec(cx)?,
+            None => Vec::new(),
+        };
         if let Some(d) = self.state[rel as usize].out.get(&actor) {
             v.retain(|(k, _)| !d.dels.contains_key(k) && !d.adds.contains_key(k));
             v.extend(d.adds.iter().map(|(&k, &s)| (k, s)));
             v.sort_unstable();
         }
-        v
+        Ok(v)
     }
 
     /// Distinct subjects of `actor`'s live records, sorted.
-    pub fn out_set(&self, rel: RelId, actor: u32) -> Vec<u32> {
+    pub fn out_set(&self, cx: &ReadCx<'_>, rel: RelId, actor: u32) -> R<Vec<u32>> {
         let mut v = Vec::new();
         match self.state[rel as usize].out.get(&actor) {
             None => {
-                if let Some(l) = self.base_out(rel, actor) {
-                    l.subjects_sorted(&mut v);
+                if let Some(l) = self.base_out(cx, rel, actor)? {
+                    l.subjects_sorted(cx, &mut v)?;
                 }
             }
             Some(_) => {
-                v = self.out_all(rel, actor).into_iter().map(|(_, s)| s).collect();
+                v = self.out_all(cx, rel, actor)?.into_iter().map(|(_, s)| s).collect();
                 v.sort_unstable();
                 v.dedup();
             }
         }
-        v
+        Ok(v)
     }
 
     // ------------------------------------------------------------ in set
 
-    pub fn in_contains(&self, rel: RelId, subject: u32, actor: u32) -> bool {
+    pub fn in_contains(&self, cx: &ReadCx<'_>, rel: RelId, subject: u32, actor: u32) -> R<bool> {
         if let Some(d) = self.state[rel as usize].inn.get(&subject) {
             if d.adds.contains(&actor) {
-                return true;
+                return Ok(true);
             }
             if d.dels.contains(&actor) {
-                return false;
+                return Ok(false);
             }
         }
-        self.base_in(rel, subject).is_some_and(|l| l.contains(actor))
+        match self.base_in(cx, rel, subject)? {
+            Some(l) => l.contains(cx, actor),
+            None => Ok(false),
+        }
     }
 
-    pub fn in_count(&self, rel: RelId, subject: u32) -> u64 {
-        let base = self.base_in(rel, subject).map_or(0, |l| l.len()) as u64;
-        match self.state[rel as usize].inn.get(&subject) {
+    pub fn in_count(&self, cx: &ReadCx<'_>, rel: RelId, subject: u32) -> R<u64> {
+        let base = self.base_in(cx, rel, subject)?.map_or(0, |l| l.len()) as u64;
+        Ok(match self.state[rel as usize].inn.get(&subject) {
             Some(d) => base + d.adds.len() as u64 - d.dels.len() as u64,
             None => base,
-        }
+        })
     }
 
     /// Actor ids above `after`, ascending.
-    pub fn in_page(&self, rel: RelId, subject: u32, limit: usize, after: Option<u32>) -> Vec<u32> {
+    pub fn in_page(&self, cx: &ReadCx<'_>, rel: RelId, subject: u32, limit: usize, after: Option<u32>) -> R<Vec<u32>> {
         let d = self.state[rel as usize].inn.get(&subject);
         let lo = after.map_or(Bound::Unbounded, Bound::Excluded);
         let adds: Vec<u32> =
             d.map(|d| d.adds.range((lo, Bound::Unbounded)).take(limit).copied().collect()).unwrap_or_default();
         let mut base = Vec::with_capacity(limit.min(1024));
-        if let Some(l) = self.base_in(rel, subject) {
-            l.for_each_after(after, |x| {
+        if let Some(l) = self.base_in(cx, rel, subject)? {
+            let want = limit.saturating_add(d.map_or(0, |d| d.dels.len()));
+            l.for_each_after(cx, after, want, |x| {
                 if !d.is_some_and(|d| d.dels.contains(&x)) {
                     base.push(x);
                 }
                 base.len() < limit
-            });
+            })?;
         }
-        merge_by(base, adds, limit, |a, b| a < b)
+        Ok(merge_by(base, adds, limit, |a, b| a < b))
     }
 
-    pub fn in_set(&self, rel: RelId, subject: u32) -> Vec<u32> {
-        let mut v = self.base_in(rel, subject).map(|l| l.to_vec()).unwrap_or_default();
+    pub fn in_set(&self, cx: &ReadCx<'_>, rel: RelId, subject: u32) -> R<Vec<u32>> {
+        let mut v = match self.base_in(cx, rel, subject)? {
+            Some(l) => l.to_vec(cx)?,
+            None => Vec::new(),
+        };
         if let Some(d) = self.state[rel as usize].inn.get(&subject) {
             v.retain(|x| !d.dels.contains(x));
             v.extend(d.adds.iter().copied());
             v.sort_unstable();
         }
-        v
+        Ok(v)
     }
 
     /// The members of sorted `probes` in `subject`'s in set.
-    pub fn in_intersect(&self, rel: RelId, subject: u32, probes: &[u32], limit: usize) -> Vec<u32> {
+    pub fn in_intersect(&self, cx: &ReadCx<'_>, rel: RelId, subject: u32, probes: &[u32], limit: usize) -> R<Vec<u32>> {
         let d = self.state[rel as usize].inn.get(&subject);
         let mut out = Vec::new();
-        let Some(l) = self.base_in(rel, subject) else {
+        let Some(l) = self.base_in(cx, rel, subject)? else {
             if let Some(d) = d {
                 out.extend(probes.iter().copied().filter(|p| d.adds.contains(p)).take(limit));
             }
-            return out;
+            return Ok(out);
         };
         match d {
-            None => l.intersect_sorted(probes, limit, &mut out),
+            None => l.intersect_sorted(cx, probes, limit, &mut out)?,
             Some(d) => {
-                l.intersect_sorted(probes, usize::MAX, &mut out);
+                l.intersect_sorted(cx, probes, usize::MAX, &mut out)?;
                 out.retain(|x| !d.dels.contains(x));
                 out.extend(probes.iter().copied().filter(|p| d.adds.contains(p)));
                 out.sort_unstable();
@@ -949,70 +1029,80 @@ impl Graph {
                 out.truncate(limit);
             }
         }
-        out
+        Ok(out)
     }
 
     // ------------------------------------------------------------ reads
 
     /// The newest record of `from` naming `to`; for a list relation the
     /// member's oldest, the one its distinct page keeps.
-    pub fn has_id(&self, rel: RelId, from: u32, to: u32) -> Option<u64> {
-        if !self.in_contains(rel, to, from) {
-            return None;
+    pub fn has_id(&self, cx: &ReadCx<'_>, rel: RelId, from: u32, to: u32) -> R<Option<u64>> {
+        if !self.in_contains(cx, rel, to, from)? {
+            return Ok(None);
         }
-        self.pair_key(rel, from, to)
+        self.pair_key(cx, rel, from, to)
     }
 
-    fn pair_key(&self, rel: RelId, from: u32, to: u32) -> Option<u64> {
+    fn pair_key(&self, cx: &ReadCx<'_>, rel: RelId, from: u32, to: u32) -> R<Option<u64>> {
         if self.rels.is_list(rel) {
-            self.out_first_subject(rel, from, to)
+            self.out_first_subject(cx, rel, from, to)
         } else {
-            self.out_find_subject(rel, from, to)
+            self.out_find_subject(cx, rel, from, to)
         }
     }
 
-    pub fn has(&self, rel: RelId, from: &str, to: &str) -> Option<String> {
+    pub fn has(&self, cx: &ReadCx<'_>, rel: RelId, from: &str, to: &str) -> R<Option<String>> {
         let g = self.obs.op(Op::Has, rel as usize, 1);
-        let r = (|| {
-            let (a, b) = (self.id_of(from)?, self.id_of(to)?);
-            let k = self.has_id(rel, a, b)?;
-            self.uri(rel, a, k)
-        })();
+        let r = match (self.id_of(from), self.id_of(to)) {
+            (Some(a), Some(b)) => self.has_id(cx, rel, a, b)?.and_then(|k| self.uri(rel, a, k)),
+            _ => None,
+        };
         self.obs.done(g, r.is_some() as usize);
-        r
+        Ok(r)
     }
 
     /// Per other and relation: (actor's record naming other, other's naming
     /// actor). The in side is one pass over the actor's in set with the
     /// others sorted; the out side scans the actor's out log once when it's
     /// short, and only hits pay a lookup in another list.
-    pub fn relationships_id(&self, actor: u32, others: &[u32], rels: &[RelId]) -> Vec<Vec<(Option<u64>, Option<u64>)>> {
+    pub fn relationships_id(
+        &self,
+        cx: &ReadCx<'_>,
+        actor: u32,
+        others: &[u32],
+        rels: &[RelId],
+    ) -> R<Vec<Vec<KeyPair>>> {
         let mut probes: Vec<u32> = others.to_vec();
         probes.sort_unstable();
         probes.dedup();
         let at = |o: u32| probes.binary_search(&o).unwrap();
         let mut res = vec![vec![(None, None); rels.len()]; others.len()];
         let mut per = vec![(None, None); probes.len()];
+        let mut pend = Ok(());
         for (ri, &rel) in rels.iter().enumerate() {
             per.iter_mut().for_each(|p| *p = (None, None));
-            for o in self.in_intersect(rel, actor, &probes, usize::MAX) {
-                per[at(o)].1 = self.pair_key(rel, o, actor);
+            if let Some(hits) = item(&mut pend, self.in_intersect(cx, rel, actor, &probes, usize::MAX)) {
+                for o in hits {
+                    per[at(o)].1 = item(&mut pend, self.pair_key(cx, rel, o, actor)).flatten();
+                }
             }
-            let scan = self.out_count(rel, actor) <= RELATIONSHIPS_SCAN
-                && !self.state[rel as usize].out.contains_key(&actor)
-                && !self.rels.is_list(rel);
-            match self.base_out(rel, actor) {
-                Some(l) if scan => l.for_each_desc(None, |k, s| {
-                    if let Ok(i) = probes.binary_search(&s) {
-                        if per[i].0.is_none() {
-                            per[i].0 = Some(k);
+            let scan = !self.state[rel as usize].out.contains_key(&actor) && !self.rels.is_list(rel);
+            let base = item(&mut pend, self.base_out(cx, rel, actor)).flatten();
+            match base {
+                Some(l) if scan && l.len() as u64 <= RELATIONSHIPS_SCAN => {
+                    let r = l.for_each_desc(cx, None, usize::MAX, |k, s| {
+                        if let Ok(i) = probes.binary_search(&s) {
+                            if per[i].0.is_none() {
+                                per[i].0 = Some(k);
+                            }
                         }
-                    }
-                    true
-                }),
+                        true
+                    });
+                    item(&mut pend, r);
+                }
                 _ => {
                     for (i, &o) in probes.iter().enumerate() {
-                        per[i].0 = self.has_id(rel, actor, o);
+                        per[i].0 = item(&mut pend, self.has_id(cx, rel, actor, o)).flatten();
                     }
                 }
             }
@@ -1020,10 +1110,16 @@ impl Graph {
                 res[j][ri] = per[at(o)];
             }
         }
-        res
+        pend.map(|()| res)
     }
 
-    pub fn relationships(&self, actor: &str, others: &[&str], rels: &[RelId]) -> Vec<Vec<Relationship>> {
+    pub fn relationships(
+        &self,
+        cx: &ReadCx<'_>,
+        actor: &str,
+        others: &[&str],
+        rels: &[RelId],
+    ) -> R<Vec<Vec<Relationship>>> {
         let g = self.obs.op(Op::Relationships, self.obs.multi(), others.len() * rels.len());
         let mut out = vec![vec![Relationship::default(); rels.len()]; others.len()];
         let mut hits = 0;
@@ -1031,7 +1127,7 @@ impl Graph {
             let known: Vec<(usize, u32)> =
                 others.iter().enumerate().filter_map(|(i, o)| self.id_of(o).map(|id| (i, id))).collect();
             let ids: Vec<u32> = known.iter().map(|k| k.1).collect();
-            let r = self.relationships_id(a, &ids, rels);
+            let r = self.relationships_id(cx, a, &ids, rels)?;
             for ((i, o), per) in known.iter().zip(r) {
                 for (ri, (fwd, back)) in per.into_iter().enumerate() {
                     let rel = rels[ri];
@@ -1043,39 +1139,51 @@ impl Graph {
             }
         }
         self.obs.done(g, hits);
-        out
+        Ok(out)
     }
 
     /// Like `out_page`, keeping only each subject's oldest record, so a
     /// member stays put under a cursor when a newer repeat arrives.
-    pub fn out_page_distinct(&self, rel: RelId, actor: u32, limit: usize, before: Option<u64>) -> Vec<(u64, u32)> {
-        let n = self.out_count(rel, actor);
+    pub fn out_page_distinct(
+        &self,
+        cx: &ReadCx<'_>,
+        rel: RelId,
+        actor: u32,
+        limit: usize,
+        before: Option<u64>,
+    ) -> R<Vec<(u64, u32)>> {
+        let n = self.out_count(cx, rel, actor)?;
         // short lists, and lists mostly of repeats (640k records for 119
         // members), in one pass: every member's oldest record
-        if n <= 4096 || self.out_distinct(rel, actor) * 2 < n {
+        if n <= 4096 || self.out_distinct(cx, rel, actor)? * 2 < n {
             let mut seen = FxHashSet::default();
             let mut firsts: Vec<(u64, u32)> =
-                self.out_all(rel, actor).into_iter().filter(|&(_, s)| seen.insert(s)).collect();
+                self.out_all(cx, rel, actor)?.into_iter().filter(|&(_, s)| seen.insert(s)).collect();
             firsts.retain(|&(k, _)| before.is_none_or(|b| k < b));
             firsts.sort_unstable_by_key(|f| std::cmp::Reverse(f.0));
             firsts.truncate(limit);
-            return firsts;
+            return Ok(firsts);
         }
         let mut out = Vec::with_capacity(limit.min(1024));
         let mut before = before;
         let chunk = limit.clamp(64, 4096);
         loop {
-            let page = self.out_page(rel, actor, chunk, before);
+            let page = self.out_page(cx, rel, actor, chunk, before)?;
+            // a miss on one record's first doesn't stop the chunk, so one
+            // pass names every page the chunk needs
+            let mut pend = Ok(());
             for &(k, s) in &page {
-                if self.out_first_subject(rel, actor, s) == Some(k) {
+                let first = item(&mut pend, self.out_first_subject(cx, rel, actor, s));
+                if pend.is_ok() && first == Some(Some(k)) {
                     out.push((k, s));
                     if out.len() == limit {
-                        return out;
+                        return Ok(out);
                     }
                 }
             }
+            pend?;
             if page.len() < chunk {
-                return out;
+                return Ok(out);
             }
             before = page.last().map(|p| p.0);
         }
@@ -1083,128 +1191,171 @@ impl Graph {
 
     fn out_list_(
         &self,
+        cx: &ReadCx<'_>,
         rel: RelId,
         actor: &str,
         limit: usize,
         cursor: Option<&str>,
         distinct: bool,
-    ) -> (Vec<(String, String)>, Option<String>) {
-        let Some(a) = self.id_of(actor) else { return (Vec::new(), None) };
+    ) -> R<OutPage> {
+        let Some(a) = self.id_of(actor) else { return Ok((Vec::new(), None)) };
         let before = cursor.map(|c| key_of(c).0);
-        let page =
-            if distinct { self.out_page_distinct(rel, a, limit, before) } else { self.out_page(rel, a, limit, before) };
+        let page = if distinct {
+            self.out_page_distinct(cx, rel, a, limit, before)?
+        } else {
+            self.out_page(cx, rel, a, limit, before)?
+        };
         let next = (page.len() == limit).then(|| page.last().and_then(|&(k, _)| self.rkey_string(rel, a, k))).flatten();
         let items = page.into_iter().filter_map(|(k, s)| Some((self.uri(rel, a, k)?, self.did_of(s)?))).collect();
-        (items, next)
+        Ok((items, next))
     }
 
-    fn in_list_(&self, rel: RelId, subject: &str, limit: usize, cursor: Option<&str>) -> (Vec<String>, Option<String>) {
-        let Some(b) = self.id_of(subject) else { return (Vec::new(), None) };
+    fn in_list_(
+        &self,
+        cx: &ReadCx<'_>,
+        rel: RelId,
+        subject: &str,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> R<(Vec<String>, Option<String>)> {
+        let Some(b) = self.id_of(subject) else { return Ok((Vec::new(), None)) };
         let after = match cursor {
             Some(c) => match self.id_of(c) {
                 Some(id) => Some(id),
-                None => return (Vec::new(), None),
+                None => return Ok((Vec::new(), None)),
             },
             None => None,
         };
-        let page = self.in_page(rel, b, limit, after);
+        let page = self.in_page(cx, rel, b, limit, after)?;
         let next = (page.len() == limit).then(|| page.last().and_then(|&x| self.did_of(x))).flatten();
-        (page.into_iter().filter_map(|x| self.did_of(x)).collect(), next)
+        Ok((page.into_iter().filter_map(|x| self.did_of(x)).collect(), next))
     }
 
-    fn counts_(&self, rel: RelId, actor: &str) -> (u64, u64) {
-        self.id_of(actor).map_or((0, 0), |a| (self.out_count(rel, a), self.in_count(rel, a)))
+    fn counts_(&self, cx: &ReadCx<'_>, rel: RelId, actor: &str) -> R<(u64, u64)> {
+        match self.id_of(actor) {
+            Some(a) => Ok((self.out_count(cx, rel, a)?, self.in_count(cx, rel, a)?)),
+            None => Ok((0, 0)),
+        }
     }
 
     /// A side's members: an out side counts subjects, not records (one list
     /// holds 640k records for 119 members).
-    fn side_len(&self, s: ListRef) -> u64 {
+    fn side_len(&self, cx: &ReadCx<'_>, s: ListRef) -> R<u64> {
         match s.dir {
-            Dir::Out => self.out_distinct(s.rel, s.actor),
-            Dir::In => self.in_count(s.rel, s.actor),
+            Dir::Out => self.out_distinct(cx, s.rel, s.actor),
+            Dir::In => self.in_count(cx, s.rel, s.actor),
         }
     }
 
-    fn side_set(&self, s: ListRef) -> Vec<u32> {
+    fn side_set(&self, cx: &ReadCx<'_>, s: ListRef) -> R<Vec<u32>> {
         match s.dir {
-            Dir::Out => self.out_set(s.rel, s.actor),
-            Dir::In => self.in_set(s.rel, s.actor),
+            Dir::Out => self.out_set(cx, s.rel, s.actor),
+            Dir::In => self.in_set(cx, s.rel, s.actor),
         }
     }
 
     /// Whether `x` is in a side. An out side asks x's in set, so it never
     /// decodes the side's list.
-    pub fn side_contains(&self, s: ListRef, x: u32) -> bool {
+    pub fn side_contains(&self, cx: &ReadCx<'_>, s: ListRef, x: u32) -> R<bool> {
         match s.dir {
-            Dir::Out => self.in_contains(s.rel, x, s.actor),
-            Dir::In => self.in_contains(s.rel, s.actor, x),
+            Dir::Out => self.in_contains(cx, s.rel, x, s.actor),
+            Dir::In => self.in_contains(cx, s.rel, s.actor, x),
         }
     }
 
     /// The members of sorted `probes` in side `s`, up to `limit`.
-    fn side_intersect(&self, s: ListRef, probes: &[u32], limit: usize) -> Vec<u32> {
-        self.side_intersect_in(s, probes, limit, &OnceCell::new())
+    fn side_intersect(&self, cx: &ReadCx<'_>, s: ListRef, probes: &[u32], limit: usize) -> R<Vec<u32>> {
+        self.side_intersect_in(cx, s, probes, limit, &OnceCell::new())
     }
 
     /// `side_intersect`, keeping a decoded out side in `whole` for the next call.
-    fn side_intersect_in(&self, s: ListRef, probes: &[u32], limit: usize, whole: &OnceCell<Vec<u32>>) -> Vec<u32> {
+    fn side_intersect_in(
+        &self,
+        cx: &ReadCx<'_>,
+        s: ListRef,
+        probes: &[u32],
+        limit: usize,
+        whole: &OnceCell<Vec<u32>>,
+    ) -> R<Vec<u32>> {
         match s.dir {
-            Dir::In => self.in_intersect(s.rel, s.actor, probes, limit),
-            Dir::Out if self.side_len(s) > probes.len() as u64 * PROBE_RATIO => {
-                probes.iter().copied().filter(|&x| self.side_contains(s, x)).take(limit).collect()
+            Dir::In => self.in_intersect(cx, s.rel, s.actor, probes, limit),
+            Dir::Out if self.side_len(cx, s)? > probes.len() as u64 * PROBE_RATIO => {
+                let mut out = Vec::new();
+                let mut pend = Ok(());
+                for &x in probes {
+                    if pend.is_ok() && out.len() == limit {
+                        break;
+                    }
+                    if item(&mut pend, self.side_contains(cx, s, x)) == Some(true) {
+                        out.push(x);
+                    }
+                }
+                pend.map(|()| out)
             }
             Dir::Out => {
                 let mut out = Vec::new();
-                inset::merge_intersect(probes, whole.get_or_init(|| self.side_set(s)), limit, &mut out);
-                out
+                inset::merge_intersect(probes, self.whole(cx, s, whole)?, limit, &mut out);
+                Ok(out)
             }
         }
     }
 
-    fn intersect_(&self, a: ListRef, b: ListRef, limit: usize) -> Vec<u32> {
-        self.combine_(a, b, SetOp::And, limit, None, 0).0
+    /// Side `s` decoded once into `whole`.
+    fn whole<'w>(&self, cx: &ReadCx<'_>, s: ListRef, whole: &'w OnceCell<Vec<u32>>) -> R<&'w Vec<u32>> {
+        if let Some(w) = whole.get() {
+            return Ok(w);
+        }
+        let v = self.side_set(cx, s)?;
+        Ok(whole.get_or_init(|| v))
+    }
+
+    fn intersect_(&self, cx: &ReadCx<'_>, a: ListRef, b: ListRef, limit: usize) -> R<Vec<u32>> {
+        Ok(self.combine_(cx, a, b, SetOp::And, limit, None, 0)?.0)
     }
 
     /// The page of ids above `after`, and with `cap` > 0 the whole result's
     /// size up to `cap` (true when there's more). Each side is decoded at
     /// most once for both.
+    #[allow(clippy::too_many_arguments)]
     fn combine_(
         &self,
+        cx: &ReadCx<'_>,
         a: ListRef,
         b: ListRef,
         op: SetOp,
         limit: usize,
         after: Option<u32>,
         cap: usize,
-    ) -> (Vec<u32>, Option<(u64, bool)>) {
+    ) -> R<Counted> {
         match op {
             SetOp::And => {
-                let (small, big) = if self.side_len(a) <= self.side_len(b) { (a, b) } else { (b, a) };
-                let probes = self.side_set(small);
+                let (la, lb) = (self.side_len(cx, a), self.side_len(cx, b));
+                let (small, big) = if la? <= lb? { (a, b) } else { (b, a) };
+                let probes = self.side_set(cx, small)?;
                 let whole = OnceCell::new();
-                page_and_count(&probes, after, limit, cap, |p, n| self.side_intersect_in(big, p, n, &whole))
+                page_and_count(&probes, after, limit, cap, |p, n| self.side_intersect_in(cx, big, p, n, &whole))
             }
             SetOp::AndNot => {
-                let left = self.side_set(a);
+                let left = self.side_set(cx, a)?;
                 let whole = OnceCell::new();
-                page_and_count(&left, after, limit, cap, |part, n| self.and_not(b, part, n, &whole))
+                page_and_count(&left, after, limit, cap, |part, n| self.and_not(cx, b, part, n, &whole))
             }
         }
     }
 
     /// The members of sorted `left` not in `b`, up to `n`. b is decoded at
     /// most once (into `whole`); an in set or a much bigger out side is probed instead.
-    fn and_not(&self, b: ListRef, left: &[u32], n: usize, whole: &OnceCell<Vec<u32>>) -> Vec<u32> {
+    fn and_not(&self, cx: &ReadCx<'_>, b: ListRef, left: &[u32], n: usize, whole: &OnceCell<Vec<u32>>) -> R<Vec<u32>> {
         let mut out = Vec::with_capacity(n.min(left.len()));
-        let probe = b.dir == Dir::In || self.side_len(b) > left.len() as u64 * PROBE_RATIO;
+        let probe = b.dir == Dir::In || self.side_len(cx, b)? > left.len() as u64 * PROBE_RATIO;
         // where the last chunk's merge left off in b, so the chunks walk b once between them
         let mut at = 0;
         // in chunks, so a short page off a long left side stops early
         for part in left.chunks(n.clamp(256, 1 << 20)) {
             let hit = if probe {
-                self.side_intersect(b, part, usize::MAX)
+                self.side_intersect(cx, b, part, usize::MAX)?
             } else {
-                let w = whole.get_or_init(|| self.side_set(b));
+                let w = self.whole(cx, b, whole)?;
                 at += w[at..].partition_point(|&y| y < part[0]);
                 let mut v = Vec::new();
                 inset::merge_intersect(part, &w[at..], usize::MAX, &mut v);
@@ -1218,95 +1369,125 @@ impl Graph {
                 if hit.get(j) != Some(&x) {
                     out.push(x);
                     if out.len() == n {
-                        return out;
+                        return Ok(out);
                     }
                 }
             }
         }
-        out
+        Ok(out)
     }
 
-    fn filter_id_(&self, viewer: u32, actors: &[u32], drop: &[(RelId, Dir)], sets: &[ListRef]) -> Vec<u32> {
-        let outs: Vec<Vec<u32>> =
-            drop.iter().map(|&(r, d)| if d == Dir::Out { self.out_set(r, viewer) } else { Vec::new() }).collect();
-        actors
+    fn filter_id_(
+        &self,
+        cx: &ReadCx<'_>,
+        viewer: u32,
+        actors: &[u32],
+        drop: &[(RelId, Dir)],
+        sets: &[ListRef],
+    ) -> R<Vec<u32>> {
+        let mut pend = Ok(());
+        let outs: Vec<Vec<u32>> = drop
             .iter()
-            .copied()
-            .filter(|&x| {
-                !drop.iter().zip(&outs).any(|(&(r, d), set)| match d {
+            .map(|&(r, d)| if d == Dir::Out { item(&mut pend, self.out_set(cx, r, viewer)) } else { None })
+            .map(Option::unwrap_or_default)
+            .collect();
+        let mut kept = Vec::with_capacity(actors.len());
+        for &x in actors {
+            let mut drops = false;
+            for (&(r, d), set) in drop.iter().zip(&outs) {
+                drops |= match d {
                     Dir::Out => set.binary_search(&x).is_ok(),
-                    Dir::In => self.in_contains(r, viewer, x),
-                }) && !sets.iter().any(|&s| self.side_contains(s, x))
-            })
-            .collect()
+                    Dir::In => item(&mut pend, self.in_contains(cx, r, viewer, x)) == Some(true),
+                };
+                if drops {
+                    break;
+                }
+            }
+            if !drops {
+                for &s in sets {
+                    if item(&mut pend, self.side_contains(cx, s, x)) == Some(true) {
+                        drops = true;
+                        break;
+                    }
+                }
+            }
+            if !drops {
+                kept.push(x);
+            }
+        }
+        pend.map(|()| kept)
     }
 
     // ------------------------------------------------------------ the API (instrumented)
 
     /// One page of `actor`'s records, newest first: (URI, subject DID), and
     /// the cursor for the next page (an rkey).
-    pub fn out_list(
-        &self,
-        rel: RelId,
-        actor: &str,
-        limit: usize,
-        cursor: Option<&str>,
-    ) -> (Vec<(String, String)>, Option<String>) {
-        self.out_list_opts(rel, actor, limit, cursor, false)
+    pub fn out_list(&self, cx: &ReadCx<'_>, rel: RelId, actor: &str, limit: usize, cursor: Option<&str>) -> R<OutPage> {
+        self.out_list_opts(cx, rel, actor, limit, cursor, false)
     }
 
     /// `out_list`; `distinct` keeps each subject's newest record only (a
     /// list's members, where 7.5% of records repeat one).
     pub fn out_list_opts(
         &self,
+        cx: &ReadCx<'_>,
         rel: RelId,
         actor: &str,
         limit: usize,
         cursor: Option<&str>,
         distinct: bool,
-    ) -> (Vec<(String, String)>, Option<String>) {
+    ) -> R<OutPage> {
         let g = self.obs.op(Op::OutList, rel as usize, limit);
-        let r = self.out_list_(rel, actor, limit, cursor, distinct);
+        let r = self.out_list_(cx, rel, actor, limit, cursor, distinct)?;
         self.obs.done(g, r.0.len());
-        r
+        Ok(r)
     }
 
     /// One page of the actors naming `subject`, in id order, and the cursor
     /// for the next page (a DID).
     pub fn in_list(
         &self,
+        cx: &ReadCx<'_>,
         rel: RelId,
         subject: &str,
         limit: usize,
         cursor: Option<&str>,
-    ) -> (Vec<String>, Option<String>) {
+    ) -> R<(Vec<String>, Option<String>)> {
         let g = self.obs.op(Op::InList, rel as usize, limit);
-        let r = self.in_list_(rel, subject, limit, cursor);
+        let r = self.in_list_(cx, rel, subject, limit, cursor)?;
         self.obs.done(g, r.0.len());
-        r
+        Ok(r)
     }
 
     /// (records out, actors in).
-    pub fn counts(&self, rel: RelId, actor: &str) -> (u64, u64) {
+    pub fn counts(&self, cx: &ReadCx<'_>, rel: RelId, actor: &str) -> R<(u64, u64)> {
         let g = self.obs.op(Op::Counts, rel as usize, 1);
-        let r = self.counts_(rel, actor);
+        let r = self.counts_(cx, rel, actor)?;
         self.obs.done(g, 1);
-        r
+        Ok(r)
     }
 
     /// Ids in both sides, ascending. The smaller side is materialized; an in
     /// set on the other side is probed block by block rather than decoded.
-    pub fn intersect(&self, a: ListRef, b: ListRef, limit: usize) -> Vec<u32> {
+    pub fn intersect(&self, cx: &ReadCx<'_>, a: ListRef, b: ListRef, limit: usize) -> R<Vec<u32>> {
         let rel = if a.rel == b.rel { a.rel as usize } else { self.obs.multi() };
         let g = self.obs.op(Op::Intersect, rel, limit);
-        let r = self.intersect_(a, b, limit);
+        let r = self.intersect_(cx, a, b, limit)?;
         self.obs.done(g, r.len());
-        r
+        Ok(r)
     }
 
     /// `a` and `b` (or `a` without `b`), ids above `after`, ascending.
-    pub fn combine(&self, a: ListRef, b: ListRef, op: SetOp, limit: usize, after: Option<u32>) -> Vec<u32> {
-        self.combine_counted(a, b, op, limit, after, 0).0
+    pub fn combine(
+        &self,
+        cx: &ReadCx<'_>,
+        a: ListRef,
+        b: ListRef,
+        op: SetOp,
+        limit: usize,
+        after: Option<u32>,
+    ) -> R<Vec<u32>> {
+        Ok(self.combine_counted(cx, a, b, op, limit, after, 0)?.0)
     }
 
     /// `combine`, and with `cap` > 0 the size of the whole result (cursor
@@ -1314,60 +1495,74 @@ impl Graph {
     /// The count costs one pass over the side the page decodes (the smaller
     /// for AND, `a` for AND_NOT) that stops at `cap` + 1 hits, on top of that
     /// decode; the hits it keeps are no more than that side's length.
+    #[allow(clippy::too_many_arguments)]
     pub fn combine_counted(
         &self,
+        cx: &ReadCx<'_>,
         a: ListRef,
         b: ListRef,
         op: SetOp,
         limit: usize,
         after: Option<u32>,
         cap: usize,
-    ) -> (Vec<u32>, Option<(u64, bool)>) {
+    ) -> R<Counted> {
         let rel = if a.rel == b.rel { a.rel as usize } else { self.obs.multi() };
         let g = self.obs.op(Op::Intersect, rel, limit);
-        let r = self.combine_(a, b, op, limit, after, cap);
+        let r = self.combine_(cx, a, b, op, limit, after, cap)?;
         self.obs.done(g, r.0.len());
-        r
+        Ok(r)
     }
 
     /// Per (a, b) pair: whether a's record of any of `rels` names b, and
     /// whether b's names a. Each is one membership test in an in set; a DID
     /// not in the graph blocks nobody.
-    pub fn block_pairs(&self, pairs: &[(&str, &str)], rels: &[RelId]) -> Vec<(bool, bool)> {
+    pub fn block_pairs(&self, cx: &ReadCx<'_>, pairs: &[(&str, &str)], rels: &[RelId]) -> R<Vec<(bool, bool)>> {
         let g = self.obs.op(Op::BlockPairs, self.obs.multi(), pairs.len());
         let mut hits = 0;
+        let mut pend = Ok(());
         let out: Vec<(bool, bool)> = pairs
             .iter()
             .map(|&(a, b)| {
                 let r = match (self.id_of(a), self.id_of(b)) {
-                    (Some(x), Some(y)) => self.block_pair_id(x, y, rels),
+                    (Some(x), Some(y)) => item(&mut pend, self.block_pair_id(cx, x, y, rels)).unwrap_or_default(),
                     _ => (false, false),
                 };
                 hits += (r.0 || r.1) as usize;
                 r
             })
             .collect();
+        pend?;
         self.obs.done(g, hits);
-        out
+        Ok(out)
     }
 
-    pub fn block_pair_id(&self, a: u32, b: u32, rels: &[RelId]) -> (bool, bool) {
-        let named = |from: u32, to: u32| rels.iter().any(|&r| self.in_contains(r, to, from));
-        (named(a, b), named(b, a))
+    pub fn block_pair_id(&self, cx: &ReadCx<'_>, a: u32, b: u32, rels: &[RelId]) -> R<(bool, bool)> {
+        let mut pend = Ok(());
+        let mut named =
+            |from: u32, to: u32| rels.iter().any(|&r| item(&mut pend, self.in_contains(cx, r, to, from)) == Some(true));
+        let r = (named(a, b), named(b, a));
+        pend.map(|()| r)
     }
 
     /// `actors` without those any of `drop` hits: (rel, Out) drops the
     /// viewer's subjects, (rel, In) drops those naming the viewer.
-    pub fn filter_id(&self, viewer: u32, actors: &[u32], drop: &[(RelId, Dir)]) -> Vec<u32> {
-        self.filter_sets(viewer, actors, drop, &[])
+    pub fn filter_id(&self, cx: &ReadCx<'_>, viewer: u32, actors: &[u32], drop: &[(RelId, Dir)]) -> R<Vec<u32>> {
+        self.filter_sets(cx, viewer, actors, drop, &[])
     }
 
     /// `filter_id`, also dropping the members of any of `sets`.
-    pub fn filter_sets(&self, viewer: u32, actors: &[u32], drop: &[(RelId, Dir)], sets: &[ListRef]) -> Vec<u32> {
+    pub fn filter_sets(
+        &self,
+        cx: &ReadCx<'_>,
+        viewer: u32,
+        actors: &[u32],
+        drop: &[(RelId, Dir)],
+        sets: &[ListRef],
+    ) -> R<Vec<u32>> {
         let g = self.obs.op(Op::Filter, self.obs.multi(), actors.len());
-        let r = self.filter_id_(viewer, actors, drop, sets);
+        let r = self.filter_id_(cx, viewer, actors, drop, sets)?;
         self.obs.done(g, r.len());
-        r
+        Ok(r)
     }
 
     /// An add with no time: it wins over any tombstone left by a delete
@@ -1390,7 +1585,7 @@ impl Graph {
     /// replaces it, so a source's ops applied in order end where its repo does.
     pub fn add_rec(&mut self, uri: &str, subject: &str, list: Option<&str>, time_us: i64) -> Result<Added> {
         let g = (!self.quiet).then(|| self.obs.op(Op::Add, self.obs.multi(), 1));
-        let r = self.add_(uri, subject, list, time_us);
+        let r = self.write(|me, cx| me.add_(cx, uri, subject, list, time_us)).and_then(|r| r);
         if let Some(g) = g {
             if let Ok((rel, a)) = &r {
                 let o = match a {
@@ -1408,7 +1603,7 @@ impl Graph {
     /// Deletes a record by URI; its source saw the delete at `time_us`.
     pub fn delete_at(&mut self, uri: &str, time_us: i64) -> Result<Removed> {
         let g = (!self.quiet).then(|| self.obs.op(Op::Delete, self.obs.multi(), 1));
-        let r = self.delete_(uri, time_us);
+        let r = self.write(|me, cx| me.delete_(cx, uri, time_us)).and_then(|r| r);
         if let Some(g) = g {
             if let Ok((rel, d)) = &r {
                 self.obs.applied(
@@ -1457,41 +1652,77 @@ impl Graph {
 
     // ------------------------------------------------------------ writes
 
-    fn add_(&mut self, uri: &str, subject: &str, list: Option<&str>, time_us: i64) -> Result<(RelId, Added)> {
-        let Some((did, coll, rkey_s)) = parse_uri(uri) else { bail!("{uri:?} isn't a record URI") };
-        let Some(rel) = self.rels.by_collection(coll) else { bail!("no relation for {coll}") };
+    /// Runs one write op in a pass over the store: its reads, then its
+    /// changes. A write can't stop halfway through, and over a store that
+    /// keeps whole files only a bad page misses, so a miss fails the op
+    /// with what the fetch found.
+    fn write<T>(&mut self, f: impl FnOnce(&mut Graph, &ReadCx<'_>) -> R<T>) -> Result<T> {
+        let engine = self.engine.clone();
+        match engine.pass(&mut Hold::none(), |cx| f(self, cx)) {
+            Ok(t) => Ok(t),
+            Err(m) => match engine.fetch_blocking(m, &mut Hold::new()) {
+                Err(e) => Err(anyhow::Error::new(e).context("a write's read failed")),
+                Ok(()) => bail!("a write's read missed a page the store had"),
+            },
+        }
+    }
+
+    /// `f` until a pass is clean, for the reads a snapshot write makes.
+    fn blocking<T>(&self, f: impl Fn(&ReadCx<'_>) -> R<T>) -> Result<T> {
+        self.read(f).map_err(|e| anyhow::Error::new(e).context("snapshot read"))
+    }
+
+    fn add_(
+        &mut self,
+        cx: &ReadCx<'_>,
+        uri: &str,
+        subject: &str,
+        list: Option<&str>,
+        time_us: i64,
+    ) -> R<Result<(RelId, Added)>> {
+        let Some((did, coll, rkey_s)) = parse_uri(uri) else { return Ok(Err(anyhow!("{uri:?} isn't a record URI"))) };
+        let Some(rel) = self.rels.by_collection(coll) else { return Ok(Err(anyhow!("no relation for {coll}"))) };
         let owner = self.rels.owner_rel(rel);
         let list = match (owner, list) {
             (None, _) => None,
-            (Some(_), None) => bail!("{coll} records name their list"),
+            (Some(_), None) => return Ok(Err(anyhow!("{coll} records name their list"))),
             (Some(_), Some(l)) => match parse_uri(l) {
                 Some((o, _, _)) if o == did => Some(l),
-                Some(_) => bail!("{l} isn't in {did}'s repo"),
-                None => bail!("{l:?} isn't a record URI"),
+                Some(_) => return Ok(Err(anyhow!("{l} isn't in {did}'s repo"))),
+                None => return Ok(Err(anyhow!("{l:?} isn't a record URI"))),
             },
         };
-        let a = self.intern(did)?;
-        let s = self.intern(subject)?;
-        let l = list.map(|l| self.intern_node(l)).transpose()?;
+        let a = match self.intern(did) {
+            Ok(a) => a,
+            Err(e) => return Ok(Err(e)),
+        };
+        let s = match self.intern(subject) {
+            Ok(s) => s,
+            Err(e) => return Ok(Err(e)),
+        };
+        let l = match list.map(|l| self.intern_node(l)).transpose() {
+            Ok(l) => l,
+            Err(e) => return Ok(Err(e)),
+        };
         let (key, side) = key_of(rkey_s);
         let rec = owner.unwrap_or(rel);
         if side {
             if let Some(have) = self.rkey_string(rec, a, key) {
                 if have != rkey_s {
-                    bail!("rkeys {have:?} and {rkey_s:?} of {did} hash alike");
+                    return Ok(Err(anyhow!("rkeys {have:?} and {rkey_s:?} of {did} hash alike")));
                 }
             }
         }
         // older than the key's last change: a second source replaying the past
         if self.tombstone(rec, a, key).is_none_or(|t| time_us >= t) && self.stale(rec, a, key, time_us) {
-            return Ok((rel, Added::Exists));
+            return Ok(Ok((rel, Added::Exists)));
         }
         let mut replaced = false;
         // a create or update of a record holding something else replaces it
         if self.tombstone(rec, a, key).is_none_or(|t| time_us >= t) {
-            let held = self.out_get(rec, a, key);
+            let held = self.out_get(cx, rec, a, key)?;
             let member = match (l, held) {
-                (Some(_), Some(hl)) => self.out_get(rel, hl, key),
+                (Some(_), Some(hl)) => self.out_get(cx, rel, hl, key)?,
                 _ => held,
             };
             let same = match l {
@@ -1499,19 +1730,19 @@ impl Graph {
                 Some(l) => held == Some(l) && member == Some(s),
             };
             if held.is_some() && !same {
-                self.remove_id(rec, a, key);
+                self.remove_id(cx, rec, a, key)?;
                 if let (Some(_), Some(hl)) = (l, held) {
-                    self.remove_id(rel, hl, key);
+                    self.remove_id(cx, rel, hl, key)?;
                 }
                 replaced = true;
             }
         }
         let r = match l {
-            None => self.add_id(rel, a, key, s, time_us),
+            None => self.add_id(cx, rel, a, key, s, time_us)?,
             Some(l) => {
-                let r = self.add_id(rec, a, key, l, time_us);
-                if r == Added::Added && self.out_get(rel, l, key).is_none() {
-                    self.put_id(rel, l, key, s);
+                let r = self.add_id(cx, rec, a, key, l, time_us)?;
+                if r == Added::Added && self.out_get(cx, rel, l, key)?.is_none() {
+                    self.put_id(cx, rel, l, key, s)?;
                 }
                 r
             }
@@ -1525,32 +1756,32 @@ impl Graph {
                 self.state[rel as usize].side.insert((l, key), rkey_s.into());
             }
         }
-        Ok((rel, r))
+        Ok(Ok((rel, r)))
     }
 
-    pub fn add_id(&mut self, rel: RelId, actor: u32, key: u64, subject: u32, time_us: i64) -> Added {
+    fn add_id(&mut self, cx: &ReadCx<'_>, rel: RelId, actor: u32, key: u64, subject: u32, time_us: i64) -> R<Added> {
         let mut recreated = false;
         if let Some(t) = self.tombstone(rel, actor, key) {
             if time_us < t {
-                return Added::Deleted;
+                return Ok(Added::Deleted);
             }
             self.clear_tomb(rel, actor, key);
             recreated = true;
         }
         if self.stale(rel, actor, key, time_us) {
-            return Added::Exists;
+            return Ok(Added::Exists);
         }
-        if self.out_get(rel, actor, key).is_some() {
-            return Added::Exists;
+        if self.out_get(cx, rel, actor, key)?.is_some() {
+            return Ok(Added::Exists);
         }
         self.set_stamp(rel, actor, key, time_us, recreated);
-        self.put_id(rel, actor, key, subject)
+        self.put_id(cx, rel, actor, key, subject)
     }
 
     /// The edge alone, no tombstone or stamp: a list relation's, whose
     /// record is its companion's.
-    fn put_id(&mut self, rel: RelId, actor: u32, key: u64, subject: u32) -> Added {
-        let pair = self.in_contains(rel, subject, actor);
+    fn put_id(&mut self, cx: &ReadCx<'_>, rel: RelId, actor: u32, key: u64, subject: u32) -> R<Added> {
+        let pair = self.in_contains(cx, rel, subject, actor)?;
         let st = &mut self.state[rel as usize];
         let od = st.out.entry(actor).or_default();
         od.add(key, subject);
@@ -1563,83 +1794,100 @@ impl Graph {
             self.pairs[rel as usize] += 1;
         }
         self.records[rel as usize] += 1;
-        self.maybe_compact(rel, actor, subject);
-        Added::Added
+        self.maybe_compact(cx, rel, actor, subject)?;
+        Ok(Added::Added)
     }
 
-    fn delete_(&mut self, uri: &str, time_us: i64) -> Result<(RelId, Removed)> {
-        let Some((did, coll, rkey_s)) = parse_uri(uri) else { bail!("{uri:?} isn't a record URI") };
-        let Some(rel) = self.rels.by_collection(coll) else { bail!("no relation for {coll}") };
-        let a = self.intern(did)?;
+    fn delete_(&mut self, cx: &ReadCx<'_>, uri: &str, time_us: i64) -> R<Result<(RelId, Removed)>> {
+        let Some((did, coll, rkey_s)) = parse_uri(uri) else { return Ok(Err(anyhow!("{uri:?} isn't a record URI"))) };
+        let Some(rel) = self.rels.by_collection(coll) else { return Ok(Err(anyhow!("no relation for {coll}"))) };
+        let a = match self.intern(did) {
+            Ok(a) => a,
+            Err(e) => return Ok(Err(e)),
+        };
         let (key, _) = key_of(rkey_s);
-        Ok((
-            rel,
-            match self.delete_key(rel, a, key, time_us) {
-                Some(s) => Removed::Subject(self.did_of(s).unwrap_or_default()),
-                None => Removed::NotFound,
-            },
-        ))
+        let r = match self.delete_key_(cx, rel, a, key, time_us, false)? {
+            Some(s) => Removed::Subject(self.did_of(s).unwrap_or_default()),
+            None => Removed::NotFound,
+        };
+        Ok(Ok((rel, r)))
     }
 
     /// Removes `actor`'s record `key` in `rel` as a configured relation
     /// sees it: a list relation's record by its owner, through the companion.
     /// Returns the subject.
-    pub fn delete_key(&mut self, rel: RelId, actor: u32, key: u64, time_us: i64) -> Option<u32> {
-        self.delete_key_(rel, actor, key, time_us, false)
-    }
-
-    fn delete_key_(&mut self, rel: RelId, actor: u32, key: u64, time_us: i64, force: bool) -> Option<u32> {
+    fn delete_key_(
+        &mut self,
+        cx: &ReadCx<'_>,
+        rel: RelId,
+        actor: u32,
+        key: u64,
+        time_us: i64,
+        force: bool,
+    ) -> R<Option<u32>> {
         match self.rels.owner_rel(rel) {
-            None => self.delete_id_(rel, actor, key, time_us, force),
-            Some(o) => {
-                let l = self.delete_id_(o, actor, key, time_us, force)?;
-                self.remove_id(rel, l, key)
-            }
+            None => self.delete_id_(cx, rel, actor, key, time_us, force),
+            Some(o) => match self.delete_id_(cx, o, actor, key, time_us, force)? {
+                Some(l) => self.remove_id(cx, rel, l, key),
+                None => Ok(None),
+            },
         }
     }
 
     /// Removes `actor`'s record `key`, returning its subject, and leaves a
     /// tombstone at `time_us` either way.
-    pub fn delete_id(&mut self, rel: RelId, actor: u32, key: u64, time_us: i64) -> Option<u32> {
-        self.delete_id_(rel, actor, key, time_us, false)
-    }
-
-    fn delete_id_(&mut self, rel: RelId, actor: u32, key: u64, time_us: i64, force: bool) -> Option<u32> {
+    fn delete_id_(
+        &mut self,
+        cx: &ReadCx<'_>,
+        rel: RelId,
+        actor: u32,
+        key: u64,
+        time_us: i64,
+        force: bool,
+    ) -> R<Option<u32>> {
         // a record another source changed after the delete is a newer one:
         // a second source's late delete, or a record that wasn't an edge, leaves it
-        if !force && self.stale(rel, actor, key, time_us) && self.out_get(rel, actor, key).is_some() {
-            return None;
+        if !force && self.stale(rel, actor, key, time_us) && self.out_get(cx, rel, actor, key)?.is_some() {
+            return Ok(None);
         }
         self.set_tomb(rel, actor, key, time_us);
-        self.remove_id(rel, actor, key)
+        self.remove_id(cx, rel, actor, key)
     }
 
-    fn remove_id(&mut self, rel: RelId, actor: u32, key: u64) -> Option<u32> {
+    fn remove_id(&mut self, cx: &ReadCx<'_>, rel: RelId, actor: u32, key: u64) -> R<Option<u32>> {
         let in_adds = self.state[rel as usize].out.get(&actor).and_then(|d| d.adds.get(&key).copied());
         let (subject, others) = match in_adds {
             Some(s) => {
+                // a re-add of a base record keeps its base position masked by dels
+                let d = &self.state[rel as usize].out[&actor];
+                let others = d.adds_naming(s).any(|k| k != key) || self.base_names(cx, rel, actor, s, None)?;
                 let st = &mut self.state[rel as usize];
                 st.out.get_mut(&actor).unwrap().remove_add(key);
                 st.side.remove(&(actor, key));
-                // a re-add of a base record keeps its base position masked by dels
-                (s, self.out_names_other(rel, actor, s, None))
+                (s, others)
             }
             None => {
                 let deleted = self.state[rel as usize].out.get(&actor).is_some_and(|d| d.dels.contains_key(&key));
                 let base = if deleted {
                     None
                 } else {
-                    self.base_out(rel, actor).and_then(|l| l.find_key(key).map(|p| (p, l.subject(p))))
+                    match self.base_out(cx, rel, actor)? {
+                        Some(l) => match l.find_key(cx, key)? {
+                            Some(p) => Some((p, l.subject(cx, p)?)),
+                            None => None,
+                        },
+                        None => None,
+                    }
                 };
                 match base {
                     Some((p, s)) => {
                         // asked before the delete lands in dels, so the base scan skips
                         // this position instead of decoding keys to check dels
-                        let others = self.out_names_other(rel, actor, s, Some(p));
+                        let others = self.out_names_other(cx, rel, actor, s, Some(p))?;
                         self.state[rel as usize].out.entry(actor).or_default().del(key, s);
                         (s, others)
                     }
-                    None => return None,
+                    None => return Ok(None),
                 }
             }
         };
@@ -1652,8 +1900,8 @@ impl Graph {
             }
             self.pairs[rel as usize] -= 1;
         }
-        self.maybe_compact(rel, actor, subject);
-        Some(subject)
+        self.maybe_compact(cx, rel, actor, subject)?;
+        Ok(Some(subject))
     }
 
     // ------------------------------------------------------------ accessors for the admin API
@@ -1680,8 +1928,8 @@ impl Graph {
     }
 
     /// Live records of `actor` naming `subject`.
-    pub fn records_naming(&self, rel: RelId, actor: u32, subject: u32) -> usize {
-        self.out_count_subject(rel, actor, subject)
+    pub fn records_naming(&self, cx: &ReadCx<'_>, rel: RelId, actor: u32, subject: u32) -> R<usize> {
+        self.out_count_subject(cx, rel, actor, subject)
     }
 
     /// Where `actor`'s record `key` is.
@@ -1712,19 +1960,18 @@ impl Graph {
         }
     }
 
-    fn maybe_compact(&mut self, rel: RelId, actor: u32, subject: u32) {
+    fn maybe_compact(&mut self, cx: &ReadCx<'_>, rel: RelId, actor: u32, subject: u32) -> R<()> {
         let min = self.compact_min;
         if min == 0 {
-            return;
+            return Ok(());
         }
         let r = rel as usize;
-        let out_due = self.state[r].out.get(&actor).is_some_and(|d| {
-            let n = d.adds.len() + d.dels.len();
-            n >= min && n as f64 > self.base_out(rel, actor).map_or(0, |l| l.len()) as f64 * self.merge_ratio
-        });
+        let out_n = self.state[r].out.get(&actor).map_or(0, |d| d.adds.len() + d.dels.len());
+        let out_due = out_n >= min
+            && out_n as f64 > self.base_out(cx, rel, actor)?.map_or(0, |l| l.len()) as f64 * self.merge_ratio;
         if out_due {
             let t = self.obs.merge_start();
-            let v = self.out_all(rel, actor);
+            let v = self.out_all(cx, rel, actor)?;
             let mut buf = Vec::new();
             if v.is_empty() {
                 buf.push(0);
@@ -1738,13 +1985,12 @@ impl Graph {
             st.out.remove(&actor);
             st.out_over.insert(actor, buf.into());
         }
-        let in_due = self.state[r].inn.get(&subject).is_some_and(|d| {
-            let n = d.adds.len() + d.dels.len();
-            n >= min && n as f64 > self.base_in(rel, subject).map_or(0, |l| l.len()) as f64 * self.merge_ratio
-        });
+        let in_n = self.state[r].inn.get(&subject).map_or(0, |d| d.adds.len() + d.dels.len());
+        let in_due = in_n >= min
+            && in_n as f64 > self.base_in(cx, rel, subject)?.map_or(0, |l| l.len()) as f64 * self.merge_ratio;
         if in_due {
             let t = self.obs.merge_start();
-            let v = self.in_set(rel, subject);
+            let v = self.in_set(cx, rel, subject)?;
             let mut buf = Vec::new();
             if v.is_empty() {
                 buf.push(0);
@@ -1758,6 +2004,7 @@ impl Graph {
             st.inn.remove(&subject);
             st.in_over.insert(subject, buf.into());
         }
+        Ok(())
     }
 
     // ------------------------------------------------------------ snapshots
@@ -2030,7 +2277,7 @@ impl Graph {
             flush(w, &mut run, ob)?;
             offsets.push(w.section_len());
             changed_actors.insert(id);
-            let v = self.out_all(rel, id);
+            let v = self.blocking(|cx| self.out_all(cx, rel, id))?;
             if v.is_empty() {
                 continue;
             }
@@ -2085,7 +2332,7 @@ impl Graph {
             }
             flush(w, &mut run, ob)?;
             offsets.push(w.section_len());
-            let v = self.in_set(rel, id);
+            let v = self.blocking(|cx| self.in_set(cx, rel, id))?;
             if v.is_empty() {
                 continue;
             }
@@ -2208,18 +2455,31 @@ fn page_and_count(
     after: Option<u32>,
     limit: usize,
     cap: usize,
-    run: impl Fn(&[u32], usize) -> Vec<u32>,
-) -> (Vec<u32>, Option<(u64, bool)>) {
+    run: impl Fn(&[u32], usize) -> R<Vec<u32>>,
+) -> R<Counted> {
     let from = after.map_or(0, |x| all.partition_point(|&y| y <= x));
     if cap == 0 {
-        return (run(&all[from..], limit), None);
+        return Ok((run(&all[from..], limit)?, None));
     }
     let count = |v: &[u32]| Some((v.len().min(cap) as u64, v.len() > cap));
     if from == 0 {
-        let mut v = run(all, limit.max(cap.saturating_add(1)));
+        let mut v = run(all, limit.max(cap.saturating_add(1)))?;
         let n = count(&v);
         v.truncate(limit);
-        return (v, n);
+        return Ok((v, n));
     }
-    (run(&all[from..], limit), count(&run(all, cap.saturating_add(1))))
+    let (page, total) = (run(&all[from..], limit), run(all, cap.saturating_add(1)));
+    Ok((page?, count(&total?)))
+}
+
+/// A batch item's value, or None after noting its miss in `pend`: a batch
+/// carries on past a miss, so one pass names every page it needs.
+fn item<T>(pend: &mut R<()>, r: R<T>) -> Option<T> {
+    match r {
+        Ok(v) => Some(v),
+        Err(e) => {
+            *pend = Err(e);
+            None
+        }
+    }
 }

@@ -31,8 +31,12 @@ fn dump(g: &Graph, n: u32) -> Vec<String> {
     let mut v = Vec::new();
     for i in 0..n + 5 {
         for rel in 0..4u8 {
-            v.push(format!("{i} {rel} {:?} {:?}", g.counts(rel, &did(i)), g.out_list(rel, &did(i), 1000, None).0));
-            v.push(format!("{i} {rel} in {:?}", g.in_list(rel, &did(i), 1000, None).0));
+            v.push(format!(
+                "{i} {rel} {:?} {:?}",
+                g.read(|cx| g.counts(cx, rel, &did(i))).unwrap(),
+                g.read(|cx| g.out_list(cx, rel, &did(i), 1000, None)).unwrap().0
+            ));
+            v.push(format!("{i} {rel} in {:?}", g.read(|cx| g.in_list(cx, rel, &did(i), 1000, None)).unwrap().0));
         }
     }
     v

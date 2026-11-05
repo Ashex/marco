@@ -1134,8 +1134,12 @@ async fn lists() {
     // everyone's list (actor 2's list 0) against a5's follows, both ways, paged
     let big = list_uri(&did(2), 0);
     let gr = s.app.graph();
-    let follows: std::collections::BTreeSet<String> =
-        gr.out_set(0, gr.id_of(&a5).unwrap()).into_iter().filter_map(|i| gr.did_of(i)).collect();
+    let follows: std::collections::BTreeSet<String> = gr
+        .read(|cx| gr.out_set(cx, 0, gr.id_of(&a5).unwrap()))
+        .unwrap()
+        .into_iter()
+        .filter_map(|i| gr.did_of(i))
+        .collect();
     drop(gr);
     let req = |op: SetOp, cursor: String| IntersectRequest {
         a: side("listitem", Dir::DIR_OUT, &big).into(),

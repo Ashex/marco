@@ -68,17 +68,17 @@ fn duplicate_records_hold_the_pair_until_the_last_goes() {
         if snapshot_between {
             g = reopen(&g);
         }
-        assert_eq!(g.counts(FOLLOW, &a), (2, 0));
-        assert_eq!(g.counts(FOLLOW, &b), (0, 1));
-        assert_eq!(g.has(FOLLOW, &a, &b), Some(follow(&a, &tid(2))), "newest record");
+        assert_eq!(g.read(|cx| g.counts(cx, FOLLOW, &a)).unwrap(), (2, 0));
+        assert_eq!(g.read(|cx| g.counts(cx, FOLLOW, &b)).unwrap(), (0, 1));
+        assert_eq!(g.read(|cx| g.has(cx, FOLLOW, &a, &b)).unwrap(), Some(follow(&a, &tid(2))), "newest record");
         assert_eq!(g.delete(&follow(&a, &tid(2))).unwrap(), removed(&b));
-        assert_eq!(g.has(FOLLOW, &a, &b), Some(follow(&a, &tid(1))));
-        assert_eq!(g.counts(FOLLOW, &b), (0, 1));
+        assert_eq!(g.read(|cx| g.has(cx, FOLLOW, &a, &b)).unwrap(), Some(follow(&a, &tid(1))));
+        assert_eq!(g.read(|cx| g.counts(cx, FOLLOW, &b)).unwrap(), (0, 1));
         assert_eq!(g.delete(&follow(&a, &tid(1))).unwrap(), removed(&b));
-        assert_eq!(g.has(FOLLOW, &a, &b), None);
-        assert_eq!(g.counts(FOLLOW, &a), (0, 0));
-        assert_eq!(g.counts(FOLLOW, &b), (0, 0));
-        assert_eq!(g.in_list(FOLLOW, &b, 10, None).0, Vec::<String>::new());
+        assert_eq!(g.read(|cx| g.has(cx, FOLLOW, &a, &b)).unwrap(), None);
+        assert_eq!(g.read(|cx| g.counts(cx, FOLLOW, &a)).unwrap(), (0, 0));
+        assert_eq!(g.read(|cx| g.counts(cx, FOLLOW, &b)).unwrap(), (0, 0));
+        assert_eq!(g.read(|cx| g.in_list(cx, FOLLOW, &b, 10, None)).unwrap().0, Vec::<String>::new());
     }
 }
 
@@ -90,11 +90,11 @@ fn duplicate_split_between_base_and_delta() {
     let mut g = reopen(&g);
     assert_eq!(g.add(&follow(&a, &tid(5)), &b).unwrap(), Added::Added);
     assert_eq!(g.delete(&follow(&a, &tid(1))).unwrap(), removed(&b));
-    assert_eq!(g.has(FOLLOW, &a, &b), Some(follow(&a, &tid(5))));
+    assert_eq!(g.read(|cx| g.has(cx, FOLLOW, &a, &b)).unwrap(), Some(follow(&a, &tid(5))));
     let mut g = reopen(&g);
     assert_eq!(g.delete(&follow(&a, &tid(5))).unwrap(), removed(&b));
-    assert_eq!(g.has(FOLLOW, &a, &b), None);
-    assert_eq!(g.counts(FOLLOW, &b), (0, 0));
+    assert_eq!(g.read(|cx| g.has(cx, FOLLOW, &a, &b)).unwrap(), None);
+    assert_eq!(g.read(|cx| g.counts(cx, FOLLOW, &b)).unwrap(), (0, 0));
 }
 
 #[test]
@@ -105,17 +105,17 @@ fn non_tid_rkeys_keep_their_strings() {
     g.add(&follow(&a, "m96dsjuf12"), &c).unwrap();
     g.add(&follow(&a, "3lhv48k7p7pza"), &b).unwrap();
     for g in [&mut g.clone_via_snapshot(), &mut g] {
-        assert_eq!(g.has(FOLLOW, &a, &c), Some(follow(&a, "m96dsjuf12")));
-        let (page, _) = g.out_list(FOLLOW, &a, 10, None);
+        assert_eq!(g.read(|cx| g.has(cx, FOLLOW, &a, &c)).unwrap(), Some(follow(&a, "m96dsjuf12")));
+        let (page, _) = g.read(|cx| g.out_list(cx, FOLLOW, &a, 10, None)).unwrap();
         assert_eq!(page.len(), 3);
         // non-TIDs sort after every TID, so they're the newest
         assert_eq!(page[2], (follow(&a, &tid(1)), b.clone()));
         assert!(page[..2].iter().any(|(u, _)| u.ends_with("/m96dsjuf12")));
         assert_eq!(g.delete(&follow(&a, "3lhv48k7p7pza")).unwrap(), removed(&b));
-        assert_eq!(g.has(FOLLOW, &a, &b), Some(follow(&a, &tid(1))));
+        assert_eq!(g.read(|cx| g.has(cx, FOLLOW, &a, &b)).unwrap(), Some(follow(&a, &tid(1))));
         assert_eq!(g.delete(&follow(&a, "m96dsjuf12")).unwrap(), removed(&c));
         assert_eq!(g.delete(&follow(&a, "m96dsjuf12")).unwrap(), Removed::NotFound);
-        assert_eq!(g.has(FOLLOW, &a, &c), None);
+        assert_eq!(g.read(|cx| g.has(cx, FOLLOW, &a, &c)).unwrap(), None);
     }
 }
 
@@ -144,22 +144,22 @@ fn a_delete_holds_against_older_adds_only() {
         }
         // a backfill that saw the record before the delete
         assert_eq!(g.add_at(&follow(&a, &tid(7)), &b, 50).unwrap(), Added::Deleted);
-        assert_eq!(g.has(FOLLOW, &a, &b), None);
-        assert_eq!(g.counts(FOLLOW, &b), (0, 1));
+        assert_eq!(g.read(|cx| g.has(cx, FOLLOW, &a, &b)).unwrap(), None);
+        assert_eq!(g.read(|cx| g.counts(cx, FOLLOW, &b)).unwrap(), (0, 1));
         // another rkey for the same pair is a different record
         assert_eq!(g.add_at(&follow(&a, &tid(8)), &b, 50).unwrap(), Added::Added);
-        assert_eq!(g.has(FOLLOW, &a, &b), Some(follow(&a, &tid(8))));
+        assert_eq!(g.read(|cx| g.has(cx, FOLLOW, &a, &b)).unwrap(), Some(follow(&a, &tid(8))));
         // a re-create seen after the delete, from any source
         assert_eq!(g.add_at(&follow(&a, &tid(7)), &b, 150).unwrap(), Added::Added);
         assert_eq!(g.tombstones(FOLLOW), 0);
-        assert_eq!(g.counts(FOLLOW, &a), (2, 0));
+        assert_eq!(g.read(|cx| g.counts(cx, FOLLOW, &a)).unwrap(), (2, 0));
         // a delete of a record it has leaves a tombstone too
         assert_eq!(g.delete_at(&follow(&a, &tid(7)), 200).unwrap(), removed(&b));
         assert_eq!(g.add_at(&follow(&a, &tid(7)), &b, 180).unwrap(), Added::Deleted);
         if base {
             let g2 = reopen(&g);
             assert_eq!(g2.tombstones(FOLLOW), 1);
-            assert_eq!(g2.counts(FOLLOW, &a), (1, 0));
+            assert_eq!(g2.read(|cx| g2.counts(cx, FOLLOW, &a)).unwrap(), (1, 0));
         }
     }
 }
@@ -196,8 +196,8 @@ fn statuses_persist_and_hide() {
     assert_eq!(g.status_of(&c), Some(Status::Takendown));
     assert_eq!(g.status_of("did:web:never.example"), Some(Status::Takendown));
     assert_eq!(g.status_of(&b), None);
-    assert_eq!(g.counts(FOLLOW, &a).0, 0, "deleted drops its records");
-    assert_eq!(g.counts(FOLLOW, &c).0, 1, "takendown keeps them");
+    assert_eq!(g.read(|cx| g.counts(cx, FOLLOW, &a)).unwrap().0, 0, "deleted drops its records");
+    assert_eq!(g.read(|cx| g.counts(cx, FOLLOW, &c)).unwrap().0, 1, "takendown keeps them");
     g.set_status(&c, None, 20).unwrap();
     let g = reopen(&g);
     assert_eq!(g.status_of(&c), None);
@@ -212,8 +212,8 @@ fn delete_by_uri_returns_the_subject_per_relation() {
     g.add(&block(&a, &tid(1)), &c).unwrap();
     let mut g = reopen(&g);
     assert_eq!(g.delete(&block(&a, &tid(1))).unwrap(), removed(&c));
-    assert_eq!(g.has(FOLLOW, &a, &b), Some(follow(&a, &tid(1))));
-    assert_eq!(g.has(BLOCK, &a, &c), None);
+    assert_eq!(g.read(|cx| g.has(cx, FOLLOW, &a, &b)).unwrap(), Some(follow(&a, &tid(1))));
+    assert_eq!(g.read(|cx| g.has(cx, BLOCK, &a, &c)).unwrap(), None);
     assert!(g.delete("at://did:plc:x/app.bsky.feed.like/3lab2xyz7qk2c").is_err());
     assert!(g.add(&follow(&a, &tid(2)), "not-a-did").is_err());
 }
@@ -240,7 +240,7 @@ fn cursors_page_through_base_and_delta() {
         let mut uris = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
-            let (page, next) = g.out_list(FOLLOW, &a, 7, cursor.as_deref());
+            let (page, next) = g.read(|cx| g.out_list(cx, FOLLOW, &a, 7, cursor.as_deref())).unwrap();
             uris.extend(page.into_iter().map(|(u, _)| u));
             match next {
                 Some(c) => cursor = Some(c),
@@ -251,13 +251,13 @@ fn cursors_page_through_base_and_delta() {
         let mut sorted = rkeys.clone();
         sorted.sort_unstable_by(|x, y| y.cmp(x));
         assert_eq!(rkeys, sorted, "newest first");
-        assert_eq!(rkeys.len() as u64, g.counts(FOLLOW, &a).0);
+        assert_eq!(rkeys.len() as u64, g.read(|cx| g.counts(cx, FOLLOW, &a)).unwrap().0);
         assert_eq!(rkeys.iter().collect::<HashSet<_>>().len(), rkeys.len());
 
         let mut followers = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
-            let (page, next) = g.in_list(FOLLOW, &a, 11, cursor.as_deref());
+            let (page, next) = g.read(|cx| g.in_list(cx, FOLLOW, &a, 11, cursor.as_deref())).unwrap();
             followers.extend(page);
             match next {
                 Some(c) => cursor = Some(c),
@@ -266,7 +266,7 @@ fn cursors_page_through_base_and_delta() {
         }
         let ids: Vec<u32> = followers.iter().map(|d| g.id_of(d).unwrap()).collect();
         assert!(ids.windows(2).all(|w| w[0] < w[1]), "id order");
-        assert_eq!(ids.len() as u64, g.counts(FOLLOW, &a).1);
+        assert_eq!(ids.len() as u64, g.read(|cx| g.counts(cx, FOLLOW, &a)).unwrap().1);
         assert_eq!(ids.len(), 300 - 8 + 40);
     }
 }
@@ -291,26 +291,36 @@ fn reads_intersect_filter_relationships() {
     for g in [&g.clone_via_snapshot(), &g] {
         let id = |i: u32| g.id_of(&did(i)).unwrap();
         let vid = g.id_of(&v).unwrap();
-        let mutuals = g.intersect(
-            ListRef { rel: FOLLOW, dir: Dir::Out, actor: vid },
-            ListRef { rel: FOLLOW, dir: Dir::In, actor: vid },
-            100,
-        );
+        let mutuals = g
+            .read(|cx| {
+                g.intersect(
+                    cx,
+                    ListRef { rel: FOLLOW, dir: Dir::Out, actor: vid },
+                    ListRef { rel: FOLLOW, dir: Dir::In, actor: vid },
+                    100,
+                )
+            })
+            .unwrap();
         let want: BTreeSet<u32> = (1..=10).map(id).collect();
         assert_eq!(mutuals.iter().copied().collect::<BTreeSet<_>>(), want);
-        let known = g.intersect(
-            ListRef { rel: FOLLOW, dir: Dir::In, actor: g.id_of(&x).unwrap() },
-            ListRef { rel: FOLLOW, dir: Dir::Out, actor: vid },
-            100,
-        );
+        let known = g
+            .read(|cx| {
+                g.intersect(
+                    cx,
+                    ListRef { rel: FOLLOW, dir: Dir::In, actor: g.id_of(&x).unwrap() },
+                    ListRef { rel: FOLLOW, dir: Dir::Out, actor: vid },
+                    100,
+                )
+            })
+            .unwrap();
         assert_eq!(known.iter().copied().collect::<BTreeSet<_>>(), (5..=15).map(id).collect());
         assert_eq!(known.len(), 11);
         let page: Vec<u32> = (1..=6).map(id).collect();
-        let kept = g.filter_id(vid, &page, &[(BLOCK, Dir::Out), (BLOCK, Dir::In)]);
+        let kept = g.read(|cx| g.filter_id(cx, vid, &page, &[(BLOCK, Dir::Out), (BLOCK, Dir::In)])).unwrap();
         assert_eq!(kept, [1, 2, 5, 6].map(id).to_vec());
         let others = [did(1), did(3), did(4), did(15), did(50)];
         let others: Vec<&str> = others.iter().map(String::as_str).collect();
-        let r = g.relationships(&v, &others, &[FOLLOW, BLOCK]);
+        let r = g.read(|cx| g.relationships(cx, &v, &others, &[FOLLOW, BLOCK])).unwrap();
         assert_eq!(r[0][0].out, Some(follow(&v, &tid(1))));
         assert_eq!(r[0][0].inn, Some(follow(&did(1), &tid(100))));
         assert_eq!(r[1][1].out, Some(block(&v, &tid(1))));
@@ -341,7 +351,7 @@ fn ids_survive_snapshots_with_live_dids() {
         assert_eq!(g2.id_of(d), Some(*id), "{d}");
         assert_eq!(g2.did_of(*id).as_deref(), Some(d.as_str()));
     }
-    assert_eq!(g2.has(FOLLOW, &did(1), "did:web:a.example"), Some(follow(&did(1), &tid(1))));
+    assert_eq!(g2.read(|cx| g2.has(cx, FOLLOW, &did(1), "did:web:a.example")).unwrap(), Some(follow(&did(1), &tid(1))));
     let g3 = reopen(&g2);
     assert_eq!(g3.id_of(&did(1)), Some(3));
 }
@@ -510,11 +520,19 @@ fn run_model(subj_index: usize) {
             for (_, rel) in rels {
                 for x in 0..actors as u32 {
                     let d = did(x);
-                    assert_eq!(g.counts(rel, &d).0, m.out_count(rel, x), "out {rel} {x} step {step}");
-                    assert_eq!(g.counts(rel, &d).1, m.in_count(rel, x), "in {rel} {x} step {step}");
+                    assert_eq!(
+                        g.read(|cx| g.counts(cx, rel, &d)).unwrap().0,
+                        m.out_count(rel, x),
+                        "out {rel} {x} step {step}"
+                    );
+                    assert_eq!(
+                        g.read(|cx| g.counts(cx, rel, &d)).unwrap().1,
+                        m.in_count(rel, x),
+                        "in {rel} {x} step {step}"
+                    );
                     let y = rnd(actors) as u32;
-                    assert_eq!(g.has(rel, &d, &did(y)).is_some(), m.pair(rel, x, y));
-                    let (page, _) = g.out_list(rel, &d, 1000, None);
+                    assert_eq!(g.read(|cx| g.has(cx, rel, &d, &did(y))).unwrap().is_some(), m.pair(rel, x, y));
+                    let (page, _) = g.read(|cx| g.out_list(cx, rel, &d, 1000, None)).unwrap();
                     let mut want: Vec<(u64, String)> = m
                         .records
                         .iter()
@@ -527,12 +545,15 @@ fn run_model(subj_index: usize) {
                     assert_eq!(got, want, "out list {rel} {x} step {step}");
                     if let Some(xi) = g.id_of(&d) {
                         let others: Vec<u32> = (0..12).filter_map(|_| g.id_of(&did(rnd(actors) as u32))).collect();
-                        let r = g.relationships_id(xi, &others, &[FOLLOW, BLOCK]);
+                        let r = g.read(|cx| g.relationships_id(cx, xi, &others, &[FOLLOW, BLOCK])).unwrap();
                         for (j, &o) in others.iter().enumerate() {
                             for (ri, rl) in [FOLLOW, BLOCK].into_iter().enumerate() {
                                 assert_eq!(
                                     r[j][ri],
-                                    (g.has_id(rl, xi, o), g.has_id(rl, o, xi)),
+                                    (
+                                        g.read(|cx| g.has_id(cx, rl, xi, o)).unwrap(),
+                                        g.read(|cx| g.has_id(cx, rl, o, xi)).unwrap()
+                                    ),
                                     "relationships step {step}"
                                 );
                             }
@@ -542,11 +563,11 @@ fn run_model(subj_index: usize) {
             }
             let ds: Vec<String> = (0..12).map(|_| did(rnd(actors) as u32)).collect();
             let pairs: Vec<(&str, &str)> = ds.chunks(2).map(|p| (p[0].as_str(), p[1].as_str())).collect();
-            let got = g.block_pairs(&pairs, &[BLOCK]);
+            let got = g.read(|cx| g.block_pairs(cx, &pairs, &[BLOCK])).unwrap();
             for (&(a, b), r) in pairs.iter().zip(got) {
                 let (x, y) = (g.id_of(a), g.id_of(b));
                 let named = |from: Option<u32>, to: Option<u32>| {
-                    from.zip(to).is_some_and(|(f, t)| g.has_id(BLOCK, f, t).is_some())
+                    from.zip(to).is_some_and(|(f, t)| g.read(|cx| g.has_id(cx, BLOCK, f, t)).unwrap().is_some())
                 };
                 assert_eq!(r, (named(x, y), named(y, x)), "block pairs step {step}");
             }
@@ -576,14 +597,14 @@ fn check_combine(g: &Graph, m: &Model, actors: u32, rnd: &mut impl FnMut(u64) ->
             let want: Vec<u32> = out_p.iter().copied().filter(|x| other.contains(x) == (op == SetOp::And)).collect();
             for after in [None, want.first().copied(), want.get(want.len() / 2).copied()] {
                 for (limit, cap) in [(2, 0), (2, 1), (5, 3), (100, 1000), (1, 2), (3, COUNT_EXACT)] {
-                    let (page, total) = g.combine_counted(a, b, op, limit, after, cap);
+                    let (page, total) = g.read(|cx| g.combine_counted(cx, a, b, op, limit, after, cap)).unwrap();
                     let rest: Vec<u32> =
                         want.iter().copied().filter(|&x| after.is_none_or(|y| x > y)).take(limit).collect();
                     assert_eq!(page, rest, "page {op:?} after {after:?} limit {limit} step {step}");
                     let n = want.len();
                     let t = (cap > 0).then(|| (n.min(cap) as u64, n > cap));
                     assert_eq!(total, t, "total {op:?} cap {cap} step {step}");
-                    assert_eq!(page, g.combine(a, b, op, limit, after));
+                    assert_eq!(page, g.read(|cx| g.combine(cx, a, b, op, limit, after)).unwrap());
                 }
             }
         }
@@ -674,36 +695,55 @@ fn lists_are_sets_of_members() {
             g = reopen(&g);
         }
         let id = |g: &Graph, s: &str| g.id_of(s).unwrap();
-        assert_eq!(g.counts(LIST, &l1), (3, 0));
-        assert_eq!(g.out_distinct(LIST, id(&g, &l1)), 2);
-        assert_eq!(g.counts(LIST, &x), (0, 1), "x is on one list");
-        assert_eq!(g.counts(LIST, &y), (0, 2));
-        assert_eq!(g.counts(LIST_OWNER, &o), (5, 0));
-        let (members, _) = g.out_list(LIST, &l1, 10, None);
+        assert_eq!(g.read(|cx| g.counts(cx, LIST, &l1)).unwrap(), (3, 0));
+        assert_eq!(g.read(|cx| g.out_distinct(cx, LIST, id(&g, &l1))).unwrap(), 2);
+        assert_eq!(g.read(|cx| g.counts(cx, LIST, &x)).unwrap(), (0, 1), "x is on one list");
+        assert_eq!(g.read(|cx| g.counts(cx, LIST, &y)).unwrap(), (0, 2));
+        assert_eq!(g.read(|cx| g.counts(cx, LIST_OWNER, &o)).unwrap(), (5, 0));
+        let (members, _) = g.read(|cx| g.out_list(cx, LIST, &l1, 10, None)).unwrap();
         let want: Vec<(String, String)> =
             [(3, &x), (2, &y), (1, &x)].into_iter().map(|(k, s)| (listitem(&o, &tid(k)), s.to_string())).collect();
         assert_eq!(members, want, "newest first, URIs in the owner's repo");
-        let (members, _) = g.out_list_opts(LIST, &l1, 10, None, true);
+        let (members, _) = g.read(|cx| g.out_list_opts(cx, LIST, &l1, 10, None, true)).unwrap();
         assert_eq!(members, want[1..].to_vec(), "one record per member, its oldest");
-        let (lists, _) = g.in_list(LIST, &y, 10, None);
+        let (lists, _) = g.read(|cx| g.in_list(cx, LIST, &y, 10, None)).unwrap();
         assert_eq!(lists.iter().collect::<BTreeSet<_>>(), [&l1, &l2].into_iter().collect());
-        assert_eq!(g.has(LIST, &l1, &x), Some(listitem(&o, &tid(1))), "the oldest, as the distinct page keeps");
-        assert_eq!(g.has(LIST, &l2, &x), None);
+        assert_eq!(
+            g.read(|cx| g.has(cx, LIST, &l1, &x)).unwrap(),
+            Some(listitem(&o, &tid(1))),
+            "the oldest, as the distinct page keeps"
+        );
+        assert_eq!(g.read(|cx| g.has(cx, LIST, &l2, &x)).unwrap(), None);
 
         let side = |g: &Graph, rel, dir, s: &str| ListRef { rel, dir, actor: id(g, s) };
         let names = |g: &Graph, v: Vec<u32>| v.into_iter().map(|i| g.did_of(i).unwrap()).collect::<BTreeSet<_>>();
         let (s1, s2) = (side(&g, LIST, Dir::Out, &l1), side(&g, LIST, Dir::Out, &l2));
-        assert_eq!(names(&g, g.combine(s1, s2, marco_core::SetOp::And, 10, None)), [y.clone()].into());
-        assert_eq!(names(&g, g.combine(s1, s2, marco_core::SetOp::AndNot, 10, None)), [x.clone()].into());
-        assert_eq!(names(&g, g.combine(s2, s1, marco_core::SetOp::AndNot, 10, None)), [z.clone()].into());
-        let both = g.combine(s1, s2, marco_core::SetOp::And, 10, None)[0];
-        assert!(g.combine(s1, s2, marco_core::SetOp::And, 10, Some(both)).is_empty(), "the cursor");
+        assert_eq!(
+            names(&g, g.read(|cx| g.combine(cx, s1, s2, marco_core::SetOp::And, 10, None)).unwrap()),
+            [y.clone()].into()
+        );
+        assert_eq!(
+            names(&g, g.read(|cx| g.combine(cx, s1, s2, marco_core::SetOp::AndNot, 10, None)).unwrap()),
+            [x.clone()].into()
+        );
+        assert_eq!(
+            names(&g, g.read(|cx| g.combine(cx, s2, s1, marco_core::SetOp::AndNot, 10, None)).unwrap()),
+            [z.clone()].into()
+        );
+        let both = g.read(|cx| g.combine(cx, s1, s2, marco_core::SetOp::And, 10, None)).unwrap()[0];
+        assert!(
+            g.read(|cx| g.combine(cx, s1, s2, marco_core::SetOp::And, 10, Some(both))).unwrap().is_empty(),
+            "the cursor"
+        );
         let ids: Vec<u32> = [&x, &y, &z].iter().map(|d| id(&g, d)).collect();
-        assert_eq!(names(&g, g.filter_sets(id(&g, &o), &ids, &[], &[s1])), [z.clone()].into());
+        assert_eq!(
+            names(&g, g.read(|cx| g.filter_sets(cx, id(&g, &o), &ids, &[], &[s1])).unwrap()),
+            [z.clone()].into()
+        );
 
         assert_eq!(g.delete(&listitem(&o, &tid(2))).unwrap(), removed(&y), "delete by URI finds the list");
-        assert_eq!(g.counts(LIST, &y), (0, 1));
-        assert_eq!(g.out_distinct(LIST, id(&g, &l1)), 1);
+        assert_eq!(g.read(|cx| g.counts(cx, LIST, &y)).unwrap(), (0, 1));
+        assert_eq!(g.read(|cx| g.out_distinct(cx, LIST, id(&g, &l1))).unwrap(), 1);
         assert_eq!(g.delete(&listitem(&o, &tid(2))).unwrap(), Removed::NotFound);
         assert_eq!(g.add_rec(&listitem(&o, &tid(6)), &z, Some(&l1), -5).unwrap(), Added::Added);
         g.delete_at(&listitem(&o, &tid(7)), 100).unwrap();
@@ -715,9 +755,9 @@ fn lists_are_sets_of_members() {
         let g = reopen(&g);
         let mut g = g;
         assert_eq!(g.set_status(&o, Some(Status::Deleted), 200).unwrap(), 5);
-        assert_eq!(g.counts(LIST, &l1), (0, 0));
-        assert_eq!(g.counts(LIST, &y), (0, 0));
-        assert_eq!(g.counts(LIST_OWNER, &o), (0, 0));
+        assert_eq!(g.read(|cx| g.counts(cx, LIST, &l1)).unwrap(), (0, 0));
+        assert_eq!(g.read(|cx| g.counts(cx, LIST, &y)).unwrap(), (0, 0));
+        assert_eq!(g.read(|cx| g.counts(cx, LIST_OWNER, &o)).unwrap(), (0, 0));
     }
 }
 
@@ -778,23 +818,35 @@ fn lists_match_a_model() {
         if step % 83 == 0 {
             for o in 0..owners as u32 {
                 let n_owner = recs.keys().filter(|k| k.0 == o).count() as u64;
-                assert_eq!(g.counts(LIST_OWNER, &did(o)).0, n_owner, "owner {o} step {step}");
+                assert_eq!(g.read(|cx| g.counts(cx, LIST_OWNER, &did(o))).unwrap().0, n_owner, "owner {o} step {step}");
                 for l in 0..3 {
                     let lu = list_uri(&did(o), l);
                     let items: Vec<(&String, u32)> =
                         recs.iter().filter(|(k, v)| k.0 == o && v.0 == l).map(|(k, v)| (&k.1, v.1)).collect();
                     let members: BTreeSet<u32> = items.iter().map(|i| i.1).collect();
-                    assert_eq!(g.counts(LIST, &lu).0, items.len() as u64, "list {o}/{l} step {step}");
+                    assert_eq!(
+                        g.read(|cx| g.counts(cx, LIST, &lu)).unwrap().0,
+                        items.len() as u64,
+                        "list {o}/{l} step {step}"
+                    );
                     let lid = g.id_of(&lu);
-                    assert_eq!(lid.map_or(0, |i| g.out_distinct(LIST, i)), members.len() as u64, "step {step}");
-                    let (page, _) = g.out_list_opts(LIST, &lu, 1000, None, true);
+                    assert_eq!(
+                        lid.map_or(0, |i| g.read(|cx| g.out_distinct(cx, LIST, i)).unwrap()),
+                        members.len() as u64,
+                        "step {step}"
+                    );
+                    let (page, _) = g.read(|cx| g.out_list_opts(cx, LIST, &lu, 1000, None, true)).unwrap();
                     assert_eq!(page.iter().map(|p| p.1.clone()).collect::<BTreeSet<_>>().len(), page.len());
                     assert_eq!(page.len(), members.len());
                     for m in 10..25u32 {
-                        assert_eq!(g.has(LIST, &lu, &did(m)).is_some(), members.contains(&m), "step {step}");
+                        assert_eq!(
+                            g.read(|cx| g.has(cx, LIST, &lu, &did(m))).unwrap().is_some(),
+                            members.contains(&m),
+                            "step {step}"
+                        );
                         if let (Some(li), Some(mi)) = (lid, g.id_of(&did(m))) {
                             let s = ListRef { rel: LIST, dir: Dir::Out, actor: li };
-                            assert_eq!(g.side_contains(s, mi), members.contains(&m));
+                            assert_eq!(g.read(|cx| g.side_contains(cx, s, mi)).unwrap(), members.contains(&m));
                         }
                     }
                 }
@@ -816,8 +868,9 @@ fn a_list_compacted_to_empty_reads_as_empty() {
     for k in 0..4 {
         g.delete(&follow(&a, &tid(k))).unwrap();
     }
-    assert_eq!(g.counts(FOLLOW, &a), (0, 0));
-    assert_eq!(reopen(&g).counts(FOLLOW, &a), (0, 0));
+    assert_eq!(g.read(|cx| g.counts(cx, FOLLOW, &a)).unwrap(), (0, 0));
+    let back = reopen(&g);
+    assert_eq!(back.read(|cx| back.counts(cx, FOLLOW, &a)).unwrap(), (0, 0));
 }
 
 #[test]
@@ -829,8 +882,18 @@ fn an_update_replaces_the_record() {
     let mut g = reopen(&g);
     assert_eq!(g.add_at(&u, &c, 2).unwrap(), Added::Added, "a new subject under the same rkey");
     assert_eq!(g.add_at(&u, &c, 3).unwrap(), Added::Exists);
-    assert_eq!((g.has(FOLLOW, &a, &b), g.has(FOLLOW, &a, &c)), (None, Some(u.clone())));
-    assert_eq!((g.counts(FOLLOW, &a), g.counts(FOLLOW, &b), g.counts(FOLLOW, &c)), ((1, 0), (0, 0), (0, 1)));
+    assert_eq!(
+        (g.read(|cx| g.has(cx, FOLLOW, &a, &b)).unwrap(), g.read(|cx| g.has(cx, FOLLOW, &a, &c)).unwrap()),
+        (None, Some(u.clone()))
+    );
+    assert_eq!(
+        (
+            g.read(|cx| g.counts(cx, FOLLOW, &a)).unwrap(),
+            g.read(|cx| g.counts(cx, FOLLOW, &b)).unwrap(),
+            g.read(|cx| g.counts(cx, FOLLOW, &c)).unwrap()
+        ),
+        ((1, 0), (0, 0), (0, 1))
+    );
     g.delete_at(&u, 10).unwrap();
     assert_eq!(g.add_at(&u, &b, 5).unwrap(), Added::Deleted, "an older update stays deleted");
 }
@@ -847,11 +910,21 @@ fn an_update_moves_a_listitem() {
             g = reopen(&g);
         }
         assert_eq!(g.add_rec(&u, &x, Some(&l2), 2).unwrap(), Added::Added);
-        assert_eq!((g.has(LIST, &l1, &x), g.has(LIST, &l2, &x)), (None, Some(u.clone())));
-        assert_eq!((g.counts(LIST, &l1).0, g.counts(LIST, &l2).0, g.counts(LIST, &x).1), (0, 1, 1));
-        assert_eq!(g.counts(LIST_OWNER, &o).0, 1);
+        assert_eq!(
+            (g.read(|cx| g.has(cx, LIST, &l1, &x)).unwrap(), g.read(|cx| g.has(cx, LIST, &l2, &x)).unwrap()),
+            (None, Some(u.clone()))
+        );
+        assert_eq!(
+            (
+                g.read(|cx| g.counts(cx, LIST, &l1)).unwrap().0,
+                g.read(|cx| g.counts(cx, LIST, &l2)).unwrap().0,
+                g.read(|cx| g.counts(cx, LIST, &x)).unwrap().1
+            ),
+            (0, 1, 1)
+        );
+        assert_eq!(g.read(|cx| g.counts(cx, LIST_OWNER, &o)).unwrap().0, 1);
         assert_eq!(g.delete(&u).unwrap(), removed(&x), "the delete finds the new list");
-        assert_eq!(g.counts(LIST, &l2).0, 0);
+        assert_eq!(g.read(|cx| g.counts(cx, LIST, &l2)).unwrap().0, 0);
     }
 }
 
@@ -862,7 +935,8 @@ fn a_graph_with_fewer_ids_than_shards_reopens() {
     let dir = tempfile::tempdir().unwrap();
     let p = dir.path().join("g");
     g.write_snapshot(&p).unwrap();
-    assert_eq!(Graph::open(&p).unwrap().counts(FOLLOW, &did(1)), (1, 0));
+    let back = Graph::open(&p).unwrap();
+    assert_eq!(back.read(|cx| back.counts(cx, FOLLOW, &did(1))).unwrap(), (1, 0));
 }
 
 /// Two sources: the live tail saw create x at 10 and update y at 20; a
@@ -880,7 +954,7 @@ fn a_late_older_add_leaves_a_newer_update() {
         }
         g.set_source("backfill");
         assert_eq!(g.add_at(&u, &x, 10).unwrap(), Added::Exists, "older than the update");
-        assert_eq!(g.has(FOLLOW, &a, &y), Some(u.clone()));
+        assert_eq!(g.read(|cx| g.has(cx, FOLLOW, &a, &y)).unwrap(), Some(u.clone()));
         assert_eq!(g.add_at(&u, &x, 30).unwrap(), Added::Added, "a newer one still lands");
     }
 }
@@ -902,7 +976,10 @@ fn an_update_older_than_a_re_create_leaves_it() {
         }
         g.set_source("slower");
         assert_eq!(g.add_at(&u, &y, 12).unwrap(), Added::Exists);
-        assert_eq!((g.has(FOLLOW, &a, &z), g.counts(FOLLOW, &a)), (Some(u.clone()), (1, 0)));
+        assert_eq!(
+            (g.read(|cx| g.has(cx, FOLLOW, &a, &z)).unwrap(), g.read(|cx| g.counts(cx, FOLLOW, &a)).unwrap()),
+            (Some(u.clone()), (1, 0))
+        );
     }
 }
 
@@ -919,7 +996,7 @@ fn a_late_older_delete_leaves_a_newer_record() {
     g.add_at(&u, &y, 20).unwrap();
     g.set_source("backfill");
     assert_eq!(g.delete_at(&u, 10).unwrap(), Removed::NotFound);
-    assert_eq!(g.has(FOLLOW, &a, &y), Some(u.clone()));
+    assert_eq!(g.read(|cx| g.has(cx, FOLLOW, &a, &y)).unwrap(), Some(u.clone()));
     let v = follow(&a, &tid(2));
     g.set_source("live");
     g.add_at(&v, &x, 5).unwrap();
@@ -941,14 +1018,29 @@ fn replace_keeps_counts_and_distinct_members_right() {
         if snapshot_between {
             g = reopen(&g);
         }
-        let distinct = |g: &Graph| g.out_distinct(LIST, g.id_of(&l).unwrap());
+        let distinct = |g: &Graph| g.read(|cx| g.out_distinct(cx, LIST, g.id_of(&l).unwrap())).unwrap();
         g.add_rec(&listitem(&o, &tid(2)), &x, Some(&l), 2).unwrap();
-        assert_eq!((g.counts(LIST, &l), distinct(&g), g.counts(LIST, &x).1, g.counts(LIST, &y).1), ((2, 0), 1, 1, 0));
+        assert_eq!(
+            (
+                g.read(|cx| g.counts(cx, LIST, &l)).unwrap(),
+                distinct(&g),
+                g.read(|cx| g.counts(cx, LIST, &x)).unwrap().1,
+                g.read(|cx| g.counts(cx, LIST, &y)).unwrap().1
+            ),
+            ((2, 0), 1, 1, 0)
+        );
         assert_eq!(distinct(&reopen(&g)), 1);
         g.add_rec(&listitem(&o, &tid(2)), &z, Some(&l), 3).unwrap();
-        assert_eq!((g.counts(LIST, &l), distinct(&g), g.counts(LIST, &z).1), ((2, 0), 2, 1));
-        let (first, _) = g.out_list_opts(LIST, &l, 1, None, true);
-        let (rest, _) = g.out_list_opts(LIST, &l, 1, Some(&tid(2)), true);
+        assert_eq!(
+            (
+                g.read(|cx| g.counts(cx, LIST, &l)).unwrap(),
+                distinct(&g),
+                g.read(|cx| g.counts(cx, LIST, &z)).unwrap().1
+            ),
+            ((2, 0), 2, 1)
+        );
+        let (first, _) = g.read(|cx| g.out_list_opts(cx, LIST, &l, 1, None, true)).unwrap();
+        let (rest, _) = g.read(|cx| g.out_list_opts(cx, LIST, &l, 1, Some(&tid(2)), true)).unwrap();
         assert_eq!(first.len() + rest.len(), 2);
         assert_eq!(g.delete(&listitem(&o, &tid(2))).unwrap(), removed(&z));
         assert_eq!((distinct(&g), g.records(LIST).0, g.records(LIST_OWNER).0), (1, 1, 1));
@@ -971,10 +1063,10 @@ fn a_distinct_page_of_a_list_of_repeats_is_quick() {
     }
     let g = reopen(&g);
     let t = std::time::Instant::now();
-    let (page, next) = g.out_list_opts(LIST, &l, 50, None, true);
-    let (rest, _) = g.out_list_opts(LIST, &l, 100, next.as_deref(), true);
+    let (page, next) = g.read(|cx| g.out_list_opts(cx, LIST, &l, 50, None, true)).unwrap();
+    let (rest, _) = g.read(|cx| g.out_list_opts(cx, LIST, &l, 100, next.as_deref(), true)).unwrap();
     assert_eq!(page.len() + rest.len(), members as usize);
-    assert!(g.has(LIST, &l, &did(10)).is_some());
+    assert!(g.read(|cx| g.has(cx, LIST, &l, &did(10))).unwrap().is_some());
     assert!(t.elapsed() < std::time::Duration::from_millis(500), "{:?}", t.elapsed());
 }
 
@@ -1002,7 +1094,10 @@ fn an_account_deletion_takes_records_stamped_after_it() {
     g.add_at(&follow(&a, &tid(2)), &y, 50).unwrap();
     g.set_source("relay");
     g.set_status(&a, Some(Status::Deleted), 99).unwrap();
-    assert_eq!((g.counts(FOLLOW, &a), g.counts(FOLLOW, &y)), ((0, 0), (0, 0)));
+    assert_eq!(
+        (g.read(|cx| g.counts(cx, FOLLOW, &a)).unwrap(), g.read(|cx| g.counts(cx, FOLLOW, &y)).unwrap()),
+        ((0, 0), (0, 0))
+    );
 }
 
 #[test]
@@ -1131,7 +1226,8 @@ fn combine_counted_on_long_lists() {
                             (5, COUNT_EXACT),
                             (300, COUNT_EXACT),
                         ] {
-                            let (page, total) = g.combine_counted(*a, *b, op, limit, after, cap);
+                            let (page, total) =
+                                g.read(|cx| g.combine_counted(cx, *a, *b, op, limit, after, cap)).unwrap();
                             let rest: Vec<u32> =
                                 want.iter().copied().filter(|&x| after.is_none_or(|y| x > y)).take(limit).collect();
                             assert_eq!(page, rest, "{a:?} {op:?} {b:?} after {after:?} limit {limit}");

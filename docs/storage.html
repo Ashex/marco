@@ -1056,6 +1056,17 @@ match app.engine.pass(&amp;mut Hold::none(), &amp;work) {           // on the to
 <li><b>Leaves:</b> main runs on FORMAT 6 through mmap, which is the FORMAT 6 baseline for E1.</li>
 </ul>
 
+<p><b>Phase 3b decisions.</b> Where this doc left the read path's wiring open, 3b decided. Phases 3c and 4 build on these:</p>
+<table class="small">
+<tr><th>Point</th><th>Decided</th><th>Where</th></tr>
+<tr><td>Two CRs</td><td>3b lands as a stack. The first moves every caller onto <code>ReadCx</code> and <code>R&lt;T&gt;</code> over FORMAT 5's bytes, each base list read as a <code>PagedOut::Whole</code> or <code>PagedIn::Whole</code>. The second puts the FORMAT 6 store under the same API and flips the defaults. Each builds and passes every test on its own.</td><td>stack</td></tr>
+<tr><td>Graph reads</td><td>Every method that reads a list takes <code>&amp;ReadCx</code> and returns <code>R&lt;T&gt;</code>. The directory, statuses, tombstones, stamps and side rkeys are pinned, so <code>id_of</code>, <code>did_of</code>, <code>hidden</code>, <code>uri</code> and the rest stay plain. <code>Graph::read(f)</code> runs one pass with <code>Hold::none()</code> and falls back to <code>read_blocking</code>: what tools, tests and admin jobs call.</td><td><code>graph</code></td></tr>
+<tr><td>Handlers</td><td>A Graph handler builds its whole response inside the closure. Validation that needs only pinned state (relation names, ids, cursors) runs before it, so the closure returns <code>R&lt;T&gt;</code> and nothing else. A request takes one <code>app.graph()</code> and keeps it across its passes, since a copy's store and engine go together until phase 4 shares one engine. <code>graph_svc::run</code> falls back to <code>read_blocking</code> on the worker, which over a store that keeps whole files never waits; phase 4 swaps that fallback for the miss pool. Admin reads go through the same <code>run</code>.</td><td><code>graph_svc</code>, <code>admin_svc</code></td></tr>
+<tr><td>Batches</td><td>Relationships, BlockPairs, Filter, the probe loop over a big out side and each chunk of a distinct ListOut catch <code>Pending</code> per item and carry on, so one pass names every page the batch misses. Inside a by-subject scan, an rkey lookup that misses doesn't stop the scan either.</td><td><code>graph::item</code></td></tr>
+<tr><td>Writes</td><td>Each write op (an add, a delete, an account's deletes) runs its reads and its changes in one pass. Over a store that keeps whole files only a bad page misses, and then the op fails with the fetch's error, which the writer counts as it does a bad URI. Phase 4's plan rounds replace this.</td><td><code>Graph::write</code></td></tr>
+<tr><td>Reads with a limit</td><td><code>out_page</code> and <code>in_page</code> pass <code>want</code> as the limit plus the delta entries that can mask base records, so a page under a delta still fetches in one round.</td><td><code>graph</code></td></tr>
+</table>
+
 <h3>Phase 3c · Patch checkpoints and compaction <span class="tag c">needs 3b</span></h3>
 <ul>
 <li>Patch files and the base + patches manifest.</li>

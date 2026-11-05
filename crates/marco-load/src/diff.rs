@@ -41,13 +41,14 @@ fn one_way(x: &Graph, y: &Graph, rel: RelId, coll: &str, samples: usize) -> Side
         samples: Mutex::new(Vec::new()),
     };
     (0..x.n_ids()).into_par_iter().with_min_len(4096).for_each(|id| {
-        let out = x.out_all(rel, id);
+        let out = x.read(|cx| x.out_all(cx, rel, id)).unwrap();
         if out.is_empty() {
             return;
         }
         s.records.fetch_add(out.len() as u64, Relaxed);
         let Some(did) = x.did_of(id) else { return };
-        let theirs = y.id_of(&did).map(|yid| (yid, y.out_all(rel, yid))).unwrap_or((0, Vec::new()));
+        let theirs =
+            y.id_of(&did).map(|yid| (yid, y.read(|cx| y.out_all(cx, rel, yid)).unwrap())).unwrap_or((0, Vec::new()));
         let (mut m, mut d) = (0u64, 0u64);
         for &(k, subj) in &out {
             let hit = theirs.1.binary_search_by_key(&k, |e| e.0).ok().map(|i| theirs.1[i].1);
