@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use connectrpc::{ConnectError, InboundStream, RequestContext, Response, ServiceRequest, ServiceResult};
 use futures::StreamExt;
-use marco_core::{Dir, Graph, ListRef, RelId, SetOp};
+use marco_core::{Dir, Graph, ListRef, RelId, SetOp, COUNT_EXACT};
 use marco_proto::connect::marco::v1 as svc;
 use marco_proto::v1::__buffa::oneof::{write_op, write_result};
 use marco_proto::v1::*;
@@ -305,7 +305,12 @@ impl svc::Graph for GraphApi {
             c => Some(g.id_of(c).ok_or_else(|| bad("cursor isn't in this graph"))?),
         };
         let lim = limit(req.limit, 100, 10_000);
-        let cap = if req.count { limit(req.count_limit, 1000, 10_000) } else { 0 };
+        // exact unless the caller caps it: the work is one pass over the side the page decodes anyway
+        let cap = match (req.count, req.count_limit) {
+            (false, _) => 0,
+            (true, 0) => COUNT_EXACT,
+            (true, l) => limit(l, 0, 10_000),
+        };
         let (ids, total) = match (a, b, op) {
             (Some(x), Some(y), _) => g.combine_counted(x, y, op, lim, after, cap),
             // a without a missing (or hidden) b is all of a

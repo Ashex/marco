@@ -263,7 +263,7 @@ async fn graph_reads() {
     let counted = g.intersect(known(5, true, 0, "")).await.unwrap().into_owned();
     assert_eq!(counted.actors, plain.actors, "the page doesn't change");
     assert_eq!(counted.cursor, plain.cursor);
-    assert_eq!((counted.total, counted.total_capped), (all, false), "default limit 1000");
+    assert_eq!((counted.total, counted.total_capped), (all, false), "no cap by default");
     let capped = g.intersect(known(5, true, 10, "")).await.unwrap().into_owned();
     assert_eq!((capped.total, capped.total_capped), (10, true));
     assert_eq!(capped.actors, plain.actors);
@@ -271,8 +271,40 @@ async fn graph_reads() {
     assert_eq!(next.actors, i.actors[5..10]);
     assert_eq!((next.total, next.total_capped), (all, false), "the count ignores the cursor");
 
-    // a block from a0, then filter a0's view
+    // past 1,000 the total stays exact unless the caller passes a cap: 1,100
+    // new accounts follow both y1 and y2
     let w = graph(s.api, Some(TOKEN));
+    const MANY: u32 = 1100;
+    let (y1, y2) = (did(N + MANY), did(N + MANY + 1));
+    for chunk in (0..MANY).collect::<Vec<_>>().chunks(500) {
+        let ops = chunk
+            .iter()
+            .flat_map(|&k| {
+                let x = did(N + k);
+                let t = tid(9_100_000 + k as u64, 1);
+                [add(&uri(&x, FOLLOW, &t), &y1), add(&uri(&x, FOLLOW, &tid(9_100_000 + k as u64, 2)), &y2)]
+            })
+            .collect();
+        w.write_batch(WriteBatchRequest { ops, ..Default::default() }).await.unwrap();
+    }
+    let both = |count, count_limit| IntersectRequest {
+        a: side("follow", Dir::DIR_IN, &y1).into(),
+        b: side("follow", Dir::DIR_IN, &y2).into(),
+        limit: 5,
+        count,
+        count_limit,
+        ..Default::default()
+    };
+    let exact = g.intersect(both(true, 0)).await.unwrap().into_owned();
+    assert_eq!((exact.total, exact.total_capped), (MANY as u64, false), "exact past 1,000");
+    assert_eq!(exact.actors.len(), 5);
+    let cap = g.intersect(both(true, 1000)).await.unwrap().into_owned();
+    assert_eq!((cap.total, cap.total_capped), (1000, true), "a passed cap still caps");
+    assert_eq!(cap.actors, exact.actors);
+    let over = g.intersect(both(true, 50_000)).await.unwrap().into_owned();
+    assert_eq!((over.total, over.total_capped), (MANY as u64, false), "a cap past the total is exact");
+
+    // a block from a0, then filter a0's view
     let bu = uri(&a0, BLOCK, &tid(9_000_000, 1));
     w.write_batch(WriteBatchRequest { ops: vec![add(&bu, &a2)], ..Default::default() }).await.unwrap();
     let f = g

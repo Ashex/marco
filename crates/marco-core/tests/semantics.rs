@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use marco_core::rkey::key_of;
-use marco_core::{Added, Dir, Graph, ListRef, Relations, Removed, SetOp, Status};
+use marco_core::{Added, Dir, Graph, ListRef, Relations, Removed, SetOp, Status, COUNT_EXACT};
 use vlatproto::tid::Tid;
 
 const FOLLOW: u8 = 0;
@@ -575,7 +575,7 @@ fn check_combine(g: &Graph, m: &Model, actors: u32, rnd: &mut impl FnMut(u64) ->
         for op in [SetOp::And, SetOp::AndNot] {
             let want: Vec<u32> = out_p.iter().copied().filter(|x| other.contains(x) == (op == SetOp::And)).collect();
             for after in [None, want.first().copied(), want.get(want.len() / 2).copied()] {
-                for (limit, cap) in [(2, 0), (2, 1), (5, 3), (100, 1000), (1, 2)] {
+                for (limit, cap) in [(2, 0), (2, 1), (5, 3), (100, 1000), (1, 2), (3, COUNT_EXACT)] {
                     let (page, total) = g.combine_counted(a, b, op, limit, after, cap);
                     let rest: Vec<u32> =
                         want.iter().copied().filter(|&x| after.is_none_or(|y| x > y)).take(limit).collect();
@@ -1093,6 +1093,7 @@ fn combine_counted_on_long_lists() {
     for (s, _) in ins {
         sets.push((s, Dir::In, edges.iter().filter(|e| e.1 == s).map(|e| e.0).collect()));
     }
+    let mut exact_over_1000 = false;
     for g in [&g.clone_via_snapshot(), &g] {
         let ids = |v: &[u32]| -> Vec<u32> {
             let mut x: Vec<u32> = v.iter().map(|&i| g.id_of(&did(i)).unwrap()).collect();
@@ -1121,7 +1122,15 @@ fn combine_counted_on_long_lists() {
                             .map(Some),
                     );
                     for after in cursors {
-                        for (limit, cap) in [(5, 0), (5, 1000), (300, 2000), (2000, 10), (1, usize::MAX)] {
+                        for (limit, cap) in [
+                            (5, 0),
+                            (5, 1000),
+                            (300, 2000),
+                            (2000, 10),
+                            (1, COUNT_EXACT),
+                            (5, COUNT_EXACT),
+                            (300, COUNT_EXACT),
+                        ] {
                             let (page, total) = g.combine_counted(*a, *b, op, limit, after, cap);
                             let rest: Vec<u32> =
                                 want.iter().copied().filter(|&x| after.is_none_or(|y| x > y)).take(limit).collect();
@@ -1132,10 +1141,12 @@ fn combine_counted_on_long_lists() {
                                 (cap > 0).then(|| (n.min(cap) as u64, n > cap)),
                                 "{a:?} {op:?} {b:?} cap {cap}"
                             );
+                            exact_over_1000 |= cap == COUNT_EXACT && n > 1000 && total == Some((n as u64, false));
                         }
                     }
                 }
             }
         }
     }
+    assert!(exact_over_1000, "some pair has an exact total past 1,000");
 }

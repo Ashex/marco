@@ -550,15 +550,16 @@ export type IntersectRequest = Message<"marco.v1.IntersectRequest"> & {
   cursor: string;
 
   /**
-   * Also count the whole result, cursor or not, up to count_limit: total
-   * and total_capped ("followed by A, B and N others").
+   * Also count the whole result, cursor or not: total ("followed by A, B
+   * and N others"). Exact unless count_limit caps it.
    *
    * @generated from field: bool count = 6;
    */
   count: boolean;
 
   /**
-   * Default 1000, at most 10000.
+   * 0 (the default): no cap, the total is exact. Otherwise count up to this
+   * many, at most 10000, and set total_capped past it.
    *
    * @generated from field: uint32 count_limit = 7;
    */
@@ -612,7 +613,8 @@ export type IntersectResponse = Message<"marco.v1.IntersectResponse"> & {
   total: bigint;
 
   /**
-   * More than count_limit: total is a floor.
+   * Only with a count_limit: the result has more than that, and total is
+   * count_limit.
    *
    * @generated from field: bool total_capped = 6;
    */

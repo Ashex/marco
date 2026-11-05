@@ -3619,8 +3619,8 @@ pub struct IntersectRequest {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
     )]
     pub cursor: ::buffa::alloc::string::String,
-    /// Also count the whole result, cursor or not, up to count_limit: total
-    /// and total_capped ("followed by A, B and N others").
+    /// Also count the whole result, cursor or not: total ("followed by A, B
+    /// and N others"). Exact unless count_limit caps it.
     ///
     /// Field 6: `count`
     #[serde(
@@ -3629,7 +3629,8 @@ pub struct IntersectRequest {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_false"
     )]
     pub count: bool,
-    /// Default 1000, at most 10000.
+    /// 0 (the default): no cap, the total is exact. Otherwise count up to this
+    /// many, at most 10000, and set total_capped past it.
     ///
     /// Field 7: `count_limit`
     #[serde(
@@ -3929,7 +3930,8 @@ pub struct IntersectResponse {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
     )]
     pub total: u64,
-    /// More than count_limit: total is a floor.
+    /// Only with a count_limit: the result has more than that, and total is
+    /// count_limit.
     ///
     /// Field 6: `total_capped`
     #[serde(

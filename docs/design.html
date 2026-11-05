@@ -487,7 +487,7 @@ list = "list"     # the edge starts at this record, which must be in the same re
 
 <h3 id="known-followers-total">Known followers' total</h3>
 <div class="fig">
-<svg viewBox="0 0 900 270" role="img" aria-label="Intersect decodes the smaller side, tests each member in the bigger, pages the first hits and counts on to the cap">
+<svg viewBox="0 0 900 270" role="img" aria-label="Intersect decodes the smaller side, tests each member in the bigger, pages the first hits and counts them all">
   <g font-size="13">
   <rect class="box" x="10" y="20" width="230" height="56" rx="6"/>
   <text x="22" y="42">viewer's follows (out)</text>
@@ -505,33 +505,31 @@ list = "list"     # the edge starts at this record, which must be in the same re
   <rect class="bar2" x="610" y="50" width="220" height="28" rx="3"/>
   <rect class="bar3" x="830" y="50" width="60" height="28" rx="3"/>
   <text x="556" y="69" font-size="12" style="fill:var(--bg)">page</text>
-  <text x="616" y="69" font-size="12" style="fill:var(--bg)">counted, up to count_limit + 1</text>
+  <text x="616" y="69" font-size="12" style="fill:var(--bg)">counted, all of them (or up to count_limit + 1)</text>
   <text x="836" y="69" font-size="12" class="m">not read</text>
   <text x="550" y="104" font-size="12">actors: the first limit hits past the cursor, as before</text>
-  <text x="550" y="124" font-size="12">total: hits up to count_limit, total_capped past it</text>
-  <text x="10" y="190" class="m" font-size="12">no cursor: one pass makes both, stopping at max(limit, count_limit + 1) hits</text>
+  <text x="550" y="124" font-size="12">total: every hit, or count_limit and total_capped if a cap was passed</text>
+  <text x="10" y="190" class="m" font-size="12">no cursor: one pass makes both, over the whole smaller side (a passed cap stops it at count_limit + 1 hits)</text>
   <text x="10" y="210" class="m" font-size="12">a cursor: the page from the cursor, the count from the start, the smaller side still decoded once</text>
   <text x="10" y="230" class="m" font-size="12">AND_NOT counts a without b the same way: b probed, or decoded once and merged in one walk across a's chunks</text>
   <text x="10" y="250" class="m" font-size="12">worst case: a membership test per member of the smaller side, which the page's decode already paid for</text>
   </g>
 </svg>
 </div>
-<p>A profile shows "followed by A, B and N others": five DIDs and the size of the viewer's follows ∩ the subject's followers. Intersect paged the ids and returned each side's length, so the total meant paging through all of it. Now <code>count</code> asks for it: <code>total</code> is exact up to <code>count_limit</code> (default 1000, at most 10,000) and <code>total_capped</code> says there's more. The page doesn't change, and nothing is counted unless asked.</p>
+<p>A profile shows "followed by A, B and N others": five DIDs and the size of the viewer's follows ∩ the subject's followers. Intersect paged the ids and returned each side's length, so the total meant paging through all of it. Now <code>count</code> asks for it, and <code>total</code> is exact. The AppView's <code>totalKnown</code> is a plain COUNT(*) with no cap, and marco matches it. A caller that passes <code>count_limit</code> (at most 10,000) gets the capped total and <code>total_capped</code>. The page doesn't change, and nothing is counted unless asked.</p>
 <div class="tw"><table>
 <tr><th>Option</th><th>Small totals (the usual case)</th><th>Worst case</th><th>Answer depends on</th></tr>
-<tr class="pick"><td><b>Exact up to a cap</b></td><td>exact</td><td>membership tests over the smaller side, stopping at cap + 1 hits</td><td>the graph and the cap</td></tr>
+<tr class="pick"><td><b>Exact</b>, optionally capped by the caller</td><td>exact</td><td>membership tests over the whole smaller side</td><td>the graph only</td></tr>
 <tr><td>A cost budget</td><td>exact while under budget</td><td>the budget</td><td>also the layout: the same pair can come back exact or not as lists grow</td></tr>
 <tr><td>An estimate (sampled)</td><td>off by whole people at N = 3</td><td>the sample</td><td>the sample's luck</td></tr>
 </table></div>
-<p>The cap matches what the UI does with the number: past a thousand it reads "1,000+". The work is bounded by the side the page already decodes. A typical viewer's few hundred follows are tested against the subject's in set, so the count is a few hundred Elias-Fano lookups. For the 886k-follow account the smaller side is its own follow list, decoded by the by-subject walk that makes mutuals slow. That decode is the page's cost and is left as it is for now. The count adds at most one pass over those members, and stops at the cap. AND_NOT is bounded the same way: b is probed when it's an in set or much bigger than a, and otherwise decoded once and merged with a in one walk, whichever chunk of a the page or the count is on. With a = 886k out follows and b the same accounts less every 600th (b decoded), a page of 5 takes 1.4 ms, the page and a total to 1000 take 2.6 ms, and decoding both sides takes 1.5 ms. The total includes accounts the page leaves out because they're taken down.</p>
+<p>No cap is needed to stay bounded: a total can't exceed the smaller side, and the page already decodes that side, so an exact count is at most one more pass over it, with a result no longer than it. AND counts over the smaller side. AND_NOT counts over a, which the page decodes too, and walks b once however many chunks of a it takes (b probed when it's an in set or much bigger than a, otherwise decoded once and merged). A typical viewer's few hundred follows are a few hundred Elias-Fano lookups. For the 886k-follow account the count is one pass over its follow list, after the by-subject walk that makes mutuals slow. The total includes accounts the page leaves out because they're taken down.</p>
 <div class="tw"><table>
-<tr><th>Known followers of the 20 most-followed, page of 5</th><th class="n">in-process µs</th><th class="n">RPC stack µs</th><th class="n">server CPU µs</th></tr>
-<tr><td>typical viewer (50 to 5,000 follows)</td><td class="n">2.2</td><td class="n">5.4</td><td class="n">12.5</td></tr>
-<tr class="pick"><td>typical viewer, with the total</td><td class="n">3.1</td><td class="n">6.4</td><td class="n">12.7</td></tr>
-<tr><td>the most-following viewer</td><td class="n">75</td><td class="n">79</td><td class="n">93</td></tr>
-<tr class="pick"><td>the most-following viewer, with the total</td><td class="n">79</td><td class="n">82</td><td class="n">98</td></tr>
+<tr><th>Known followers of the 20 most-followed, page of 5</th><th class="n">no total µs</th><th class="n">exact total µs</th><th class="n">capped at 1,000 µs</th></tr>
+<tr><td>typical viewer (50 to 5,000 follows)</td><td class="n">2.1</td><td class="n pick">3.2</td><td class="n">3.1</td></tr>
+<tr><td>the most-following viewer</td><td class="n">117</td><td class="n pick">126</td><td class="n">109</td></tr>
 </table></div>
-<p class="cap">internal/known-followers-bench.json on the same 1M-actor synthetic snapshot as above, means per call. Its most-following actor follows everyone and its most-followed is followed by everyone, so that pair decodes a 1M list and the count stops at 1,001 hits. The whole network's numbers (the 886k-follow account) are in read-mix.html's measured section.</p>
+<p class="cap">In-process, one thread, median of 3 runs per call, on the 1M-actor synthetic snapshot (internal/known-followers-bench.json). Its most-following actor follows everyone and its most-followed is followed by everyone, so that pair decodes a 1M list and the exact count walks all 1M hits, which costs about the same as the capped one within run-to-run noise (~10%). The whole network's numbers (the 886k-follow account) are in read-mix.html's measured section.</p>
 
 <h2>Writes, durability and ingest</h2>
 <div class="fig">

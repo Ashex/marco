@@ -1310,9 +1310,10 @@ impl Graph {
     }
 
     /// `combine`, and with `cap` > 0 the size of the whole result (cursor
-    /// or not) up to `cap`, true when it's bigger. The count costs one pass
-    /// over the smaller side that stops at `cap` + 1 hits, on top of the
-    /// page's decode of that side.
+    /// or not) up to `cap`, true when it's bigger; `COUNT_EXACT` never is.
+    /// The count costs one pass over the side the page decodes (the smaller
+    /// for AND, `a` for AND_NOT) that stops at `cap` + 1 hits, on top of that
+    /// decode; the hits it keeps are no more than that side's length.
     pub fn combine_counted(
         &self,
         a: ListRef,
@@ -2195,6 +2196,10 @@ fn merge_by<T: Copy>(a: Vec<T>, b: Vec<T>, limit: usize, first: impl Fn(&T, &T) 
     }
     out
 }
+
+/// The `cap` for an exact count: no result reaches it, so the total is never
+/// capped.
+pub const COUNT_EXACT: usize = usize::MAX;
 
 /// A page of `run` over `all` past `after`, and with `cap` > 0 the size of
 /// `run` over all of it, up to `cap`. Without a cursor one pass makes both.

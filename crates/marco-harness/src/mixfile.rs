@@ -90,9 +90,12 @@ pub struct FileShape {
     pub batch: Vec<(u32, f64)>,
     #[serde(default)]
     pub limit: u32,
-    /// intersect: also count the result up to this many (0: no count).
+    /// intersect: also count the result.
     #[serde(default)]
-    pub count: u32,
+    pub count: bool,
+    /// intersect with count: cap the total at this many (0: exact).
+    #[serde(default)]
+    pub count_limit: u32,
     #[serde(default)]
     pub a: Option<SideSpec>,
     #[serde(default)]
@@ -219,8 +222,8 @@ fn make(inp: &Inputs, s: &FileShape, rng: &mut Rng) -> Result<Req> {
                 a: side(&s.a)?.into(),
                 b: side(&s.b)?.into(),
                 limit: s.limit,
-                count: s.count > 0,
-                count_limit: s.count,
+                count: s.count,
+                count_limit: s.count_limit,
                 ..Default::default()
             })
         }

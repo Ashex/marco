@@ -157,6 +157,21 @@ Two sides, each a `(rel, dir, actor)`, combined with `SET_OP_AND` (the default) 
   side counts actors, and hidden actors are included.
 - `limit`: default 100, at most 10,000. A full page carries a `cursor` (the last actor's DID), and
   passing it back gets the actors after it.
+- `count`: also return `total`, the size of the whole result, whatever the page or cursor, for
+  "followed by A, B and N others". It's exact by default. The page doesn't change, and nothing is
+  counted unless asked. The count is one pass over the side the page already decodes (the smaller
+  one for AND, `a` for AND_NOT), so it costs no more than that side's length.
+- `count_limit`: cap the total at this many (at most 10,000). Past it `totalCapped` is true and
+  `total` is the cap. Leave it out, or send 0, for an exact total. `total` includes actors the page
+  leaves out as taken down or deleted.
+
+```json
+// Intersect {"a":{"rel":"follow","dir":"DIR_IN","actor":"did:plc:carol2222…"},
+//            "b":{"rel":"follow","dir":"DIR_OUT","actor":"did:plc:alice2222…"},
+//            "limit":5,"count":true}
+{"actors":["did:plc:bob222222222222222222222"],"aLen":"3","bLen":"2","total":"1"}
+```
+
 - A cursor that isn't a DID in the graph is `invalid_argument`. A side whose actor marco doesn't
   know, or that's hidden, is empty, so AND gives nothing and AND_NOT gives all of `a`.
 - The cost is the smaller side: a random viewer's mutuals take ~0.6 µs on the engine, and an

@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use connectrpc::client::{ClientConfig, ClientTransport, HttpClient, ServiceTransport};
 use connectrpc::ConnectError;
-use marco_core::{Dir, Graph, ListRef, RelId, SetOp};
+use marco_core::{Dir, Graph, ListRef, RelId, SetOp, COUNT_EXACT};
 use marco_proto::connect::marco::v1::GraphClient;
 use marco_proto::v1::*;
 use marco_server::app::{App, Config};
@@ -483,7 +483,11 @@ impl Engine {
             Req::Intersect(r) => {
                 let side =
                     |s: &ListSide| g.id_of(&s.actor).map(|actor| ListRef { rel: rel(&s.rel), dir: dir(&s.dir), actor });
-                let cap = if r.count { r.count_limit.max(1) as usize } else { 0 };
+                let cap = match (r.count, r.count_limit) {
+                    (false, _) => 0,
+                    (true, 0) => COUNT_EXACT,
+                    (true, l) => l as usize,
+                };
                 match (side(&r.a), side(&r.b)) {
                     (Some(a), Some(b)) => {
                         let (ids, total) = g.combine_counted(a, b, SetOp::And, r.limit as usize, None, cap);

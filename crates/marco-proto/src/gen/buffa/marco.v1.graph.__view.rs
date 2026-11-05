@@ -5749,12 +5749,13 @@ pub struct IntersectRequestView<'a> {
     ///
     /// Field 5: `cursor`
     pub cursor: &'a str,
-    /// Also count the whole result, cursor or not, up to count_limit: total
-    /// and total_capped ("followed by A, B and N others").
+    /// Also count the whole result, cursor or not: total ("followed by A, B
+    /// and N others"). Exact unless count_limit caps it.
     ///
     /// Field 6: `count`
     pub count: bool,
-    /// Default 1000, at most 10000.
+    /// 0 (the default): no cap, the total is exact. Otherwise count up to this
+    /// many, at most 10000, and set total_capped past it.
     ///
     /// Field 7: `count_limit`
     pub count_limit: u32,
@@ -6184,15 +6185,16 @@ impl IntersectRequestOwnedView {
     pub fn cursor(&self) -> &'_ str {
         self.0.reborrow().cursor
     }
-    /// Also count the whole result, cursor or not, up to count_limit: total
-    /// and total_capped ("followed by A, B and N others").
+    /// Also count the whole result, cursor or not: total ("followed by A, B
+    /// and N others"). Exact unless count_limit caps it.
     ///
     /// Field 6: `count`
     #[must_use]
     pub fn count(&self) -> bool {
         self.0.reborrow().count
     }
-    /// Default 1000, at most 10000.
+    /// 0 (the default): no cap, the total is exact. Otherwise count up to this
+    /// many, at most 10000, and set total_capped past it.
     ///
     /// Field 7: `count_limit`
     #[must_use]
@@ -6252,7 +6254,8 @@ pub struct IntersectResponseView<'a> {
     ///
     /// Field 5: `total`
     pub total: u64,
-    /// More than count_limit: total is a floor.
+    /// Only with a count_limit: the result has more than that, and total is
+    /// count_limit.
     ///
     /// Field 6: `total_capped`
     pub total_capped: bool,
@@ -6601,7 +6604,8 @@ impl IntersectResponseOwnedView {
     pub fn total(&self) -> u64 {
         self.0.reborrow().total
     }
-    /// More than count_limit: total is a floor.
+    /// Only with a count_limit: the result has more than that, and total is
+    /// count_limit.
     ///
     /// Field 6: `total_capped`
     #[must_use]
