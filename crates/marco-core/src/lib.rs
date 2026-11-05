@@ -4,6 +4,7 @@
 //! sets, and the snapshot file they're frozen into.
 
 pub mod did;
+pub mod format6;
 pub mod graph;
 pub mod inset;
 pub mod obs;

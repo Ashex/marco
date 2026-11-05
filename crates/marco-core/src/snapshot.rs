@@ -39,7 +39,7 @@ use serde::{Deserialize, Serialize};
 use crate::did::{plc_from_bytes, plc_to_bytes, PACKED_LEN};
 use crate::outlog::OutBytes;
 use crate::relation::Relation;
-use crate::store::page::{page_align, page_seed, page_sum, section_tag, PAGE};
+use crate::store::page::{page_align, page_seed, page_sum, section_tag, Page, PAGE};
 use crate::varint::{self, u32_at, u64_at};
 
 pub const MAGIC: &[u8; 8] = b"MARCOSN1";
@@ -578,8 +578,52 @@ pub struct DirParts<'a> {
     pub ids: Option<(&'a [u32], &'a [u32])>,
 }
 
-pub fn write_directory(w: &mut Writer, d: &DirParts) -> Result<()> {
-    w.begin("dir.plc");
+/// Where [`write_directory`] puts its sections: a FORMAT 5 [`Writer`], or a
+/// FORMAT 6 [`PagedWriter`], where every directory section is pinned.
+pub trait SectionSink {
+    fn begin(&mut self, name: &str) -> Result<()>;
+    fn write(&mut self, b: &[u8]) -> Result<()>;
+    fn end(&mut self) -> Result<u64>;
+
+    fn section(&mut self, name: &str, b: &[u8]) -> Result<()> {
+        self.begin(name)?;
+        self.write(b)?;
+        self.end()?;
+        Ok(())
+    }
+}
+
+impl SectionSink for Writer {
+    fn begin(&mut self, name: &str) -> Result<()> {
+        Writer::begin(self, name);
+        Ok(())
+    }
+
+    fn write(&mut self, b: &[u8]) -> Result<()> {
+        Writer::write(self, b)
+    }
+
+    fn end(&mut self) -> Result<u64> {
+        Writer::end(self)
+    }
+}
+
+impl SectionSink for PagedWriter {
+    fn begin(&mut self, name: &str) -> Result<()> {
+        self.begin_pinned(name)
+    }
+
+    fn write(&mut self, b: &[u8]) -> Result<()> {
+        self.write_pinned(b)
+    }
+
+    fn end(&mut self) -> Result<u64> {
+        self.end_pinned()
+    }
+}
+
+pub fn write_directory(w: &mut impl SectionSink, d: &DirParts) -> Result<()> {
+    w.begin("dir.plc")?;
     let mut buf = Vec::with_capacity(1 << 20);
     for chunk in d.plc.chunks(1 << 16) {
         buf.clear();
@@ -1226,17 +1270,156 @@ impl PagedFooter {
     }
 }
 
-/// Writes one FORMAT 6 file through a temp file, buffered: what tests and
-/// test fixtures use to make files the reader and the engine can open. It
-/// computes the page sums and writes their sections itself, and checks the
-/// footer before writing it, so a file it finishes always parses.
+/// A page in memory aligned to [`PAGE`], so `O_DIRECT` can write it (and,
+/// later, read into it) without a copy.
+#[derive(Clone)]
+#[repr(C, align(4096))]
+pub struct AlignedPage(pub Page);
+
+impl AlignedPage {
+    pub const ZERO: AlignedPage = AlignedPage([0; PAGE]);
+}
+
+impl Default for AlignedPage {
+    fn default() -> AlignedPage {
+        AlignedPage::ZERO
+    }
+}
+
+/// Pages a [`DirectFile`] stages before each write: 1 MiB.
+const STAGE_PAGES: usize = 256;
+
+/// A file written front to back with `O_DIRECT` (`F_NOCACHE` on macOS), so a
+/// snapshot write never fills the page cache. Bytes are staged in an aligned
+/// buffer and written a whole number of pages at a time; whole aligned pages
+/// go straight from the caller's memory. A filesystem that refuses
+/// `O_DIRECT` (tmpfs) gets plain writes, which are just as correct.
+pub struct DirectFile {
+    f: File,
+    stage: Vec<AlignedPage>,
+    /// Bytes staged.
+    len: usize,
+    direct: bool,
+}
+
+impl DirectFile {
+    pub fn create(path: &Path) -> Result<DirectFile> {
+        let (f, direct) = open_direct(path).with_context(|| format!("create {}", path.display()))?;
+        Ok(DirectFile { f, stage: vec![AlignedPage::ZERO; STAGE_PAGES], len: 0, direct })
+    }
+
+    /// Whether writes bypass the page cache.
+    pub fn is_direct(&self) -> bool {
+        self.direct
+    }
+
+    fn stage_bytes(&mut self) -> &mut [u8] {
+        // SAFETY: AlignedPage is repr(C) over [u8; PAGE], so the pages are one
+        // contiguous run of bytes.
+        unsafe { std::slice::from_raw_parts_mut(self.stage.as_mut_ptr().cast::<u8>(), STAGE_PAGES * PAGE) }
+    }
+
+    pub fn write(&mut self, mut b: &[u8]) -> Result<()> {
+        while !b.is_empty() {
+            let at = self.len;
+            let n = b.len().min(STAGE_PAGES * PAGE - at);
+            self.stage_bytes()[at..at + n].copy_from_slice(&b[..n]);
+            self.len += n;
+            b = &b[n..];
+            if self.len == STAGE_PAGES * PAGE {
+                self.flush_stage()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Whole pages, written from `pages` itself when nothing partial is staged.
+    pub fn write_pages(&mut self, pages: &[AlignedPage]) -> Result<()> {
+        if !self.len.is_multiple_of(PAGE) || pages.len() < STAGE_PAGES / 4 {
+            for p in pages {
+                self.write(&p.0)?;
+            }
+            return Ok(());
+        }
+        self.flush_stage()?;
+        // SAFETY: as stage_bytes; the slice is pages.len() aligned pages.
+        let bytes = unsafe { std::slice::from_raw_parts(pages.as_ptr().cast::<u8>(), pages.len() * PAGE) };
+        self.f.write_all(bytes)?;
+        Ok(())
+    }
+
+    /// Writes what's staged; the file then ends on a page boundary only if it
+    /// does in bytes written.
+    fn flush_stage(&mut self) -> Result<()> {
+        if self.len == 0 {
+            return Ok(());
+        }
+        let n = self.len;
+        if self.direct && !n.is_multiple_of(PAGE) {
+            bail!("an O_DIRECT file must end on a page boundary, not {n} bytes into its last stage");
+        }
+        let f = &mut self.f;
+        // SAFETY: as stage_bytes.
+        let bytes = unsafe { std::slice::from_raw_parts(self.stage.as_ptr().cast::<u8>(), n) };
+        f.write_all(bytes)?;
+        self.len = 0;
+        Ok(())
+    }
+
+    /// Writes the rest and fsyncs.
+    pub fn finish(mut self) -> Result<File> {
+        self.flush_stage()?;
+        self.f.sync_all()?;
+        Ok(self.f)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn open_direct(path: &Path) -> std::io::Result<(File, bool)> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create(true).truncate(true);
+    match o.clone().custom_flags(libc::O_DIRECT).open(path) {
+        Ok(f) => Ok((f, true)),
+        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => Ok((o.open(path)?, false)),
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn open_direct(path: &Path) -> std::io::Result<(File, bool)> {
+    use std::os::fd::AsRawFd;
+    let f = File::create(path)?;
+    // SAFETY: fcntl on a descriptor we own.
+    let direct = unsafe { libc::fcntl(f.as_raw_fd(), libc::F_NOCACHE, 1) } == 0;
+    Ok((f, direct))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn open_direct(path: &Path) -> std::io::Result<(File, bool)> {
+    Ok((File::create(path)?, false))
+}
+
+enum Open {
+    Pinned { name: String, off: u64, hasher: Box<xxhash_rust::xxh3::Xxh3> },
+    Paged { name: String, off: u64, first: u32, sums: Vec<u8> },
+}
+
+/// Writes one FORMAT 6 file through a temp file with `O_DIRECT`
+/// ([`DirectFile`]): what the builder writes snapshots with, and what tests
+/// make fixture files with. It computes the page sums and writes their
+/// sections itself, and checks the footer before writing it, so a file it
+/// finishes always parses. A section can be written whole ([`Self::pinned`],
+/// [`Self::paged`]) or streamed (`begin_*`, `write_*`, `end_*`), one open at
+/// a time.
 pub struct PagedWriter {
-    f: BufWriter<File>,
+    f: DirectFile,
     pos: u64,
     file: FileKind,
     salt: u64,
     sections: Vec<PagedSection>,
     sums: Vec<(String, Vec<u8>)>,
+    open: Option<Open>,
     tmp: PathBuf,
     path: PathBuf,
 }
@@ -1253,14 +1436,14 @@ impl PagedWriter {
     /// A file with a chosen salt, for tests that need the same bytes twice.
     pub fn with_salt(path: &Path, file: FileKind, salt: u64) -> Result<PagedWriter> {
         let tmp = temp_path(path)?;
-        let f = File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
         Ok(PagedWriter {
-            f: BufWriter::with_capacity(8 << 20, f),
+            f: DirectFile::create(&tmp)?,
             pos: 0,
             file,
             salt,
             sections: Vec::new(),
             sums: Vec::new(),
+            open: None,
             tmp,
             path: path.to_path_buf(),
         })
@@ -1270,47 +1453,111 @@ impl PagedWriter {
         self.salt
     }
 
+    /// Whether the file bypasses the page cache.
+    pub fn is_direct(&self) -> bool {
+        self.f.is_direct()
+    }
+
+    /// Bytes written so far.
+    pub fn pos(&self) -> u64 {
+        self.pos
+    }
+
     fn pad_to(&mut self, align: u64) -> Result<()> {
         let pad = self.pos.next_multiple_of(align) - self.pos;
-        self.f.write_all(&vec![0u8; pad as usize])?;
+        self.f.write(&vec![0u8; pad as usize])?;
         self.pos += pad;
+        Ok(())
+    }
+
+    fn not_open(&self, name: &str) -> Result<()> {
+        if let Some(Open::Pinned { name: o, .. } | Open::Paged { name: o, .. }) = &self.open {
+            bail!("section {name} begun inside {o}");
+        }
         Ok(())
     }
 
     /// A pinned section of `bytes`.
     pub fn pinned(&mut self, name: &str, bytes: &[u8]) -> Result<()> {
-        self.pad_to(PINNED_ALIGN)?;
-        let len = bytes.len() as u64;
-        let xxh3 = xxhash_rust::xxh3::xxh3_64(bytes);
-        self.sections.push(PagedSection { name: name.into(), off: self.pos, kind: SectionKind::Pinned { len, xxh3 } });
-        self.f.write_all(bytes)?;
-        self.pos += len;
+        self.begin_pinned(name)?;
+        self.write_pinned(bytes)?;
+        self.end_pinned()?;
         Ok(())
+    }
+
+    pub fn begin_pinned(&mut self, name: &str) -> Result<()> {
+        self.not_open(name)?;
+        self.pad_to(PINNED_ALIGN)?;
+        self.open =
+            Some(Open::Pinned { name: name.into(), off: self.pos, hasher: Box::new(xxhash_rust::xxh3::Xxh3::new()) });
+        Ok(())
+    }
+
+    pub fn write_pinned(&mut self, bytes: &[u8]) -> Result<()> {
+        let Some(Open::Pinned { hasher, .. }) = &mut self.open else { bail!("no pinned section open") };
+        hasher.update(bytes);
+        self.f.write(bytes)?;
+        self.pos += bytes.len() as u64;
+        Ok(())
+    }
+
+    /// Ends the open pinned section; returns its length.
+    pub fn end_pinned(&mut self) -> Result<u64> {
+        let Some(Open::Pinned { name, off, hasher }) = self.open.take() else { bail!("no pinned section open") };
+        let len = self.pos - off;
+        self.sections.push(PagedSection { name, off, kind: SectionKind::Pinned { len, xxh3: hasher.digest() } });
+        Ok(len)
     }
 
     /// A paged section of `bytes`, the last page padded with zeros, starting
     /// at page `first` of its space. Returns its pages.
     pub fn paged(&mut self, name: &str, first: u32, bytes: &[u8]) -> Result<u32> {
-        self.pad_to(PAGE as u64)?;
-        let pages = u32::try_from(bytes.len().div_ceil(PAGE)).context("a paged section over 2^32 pages")?;
-        let s = PagedSection { name: name.into(), off: self.pos, kind: SectionKind::Paged { pages, first } };
-        let mut sums = Vec::with_capacity(4 * pages as usize);
-        for (i, chunk) in bytes.chunks(PAGE).enumerate() {
-            let mut p = [0u8; PAGE];
-            p[..chunk.len()].copy_from_slice(chunk);
-            let page = s.first_page() + i as u32;
-            sums.extend_from_slice(&page_sum(&p, page_seed(self.salt, s.tag(), page)).to_le_bytes());
-            self.f.write_all(&p)?;
+        self.begin_paged(name, first)?;
+        let mut p = AlignedPage::ZERO;
+        for chunk in bytes.chunks(PAGE) {
+            p.0[..chunk.len()].copy_from_slice(chunk);
+            p.0[chunk.len()..].fill(0);
+            self.write_pages(std::slice::from_ref(&p))?;
         }
-        self.pos += pages as u64 * PAGE as u64;
-        self.sections.push(s);
-        self.sums.push((sums_section(name), sums));
+        self.end_paged()
+    }
+
+    /// Opens a paged section starting at page `first` of its space.
+    pub fn begin_paged(&mut self, name: &str, first: u32) -> Result<()> {
+        self.not_open(name)?;
+        self.pad_to(PAGE as u64)?;
+        self.open = Some(Open::Paged { name: name.into(), off: self.pos, first, sums: Vec::new() });
+        Ok(())
+    }
+
+    /// Appends whole pages to the open paged section, summing each.
+    pub fn write_pages(&mut self, pages: &[AlignedPage]) -> Result<()> {
+        let Some(Open::Paged { name, off, sums, .. }) = &mut self.open else { bail!("no paged section open") };
+        let tag = section_tag(name);
+        debug_assert_eq!(*off % PAGE as u64, 0);
+        for (page, p) in ((self.pos / PAGE as u64) as u32..).zip(pages) {
+            sums.extend_from_slice(&page_sum(&p.0, page_seed(self.salt, tag, page)).to_le_bytes());
+        }
+        self.f.write_pages(pages)?;
+        self.pos += (pages.len() * PAGE) as u64;
+        Ok(())
+    }
+
+    /// Ends the open paged section; returns its pages.
+    pub fn end_paged(&mut self) -> Result<u32> {
+        let Some(Open::Paged { name, off, first, sums }) = self.open.take() else { bail!("no paged section open") };
+        let pages = u32::try_from((self.pos - off) / PAGE as u64).context("a paged section over 2^32 pages")?;
+        self.sections.push(PagedSection { name: name.clone(), off, kind: SectionKind::Paged { pages, first } });
+        self.sums.push((sums_section(&name), sums));
         Ok(pages)
     }
 
     /// Writes the sums sections and the footer, fsyncs and renames the file
     /// into place. Returns the footer as written.
     pub fn finish(mut self, kind: &str, meta: &impl Serialize) -> Result<PagedFooter> {
+        if let Some(Open::Pinned { name, .. } | Open::Paged { name, .. }) = &self.open {
+            bail!("section {name} still open");
+        }
         for (name, sums) in std::mem::take(&mut self.sums) {
             self.pinned(&name, &sums)?;
         }
@@ -1323,8 +1570,12 @@ impl PagedWriter {
             sections: std::mem::take(&mut self.sections),
         };
         footer.validate(self.pos)?;
-        self.f.write_all(&footer.encode(self.pos)?)?;
-        commit(self.f, &self.tmp, &self.path)?;
+        self.f.write(&footer.encode(self.pos)?)?;
+        let f = self.f.finish()?;
+        drop(f);
+        std::fs::rename(&self.tmp, &self.path)?;
+        let parent = self.path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        File::open(parent)?.sync_all()?;
         Ok(footer)
     }
 }
@@ -1392,6 +1643,52 @@ mod paged_tests {
         let mut flipped = bytes.clone();
         flipped[footer.section("r0.out.head").unwrap().off as usize] ^= 1;
         assert!(footer.verify(&flipped).unwrap_err().to_string().contains("section r0.out.head checksum"));
+    }
+
+    #[test]
+    fn streamed_sections_write_the_same_file() {
+        let d = tempfile::tempdir().unwrap();
+        let pages: Vec<AlignedPage> = (0..300)
+            .map(|i| {
+                let mut p = AlignedPage::ZERO;
+                p.0.iter_mut().enumerate().for_each(|(j, b)| *b = (i * 7 + j) as u8);
+                p
+            })
+            .collect();
+        let flat: Vec<u8> = pages.iter().flat_map(|p| p.0).collect();
+        let (whole, wf) = write(d.path(), "whole", FileKind::Base, |w| {
+            w.pinned("a", &ramp(100, 1)).unwrap();
+            w.paged("b", 0, &flat).unwrap();
+            w.pinned("c", &ramp(3 * PAGE + 5, 2)).unwrap();
+            w.paged("d", 0, &flat[..5 * PAGE]).unwrap();
+        });
+        let (streamed, sf) = write(d.path(), "streamed", FileKind::Base, |w| {
+            w.begin_pinned("a").unwrap();
+            w.write_pinned(&ramp(100, 1)[..30]).unwrap();
+            w.write_pinned(&ramp(100, 1)[30..]).unwrap();
+            assert_eq!(w.end_pinned().unwrap(), 100);
+            w.begin_paged("b", 0).unwrap();
+            w.write_pages(&pages[..1]).unwrap();
+            w.write_pages(&pages[1..200]).unwrap();
+            w.write_pages(&pages[200..]).unwrap();
+            assert!(w.begin_pinned("x").unwrap_err().to_string().contains("inside b"));
+            assert_eq!(w.end_paged().unwrap(), 300);
+            w.begin_pinned("c").unwrap();
+            for chunk in ramp(3 * PAGE + 5, 2).chunks(1000) {
+                w.write_pinned(chunk).unwrap();
+            }
+            w.end_pinned().unwrap();
+            w.begin_paged("d", 0).unwrap();
+            w.write_pages(&pages[..5]).unwrap();
+            w.end_paged().unwrap();
+        });
+        assert_eq!(wf, sf);
+        assert!(whole == streamed, "the same bytes");
+        sf.verify(&streamed).unwrap();
+        let p = d.path().join("open");
+        let mut w = PagedWriter::with_salt(&p, FileKind::Base, 1).unwrap();
+        w.begin_pinned("x").unwrap();
+        assert!(w.finish("shard", &()).unwrap_err().to_string().contains("still open"));
     }
 
     #[test]

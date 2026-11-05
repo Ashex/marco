@@ -8,6 +8,7 @@
 //! marco-load verify --snapshot FILE            checksums, every list decoded, a sampled export checked
 //! marco-load replay --snapshot FILE --deletes DIR   delete-by-URI replay through the mutable path
 //! marco-load diff   --a SNAP --b SNAP              two snapshots compared record by record
+//! marco-load compare6 --a SNAP5 --b SNAP6          a FORMAT 6 build against FORMAT 5's, list by list
 //! marco-load scan-scylla --config TOML --out DIR [--snapshot SNAP]   Scylla tables -> build input (-> snapshot)
 //! marco-load fill-scylla --config TOML --input DIR   build input -> Scylla tables (tests, benchmarks)
 //! ```
@@ -21,6 +22,7 @@ use clap::{Parser, Subcommand};
 
 mod bench;
 mod build;
+mod compare6;
 #[cfg(feature = "scylla")]
 mod cql;
 mod diff;
@@ -79,6 +81,9 @@ enum Cmd {
         /// Build even if a cursor is past the retention.
         #[arg(long)]
         allow_gap: bool,
+        /// Snapshot format: 5, which the server reads, or 6 (paged, written with O_DIRECT).
+        #[arg(long, default_value_t = marco_core::snapshot::FORMAT)]
+        format: u32,
     },
     Open {
         #[arg(long)]
@@ -89,6 +94,8 @@ enum Cmd {
     Verify(verify::VerifyArgs),
     Replay(verify::ReplayArgs),
     Diff(diff::Args),
+    /// A FORMAT 6 snapshot against the FORMAT 5 one built from the same input.
+    Compare6(compare6::Args),
     /// Scan Scylla tables into build input (see the README), then optionally build.
     #[cfg(feature = "scylla")]
     ScanScylla(Box<cql::scan::Args>),
@@ -116,6 +123,7 @@ fn main() -> Result<()> {
             deletes_since_us,
             retention_hours,
             allow_gap,
+            format,
         } => {
             let rels = match relations {
                 Some(p) => marco_core::Relations::parse_toml(&std::fs::read_to_string(p)?)?,
@@ -125,8 +133,18 @@ fn main() -> Result<()> {
             let deletes = deletes_out.map(|dir| build::DeletesOut { dir, since_us: deletes_since_us });
             let retention = std::time::Duration::from_secs_f64(retention_hours.max(0.0) * 3600.0);
             let cursors = build::read_cursors(&input, retention, allow_gap)?;
-            let o =
-                build::Opts { input, out, tmp: tmp.clone(), rels, subj_index, shards, sub_buckets, deletes, cursors };
+            let o = build::Opts {
+                input,
+                out,
+                tmp: tmp.clone(),
+                rels,
+                subj_index,
+                shards,
+                sub_buckets,
+                deletes,
+                cursors,
+                format,
+            };
             let r = build::build(&o)?;
             let _ = std::fs::remove_dir(&tmp);
             serde_json::to_value(r)?
@@ -137,6 +155,7 @@ fn main() -> Result<()> {
         Cmd::Verify(a) => verify::verify(&a)?,
         Cmd::Replay(a) => verify::replay(&a)?,
         Cmd::Diff(a) => diff::run(&a)?,
+        Cmd::Compare6(a) => compare6::run(&a)?,
         #[cfg(feature = "scylla")]
         Cmd::ScanScylla(a) => cql::scan::run(&a)?,
         #[cfg(feature = "scylla")]

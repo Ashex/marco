@@ -15,6 +15,10 @@
 //! from its own density, which is what partitioned Elias-Fano buys over one
 //! list-wide `l`.
 
+use anyhow::Result;
+
+use crate::format6::{Packer, Space};
+use crate::read::{Blocks, Pending, ReadCx, R};
 use crate::varint::{self, u32_at, u64_padded};
 
 pub const BLOCK: usize = 128;
@@ -50,7 +54,9 @@ pub fn encode(ids: &[u32], out: &mut Vec<u8>) {
     }
 }
 
-fn encode_block(vals: &[u32], out: &mut Vec<u8>) {
+/// Elias-Fano of `vals[1..]` from `vals[0]`, which the caller keeps
+/// elsewhere: nothing for one value. `vals` ascending; repeats allowed.
+pub fn encode_block(vals: &[u32], out: &mut Vec<u8>) {
     let m = vals.len() - 1;
     if m == 0 {
         return;
@@ -86,7 +92,7 @@ fn encode_block(vals: &[u32], out: &mut Vec<u8>) {
 
 /// Decodes a block's ids after `first` into `out[1..k]`.
 #[inline]
-fn decode_block(bytes: &[u8], first: u32, k: usize, out: &mut [u32; BLOCK]) {
+pub fn decode_block(bytes: &[u8], first: u32, k: usize, out: &mut [u32; BLOCK]) {
     out[0] = first;
     let m = k - 1;
     if m == 0 {
@@ -289,6 +295,292 @@ impl<'a> InList<'a> {
             if buf[..k].binary_search(&x).is_ok() {
                 out.push(x);
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- FORMAT 6
+
+/// Writes a big set (more than [`crate::format6::WHOLE`] members): its
+/// blocks into `blocks`, its head onto `head`.
+///
+/// ```text
+/// head:   u32 n, then nb x (u32 first id, u32 block at)
+/// blocks: FORMAT 5's: per block, Elias-Fano of the ids after its first
+/// ```
+pub fn encode_split(ids: &[u32], blocks: &mut Packer, head: &mut Vec<u8>) -> Result<()> {
+    debug_assert!(ids.len() > crate::format6::WHOLE && ids.windows(2).all(|w| w[0] < w[1]));
+    head.extend_from_slice(&(ids.len() as u32).to_le_bytes());
+    let mut buf = Vec::with_capacity(4 * BLOCK);
+    for chunk in ids.chunks(BLOCK) {
+        buf.clear();
+        encode_block(chunk, &mut buf);
+        let at = u32::try_from(blocks.put(&buf))
+            .map_err(|_| anyhow::anyhow!("an in.blocks column passes 4 GiB in one shard: build with more shards"))?;
+        head.extend_from_slice(&chunk[0].to_le_bytes());
+        head.extend_from_slice(&at.to_le_bytes());
+    }
+    Ok(())
+}
+
+/// A big set read through the page store: firsts pinned, blocks paged.
+#[derive(Clone, Copy)]
+pub struct SplitIn<'g> {
+    n: usize,
+    heads: &'g [u8],
+    space: &'g Space,
+}
+
+/// A big set's blocks as [`Blocks`]: block b to the end of its page, or
+/// nothing for a block of one id.
+pub struct SetBlocks<'s, 'g>(&'s SplitIn<'g>);
+
+impl<'g> Blocks<'g> for SetBlocks<'_, 'g> {
+    fn block(&self, cx: &ReadCx<'g>, b: usize) -> R<&'g [u8]> {
+        let s = self.0;
+        if s.block_len(b) == 1 {
+            return Ok(&[]);
+        }
+        s.space.tail(cx, s.at(b) as u64)
+    }
+}
+
+impl<'g> SplitIn<'g> {
+    pub fn parse(head: &'g [u8], space: &'g Space) -> Option<SplitIn<'g>> {
+        let n = u32_at(head.get(..4)?, 0) as usize;
+        let heads = head.get(4..4 + 8 * n.div_ceil(BLOCK))?;
+        Some(SplitIn { n, heads, space })
+    }
+
+    pub fn len(&self) -> usize {
+        self.n
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.n == 0
+    }
+
+    pub fn blocks(&self) -> SetBlocks<'_, 'g> {
+        SetBlocks(self)
+    }
+
+    fn nb(&self) -> usize {
+        self.n.div_ceil(BLOCK)
+    }
+
+    fn first(&self, b: usize) -> u32 {
+        u32_at(self.heads, 8 * b)
+    }
+
+    fn at(&self, b: usize) -> u32 {
+        u32_at(self.heads, 8 * b + 4)
+    }
+
+    fn block_len(&self, b: usize) -> usize {
+        (self.n - b * BLOCK).min(BLOCK)
+    }
+
+    fn decode(&self, cx: &ReadCx<'g>, b: usize, out: &mut [u32; BLOCK]) -> R<usize> {
+        let k = self.block_len(b);
+        decode_block(self.blocks().block(cx, b)?, self.first(b), k, out);
+        Ok(k)
+    }
+
+    /// The block that would hold `x`: the last whose first id is <= x.
+    fn block_for(&self, x: u32, from: usize) -> Option<usize> {
+        let nb = self.nb();
+        if from >= nb || self.first(from) > x {
+            return None;
+        }
+        let (mut lo, mut hi) = (from, nb);
+        while hi - lo > 1 {
+            let mid = (lo + hi) / 2;
+            if self.first(mid) <= x {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        Some(lo)
+    }
+
+    pub fn contains(&self, cx: &ReadCx<'g>, x: u32) -> R<bool> {
+        let Some(b) = self.block_for(x, 0) else { return Ok(false) };
+        if self.first(b) == x {
+            return Ok(true);
+        }
+        let mut buf = [0u32; BLOCK];
+        let k = self.decode(cx, b, &mut buf)?;
+        Ok(buf[..k].binary_search(&x).is_ok())
+    }
+
+    pub fn decode_all(&self, cx: &ReadCx<'g>, out: &mut Vec<u32>) -> R<()> {
+        self.blocks().need(cx, 0..self.nb())?;
+        out.reserve(self.n);
+        let mut buf = [0u32; BLOCK];
+        for b in 0..self.nb() {
+            let k = self.decode(cx, b, &mut buf)?;
+            out.extend_from_slice(&buf[..k]);
+        }
+        Ok(())
+    }
+
+    /// Ids greater than `after`, ascending, until `f` returns false. `want`
+    /// bounds how many `f` takes, as in [`crate::outlog::SplitOut::for_each_desc`].
+    pub fn for_each_after(
+        &self,
+        cx: &ReadCx<'g>,
+        after: Option<u32>,
+        want: usize,
+        mut f: impl FnMut(u32) -> bool,
+    ) -> R<()> {
+        let start = match after {
+            None => 0,
+            Some(a) => self.block_for(a, 0).unwrap_or(0),
+        };
+        let span = want.saturating_add(BLOCK - 1) / BLOCK + 1;
+        self.blocks().need(cx, start..start.saturating_add(span).min(self.nb()))?;
+        let mut buf = [0u32; BLOCK];
+        for b in start..self.nb() {
+            let k = self.decode(cx, b, &mut buf)?;
+            for &x in &buf[..k] {
+                if after.is_none_or(|a| x > a) && !f(x) {
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The members of `probes` (sorted) in this set, up to `limit`. Reads
+    /// only the blocks the probes land in.
+    pub fn intersect_sorted(&self, cx: &ReadCx<'g>, probes: &[u32], limit: usize, out: &mut Vec<u32>) -> R<()> {
+        let mut ok = true;
+        let mut from = 0;
+        let mut last = None;
+        for &x in probes {
+            let Some(b) = self.block_for(x, from) else { continue };
+            from = b;
+            if last != Some(b) && self.first(b) != x {
+                ok &= self.blocks().block(cx, b).is_ok();
+                last = Some(b);
+            }
+        }
+        if !ok {
+            return Err(Pending);
+        }
+        let mut buf = [0u32; BLOCK];
+        let mut cur: Option<(usize, usize)> = None;
+        let mut from = 0;
+        for &x in probes {
+            if out.len() >= limit {
+                return Ok(());
+            }
+            let Some(b) = self.block_for(x, from) else { continue };
+            from = b;
+            if self.first(b) == x {
+                out.push(x);
+                continue;
+            }
+            let k = match cur {
+                Some((cb, k)) if cb == b => k,
+                _ => {
+                    let k = self.decode(cx, b, &mut buf)?;
+                    cur = Some((b, k));
+                    k
+                }
+            };
+            if buf[..k].binary_search(&x).is_ok() {
+                out.push(x);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// An in set in a FORMAT 6 shard: whole (at most
+/// [`crate::format6::WHOLE`] members, FORMAT 5's bytes, its page already
+/// read) or split. An override built from deltas is a `Whole` of any size.
+#[derive(Clone, Copy)]
+pub enum PagedIn<'g> {
+    Whole(InList<'g>),
+    Split(SplitIn<'g>),
+}
+
+impl<'g> PagedIn<'g> {
+    pub fn open(
+        cx: &ReadCx<'g>,
+        e: crate::format6::Entry,
+        small: &'g Space,
+        head: &'g [u8],
+        blocks: &'g Space,
+    ) -> R<PagedIn<'g>> {
+        match e {
+            crate::format6::Entry::Small(at) => Ok(PagedIn::Whole(InList::parse(small.tail(cx, at as u64)?))),
+            crate::format6::Entry::Head(at) => {
+                let h = head.get(at as usize..).ok_or(Pending)?;
+                SplitIn::parse(h, blocks).map(PagedIn::Split).ok_or(Pending)
+            }
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            PagedIn::Whole(l) => l.len(),
+            PagedIn::Split(l) => l.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn contains(&self, cx: &ReadCx<'g>, x: u32) -> R<bool> {
+        match self {
+            PagedIn::Whole(l) => Ok(l.contains(x)),
+            PagedIn::Split(l) => l.contains(cx, x),
+        }
+    }
+
+    pub fn decode_all(&self, cx: &ReadCx<'g>, out: &mut Vec<u32>) -> R<()> {
+        match self {
+            PagedIn::Whole(l) => {
+                l.decode_all(out);
+                Ok(())
+            }
+            PagedIn::Split(l) => l.decode_all(cx, out),
+        }
+    }
+
+    pub fn to_vec(&self, cx: &ReadCx<'g>) -> R<Vec<u32>> {
+        let mut v = Vec::new();
+        self.decode_all(cx, &mut v)?;
+        Ok(v)
+    }
+
+    pub fn for_each_after(
+        &self,
+        cx: &ReadCx<'g>,
+        after: Option<u32>,
+        want: usize,
+        f: impl FnMut(u32) -> bool,
+    ) -> R<()> {
+        match self {
+            PagedIn::Whole(l) => {
+                l.for_each_after(after, f);
+                Ok(())
+            }
+            PagedIn::Split(l) => l.for_each_after(cx, after, want, f),
+        }
+    }
+
+    pub fn intersect_sorted(&self, cx: &ReadCx<'g>, probes: &[u32], limit: usize, out: &mut Vec<u32>) -> R<()> {
+        match self {
+            PagedIn::Whole(l) => {
+                l.intersect_sorted(probes, limit, out);
+                Ok(())
+            }
+            PagedIn::Split(l) => l.intersect_sorted(cx, probes, limit, out),
         }
     }
 }

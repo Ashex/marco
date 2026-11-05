@@ -552,6 +552,7 @@ pub fn run(a: &Args) -> Result<Value> {
             sub_buckets: 4,
             deletes: None,
             cursors,
+            format: marco_core::snapshot::FORMAT,
         };
         let b = crate::build::build(&o)?;
         let _ = std::fs::remove_dir(&tmp);

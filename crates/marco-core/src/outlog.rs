@@ -14,6 +14,12 @@
 //! block's subjects can be scanned without decoding rkeys. Only long lists
 //! pay for `bysubj`; shorter ones scan their subjects.
 
+use std::ops::Range;
+
+use anyhow::Result;
+
+use crate::format6::{Packer, Space};
+use crate::read::{Blocks, Pending, ReadCx, R};
 use crate::varint::{self, u32_at, u64_at};
 
 pub const BLOCK: usize = 128;
@@ -360,6 +366,578 @@ impl<'a> OutList<'a> {
         }
         out.sort_unstable();
         out.dedup();
+    }
+}
+
+// ---------------------------------------------------------------- FORMAT 6
+
+/// The columns a big list's blocks go into (format6.rs).
+pub struct SplitCols<'a> {
+    pub subj: &'a mut Packer,
+    pub rkey: &'a mut Packer,
+    pub bysubj: &'a mut Packer,
+}
+
+/// The spaces of a relation's columns in one shard.
+#[derive(Clone, Copy)]
+pub struct OutSpaces<'a> {
+    pub subj: &'a Space,
+    pub rkey: &'a Space,
+    pub bysubj: &'a Space,
+}
+
+const HEAD_FIXED: usize = 12;
+const HEAD_BLOCK: usize = 16;
+const HEAD_FENCE: usize = 8;
+
+fn col_at(at: u64, col: &str) -> Result<u32> {
+    u32::try_from(at)
+        .map_err(|_| anyhow::anyhow!("an out.{col} column passes 4 GiB in one shard: build with more shards"))
+}
+
+/// Writes a big list (more than [`crate::format6::WHOLE`] records): its
+/// blocks into the columns, its head onto `head`.
+///
+/// ```text
+/// head:  u32 n, u32 dups, u32 nbs (by-subject blocks; 0 below subj_index)
+///        nb  x (u64 first rkey, u32 subject block at, u32 rkey block at)
+///        nbs x (u32 first subject, u32 by-subject block at)
+/// subj:  per block, its k subjects as u32
+/// rkey:  per block, its k - 1 rkey deltas as varints (the first rkey is in the head)
+/// bysubj: per block of 128 positions sorted by (subject, position): the
+///        positions as u32, then their subjects as one inset block (Elias-Fano
+///        from the block's first subject, which is in the head; repeats allowed)
+/// ```
+///
+/// `edges` sorted by rkey, rkeys unique.
+pub fn encode_split(
+    edges: &[(u64, u32)],
+    subj_index: usize,
+    cols: SplitCols,
+    head: &mut Vec<u8>,
+    bytes: &mut OutBytes,
+) -> Result<()> {
+    let n = edges.len();
+    debug_assert!(n > crate::format6::WHOLE && edges.windows(2).all(|w| w[0].0 < w[1].0));
+    let nb = n.div_ceil(BLOCK);
+    let nbs = if n >= subj_index { nb } else { 0 };
+    let h0 = head.len();
+    head.extend_from_slice(&(n as u32).to_le_bytes());
+    head.extend_from_slice(&((n - distinct(edges)) as u32).to_le_bytes());
+    head.extend_from_slice(&(nbs as u32).to_le_bytes());
+    let mut blk = Vec::with_capacity(4 * BLOCK);
+    let mut keys = Vec::with_capacity(10 * BLOCK);
+    for chunk in edges.chunks(BLOCK) {
+        blk.clear();
+        for &(_, s) in chunk {
+            blk.extend_from_slice(&s.to_le_bytes());
+        }
+        keys.clear();
+        for w in chunk.windows(2) {
+            varint::put(&mut keys, w[1].0 - w[0].0);
+        }
+        let sat = col_at(cols.subj.put(&blk), "subj")?;
+        let rat = col_at(cols.rkey.put(&keys), "rkey")?;
+        head.extend_from_slice(&chunk[0].0.to_le_bytes());
+        head.extend_from_slice(&sat.to_le_bytes());
+        head.extend_from_slice(&rat.to_le_bytes());
+        bytes.subjects += blk.len() as u64;
+        bytes.rkeys += keys.len() as u64;
+    }
+    if nbs > 0 {
+        let mut pos: Vec<u32> = (0..n as u32).collect();
+        pos.sort_unstable_by_key(|&p| (edges[p as usize].1, p));
+        let mut subj = Vec::with_capacity(BLOCK);
+        for chunk in pos.chunks(BLOCK) {
+            blk.clear();
+            subj.clear();
+            for &p in chunk {
+                blk.extend_from_slice(&p.to_le_bytes());
+                subj.push(edges[p as usize].1);
+            }
+            crate::inset::encode_block(&subj, &mut blk);
+            let at = col_at(cols.bysubj.put(&blk), "bysubj")?;
+            head.extend_from_slice(&subj[0].to_le_bytes());
+            head.extend_from_slice(&at.to_le_bytes());
+            bytes.bysubj += blk.len() as u64;
+        }
+    }
+    bytes.header += (head.len() - h0) as u64;
+    Ok(())
+}
+
+/// A big list read through the page store: its head is pinned, its blocks
+/// are paged. Every method first registers every page it will read
+/// ([`Blocks::need`]), so a pass that misses names all of them, and only
+/// then decodes.
+#[derive(Clone, Copy)]
+pub struct SplitOut<'g> {
+    n: usize,
+    dups: usize,
+    nb: usize,
+    nbs: usize,
+    blocks: &'g [u8],
+    fences: &'g [u8],
+    sp: OutSpaces<'g>,
+}
+
+/// A big list's subject column as [`Blocks`].
+pub struct SubjBlocks<'s, 'g>(&'s SplitOut<'g>);
+/// A big list's rkey column as [`Blocks`]: block b is its k - 1 deltas, to
+/// the end of its page.
+pub struct RkeyBlocks<'s, 'g>(&'s SplitOut<'g>);
+/// A big list's by-subject blocks as [`Blocks`], each to the end of its page.
+pub struct BySubjBlocks<'s, 'g>(&'s SplitOut<'g>);
+
+impl<'g> Blocks<'g> for SubjBlocks<'_, 'g> {
+    fn block(&self, cx: &ReadCx<'g>, b: usize) -> R<&'g [u8]> {
+        let l = self.0;
+        l.sp.subj.slice(cx, l.subj_at(b) as u64, 4 * l.block_len(b))
+    }
+}
+
+impl<'g> Blocks<'g> for RkeyBlocks<'_, 'g> {
+    fn block(&self, cx: &ReadCx<'g>, b: usize) -> R<&'g [u8]> {
+        let l = self.0;
+        if l.block_len(b) == 1 {
+            return Ok(&[]);
+        }
+        l.sp.rkey.tail(cx, l.rkey_at(b) as u64)
+    }
+}
+
+impl<'g> Blocks<'g> for BySubjBlocks<'_, 'g> {
+    fn block(&self, cx: &ReadCx<'g>, j: usize) -> R<&'g [u8]> {
+        let l = self.0;
+        l.sp.bysubj.tail(cx, l.by_at(j) as u64)
+    }
+}
+
+impl<'g> SplitOut<'g> {
+    /// The big list whose head starts `head`, its blocks in `sp`. None if
+    /// the head is cut short.
+    pub fn parse(head: &'g [u8], sp: OutSpaces<'g>) -> Option<SplitOut<'g>> {
+        let h = head.get(..HEAD_FIXED)?;
+        let n = u32_at(h, 0) as usize;
+        let dups = (u32_at(h, 4) as usize).min(n);
+        let nbs = u32_at(h, 8) as usize;
+        let nb = n.div_ceil(BLOCK);
+        let blocks = head.get(HEAD_FIXED..HEAD_FIXED + HEAD_BLOCK * nb)?;
+        let f0 = HEAD_FIXED + HEAD_BLOCK * nb;
+        let fences = head.get(f0..f0 + HEAD_FENCE * nbs)?;
+        Some(SplitOut { n, dups, nb, nbs, blocks, fences, sp })
+    }
+
+    pub fn len(&self) -> usize {
+        self.n
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.n == 0
+    }
+
+    pub fn distinct(&self) -> usize {
+        self.n - self.dups
+    }
+
+    /// Blocks of [`BLOCK`] records.
+    pub fn blocks(&self) -> usize {
+        self.nb
+    }
+
+    pub fn has_bysubj(&self) -> bool {
+        self.nbs > 0
+    }
+
+    pub fn subjects(&self) -> SubjBlocks<'_, 'g> {
+        SubjBlocks(self)
+    }
+
+    pub fn rkeys(&self) -> RkeyBlocks<'_, 'g> {
+        RkeyBlocks(self)
+    }
+
+    pub fn by_subject(&self) -> BySubjBlocks<'_, 'g> {
+        BySubjBlocks(self)
+    }
+
+    fn block_len(&self, b: usize) -> usize {
+        (self.n - b * BLOCK).min(BLOCK)
+    }
+
+    pub fn first_key(&self, b: usize) -> u64 {
+        u64_at(self.blocks, HEAD_BLOCK * b)
+    }
+
+    fn subj_at(&self, b: usize) -> u32 {
+        u32_at(self.blocks, HEAD_BLOCK * b + 8)
+    }
+
+    fn rkey_at(&self, b: usize) -> u32 {
+        u32_at(self.blocks, HEAD_BLOCK * b + 12)
+    }
+
+    fn fence(&self, j: usize) -> u32 {
+        u32_at(self.fences, HEAD_FENCE * j)
+    }
+
+    fn by_at(&self, j: usize) -> u32 {
+        u32_at(self.fences, HEAD_FENCE * j + 4)
+    }
+
+    /// Decodes block b's rkeys from its bytes.
+    fn keys_of(&self, b: usize, bytes: &[u8], out: &mut [u64; BLOCK]) -> usize {
+        let k = self.block_len(b);
+        let mut key = self.first_key(b);
+        out[0] = key;
+        let mut pos = 0;
+        for o in out.iter_mut().take(k).skip(1) {
+            key += varint::get(bytes, &mut pos);
+            *o = key;
+        }
+        k
+    }
+
+    /// By-subject block j: its positions (u32s) and subjects, decoded.
+    fn by_block(&self, cx: &ReadCx<'g>, j: usize, subj: &mut [u32; BLOCK]) -> R<(&'g [u8], usize)> {
+        let k = self.block_len(j);
+        let b = self.by_subject().block(cx, j)?;
+        crate::inset::decode_block(&b[4 * k..], self.fence(j), k, subj);
+        Ok((&b[..4 * k], k))
+    }
+
+    pub fn subject(&self, cx: &ReadCx<'g>, pos: usize) -> R<u32> {
+        let b = self.subjects().block(cx, pos / BLOCK)?;
+        Ok(u32_at(b, 4 * (pos % BLOCK)))
+    }
+
+    pub fn block_subjects(&self, cx: &ReadCx<'g>, b: usize) -> R<&'g [u8]> {
+        self.subjects().block(cx, b)
+    }
+
+    pub fn block_keys(&self, cx: &ReadCx<'g>, b: usize, out: &mut [u64; BLOCK]) -> R<usize> {
+        let bytes = self.rkeys().block(cx, b)?;
+        Ok(self.keys_of(b, bytes, out))
+    }
+
+    pub fn key_at(&self, cx: &ReadCx<'g>, pos: usize) -> R<u64> {
+        let mut keys = [0u64; BLOCK];
+        self.block_keys(cx, pos / BLOCK, &mut keys)?;
+        Ok(keys[pos % BLOCK])
+    }
+
+    pub fn find_key(&self, cx: &ReadCx<'g>, key: u64) -> R<Option<usize>> {
+        if self.n == 0 || key < self.first_key(0) {
+            return Ok(None);
+        }
+        let b = partition(self.nb, |b| self.first_key(b) <= key) - 1;
+        if self.first_key(b) == key {
+            return Ok(Some(b * BLOCK));
+        }
+        let mut keys = [0u64; BLOCK];
+        let k = self.block_keys(cx, b, &mut keys)?;
+        Ok(keys[..k].binary_search(&key).ok().map(|i| b * BLOCK + i))
+    }
+
+    /// The by-subject blocks that may hold `subject`.
+    fn by_range(&self, subject: u32) -> Range<usize> {
+        let lo = partition(self.nbs, |j| self.fence(j) < subject);
+        let hi = partition(self.nbs, |j| self.fence(j) <= subject);
+        lo.saturating_sub(1)..hi
+    }
+
+    /// Positions holding `subject`, newest first, until `f` returns false.
+    pub fn for_subject(&self, cx: &ReadCx<'g>, subject: u32, mut f: impl FnMut(usize) -> bool) -> R<()> {
+        if self.nbs > 0 {
+            let js = self.by_range(subject);
+            self.by_subject().need(cx, js.clone())?;
+            let mut subj = [0u32; BLOCK];
+            for j in js.rev() {
+                let (pos, k) = self.by_block(cx, j, &mut subj)?;
+                for i in (0..k).rev() {
+                    if subj[i] == subject && !f(u32_at(pos, 4 * i) as usize) {
+                        return Ok(());
+                    }
+                }
+            }
+            return Ok(());
+        }
+        self.subjects().need(cx, 0..self.nb)?;
+        for b in (0..self.nb).rev() {
+            let s = self.subjects().block(cx, b)?;
+            for i in (0..s.len() / 4).rev() {
+                if u32_at(s, 4 * i) == subject && !f(b * BLOCK + i) {
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Positions holding `subject`, oldest first, until `f` returns false.
+    pub fn for_subject_asc(&self, cx: &ReadCx<'g>, subject: u32, mut f: impl FnMut(usize) -> bool) -> R<()> {
+        if self.nbs > 0 {
+            let js = self.by_range(subject);
+            self.by_subject().need(cx, js.clone())?;
+            let mut subj = [0u32; BLOCK];
+            for j in js {
+                let (pos, k) = self.by_block(cx, j, &mut subj)?;
+                for (i, &s) in subj[..k].iter().enumerate() {
+                    if s == subject && !f(u32_at(pos, 4 * i) as usize) {
+                        return Ok(());
+                    }
+                }
+            }
+            return Ok(());
+        }
+        self.subjects().need(cx, 0..self.nb)?;
+        for b in 0..self.nb {
+            let s = self.subjects().block(cx, b)?;
+            for i in 0..s.len() / 4 {
+                if u32_at(s, 4 * i) == subject && !f(b * BLOCK + i) {
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Records with rkey below `before` (all if None), newest first, until
+    /// `f` returns false. `want` bounds how many `f` takes: the blocks
+    /// holding that many are fetched in one round, and a caller that takes
+    /// more reads on past them.
+    pub fn for_each_desc(
+        &self,
+        cx: &ReadCx<'g>,
+        before: Option<u64>,
+        want: usize,
+        mut f: impl FnMut(u64, u32) -> bool,
+    ) -> R<()> {
+        let end = match before {
+            None => self.nb,
+            Some(c) => partition(self.nb, |b| self.first_key(b) < c),
+        };
+        let span = want.saturating_add(BLOCK - 1) / BLOCK + 1;
+        let start = end.saturating_sub(span);
+        both(self.subjects().need(cx, start..end), self.rkeys().need(cx, start..end))?;
+        let mut keys = [0u64; BLOCK];
+        for b in (0..end).rev() {
+            let k = self.block_keys(cx, b, &mut keys)?;
+            let subj = self.subjects().block(cx, b)?;
+            for i in (0..k).rev() {
+                if before.is_some_and(|c| keys[i] >= c) {
+                    continue;
+                }
+                if !f(keys[i], u32_at(subj, 4 * i)) {
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn to_vec(&self, cx: &ReadCx<'g>) -> R<Vec<(u64, u32)>> {
+        both(self.subjects().need(cx, 0..self.nb), self.rkeys().need(cx, 0..self.nb))?;
+        let mut v = Vec::with_capacity(self.n);
+        let mut keys = [0u64; BLOCK];
+        for b in 0..self.nb {
+            let k = self.block_keys(cx, b, &mut keys)?;
+            let subj = self.subjects().block(cx, b)?;
+            for (i, &key) in keys.iter().enumerate().take(k) {
+                v.push((key, u32_at(subj, 4 * i)));
+            }
+        }
+        Ok(v)
+    }
+
+    /// Distinct subjects, sorted.
+    pub fn subjects_sorted(&self, cx: &ReadCx<'g>, out: &mut Vec<u32>) -> R<()> {
+        if self.nbs > 0 {
+            self.by_subject().need(cx, 0..self.nbs)?;
+            out.reserve(self.n - self.dups);
+            let mut subj = [0u32; BLOCK];
+            for j in 0..self.nbs {
+                let (_, k) = self.by_block(cx, j, &mut subj)?;
+                for &s in &subj[..k] {
+                    if out.last() != Some(&s) {
+                        out.push(s);
+                    }
+                }
+            }
+            return Ok(());
+        }
+        self.subjects().need(cx, 0..self.nb)?;
+        out.reserve(self.n);
+        for b in 0..self.nb {
+            for c in self.subjects().block(cx, b)?.as_chunks::<4>().0 {
+                out.push(u32::from_le_bytes(*c));
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        Ok(())
+    }
+}
+
+/// Both columns' misses registered before either fails the pass.
+fn both(a: R<()>, b: R<()>) -> R<()> {
+    a.and(b)
+}
+
+/// The first i in 0..n where `pred` turns false (it must be true, then false).
+fn partition(n: usize, pred: impl Fn(usize) -> bool) -> usize {
+    let (mut lo, mut hi) = (0, n);
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if pred(mid) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+/// An out list in a FORMAT 6 shard: whole (a list of at most
+/// [`crate::format6::WHOLE`] records, in FORMAT 5's bytes, the one page that
+/// holds it already read) or split into a pinned head and paged blocks. An
+/// override built from deltas is a `Whole` of any length.
+#[derive(Clone, Copy)]
+pub enum PagedOut<'g> {
+    Whole(OutList<'g>),
+    Split(SplitOut<'g>),
+}
+
+impl<'g> PagedOut<'g> {
+    /// The list an index entry names: a small one is read from its page
+    /// now, a big one only has its head parsed.
+    pub fn open(
+        cx: &ReadCx<'g>,
+        e: crate::format6::Entry,
+        small: &'g Space,
+        head: &'g [u8],
+        sp: OutSpaces<'g>,
+        subj_index: usize,
+    ) -> R<PagedOut<'g>> {
+        match e {
+            crate::format6::Entry::Small(at) => {
+                Ok(PagedOut::Whole(OutList::parse(small.tail(cx, at as u64)?, subj_index)))
+            }
+            crate::format6::Entry::Head(at) => {
+                let h = head.get(at as usize..).ok_or(Pending)?;
+                SplitOut::parse(h, sp).map(PagedOut::Split).ok_or(Pending)
+            }
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            PagedOut::Whole(l) => l.len(),
+            PagedOut::Split(l) => l.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn distinct(&self) -> usize {
+        match self {
+            PagedOut::Whole(l) => l.distinct(),
+            PagedOut::Split(l) => l.distinct(),
+        }
+    }
+
+    pub fn blocks(&self) -> usize {
+        self.len().div_ceil(BLOCK)
+    }
+
+    pub fn subject(&self, cx: &ReadCx<'g>, pos: usize) -> R<u32> {
+        match self {
+            PagedOut::Whole(l) => Ok(l.subject(pos)),
+            PagedOut::Split(l) => l.subject(cx, pos),
+        }
+    }
+
+    pub fn block_subjects(&self, cx: &ReadCx<'g>, b: usize) -> R<&'g [u8]> {
+        match self {
+            PagedOut::Whole(l) => Ok(l.block_subjects(b)),
+            PagedOut::Split(l) => l.block_subjects(cx, b),
+        }
+    }
+
+    pub fn block_keys(&self, cx: &ReadCx<'g>, b: usize, out: &mut [u64; BLOCK]) -> R<usize> {
+        match self {
+            PagedOut::Whole(l) => Ok(l.block_keys(b, out)),
+            PagedOut::Split(l) => l.block_keys(cx, b, out),
+        }
+    }
+
+    pub fn key_at(&self, cx: &ReadCx<'g>, pos: usize) -> R<u64> {
+        match self {
+            PagedOut::Whole(l) => Ok(l.key_at(pos)),
+            PagedOut::Split(l) => l.key_at(cx, pos),
+        }
+    }
+
+    pub fn find_key(&self, cx: &ReadCx<'g>, key: u64) -> R<Option<usize>> {
+        match self {
+            PagedOut::Whole(l) => Ok(l.find_key(key)),
+            PagedOut::Split(l) => l.find_key(cx, key),
+        }
+    }
+
+    pub fn for_subject(&self, cx: &ReadCx<'g>, subject: u32, f: impl FnMut(usize) -> bool) -> R<()> {
+        match self {
+            PagedOut::Whole(l) => {
+                l.for_subject(subject, f);
+                Ok(())
+            }
+            PagedOut::Split(l) => l.for_subject(cx, subject, f),
+        }
+    }
+
+    pub fn for_subject_asc(&self, cx: &ReadCx<'g>, subject: u32, f: impl FnMut(usize) -> bool) -> R<()> {
+        match self {
+            PagedOut::Whole(l) => {
+                l.for_subject_asc(subject, f);
+                Ok(())
+            }
+            PagedOut::Split(l) => l.for_subject_asc(cx, subject, f),
+        }
+    }
+
+    pub fn for_each_desc(
+        &self,
+        cx: &ReadCx<'g>,
+        before: Option<u64>,
+        want: usize,
+        f: impl FnMut(u64, u32) -> bool,
+    ) -> R<()> {
+        match self {
+            PagedOut::Whole(l) => {
+                l.for_each_desc(before, f);
+                Ok(())
+            }
+            PagedOut::Split(l) => l.for_each_desc(cx, before, want, f),
+        }
+    }
+
+    pub fn to_vec(&self, cx: &ReadCx<'g>) -> R<Vec<(u64, u32)>> {
+        match self {
+            PagedOut::Whole(l) => Ok(l.to_vec()),
+            PagedOut::Split(l) => l.to_vec(cx),
+        }
+    }
+
+    pub fn subjects_sorted(&self, cx: &ReadCx<'g>, out: &mut Vec<u32>) -> R<()> {
+        match self {
+            PagedOut::Whole(l) => {
+                l.subjects_sorted(out);
+                Ok(())
+            }
+            PagedOut::Split(l) => l.subjects_sorted(cx, out),
+        }
     }
 }
 
