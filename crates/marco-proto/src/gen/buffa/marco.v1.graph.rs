@@ -3615,6 +3615,26 @@ pub struct IntersectRequest {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
     )]
     pub cursor: ::buffa::alloc::string::String,
+    /// Also count the whole result, cursor or not, up to count_limit: total
+    /// and total_capped ("followed by A, B and N others").
+    ///
+    /// Field 6: `count`
+    #[serde(
+        rename = "count",
+        with = "::buffa::json_helpers::proto_bool",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_false"
+    )]
+    pub count: bool,
+    /// Default 1000, at most 10000.
+    ///
+    /// Field 7: `count_limit`
+    #[serde(
+        rename = "countLimit",
+        alias = "count_limit",
+        with = "::buffa::json_helpers::uint32",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u32"
+    )]
+    pub count_limit: u32,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -3627,6 +3647,8 @@ impl ::core::fmt::Debug for IntersectRequest {
             .field("limit", &self.limit)
             .field("op", &self.op)
             .field("cursor", &self.cursor)
+            .field("count", &self.count)
+            .field("count_limit", &self.count_limit)
             .finish()
     }
 }
@@ -3685,6 +3707,12 @@ impl ::buffa::Message for IntersectRequest {
         if !self.cursor.is_empty() {
             size += 1u64 + ::buffa::types::string_encoded_len(&self.cursor) as u64;
         }
+        if self.count {
+            size += 1u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
+        }
+        if self.count_limit != 0u32 {
+            size += 1u64 + ::buffa::types::uint32_encoded_len(self.count_limit) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -3722,6 +3750,12 @@ impl ::buffa::Message for IntersectRequest {
         }
         if !self.cursor.is_empty() {
             ::buffa::types::put_string_field(5u32, &self.cursor, buf);
+        }
+        if self.count {
+            ::buffa::types::put_bool_field(6u32, self.count, buf);
+        }
+        if self.count_limit != 0u32 {
+            ::buffa::types::put_uint32_field(7u32, self.count_limit, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -3779,6 +3813,20 @@ impl ::buffa::Message for IntersectRequest {
                 )?;
                 ::buffa::types::merge_string(&mut self.cursor, buf)?;
             }
+            6u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.count = ::buffa::types::decode_bool(buf)?;
+            }
+            7u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.count_limit = ::buffa::types::decode_uint32(buf)?;
+            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -3792,6 +3840,8 @@ impl ::buffa::Message for IntersectRequest {
         self.limit = 0u32;
         self.op = ::buffa::EnumValue::from(0);
         self.cursor.clear();
+        self.count = false;
+        self.count_limit = 0u32;
         self.__buffa_unknown_fields.clear();
     }
 }
@@ -3864,6 +3914,26 @@ pub struct IntersectResponse {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
     )]
     pub cursor: ::buffa::alloc::string::String,
+    /// With count: the result's size, or count_limit when total_capped. It
+    /// counts accounts the page leaves out as taken down or deleted.
+    ///
+    /// Field 5: `total`
+    #[serde(
+        rename = "total",
+        with = "::buffa::json_helpers::uint64",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
+    )]
+    pub total: u64,
+    /// More than count_limit: total is a floor.
+    ///
+    /// Field 6: `total_capped`
+    #[serde(
+        rename = "totalCapped",
+        alias = "total_capped",
+        with = "::buffa::json_helpers::proto_bool",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_false"
+    )]
+    pub total_capped: bool,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -3875,6 +3945,8 @@ impl ::core::fmt::Debug for IntersectResponse {
             .field("a_len", &self.a_len)
             .field("b_len", &self.b_len)
             .field("cursor", &self.cursor)
+            .field("total", &self.total)
+            .field("total_capped", &self.total_capped)
             .finish()
     }
 }
@@ -3917,6 +3989,12 @@ impl ::buffa::Message for IntersectResponse {
         if !self.cursor.is_empty() {
             size += 1u64 + ::buffa::types::string_encoded_len(&self.cursor) as u64;
         }
+        if self.total != 0u64 {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(self.total) as u64;
+        }
+        if self.total_capped {
+            size += 1u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -3938,6 +4016,12 @@ impl ::buffa::Message for IntersectResponse {
         }
         if !self.cursor.is_empty() {
             ::buffa::types::put_string_field(4u32, &self.cursor, buf);
+        }
+        if self.total != 0u64 {
+            ::buffa::types::put_uint64_field(5u32, self.total, buf);
+        }
+        if self.total_capped {
+            ::buffa::types::put_bool_field(6u32, self.total_capped, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -3984,6 +4068,20 @@ impl ::buffa::Message for IntersectResponse {
                 )?;
                 ::buffa::types::merge_string(&mut self.cursor, buf)?;
             }
+            5u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.total = ::buffa::types::decode_uint64(buf)?;
+            }
+            6u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.total_capped = ::buffa::types::decode_bool(buf)?;
+            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -3996,6 +4094,8 @@ impl ::buffa::Message for IntersectResponse {
         self.a_len = 0u64;
         self.b_len = 0u64;
         self.cursor.clear();
+        self.total = 0u64;
+        self.total_capped = false;
         self.__buffa_unknown_fields.clear();
     }
 }

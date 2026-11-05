@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use marco_core::rkey::key_of;
-use marco_core::{Added, Dir, Graph, ListRef, Relations, Removed, Status};
+use marco_core::{Added, Dir, Graph, ListRef, Relations, Removed, SetOp, Status};
 use vlatproto::tid::Tid;
 
 const FOLLOW: u8 = 0;
@@ -550,6 +550,42 @@ fn run_model(subj_index: usize) {
                 };
                 assert_eq!(r, (named(x, y), named(y, x)), "block pairs step {step}");
             }
+            check_combine(&g, &m, actors as u32, &mut rnd, step);
+        }
+    }
+}
+
+/// combine_counted against the model's sets: pages under cursors, totals under caps.
+fn check_combine(g: &Graph, m: &Model, actors: u32, rnd: &mut impl FnMut(u64) -> u64, step: usize) {
+    let (p, q) = (rnd(actors as u64) as u32, rnd(actors as u64) as u32);
+    let (Some(pi), Some(qi)) = (g.id_of(&did(p)), g.id_of(&did(q))) else { return };
+    let ids = |f: &dyn Fn(u32) -> bool| -> Vec<u32> {
+        let mut v: Vec<u32> = (0..actors).filter(|&x| f(x)).filter_map(|x| g.id_of(&did(x))).collect();
+        v.sort_unstable();
+        v
+    };
+    let out_p = ids(&|y| m.pair(FOLLOW, p, y));
+    let in_q = ids(&|x| m.pair(FOLLOW, x, q));
+    let out_q = ids(&|y| m.pair(FOLLOW, q, y));
+    let a = ListRef { rel: FOLLOW, dir: Dir::Out, actor: pi };
+    for (b, other) in [
+        (ListRef { rel: FOLLOW, dir: Dir::In, actor: qi }, &in_q),
+        (ListRef { rel: FOLLOW, dir: Dir::Out, actor: qi }, &out_q),
+    ] {
+        for op in [SetOp::And, SetOp::AndNot] {
+            let want: Vec<u32> = out_p.iter().copied().filter(|x| other.contains(x) == (op == SetOp::And)).collect();
+            for after in [None, want.first().copied(), want.get(want.len() / 2).copied()] {
+                for (limit, cap) in [(2, 0), (2, 1), (5, 3), (100, 1000), (1, 2)] {
+                    let (page, total) = g.combine_counted(a, b, op, limit, after, cap);
+                    let rest: Vec<u32> =
+                        want.iter().copied().filter(|&x| after.is_none_or(|y| x > y)).take(limit).collect();
+                    assert_eq!(page, rest, "page {op:?} after {after:?} limit {limit} step {step}");
+                    let n = want.len();
+                    let t = (cap > 0).then(|| (n.min(cap) as u64, n > cap));
+                    assert_eq!(total, t, "total {op:?} cap {cap} step {step}");
+                    assert_eq!(page, g.combine(a, b, op, limit, after));
+                }
+            }
         }
     }
 }
@@ -1026,4 +1062,80 @@ fn stamps_follow_the_tombstone_ttl_and_checkpoints() {
     g.snapshot().unwrap().verify_checksums().unwrap();
     assert_eq!(g.stamp(FOLLOW, id, key(&new)), Some(now - 50_000_000));
     assert_eq!(g.stamp(FOLLOW, id, key(&plain)), None);
+}
+
+/// An actor and which of the others its side holds.
+type Keep = (u32, fn(u32) -> bool);
+
+/// combine_counted on lists long enough for AND_NOT to merge in several
+/// chunks and for an out side to be probed, sides of both directions on
+/// either end, cursors in and out of the result, in the delta and the base.
+#[test]
+fn combine_counted_on_long_lists() {
+    const N: u32 = 6000;
+    let mut g = graph();
+    let mut edges: BTreeSet<(u32, u32)> = BTreeSet::new();
+    let outs: [Keep; 3] = [(0, |_| true), (1, |j| j % 600 != 0), (2, |j| j % 3 == 0)];
+    for (a, keep) in outs {
+        edges.extend((3..N).filter(|&j| keep(j)).map(|j| (a, j)));
+    }
+    let ins: [Keep; 3] = [(5000, |j| (10..3000).contains(&j)), (5001, |j| j % 7 == 0), (5002, |j| j % 60 == 0)];
+    for (s, keep) in ins {
+        edges.extend((3..N).filter(|&j| keep(j) && j != s).map(|j| (j, s)));
+    }
+    for (k, &(f, t)) in edges.iter().enumerate() {
+        g.add(&follow(&did(f), &tid(k as u64)), &did(t)).unwrap();
+    }
+    let mut sets: Vec<(u32, Dir, Vec<u32>)> = Vec::new();
+    for (a, _) in outs {
+        sets.push((a, Dir::Out, edges.iter().filter(|e| e.0 == a).map(|e| e.1).collect()));
+    }
+    for (s, _) in ins {
+        sets.push((s, Dir::In, edges.iter().filter(|e| e.1 == s).map(|e| e.0).collect()));
+    }
+    for g in [&g.clone_via_snapshot(), &g] {
+        let ids = |v: &[u32]| -> Vec<u32> {
+            let mut x: Vec<u32> = v.iter().map(|&i| g.id_of(&did(i)).unwrap()).collect();
+            x.sort_unstable();
+            x
+        };
+        let sides: Vec<(ListRef, Vec<u32>)> = sets
+            .iter()
+            .map(|(x, d, v)| (ListRef { rel: FOLLOW, dir: *d, actor: g.id_of(&did(*x)).unwrap() }, ids(v)))
+            .collect();
+        for (a, av) in &sides {
+            for (b, bv) in &sides {
+                if a.actor == b.actor {
+                    continue;
+                }
+                for op in [SetOp::And, SetOp::AndNot] {
+                    let want: Vec<u32> =
+                        av.iter().copied().filter(|x| bv.binary_search(x).is_ok() == (op == SetOp::And)).collect();
+                    let mut cursors = vec![None, want.get(want.len() / 3).copied()];
+                    // ids that aren't in the result, past its start
+                    cursors.extend(
+                        [7, 2999, 4321]
+                            .iter()
+                            .filter_map(|&k| g.id_of(&did(k)))
+                            .filter(|c| want.binary_search(c).is_err())
+                            .map(Some),
+                    );
+                    for after in cursors {
+                        for (limit, cap) in [(5, 0), (5, 1000), (300, 2000), (2000, 10), (1, usize::MAX)] {
+                            let (page, total) = g.combine_counted(*a, *b, op, limit, after, cap);
+                            let rest: Vec<u32> =
+                                want.iter().copied().filter(|&x| after.is_none_or(|y| x > y)).take(limit).collect();
+                            assert_eq!(page, rest, "{a:?} {op:?} {b:?} after {after:?} limit {limit}");
+                            let n = want.len();
+                            assert_eq!(
+                                total,
+                                (cap > 0).then(|| (n.min(cap) as u64, n > cap)),
+                                "{a:?} {op:?} {b:?} cap {cap}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

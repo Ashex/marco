@@ -247,6 +247,30 @@ async fn graph_reads() {
     };
     assert_eq!(g.intersect(bad).await.unwrap_err().code, ErrorCode::InvalidArgument);
 
+    // the count: the whole result whatever the page, up to count_limit
+    let all = i.actors.len() as u64;
+    let known = |limit, count, count_limit, cursor: &str| IntersectRequest {
+        a: side("follow", Dir::DIR_OUT, &a0).into(),
+        b: side("follow", Dir::DIR_IN, &a1).into(),
+        limit,
+        count,
+        count_limit,
+        cursor: cursor.into(),
+        ..Default::default()
+    };
+    let plain = g.intersect(known(5, false, 0, "")).await.unwrap().into_owned();
+    assert_eq!((plain.total, plain.total_capped), (0, false), "no count unless asked");
+    let counted = g.intersect(known(5, true, 0, "")).await.unwrap().into_owned();
+    assert_eq!(counted.actors, plain.actors, "the page doesn't change");
+    assert_eq!(counted.cursor, plain.cursor);
+    assert_eq!((counted.total, counted.total_capped), (all, false), "default limit 1000");
+    let capped = g.intersect(known(5, true, 10, "")).await.unwrap().into_owned();
+    assert_eq!((capped.total, capped.total_capped), (10, true));
+    assert_eq!(capped.actors, plain.actors);
+    let next = g.intersect(known(5, true, 0, &plain.cursor)).await.unwrap().into_owned();
+    assert_eq!(next.actors, i.actors[5..10]);
+    assert_eq!((next.total, next.total_capped), (all, false), "the count ignores the cursor");
+
     // a block from a0, then filter a0's view
     let w = graph(s.api, Some(TOKEN));
     let bu = uri(&a0, BLOCK, &tid(9_000_000, 1));

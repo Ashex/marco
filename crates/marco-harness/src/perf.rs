@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use connectrpc::client::{ClientConfig, ClientTransport, HttpClient, ServiceTransport};
 use connectrpc::ConnectError;
-use marco_core::{Dir, Graph, ListRef, RelId};
+use marco_core::{Dir, Graph, ListRef, RelId, SetOp};
 use marco_proto::connect::marco::v1::GraphClient;
 use marco_proto::v1::*;
 use marco_server::app::{App, Config};
@@ -378,6 +378,7 @@ impl Inputs {
         match p {
             mixfile::Pool::Active => &self.viewers_active,
             mixfile::Pool::Heavy => &self.viewers_heavy,
+            mixfile::Pool::Heaviest => &self.viewers_heavy[..self.viewers_heavy.len().min(1)],
             _ => &self.viewers_random,
         }
     }
@@ -482,8 +483,13 @@ impl Engine {
             Req::Intersect(r) => {
                 let side =
                     |s: &ListSide| g.id_of(&s.actor).map(|actor| ListRef { rel: rel(&s.rel), dir: dir(&s.dir), actor });
+                let cap = if r.count { r.count_limit.max(1) as usize } else { 0 };
                 match (side(&r.a), side(&r.b)) {
-                    (Some(a), Some(b)) => dids(g.intersect(a, b, r.limit as usize)),
+                    (Some(a), Some(b)) => {
+                        let (ids, total) = g.combine_counted(a, b, SetOp::And, r.limit as usize, None, cap);
+                        std::hint::black_box(total);
+                        dids(ids)
+                    }
                     _ => 0,
                 }
             }

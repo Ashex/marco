@@ -1162,53 +1162,68 @@ impl Graph {
     }
 
     fn intersect_(&self, a: ListRef, b: ListRef, limit: usize) -> Vec<u32> {
-        self.combine_(a, b, SetOp::And, limit, None)
+        self.combine_(a, b, SetOp::And, limit, None, 0).0
     }
 
-    fn combine_(&self, a: ListRef, b: ListRef, op: SetOp, limit: usize, after: Option<u32>) -> Vec<u32> {
-        let after_of = |mut v: Vec<u32>| {
-            if let Some(x) = after {
-                v.drain(..v.partition_point(|&y| y <= x));
-            }
-            v
-        };
+    /// The page of ids above `after`, and with `cap` > 0 the whole result's
+    /// size up to `cap` (true when there's more). Each side is decoded at
+    /// most once for both.
+    fn combine_(
+        &self,
+        a: ListRef,
+        b: ListRef,
+        op: SetOp,
+        limit: usize,
+        after: Option<u32>,
+        cap: usize,
+    ) -> (Vec<u32>, Option<(u64, bool)>) {
         match op {
             SetOp::And => {
                 let (small, big) = if self.side_len(a) <= self.side_len(b) { (a, b) } else { (b, a) };
-                let probes = after_of(self.side_set(small));
-                self.side_intersect(big, &probes, limit)
+                let probes = self.side_set(small);
+                let whole = OnceCell::new();
+                page_and_count(&probes, after, limit, cap, |p, n| self.side_intersect_in(big, p, n, &whole))
             }
             SetOp::AndNot => {
-                let left = after_of(self.side_set(a));
-                let mut out = Vec::with_capacity(limit.min(left.len()));
-                // b decoded at most once; an in set or a much bigger out side is probed instead
-                let probe = b.dir == Dir::In || self.side_len(b) > left.len() as u64 * PROBE_RATIO;
-                let whole = if probe { Vec::new() } else { self.side_set(b) };
-                // in chunks, so a short page off a long left side stops early
-                for part in left.chunks(limit.max(256)) {
-                    let hit = if probe {
-                        self.side_intersect(b, part, usize::MAX)
-                    } else {
-                        let mut v = Vec::new();
-                        inset::merge_intersect(part, &whole, usize::MAX, &mut v);
-                        v
-                    };
-                    let mut j = 0;
-                    for &x in part {
-                        while j < hit.len() && hit[j] < x {
-                            j += 1;
-                        }
-                        if hit.get(j) != Some(&x) {
-                            out.push(x);
-                            if out.len() == limit {
-                                return out;
-                            }
-                        }
-                    }
-                }
-                out
+                let left = self.side_set(a);
+                let whole = OnceCell::new();
+                page_and_count(&left, after, limit, cap, |part, n| self.and_not(b, part, n, &whole))
             }
         }
+    }
+
+    /// The members of sorted `left` not in `b`, up to `n`. b is decoded at
+    /// most once (into `whole`); an in set or a much bigger out side is probed instead.
+    fn and_not(&self, b: ListRef, left: &[u32], n: usize, whole: &OnceCell<Vec<u32>>) -> Vec<u32> {
+        let mut out = Vec::with_capacity(n.min(left.len()));
+        let probe = b.dir == Dir::In || self.side_len(b) > left.len() as u64 * PROBE_RATIO;
+        // where the last chunk's merge left off in b, so the chunks walk b once between them
+        let mut at = 0;
+        // in chunks, so a short page off a long left side stops early
+        for part in left.chunks(n.clamp(256, 1 << 20)) {
+            let hit = if probe {
+                self.side_intersect(b, part, usize::MAX)
+            } else {
+                let w = whole.get_or_init(|| self.side_set(b));
+                at += w[at..].partition_point(|&y| y < part[0]);
+                let mut v = Vec::new();
+                inset::merge_intersect(part, &w[at..], usize::MAX, &mut v);
+                v
+            };
+            let mut j = 0;
+            for &x in part {
+                while j < hit.len() && hit[j] < x {
+                    j += 1;
+                }
+                if hit.get(j) != Some(&x) {
+                    out.push(x);
+                    if out.len() == n {
+                        return out;
+                    }
+                }
+            }
+        }
+        out
     }
 
     fn filter_id_(&self, viewer: u32, actors: &[u32], drop: &[(RelId, Dir)], sets: &[ListRef]) -> Vec<u32> {
@@ -1291,10 +1306,26 @@ impl Graph {
 
     /// `a` and `b` (or `a` without `b`), ids above `after`, ascending.
     pub fn combine(&self, a: ListRef, b: ListRef, op: SetOp, limit: usize, after: Option<u32>) -> Vec<u32> {
+        self.combine_counted(a, b, op, limit, after, 0).0
+    }
+
+    /// `combine`, and with `cap` > 0 the size of the whole result (cursor
+    /// or not) up to `cap`, true when it's bigger. The count costs one pass
+    /// over the smaller side that stops at `cap` + 1 hits, on top of the
+    /// page's decode of that side.
+    pub fn combine_counted(
+        &self,
+        a: ListRef,
+        b: ListRef,
+        op: SetOp,
+        limit: usize,
+        after: Option<u32>,
+        cap: usize,
+    ) -> (Vec<u32>, Option<(u64, bool)>) {
         let rel = if a.rel == b.rel { a.rel as usize } else { self.obs.multi() };
         let g = self.obs.op(Op::Intersect, rel, limit);
-        let r = self.combine_(a, b, op, limit, after);
-        self.obs.done(g, r.len());
+        let r = self.combine_(a, b, op, limit, after, cap);
+        self.obs.done(g, r.0.len());
         r
     }
 
@@ -2163,4 +2194,27 @@ fn merge_by<T: Copy>(a: Vec<T>, b: Vec<T>, limit: usize, first: impl Fn(&T, &T) 
         }
     }
     out
+}
+
+/// A page of `run` over `all` past `after`, and with `cap` > 0 the size of
+/// `run` over all of it, up to `cap`. Without a cursor one pass makes both.
+fn page_and_count(
+    all: &[u32],
+    after: Option<u32>,
+    limit: usize,
+    cap: usize,
+    run: impl Fn(&[u32], usize) -> Vec<u32>,
+) -> (Vec<u32>, Option<(u64, bool)>) {
+    let from = after.map_or(0, |x| all.partition_point(|&y| y <= x));
+    if cap == 0 {
+        return (run(&all[from..], limit), None);
+    }
+    let count = |v: &[u32]| Some((v.len().min(cap) as u64, v.len() > cap));
+    if from == 0 {
+        let mut v = run(all, limit.max(cap.saturating_add(1)));
+        let n = count(&v);
+        v.truncate(limit);
+        return (v, n);
+    }
+    (run(&all[from..], limit), count(&run(all, cap.saturating_add(1))))
 }

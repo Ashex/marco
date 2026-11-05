@@ -305,20 +305,23 @@ impl svc::Graph for GraphApi {
             c => Some(g.id_of(c).ok_or_else(|| bad("cursor isn't in this graph"))?),
         };
         let lim = limit(req.limit, 100, 10_000);
-        let ids = match (a, b, op) {
-            (Some(x), Some(y), _) => g.combine(x, y, op, lim, after),
+        let cap = if req.count { limit(req.count_limit, 1000, 10_000) } else { 0 };
+        let (ids, total) = match (a, b, op) {
+            (Some(x), Some(y), _) => g.combine_counted(x, y, op, lim, after, cap),
             // a without a missing (or hidden) b is all of a
             (Some(x), None, SetOp::AndNot) => {
                 let mut v = match x.dir {
                     Dir::Out => g.out_set(x.rel, x.actor),
                     Dir::In => g.in_set(x.rel, x.actor),
                 };
+                let total = (cap > 0).then(|| (v.len().min(cap) as u64, v.len() > cap));
                 v.retain(|&i| after.is_none_or(|a| i > a));
                 v.truncate(lim);
-                v
+                (v, total)
             }
-            _ => Vec::new(),
+            _ => (Vec::new(), (cap > 0).then_some((0, false))),
         };
+        let (total, total_capped) = total.unwrap_or_default();
         let cursor = if ids.len() == lim { ids.last().and_then(|&i| g.did_of(i)) } else { None };
         let actors = ids.into_iter().filter_map(|id| g.did_of(id)).filter(|d| !g.hidden(d)).collect();
         Response::ok(IntersectResponse {
@@ -326,6 +329,8 @@ impl svc::Graph for GraphApi {
             a_len: len(a),
             b_len: len(b),
             cursor: cursor.unwrap_or_default(),
+            total,
+            total_capped,
             ..Default::default()
         })
     }

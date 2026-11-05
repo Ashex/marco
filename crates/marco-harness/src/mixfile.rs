@@ -33,14 +33,15 @@ pub enum Call {
 }
 
 /// Where an argument comes from: a viewer pool (`random`, `active`,
-/// `heavy`, which carry their follows), a DID pool (`popular`, `uniform`,
-/// `hot_in`) or `lists` (list URIs).
+/// `heavy`, `heaviest` (the most-following actor alone), which carry their
+/// follows), a DID pool (`popular`, `uniform`, `hot_in`) or `lists` (list URIs).
 #[derive(Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "snake_case")]
 pub enum Pool {
     Random,
     Active,
     Heavy,
+    Heaviest,
     Popular,
     Uniform,
     HotIn,
@@ -89,6 +90,9 @@ pub struct FileShape {
     pub batch: Vec<(u32, f64)>,
     #[serde(default)]
     pub limit: u32,
+    /// intersect: also count the result up to this many (0: no count).
+    #[serde(default)]
+    pub count: u32,
     #[serde(default)]
     pub a: Option<SideSpec>,
     #[serde(default)]
@@ -140,7 +144,7 @@ fn uniform01(rng: &mut Rng) -> f64 {
 fn draw<'a>(inp: &'a Inputs, rng: &mut Rng, p: Pool) -> (&'a str, &'a [String]) {
     let pick = |v: &'a [String], rng: &mut Rng| v[rng.below(v.len() as u64) as usize].as_str();
     match p {
-        Pool::Random | Pool::Active | Pool::Heavy => {
+        Pool::Random | Pool::Active | Pool::Heavy | Pool::Heaviest => {
             let v = inp.viewers(p);
             let x = &v[rng.below(v.len() as u64) as usize];
             (x.did.as_str(), &x.follows[..])
@@ -215,6 +219,8 @@ fn make(inp: &Inputs, s: &FileShape, rng: &mut Rng) -> Result<Req> {
                 a: side(&s.a)?.into(),
                 b: side(&s.b)?.into(),
                 limit: s.limit,
+                count: s.count > 0,
+                count_limit: s.count,
                 ..Default::default()
             })
         }
@@ -268,7 +274,7 @@ fn pools_of(s: &FileShape) -> Vec<Pool> {
 
 fn pool_empty(inp: &Inputs, p: Pool) -> bool {
     match p {
-        Pool::Random | Pool::Active | Pool::Heavy => inp.viewers(p).is_empty(),
+        Pool::Random | Pool::Active | Pool::Heavy | Pool::Heaviest => inp.viewers(p).is_empty(),
         Pool::Popular => inp.popular.is_empty(),
         Pool::Uniform => inp.misses.is_empty(),
         Pool::HotIn => inp.hot_in.is_empty(),

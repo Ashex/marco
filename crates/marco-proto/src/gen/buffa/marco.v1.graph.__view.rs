@@ -5741,6 +5741,15 @@ pub struct IntersectRequestView<'a> {
     ///
     /// Field 5: `cursor`
     pub cursor: &'a str,
+    /// Also count the whole result, cursor or not, up to count_limit: total
+    /// and total_capped ("followed by A, B and N others").
+    ///
+    /// Field 6: `count`
+    pub count: bool,
+    /// Default 1000, at most 10000.
+    ///
+    /// Field 7: `count_limit`
+    pub count_limit: u32,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for IntersectRequestView<'a> {
@@ -5838,6 +5847,20 @@ impl<'a> ::buffa::MessageView<'a> for IntersectRequestView<'a> {
                 )?;
                 view.cursor = ::buffa::types::borrow_str(&mut cur)?;
             }
+            6u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.count = ::buffa::types::decode_bool(&mut cur)?;
+            }
+            7u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.count_limit = ::buffa::types::decode_uint32(&mut cur)?;
+            }
             _ => {
                 ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
                 let span_len = before_tag.len() - cur.len();
@@ -5881,6 +5904,8 @@ impl<'a> ::buffa::MessageView<'a> for IntersectRequestView<'a> {
             limit: self.limit,
             op: self.op,
             cursor: self.cursor.to_string(),
+            count: self.count,
+            count_limit: self.count_limit,
             __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
@@ -5920,6 +5945,12 @@ impl<'a> ::buffa::ViewEncode<'a> for IntersectRequestView<'a> {
         if !self.cursor.is_empty() {
             size += 1u64 + ::buffa::types::string_encoded_len(&self.cursor) as u64;
         }
+        if self.count {
+            size += 1u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
+        }
+        if self.count_limit != 0u32 {
+            size += 1u64 + ::buffa::types::uint32_encoded_len(self.count_limit) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -5958,6 +5989,12 @@ impl<'a> ::buffa::ViewEncode<'a> for IntersectRequestView<'a> {
         }
         if !self.cursor.is_empty() {
             ::buffa::types::put_string_field(5u32, &self.cursor, buf);
+        }
+        if self.count {
+            ::buffa::types::put_bool_field(6u32, self.count, buf);
+        }
+        if self.count_limit != 0u32 {
+            ::buffa::types::put_uint32_field(7u32, self.count_limit, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -6002,6 +6039,16 @@ impl<'__a> ::serde::Serialize for IntersectRequestView<'__a> {
         }
         if !::buffa::json_helpers::skip_if::is_empty_str(self.cursor) {
             __map.serialize_entry("cursor", self.cursor)?;
+        }
+        if self.count {
+            __map.serialize_entry("count", &self.count)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u32(&self.count_limit) {
+            __map
+                .serialize_entry(
+                    "countLimit",
+                    &::buffa::json_helpers::ProtoJson(&self.count_limit),
+                )?;
         }
         __map.end()
     }
@@ -6129,6 +6176,21 @@ impl IntersectRequestOwnedView {
     pub fn cursor(&self) -> &'_ str {
         self.0.reborrow().cursor
     }
+    /// Also count the whole result, cursor or not, up to count_limit: total
+    /// and total_capped ("followed by A, B and N others").
+    ///
+    /// Field 6: `count`
+    #[must_use]
+    pub fn count(&self) -> bool {
+        self.0.reborrow().count
+    }
+    /// Default 1000, at most 10000.
+    ///
+    /// Field 7: `count_limit`
+    #[must_use]
+    pub fn count_limit(&self) -> u32 {
+        self.0.reborrow().count_limit
+    }
 }
 impl ::core::convert::From<::buffa::OwnedView<IntersectRequestView<'static>>>
 for IntersectRequestOwnedView {
@@ -6176,6 +6238,15 @@ pub struct IntersectResponseView<'a> {
     ///
     /// Field 4: `cursor`
     pub cursor: &'a str,
+    /// With count: the result's size, or count_limit when total_capped. It
+    /// counts accounts the page leaves out as taken down or deleted.
+    ///
+    /// Field 5: `total`
+    pub total: u64,
+    /// More than count_limit: total is a floor.
+    ///
+    /// Field 6: `total_capped`
+    pub total_capped: bool,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for IntersectResponseView<'a> {
@@ -6229,6 +6300,20 @@ impl<'a> ::buffa::MessageView<'a> for IntersectResponseView<'a> {
                 )?;
                 view.cursor = ::buffa::types::borrow_str(&mut cur)?;
             }
+            5u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.total = ::buffa::types::decode_uint64(&mut cur)?;
+            }
+            6u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.total_capped = ::buffa::types::decode_bool(&mut cur)?;
+            }
             1u32 => {
                 ::buffa::encoding::check_wire_type(
                     tag,
@@ -6266,6 +6351,8 @@ impl<'a> ::buffa::MessageView<'a> for IntersectResponseView<'a> {
             a_len: self.a_len,
             b_len: self.b_len,
             cursor: self.cursor.to_string(),
+            total: self.total,
+            total_capped: self.total_capped,
             __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
@@ -6289,6 +6376,12 @@ impl<'a> ::buffa::ViewEncode<'a> for IntersectResponseView<'a> {
         if !self.cursor.is_empty() {
             size += 1u64 + ::buffa::types::string_encoded_len(&self.cursor) as u64;
         }
+        if self.total != 0u64 {
+            size += 1u64 + ::buffa::types::uint64_encoded_len(self.total) as u64;
+        }
+        if self.total_capped {
+            size += 1u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -6311,6 +6404,12 @@ impl<'a> ::buffa::ViewEncode<'a> for IntersectResponseView<'a> {
         }
         if !self.cursor.is_empty() {
             ::buffa::types::put_string_field(4u32, &self.cursor, buf);
+        }
+        if self.total != 0u64 {
+            ::buffa::types::put_uint64_field(5u32, self.total, buf);
+        }
+        if self.total_capped {
+            ::buffa::types::put_bool_field(6u32, self.total_capped, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -6352,6 +6451,16 @@ impl<'__a> ::serde::Serialize for IntersectResponseView<'__a> {
         }
         if !::buffa::json_helpers::skip_if::is_empty_str(self.cursor) {
             __map.serialize_entry("cursor", self.cursor)?;
+        }
+        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.total) {
+            __map
+                .serialize_entry(
+                    "total",
+                    &::buffa::json_helpers::ProtoJson(&self.total),
+                )?;
+        }
+        if self.total_capped {
+            __map.serialize_entry("totalCapped", &self.total_capped)?;
         }
         __map.end()
     }
@@ -6473,6 +6582,21 @@ impl IntersectResponseOwnedView {
     #[must_use]
     pub fn cursor(&self) -> &'_ str {
         self.0.reborrow().cursor
+    }
+    /// With count: the result's size, or count_limit when total_capped. It
+    /// counts accounts the page leaves out as taken down or deleted.
+    ///
+    /// Field 5: `total`
+    #[must_use]
+    pub fn total(&self) -> u64 {
+        self.0.reborrow().total
+    }
+    /// More than count_limit: total is a floor.
+    ///
+    /// Field 6: `total_capped`
+    #[must_use]
+    pub fn total_capped(&self) -> bool {
+        self.0.reborrow().total_capped
     }
 }
 impl ::core::convert::From<::buffa::OwnedView<IntersectResponseView<'static>>>

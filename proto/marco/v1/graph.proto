@@ -207,6 +207,11 @@ message IntersectRequest {
   SetOp op = 4;
   // The last response's cursor: the actors after it, in id order.
   string cursor = 5;
+  // Also count the whole result, cursor or not, up to count_limit: total
+  // and total_capped ("followed by A, B and N others").
+  bool count = 6;
+  // Default 1000, at most 10000.
+  uint32 count_limit = 7;
 }
 
 message IntersectResponse {
@@ -217,6 +222,11 @@ message IntersectResponse {
   uint64 b_len = 3;
   // Empty on the last page.
   string cursor = 4;
+  // With count: the result's size, or count_limit when total_capped. It
+  // counts accounts the page leaves out as taken down or deleted.
+  uint64 total = 5;
+  // More than count_limit: total is a floor.
+  bool total_capped = 6;
 }
 
 message FilterDrop {
