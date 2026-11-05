@@ -49,9 +49,11 @@ fn label(m: &prometheus::proto::Metric, name: &str) -> String {
     m.get_label().iter().find(|l| l.name() == name).map(|l| l.value().to_string()).unwrap_or_default()
 }
 
+/// A series' key: its family and label values, leaving out the RPC path,
+/// whose fast and pool histograms the console sums.
 fn id(fam: &str, m: &prometheus::proto::Metric) -> String {
     let mut s = fam.to_string();
-    for l in m.get_label() {
+    for l in m.get_label().iter().filter(|l| l.name() != "path") {
         s.push('|');
         s.push_str(l.value());
     }
@@ -99,8 +101,14 @@ impl Ring {
                 match f.get_field_type() {
                     MetricType::HISTOGRAM => {
                         let h = m.get_histogram();
-                        let buckets = h.get_bucket().iter().map(|b| (b.upper_bound(), b.cumulative_count())).collect();
-                        hists.insert(id(f.name(), m), Hist { count: h.get_sample_count(), buckets });
+                        let e = hists.entry(id(f.name(), m)).or_insert_with(|| Hist {
+                            count: 0,
+                            buckets: h.get_bucket().iter().map(|b| (b.upper_bound(), 0)).collect(),
+                        });
+                        e.count += h.get_sample_count();
+                        for (x, b) in e.buckets.iter_mut().zip(h.get_bucket()) {
+                            x.1 += b.cumulative_count();
+                        }
                     }
                     MetricType::COUNTER => {
                         ctrs.insert(id(f.name(), m), m.get_counter().get_value());
@@ -114,9 +122,13 @@ impl Ring {
             let dt = now.duration_since(*t0).as_secs_f64().max(1e-3);
             let rate = |id: &str, v: f64| (v - pc.get(id).copied().unwrap_or(0.0)).max(0.0) / dt;
             let mut rpc_err: HashMap<String, f64> = HashMap::new();
+            let mut seen = std::collections::HashSet::new();
             for f in fams {
                 for m in f.get_metric() {
                     let i = id(f.name(), m);
+                    if !seen.insert(i.clone()) {
+                        continue;
+                    }
                     match f.name() {
                         "marco_op_seconds" | "marco_rpc_seconds" | "marco_merge_seconds" => {
                             let h = &hists[&i];
@@ -251,7 +263,7 @@ fn sample(app: &App, cache: bool) {
         (d, t, g.shared_snapshot())
     };
     if let (true, Some(s)) = (cache, snap) {
-        let b: u64 = s.files().map(|f| crate::sys::resident(f.1.bytes())).sum();
+        let b: u64 = s.files().map(|f| f.1.mapped().map_or(0, crate::sys::resident)).sum();
         app.cached_bytes.store(b, Ordering::Relaxed);
         crate::metrics::CACHED.set(b as i64);
     }

@@ -123,9 +123,25 @@ struct Serve {
     /// Checkpoints drop tombstones older than this many days: past what any source still replays.
     #[arg(long, env = "MARCO_TOMBSTONE_DAYS", default_value_t = 7.0)]
     tombstone_days: f64,
-    /// Don't map the snapshot's pages in after open (they then fault in as reads touch them).
+    /// Don't map the snapshot's pages in after open (they then fault in as reads touch them). On
+    /// --storage engine: don't load every page at open when --memory holds them all.
     #[arg(long, env = "MARCO_NO_PREFAULT")]
     no_prefault: bool,
+    /// How the snapshot is read: mmap (the kernel's page cache) or engine (O_DIRECT into a cache
+    /// of --memory bytes, every page checked against its sum).
+    #[arg(long, env = "MARCO_STORAGE", default_value = "mmap", value_parser = ["mmap", "engine"])]
+    storage: String,
+    /// The engine's budget: its pinned sections, page cache and tables (44GiB, 13GiB, 6G). It
+    /// must hold the pinned tier plus 2 GiB; the graph's deltas and the process live outside it.
+    #[arg(long, env = "MARCO_MEMORY", required_if_eq("storage", "engine"))]
+    memory: Option<String>,
+    /// Threads a request that misses the engine's cache moves to.
+    #[arg(long, env = "MARCO_MISS_THREADS", default_value_t = 64)]
+    miss_threads: usize,
+    /// Caps the engine's frames below what --memory allows, skipping the minimum-budget check:
+    /// for tests that want a starved cache.
+    #[arg(long, env = "MARCO_MAX_FRAMES", hide = true)]
+    max_frames: Option<u32>,
     /// Follow a Jetstream instance (wss://host or wss://host/subscribe) for the relations' collections.
     #[arg(long, env = "MARCO_JETSTREAM", conflicts_with = "firehose")]
     jetstream: Option<String>,
@@ -172,6 +188,9 @@ fn flags(m: &ArgMatches, s: &Serve) -> Vec<FlagInfo> {
         ("serve_before_ready", s.serve_before_ready.to_string()),
         ("tombstone_days", s.tombstone_days.to_string()),
         ("no_prefault", s.no_prefault.to_string()),
+        ("storage", s.storage.clone()),
+        ("memory", s.memory.clone().unwrap_or_else(|| "—".into())),
+        ("miss_threads", s.miss_threads.to_string()),
         ("jetstream", s.jetstream.clone().unwrap_or_else(|| "—".into())),
         ("firehose", s.firehose.clone().unwrap_or_else(|| "—".into())),
         ("source_retention_hours", s.source_retention_hours.to_string()),
@@ -273,6 +292,17 @@ fn main() -> Result<()> {
             if source.is_some() && s.read_only {
                 bail!("--read-only can't follow a source");
             }
+            let storage = match (s.storage.as_str(), &s.memory) {
+                ("engine", Some(m)) => marco_core::store::Storage::Engine {
+                    memory: marco_core::store::parse_bytes(m).context("--memory")?,
+                    max_frames: s.max_frames,
+                },
+                ("engine", None) => bail!("--storage engine needs --memory"),
+                _ => marco_core::store::Storage::Mmap,
+            };
+            if s.miss_threads == 0 {
+                bail!("--miss-threads must be at least 1");
+            }
             let cfg = Config {
                 read_only: s.read_only,
                 api_read_only: s.api_read_only,
@@ -290,6 +320,8 @@ fn main() -> Result<()> {
                 prefault: !s.no_prefault,
                 tombstone_ttl: std::time::Duration::from_secs_f64(s.tombstone_days.max(0.0) * 86_400.0),
                 expected_sources: source.iter().map(|s| s.name.clone()).collect(),
+                storage,
+                miss_threads: s.miss_threads,
                 ..Config::new(s.snapshot.clone())
             };
             let site = marco_server::ui::Site {
@@ -297,7 +329,7 @@ fn main() -> Result<()> {
                 handle_resolver: origin("--handle-resolver", s.handle_resolver.as_deref())?,
             };
             let ui = Arc::new(marco_server::ui::Ui::load_with(s.ui_dir.as_deref(), site)?);
-            let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+            let rt = marco_server::runtime(None)?;
             rt.block_on(async move {
                 let app = App::open(cfg)?;
                 let (api, admin) = marco_server::serve(app.clone(), ui).await?;

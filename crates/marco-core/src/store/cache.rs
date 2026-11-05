@@ -570,6 +570,22 @@ impl Cache {
         self.policy.lock().unwrap().groups.iter().map(|g| g.cap as usize).sum()
     }
 
+    /// Frames the budget holds with what's borrowed taken out: the groups
+    /// that fit beside the borrowed bytes and the tables.
+    pub fn room(&self) -> usize {
+        let p = self.policy.lock().unwrap();
+        let free = self.limit.saturating_sub(p.borrowed + p.tables + p.pending);
+        let groups = (free / GROUP as u64) as usize;
+        p.groups.iter().filter(|g| g.cap > 0).take(groups).map(|g| g.cap as usize).sum()
+    }
+
+    /// The retired reserve the evictor keeps once [`Cache::room`]'s frames
+    /// are all in use.
+    pub fn reserve_frames(&self) -> usize {
+        let n = self.room();
+        (n / 200).max(1024).min(n / 8).max(1)
+    }
+
     /// Frame `f`'s page. The caller must have read `f` from a slot under a
     /// guard it still holds, or own the frame.
     #[inline]
@@ -895,12 +911,16 @@ impl Cache {
     /// Makes freshly read frames resident and queued, each with `pins` pins
     /// plus one the caller drops after publishing its slot (so no evictor
     /// can take a frame whose slot isn't set yet). A page the ghost
-    /// remembers goes to main, any other to small.
-    pub fn admit(&self, frames: &[u32], pins: u32) {
+    /// remembers goes to main, any other to small; with `main`, every page
+    /// goes to main (the full-residency load).
+    pub fn admit(&self, frames: &[u32], pins: u32, main: bool) {
         let mut p = self.policy.lock().unwrap();
         for &f in frames {
             let fr = &self.frames[f as usize];
-            let q = if p.ghost.take(key(fr.owner())) {
+            let q = if main {
+                p.main_live += 1;
+                Q_MAIN
+            } else if p.ghost.take(key(fr.owner())) {
                 self.counters.ghost_hits.fetch_add(1, Relaxed);
                 p.main_live += 1;
                 Q_MAIN

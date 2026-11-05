@@ -22,7 +22,9 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use arc_swap::{ArcSwap, Guard};
 use marco_core::did::classify;
+use marco_core::read::{Engine, Hold};
 use marco_core::relation::parse_uri;
+use marco_core::store::Storage;
 use marco_core::{segment, Added, Graph, Rec, Removed};
 
 pub use marco_core::{Op, Status};
@@ -74,9 +76,17 @@ pub struct Config {
     /// Sources readiness waits for (expect_source adds more).
     pub expected_sources: Vec<String>,
     /// Map the snapshot's pages in after open and after each checkpoint, in
-    /// the background, so reads and writes don't take page faults.
+    /// the background, so reads and writes don't take page faults. On the
+    /// engine: load every page at open when the budget holds them all.
     pub prefault: bool,
+    /// How the snapshot is read (`--storage`, `--memory`).
+    pub storage: Storage,
+    /// Threads a request that misses moves to (`--miss-threads`).
+    pub miss_threads: usize,
 }
+
+/// Memory a store budget must leave the cache beyond the pinned tier.
+pub const MIN_CACHE: u64 = 2 << 30;
 
 impl Config {
     pub fn new(snapshot: PathBuf) -> Config {
@@ -98,6 +108,8 @@ impl Config {
             tombstone_ttl: Duration::from_secs(7 * 86_400),
             expected_sources: Vec::new(),
             prefault: true,
+            storage: Storage::from_env().unwrap_or_else(|e| panic!("{e:#}")),
+            miss_threads: 64,
         }
     }
 }
@@ -256,6 +268,10 @@ pub struct Durability {
 
 pub struct App {
     pub cfg: Config,
+    /// The page store every copy of the graph and every snapshot opened
+    /// reads through.
+    pub engine: Arc<Engine>,
+    pub miss_pool: crate::pool::MissPool,
     graph: ArcSwap<Graph>,
     tx: Mutex<Option<mpsc::Sender<Req>>>,
     pub recent: Mutex<VecDeque<Recent>>,
@@ -281,6 +297,23 @@ pub fn now_ms() -> i64 {
     marco_core::store::now_ms()
 }
 
+/// Warns when the cgroup's memory limit leaves under 2 GiB beside the store
+/// budget: the deltas, the directory's live DIDs and the request heap live
+/// outside it.
+fn warn_cgroup(memory: u64) {
+    let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/memory.max") else { return };
+    let Ok(limit) = s.trim().parse::<u64>() else { return };
+    if limit.saturating_sub(memory) < MIN_CACHE {
+        eprintln!(
+            "marco: warning: the cgroup's memory limit ({} MiB) leaves under {} MiB beside --memory ({} MiB) for the \
+             graph's deltas and the process",
+            limit >> 20,
+            MIN_CACHE >> 20,
+            memory >> 20
+        );
+    }
+}
+
 /// A snapshot with the change segments after it replayed.
 pub struct Replayed {
     pub graph: Graph,
@@ -292,11 +325,38 @@ pub struct Replayed {
     pub last: u64,
 }
 
-/// Opens the snapshot and replays the segments after it; with `upto`, the
-/// segments after that are left out.
-pub fn open_replayed(cfg: &Config, upto: Option<u64>) -> Result<Replayed> {
+/// Applies `recs` in order to `g`, and to its twin `t` if given, planning
+/// each run of them first so their reads wait on disk once per dependency
+/// level ([`Graph::plan`]); the plan's pins last through both applies.
+pub fn apply_planned(g: &mut Graph, mut t: Option<&mut Graph>, recs: &[Rec]) {
+    let mut at = 0;
+    while at < recs.len() {
+        let mut ops = 0;
+        let end = recs[at..].iter().position(|r| {
+            ops += r.ops();
+            ops > PLAN_OPS
+        });
+        let end = at + end.map_or(recs.len() - at, |e| e.max(1));
+        let mut hold = Hold::new();
+        g.plan(&recs[at..end].iter().collect::<Vec<_>>(), &mut hold);
+        for r in &recs[at..end] {
+            apply_rec(g, r);
+            if let Some(t) = t.as_deref_mut() {
+                apply_rec(t, r);
+            }
+        }
+        at = end;
+    }
+}
+
+/// Ops a replay plans at once.
+const PLAN_OPS: usize = 1000;
+
+/// Opens the snapshot through `engine` and replays the segments after it;
+/// with `upto`, the segments after that are left out.
+pub fn open_replayed(cfg: &Config, engine: &Arc<Engine>, upto: Option<u64>) -> Result<Replayed> {
     let path = &cfg.snapshot;
-    let mut g = Graph::open(path)?;
+    let mut g = Graph::open_on(path, engine)?;
     g.merge_ratio = cfg.merge_ratio;
     g.compact_min = cfg.compact_min;
     g.tombstone_ttl_us = cfg.tombstone_ttl.as_micros() as i64;
@@ -318,10 +378,8 @@ pub fn open_replayed(cfg: &Config, upto: Option<u64>) -> Result<Replayed> {
         if s.header.build != m.build {
             bail!("{} belongs to another snapshot", p.display());
         }
-        for r in &s.records {
-            apply_rec(&mut g, r);
-            ops += r.ops() as u64;
-        }
+        apply_planned(&mut g, None, &s.records);
+        ops += s.records.iter().map(|r| r.ops() as u64).sum::<u64>();
         cursors = s.header.cursors;
         last = k;
         n += 1;
@@ -332,6 +390,13 @@ pub fn open_replayed(cfg: &Config, upto: Option<u64>) -> Result<Replayed> {
 
 impl App {
     pub fn open(cfg: Config) -> Result<Arc<App>> {
+        let engine = cfg.storage.engine()?;
+        App::open_on(cfg, engine)
+    }
+
+    /// Opens on an engine the caller made (tests give it a faulty device);
+    /// it must match `cfg.storage`.
+    pub fn open_on(cfg: Config, engine: Arc<Engine>) -> Result<Arc<App>> {
         let t = Instant::now();
         if !cfg.read_only {
             let m = marco_core::store::Manifest::read(&cfg.snapshot)?;
@@ -339,7 +404,34 @@ impl App {
                 eprintln!("marco: removing leftovers in {}: {e:#}", cfg.snapshot.display());
             }
         }
-        let Replayed { graph: g, cursors, segments: segs, ops, last } = open_replayed(&cfg, None)?;
+        let Replayed { graph: g, cursors, segments: segs, ops, last } = open_replayed(&cfg, &engine, None)?;
+        if let (Storage::Engine { memory, max_frames: None }, Some(s)) = (&cfg.storage, g.snapshot()) {
+            // twice the pinned tier: a checkpoint registers each dirty shard's whole
+            // new file beside the old until the switch
+            let pinned = engine.bytes().borrowed;
+            let min = 2 * pinned + MIN_CACHE;
+            if min > *memory {
+                bail!(
+                    "--memory {} MiB is too small: this snapshot's pinned tier takes {} MiB, a checkpoint needs it \
+                     twice, and the cache needs {} MiB more; give it at least {} MiB",
+                    memory >> 20,
+                    pinned >> 20,
+                    MIN_CACHE >> 20,
+                    min.div_ceil(1 << 20)
+                );
+            }
+            warn_cgroup(*memory);
+            if cfg.prefault {
+                let t = Instant::now();
+                if s.load() {
+                    eprintln!(
+                        "marco: loaded {} MiB of pages in {:.1} s",
+                        (s.paged_pages() * marco_core::store::page::PAGE as u64) >> 20,
+                        t.elapsed().as_secs_f64()
+                    );
+                }
+            }
+        }
         let open_seconds = t.elapsed().as_secs_f64();
         let m = g.manifest().cloned().unwrap_or_default();
         let files = g.snapshot().map_or(0, |s| s.files().count());
@@ -375,8 +467,11 @@ impl App {
         }
         let ready = cfg.expected_sources.is_empty();
         let spare = (!cfg.read_only).then(|| g.clone());
+        let miss_pool = crate::pool::MissPool::new(cfg.miss_threads);
         let app = Arc::new(App {
             cfg,
+            engine,
+            miss_pool,
             graph: ArcSwap::from_pointee(g),
             tx: Mutex::new(None),
             recent: Mutex::new(VecDeque::with_capacity(RECENT)),
@@ -745,9 +840,10 @@ impl App {
         }
     }
 
-    /// Maps the served snapshot's pages in, on a thread of its own.
+    /// Maps the served snapshot's pages in, on a thread of its own. (On the
+    /// engine, open loaded them already when they fit.)
     pub(crate) fn prefault(&self) {
-        if !self.cfg.prefault {
+        if !self.cfg.prefault || self.engine.paged() {
             return;
         }
         if let Some(s) = self.graph().shared_snapshot() {
@@ -759,27 +855,20 @@ impl App {
         self.graph().snapshot().map_or(0, |s| s.files().count())
     }
 
-    /// Checks each file's checksums from a mapping of its own, so no copy of
-    /// the graph is held for the minute a whole-network check takes.
+    /// Checks each file's checksums, reading it from disk again, over the
+    /// served snapshot held apart from the graph, so no copy of the graph is
+    /// held for the minute a whole-network check takes. On the engine, a
+    /// page that fails is marked bad and one that reads clean loses its mark.
     pub fn start_verify(self: &Arc<Self>) -> Result<JobState, String> {
-        let (paths, build) = {
-            let g = self.graph();
-            let Some(s) = g.snapshot() else { return Err("no snapshot".into()) };
-            let p: Vec<PathBuf> = s.files().map(|(name, _)| self.cfg.snapshot.join(name)).collect();
-            (p, s.dir.meta.build)
-        };
-        self.begin_job("verify", paths.len() as u32)?;
-        *self.verify.lock().unwrap() = vec![Verify::Verifying; paths.len()];
+        let Some(snap) = self.graph().shared_snapshot() else { return Err("no snapshot".into()) };
+        let n = snap.files().count();
+        self.begin_job("verify", n as u32)?;
+        *self.verify.lock().unwrap() = vec![Verify::Verifying; n];
         let app = self.clone();
         tokio::task::spawn_blocking(move || {
             let mut failed = 0;
-            for (i, p) in paths.iter().enumerate() {
-                let r = marco_core::store::MappedFile::open(p).and_then(|f| {
-                    let b = f.footer.meta.get("build").and_then(|v| v.as_u64());
-                    anyhow::ensure!(b == Some(build), "{} is from another snapshot", p.display());
-                    f.verify_checksums()
-                });
-                let v = match r {
+            for (i, (_, f)) in snap.files().enumerate() {
+                let v = match f.verify_checksums(&snap.engine) {
                     Ok(()) => Verify::Ok,
                     Err(e) => {
                         failed += 1;

@@ -635,12 +635,19 @@ fn checksums_catch_a_flipped_byte() {
         b
     };
     let good = flip("r0.out.small");
-    let err = marco_core::store::Store::open(&p).unwrap().verify_checksums().unwrap_err();
-    assert!(format!("{err:#}").contains("r0.out.small page"), "{err:#}");
+    let err = open_and_verify(&p);
+    assert!(err.contains("r0.out.small page"), "{err}");
     std::fs::write(&f, good).unwrap();
     flip("r0.out.idx");
-    let err = marco_core::store::Store::open(&p).unwrap().verify_checksums().unwrap_err();
-    assert!(format!("{err:#}").contains("section r0.out.idx checksum"), "{err:#}");
+    let err = open_and_verify(&p);
+    assert!(err.contains("section r0.out.idx checksum"), "{err}");
+}
+
+/// Why opening the snapshot at `p` and checking it fails: the engine checks
+/// pinned sections at open, a mapped store only when asked.
+fn open_and_verify(p: &std::path::Path) -> String {
+    let e = marco_core::store::Store::open(p).and_then(|s| s.verify_checksums()).unwrap_err();
+    format!("{e:#}")
 }
 
 #[test]
@@ -1135,10 +1142,10 @@ fn the_stamp_section_is_checksummed() {
     drop(g);
     let fp = p.join(&name);
     let mut b = std::fs::read(&fp).unwrap();
-    b[r.start] ^= 1;
+    b[r.off as usize] ^= 1;
     std::fs::write(&fp, &b).unwrap();
-    let err = Graph::open(&p).unwrap().snapshot().unwrap().verify_checksums().unwrap_err();
-    assert!(format!("{err:#}").contains("r0.stamp checksum"), "{err:#}");
+    let err = open_and_verify(&p);
+    assert!(err.contains("r0.stamp checksum"), "{err}");
 }
 
 /// Stamps past the TTL go at a snapshot or checkpoint; newer ones stay. A

@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use marco_core::did::unpack_plc;
-use marco_core::read::{ReadCx, StorageError, R};
+use marco_core::read::{Engine, ReadCx, StorageError, R};
 use marco_core::snapshot::{BaseDir, DidAt};
 use marco_core::store::{ShardFile, Store};
 
@@ -137,7 +137,9 @@ impl Cache {
     }
 
     /// The stats for `build`, starting the pass if nobody has.
-    pub fn get(self: &Arc<Self>, build: u64, path: PathBuf) -> Answer {
+    /// Reads the snapshot at `path` through `engine`, the server's own, so it
+    /// shares the served files.
+    pub fn get(self: &Arc<Self>, build: u64, path: PathBuf, engine: Arc<Engine>) -> Answer {
         let mut s = self.state.lock().unwrap();
         if let Some(r) = s.result.as_ref().filter(|r| r.build == build) {
             return Answer::Ready(r.clone());
@@ -151,7 +153,7 @@ impl Cache {
             std::thread::Builder::new()
                 .name("marco-liststats".into())
                 .spawn(move || {
-                    let r = compute(&path, &me.done, &me.total);
+                    let r = compute(&path, &engine, &me.done, &me.total);
                     let mut s = me.state.lock().unwrap();
                     s.running = false;
                     match r {
@@ -174,8 +176,8 @@ fn did_at(d: &BaseDir, id: u32) -> String {
     }
 }
 
-fn compute(path: &std::path::Path, done: &AtomicUsize, total: &AtomicUsize) -> Result<Stats> {
-    let store = Store::open(path)?;
+fn compute(path: &std::path::Path, engine: &Arc<Engine>, done: &AtomicUsize, total: &AtomicUsize) -> Result<Stats> {
+    let store = Store::open_on(path, engine)?;
     let nrel = store.dir.meta.relations.len();
     let subj = store.dir.meta.subj_index as usize;
     total.store(store.shards.len(), Ordering::Relaxed);

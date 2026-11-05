@@ -64,7 +64,7 @@ pub fn run(a: &Args) -> Result<Value> {
         .files()
         .collect::<Vec<_>>()
         .par_iter()
-        .map(|f| f.1.bytes().iter().step_by(4096).map(|&b| b as u64).sum::<u64>())
+        .map(|f| f.1.mapped().unwrap_or_default().iter().step_by(4096).map(|&b| b as u64).sum::<u64>())
         .sum();
     std::hint::black_box(touched);
     out.insert("warm_secs".into(), json!(t.elapsed().as_secs_f64()));

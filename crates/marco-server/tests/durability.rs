@@ -223,7 +223,7 @@ async fn a_crash_on_either_side_of_a_checkpoints_commit() {
         std::fs::copy(e.path(), copy.join(e.file_name())).unwrap();
     }
     let ccfg = cfg(&copy);
-    let r = marco_server::app::open_replayed(&ccfg, None).unwrap();
+    let r = marco_server::app::open_replayed(&ccfg, &ccfg.storage.engine().unwrap(), None).unwrap();
     let m = r.graph.write_checkpoint(&copy, 1, r.last, r.cursors.clone()).unwrap();
     drop(r);
     let new_files: Vec<String> =
@@ -247,7 +247,7 @@ async fn a_crash_on_either_side_of_a_checkpoints_commit() {
     drop(app);
 
     // 2: the manifest was renamed, the old files and segments weren't removed yet
-    assert_eq!(marco_server::app::open_replayed(&ccfg, None).unwrap().last, m.segment);
+    assert_eq!(marco_server::app::open_replayed(&ccfg, &ccfg.storage.engine().unwrap(), None).unwrap().last, m.segment);
     // the first write's segment (a new source), the flush at 400, then 400..600
     assert_eq!(segment::list(&snap).unwrap().len(), 3);
     // the copy's checkpoint folded the first two; the third is newer

@@ -28,7 +28,9 @@ use anyhow::{anyhow, Result};
 use marco_core::store::{remove_unlisted, Manifest};
 use marco_core::{segment, Graph, Rec};
 
-use crate::app::{apply_rec, now_ms, open_replayed, App, Applied};
+use marco_core::read::Hold;
+
+use crate::app::{apply_planned, apply_rec, now_ms, open_replayed, App, Applied};
 
 pub enum Req {
     Apply { rec: Rec, durable: bool, reply: tokio::sync::oneshot::Sender<Result<Applied>> },
@@ -302,9 +304,13 @@ impl Writer {
         }
         let mut g = self.spare.take().expect("the spare copy");
         let mut outs = Vec::with_capacity(applies.len());
+        // the plan's pins last through both copies' applies
+        let mut hold = Hold::new();
         {
             let gm = exclusive(&mut g);
             gm.quiet = false;
+            let recs: Vec<&Rec> = applies.iter().map(|a| &a.0).collect();
+            gm.plan(&recs, &mut hold);
             for (rec, _, _) in &applies {
                 outs.push(apply_rec(gm, rec));
                 let (source, cursor) = source_cursor(rec);
@@ -330,6 +336,7 @@ impl Writer {
             apply_rec(om, rec);
         }
         om.quiet = false;
+        drop(hold);
         self.spare = Some(old);
         if buffer {
             self.buf_ops += recs.iter().map(|r| r.ops() as u64).sum::<u64>();
@@ -452,15 +459,9 @@ impl Writer {
         g.quiet = true;
         t.quiet = true;
         for (_, recs) in since.iter().filter(|(k, _)| *k > sw.last) {
-            for rec in recs.iter() {
-                apply_rec(&mut g, rec);
-                apply_rec(&mut t, rec);
-            }
+            apply_planned(&mut g, Some(&mut t), recs);
         }
-        for rec in &self.buf {
-            apply_rec(&mut g, rec);
-            apply_rec(&mut t, rec);
-        }
+        apply_planned(&mut g, Some(&mut t), &self.buf);
         g.quiet = false;
         t.quiet = false;
         let old = (self.app.publish(Arc::new(g)), self.spare.replace(Arc::new(t)));
@@ -494,7 +495,7 @@ fn rewrite(app: &App, id: u64, upto: u64, cursors: BTreeMap<String, String>) -> 
     while app.durability.lock().unwrap().segment < upto {
         std::thread::sleep(Duration::from_millis(5));
     }
-    let g = open_replayed(cfg, Some(upto))?.graph;
+    let g = open_replayed(cfg, &app.engine, Some(upto))?.graph;
     let manifest = g.write_checkpoint(&cfg.snapshot, id, upto, cursors)?;
     drop(g);
     let new: Vec<&String> =
@@ -503,11 +504,12 @@ fn rewrite(app: &App, id: u64, upto: u64, cursors: BTreeMap<String, String>) -> 
     let shards = new.len() as u32;
     let cleanup = remove_unlisted(&cfg.snapshot, &manifest, false).err().map(|e| format!("{e:#}"));
     let switch = (|| -> Result<Switch> {
-        let r = open_replayed(cfg, None)?;
+        let r = open_replayed(cfg, &app.engine, None)?;
         if cfg.prefault {
-            // before the switch: the new files' first reads would fault every page
+            // before the switch: the new files' first reads would fault (or miss) every page
             if let Some(s) = r.graph.snapshot() {
                 s.populate();
+                s.load();
             }
         }
         let seg_bytes = segment::list(&cfg.snapshot)?

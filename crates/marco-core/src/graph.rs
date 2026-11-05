@@ -32,7 +32,7 @@ use std::ops::Bound;
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::did::{classify, unpack_plc, DidKey, DidRef};
@@ -43,7 +43,7 @@ use crate::outlog::{self, OutBytes, OutList, PagedOut};
 use crate::read::{Engine, Hold, ReadCx, StorageError, R};
 use crate::relation::{parse_uri, RelId, Relations};
 use crate::rkey::{self, is_tid, key_of};
-use crate::segment::Status;
+use crate::segment::{Rec, Status};
 use crate::snapshot::{
     decode_live, decode_stamps, decode_statuses, decode_tombs, encode_live, encode_side, encode_stamps,
     encode_statuses, encode_tombs, rel_section, write_directory, BaseDir, DidAt, DirParts, FileKind, Meta, PagedWriter,
@@ -274,9 +274,17 @@ impl Graph {
         }
     }
 
+    /// Opens the snapshot at `path` the way [`crate::store::Storage::from_env`]
+    /// says, on an engine of its own.
     pub fn open(path: &Path) -> Result<Graph> {
+        Graph::open_on(path, &crate::store::Storage::from_env()?.engine()?)
+    }
+
+    /// Opens the snapshot at `path` through `engine`, which a server shares
+    /// between every copy of the graph and every snapshot it opens.
+    pub fn open_on(path: &Path, engine: &Arc<Engine>) -> Result<Graph> {
         let t = std::time::Instant::now();
-        let g = Graph::from_store(Store::open(path)?)?;
+        let g = Graph::from_store(Store::open_on(path, engine)?)?;
         obs::snapshot_timed("open", t.elapsed().as_secs_f64());
         Ok(g)
     }
@@ -562,18 +570,14 @@ impl Graph {
                     continue;
                 }
                 let list_rel = self.rels.list_rel(rel);
-                removed += self.write(|me, cx| {
-                    let mut n = 0;
-                    for (k, _) in me.out_all(cx, rel, a)? {
-                        // an account's deletion takes every record, whenever it was stamped
-                        let gone = match list_rel {
-                            Some(p) => me.delete_key_(cx, p, a, k, time_us, true)?,
-                            None => me.delete_id_(cx, rel, a, k, time_us, true)?,
-                        };
-                        n += gone.is_some() as u64;
-                    }
-                    Ok(n)
-                })?;
+                for (k, _) in self.rd(|g, cx| g.out_all(cx, rel, a))? {
+                    // an account's deletion takes every record, whenever it was stamped
+                    let gone = match list_rel {
+                        Some(p) => self.delete_key_(p, a, k, time_us, true)?,
+                        None => self.delete_id_(rel, a, k, time_us, true)?,
+                    };
+                    removed += gone.is_some() as u64;
+                }
             }
         }
         self.status.insert(a, status);
@@ -1223,7 +1227,11 @@ impl Graph {
 
     fn counts_(&self, cx: &ReadCx<'_>, rel: RelId, actor: &str) -> R<(u64, u64)> {
         match self.id_of(actor) {
-            Some(a) => Ok((self.out_count(cx, rel, a)?, self.in_count(cx, rel, a)?)),
+            // both asked before either's miss returns, so one pass names both pages
+            Some(a) => {
+                let (o, i) = (self.out_count(cx, rel, a), self.in_count(cx, rel, a));
+                Ok((o?, i?))
+            }
             None => Ok((0, 0)),
         }
     }
@@ -1575,7 +1583,7 @@ impl Graph {
     /// replaces it, so a source's ops applied in order end where its repo does.
     pub fn add_rec(&mut self, uri: &str, subject: &str, list: Option<&str>, time_us: i64) -> Result<Added> {
         let g = (!self.quiet).then(|| self.obs.op(Op::Add, self.obs.multi(), 1));
-        let r = self.write(|me, cx| me.add_(cx, uri, subject, list, time_us)).and_then(|r| r);
+        let r = self.add_(uri, subject, list, time_us);
         if let Some(g) = g {
             if let Ok((rel, a)) = &r {
                 let o = match a {
@@ -1593,7 +1601,7 @@ impl Graph {
     /// Deletes a record by URI; its source saw the delete at `time_us`.
     pub fn delete_at(&mut self, uri: &str, time_us: i64) -> Result<Removed> {
         let g = (!self.quiet).then(|| self.obs.op(Op::Delete, self.obs.multi(), 1));
-        let r = self.write(|me, cx| me.delete_(cx, uri, time_us)).and_then(|r| r);
+        let r = self.delete_(uri, time_us);
         if let Some(g) = g {
             if let Ok((rel, d)) = &r {
                 self.obs.applied(
@@ -1642,19 +1650,18 @@ impl Graph {
 
     // ------------------------------------------------------------ writes
 
-    /// Runs one write op in a pass over the store: its reads, then its
-    /// changes. A write can't stop halfway through, and over a store that
-    /// keeps whole files only a bad page misses, so a miss fails the op
-    /// with what the fetch found.
-    fn write<T>(&mut self, f: impl FnOnce(&mut Graph, &ReadCx<'_>) -> R<T>) -> Result<T> {
-        let engine = self.engine.clone();
-        match engine.pass(&mut Hold::none(), |cx| f(self, cx)) {
+    /// One read a write makes, in passes of its own that may wait on disk:
+    /// a write can't stop halfway through its changes, so each read
+    /// finishes before the change that depends on it. The writer's plan
+    /// ([`Graph::plan`]) has usually pinned what it needs.
+    /// No page limit: a limit could stop one copy's op partway where the
+    /// other copy, finding the pages in memory, finishes it.
+    fn rd<T>(&self, f: impl Fn(&Graph, &ReadCx<'_>) -> R<T>) -> Result<T> {
+        let r = match self.engine.pass(&mut Hold::none(), |cx| f(self, cx)) {
             Ok(t) => Ok(t),
-            Err(m) => match engine.fetch_blocking(m, &mut Hold::new()) {
-                Err(e) => Err(anyhow::Error::new(e).context("a write's read failed")),
-                Ok(()) => bail!("a write's read missed a page the store had"),
-            },
-        }
+            Err(m) => self.engine.resume_blocking(&mut Hold::new(), Some(m), |cx| f(self, cx)),
+        };
+        r.map_err(|e| anyhow::Error::new(e).context("a write's read failed"))
     }
 
     /// `f` until a pass is clean, for the reads a snapshot write makes.
@@ -1662,57 +1669,41 @@ impl Graph {
         self.read(f).map_err(|e| anyhow::Error::new(e).context("snapshot read"))
     }
 
-    fn add_(
-        &mut self,
-        cx: &ReadCx<'_>,
-        uri: &str,
-        subject: &str,
-        list: Option<&str>,
-        time_us: i64,
-    ) -> R<Result<(RelId, Added)>> {
-        let Some((did, coll, rkey_s)) = parse_uri(uri) else { return Ok(Err(anyhow!("{uri:?} isn't a record URI"))) };
-        let Some(rel) = self.rels.by_collection(coll) else { return Ok(Err(anyhow!("no relation for {coll}"))) };
+    fn add_(&mut self, uri: &str, subject: &str, list: Option<&str>, time_us: i64) -> Result<(RelId, Added)> {
+        let Some((did, coll, rkey_s)) = parse_uri(uri) else { bail!("{uri:?} isn't a record URI") };
+        let Some(rel) = self.rels.by_collection(coll) else { bail!("no relation for {coll}") };
         let owner = self.rels.owner_rel(rel);
         let list = match (owner, list) {
             (None, _) => None,
-            (Some(_), None) => return Ok(Err(anyhow!("{coll} records name their list"))),
+            (Some(_), None) => bail!("{coll} records name their list"),
             (Some(_), Some(l)) => match parse_uri(l) {
                 Some((o, _, _)) if o == did => Some(l),
-                Some(_) => return Ok(Err(anyhow!("{l} isn't in {did}'s repo"))),
-                None => return Ok(Err(anyhow!("{l:?} isn't a record URI"))),
+                Some(_) => bail!("{l} isn't in {did}'s repo"),
+                None => bail!("{l:?} isn't a record URI"),
             },
         };
-        let a = match self.intern(did) {
-            Ok(a) => a,
-            Err(e) => return Ok(Err(e)),
-        };
-        let s = match self.intern(subject) {
-            Ok(s) => s,
-            Err(e) => return Ok(Err(e)),
-        };
-        let l = match list.map(|l| self.intern_node(l)).transpose() {
-            Ok(l) => l,
-            Err(e) => return Ok(Err(e)),
-        };
+        let a = self.intern(did)?;
+        let s = self.intern(subject)?;
+        let l = list.map(|l| self.intern_node(l)).transpose()?;
         let (key, side) = key_of(rkey_s);
         let rec = owner.unwrap_or(rel);
         if side {
             if let Some(have) = self.rkey_string(rec, a, key) {
                 if have != rkey_s {
-                    return Ok(Err(anyhow!("rkeys {have:?} and {rkey_s:?} of {did} hash alike")));
+                    bail!("rkeys {have:?} and {rkey_s:?} of {did} hash alike");
                 }
             }
         }
         // older than the key's last change: a second source replaying the past
         if self.tombstone(rec, a, key).is_none_or(|t| time_us >= t) && self.stale(rec, a, key, time_us) {
-            return Ok(Ok((rel, Added::Exists)));
+            return Ok((rel, Added::Exists));
         }
         let mut replaced = false;
         // a create or update of a record holding something else replaces it
         if self.tombstone(rec, a, key).is_none_or(|t| time_us >= t) {
-            let held = self.out_get(cx, rec, a, key)?;
+            let held = self.rd(|g, cx| g.out_get(cx, rec, a, key))?;
             let member = match (l, held) {
-                (Some(_), Some(hl)) => self.out_get(cx, rel, hl, key)?,
+                (Some(_), Some(hl)) => self.rd(|g, cx| g.out_get(cx, rel, hl, key))?,
                 _ => held,
             };
             let same = match l {
@@ -1720,19 +1711,19 @@ impl Graph {
                 Some(l) => held == Some(l) && member == Some(s),
             };
             if held.is_some() && !same {
-                self.remove_id(cx, rec, a, key)?;
+                self.remove_id(rec, a, key)?;
                 if let (Some(_), Some(hl)) = (l, held) {
-                    self.remove_id(cx, rel, hl, key)?;
+                    self.remove_id(rel, hl, key)?;
                 }
                 replaced = true;
             }
         }
         let r = match l {
-            None => self.add_id(cx, rel, a, key, s, time_us)?,
+            None => self.add_id(rel, a, key, s, time_us)?,
             Some(l) => {
-                let r = self.add_id(cx, rec, a, key, l, time_us)?;
-                if r == Added::Added && self.out_get(cx, rel, l, key)?.is_none() {
-                    self.put_id(cx, rel, l, key, s)?;
+                let r = self.add_id(rec, a, key, l, time_us)?;
+                if r == Added::Added && self.rd(|g, cx| g.out_get(cx, rel, l, key))?.is_none() {
+                    self.put_id(rel, l, key, s)?;
                 }
                 r
             }
@@ -1746,10 +1737,10 @@ impl Graph {
                 self.state[rel as usize].side.insert((l, key), rkey_s.into());
             }
         }
-        Ok(Ok((rel, r)))
+        Ok((rel, r))
     }
 
-    fn add_id(&mut self, cx: &ReadCx<'_>, rel: RelId, actor: u32, key: u64, subject: u32, time_us: i64) -> R<Added> {
+    fn add_id(&mut self, rel: RelId, actor: u32, key: u64, subject: u32, time_us: i64) -> Result<Added> {
         let mut recreated = false;
         if let Some(t) = self.tombstone(rel, actor, key) {
             if time_us < t {
@@ -1761,17 +1752,17 @@ impl Graph {
         if self.stale(rel, actor, key, time_us) {
             return Ok(Added::Exists);
         }
-        if self.out_get(cx, rel, actor, key)?.is_some() {
+        if self.rd(|g, cx| g.out_get(cx, rel, actor, key))?.is_some() {
             return Ok(Added::Exists);
         }
         self.set_stamp(rel, actor, key, time_us, recreated);
-        self.put_id(cx, rel, actor, key, subject)
+        self.put_id(rel, actor, key, subject)
     }
 
     /// The edge alone, no tombstone or stamp: a list relation's, whose
     /// record is its companion's.
-    fn put_id(&mut self, cx: &ReadCx<'_>, rel: RelId, actor: u32, key: u64, subject: u32) -> R<Added> {
-        let pair = self.in_contains(cx, rel, subject, actor)?;
+    fn put_id(&mut self, rel: RelId, actor: u32, key: u64, subject: u32) -> Result<Added> {
+        let pair = self.rd(|g, cx| g.in_contains(cx, rel, subject, actor))?;
         let st = &mut self.state[rel as usize];
         let od = st.out.entry(actor).or_default();
         od.add(key, subject);
@@ -1784,41 +1775,30 @@ impl Graph {
             self.pairs[rel as usize] += 1;
         }
         self.records[rel as usize] += 1;
-        self.maybe_compact(cx, rel, actor, subject)?;
+        self.maybe_compact(rel, actor, subject)?;
         Ok(Added::Added)
     }
 
-    fn delete_(&mut self, cx: &ReadCx<'_>, uri: &str, time_us: i64) -> R<Result<(RelId, Removed)>> {
-        let Some((did, coll, rkey_s)) = parse_uri(uri) else { return Ok(Err(anyhow!("{uri:?} isn't a record URI"))) };
-        let Some(rel) = self.rels.by_collection(coll) else { return Ok(Err(anyhow!("no relation for {coll}"))) };
-        let a = match self.intern(did) {
-            Ok(a) => a,
-            Err(e) => return Ok(Err(e)),
-        };
+    fn delete_(&mut self, uri: &str, time_us: i64) -> Result<(RelId, Removed)> {
+        let Some((did, coll, rkey_s)) = parse_uri(uri) else { bail!("{uri:?} isn't a record URI") };
+        let Some(rel) = self.rels.by_collection(coll) else { bail!("no relation for {coll}") };
+        let a = self.intern(did)?;
         let (key, _) = key_of(rkey_s);
-        let r = match self.delete_key_(cx, rel, a, key, time_us, false)? {
+        let r = match self.delete_key_(rel, a, key, time_us, false)? {
             Some(s) => Removed::Subject(self.did_of(s).unwrap_or_default()),
             None => Removed::NotFound,
         };
-        Ok(Ok((rel, r)))
+        Ok((rel, r))
     }
 
     /// Removes `actor`'s record `key` in `rel` as a configured relation
     /// sees it: a list relation's record by its owner, through the companion.
     /// Returns the subject.
-    fn delete_key_(
-        &mut self,
-        cx: &ReadCx<'_>,
-        rel: RelId,
-        actor: u32,
-        key: u64,
-        time_us: i64,
-        force: bool,
-    ) -> R<Option<u32>> {
+    fn delete_key_(&mut self, rel: RelId, actor: u32, key: u64, time_us: i64, force: bool) -> Result<Option<u32>> {
         match self.rels.owner_rel(rel) {
-            None => self.delete_id_(cx, rel, actor, key, time_us, force),
-            Some(o) => match self.delete_id_(cx, o, actor, key, time_us, force)? {
-                Some(l) => self.remove_id(cx, rel, l, key),
+            None => self.delete_id_(rel, actor, key, time_us, force),
+            Some(o) => match self.delete_id_(o, actor, key, time_us, force)? {
+                Some(l) => self.remove_id(rel, l, key),
                 None => Ok(None),
             },
         }
@@ -1826,31 +1806,25 @@ impl Graph {
 
     /// Removes `actor`'s record `key`, returning its subject, and leaves a
     /// tombstone at `time_us` either way.
-    fn delete_id_(
-        &mut self,
-        cx: &ReadCx<'_>,
-        rel: RelId,
-        actor: u32,
-        key: u64,
-        time_us: i64,
-        force: bool,
-    ) -> R<Option<u32>> {
+    fn delete_id_(&mut self, rel: RelId, actor: u32, key: u64, time_us: i64, force: bool) -> Result<Option<u32>> {
         // a record another source changed after the delete is a newer one:
         // a second source's late delete, or a record that wasn't an edge, leaves it
-        if !force && self.stale(rel, actor, key, time_us) && self.out_get(cx, rel, actor, key)?.is_some() {
+        if !force && self.stale(rel, actor, key, time_us) && self.rd(|g, cx| g.out_get(cx, rel, actor, key))?.is_some()
+        {
             return Ok(None);
         }
         self.set_tomb(rel, actor, key, time_us);
-        self.remove_id(cx, rel, actor, key)
+        self.remove_id(rel, actor, key)
     }
 
-    fn remove_id(&mut self, cx: &ReadCx<'_>, rel: RelId, actor: u32, key: u64) -> R<Option<u32>> {
+    fn remove_id(&mut self, rel: RelId, actor: u32, key: u64) -> Result<Option<u32>> {
         let in_adds = self.state[rel as usize].out.get(&actor).and_then(|d| d.adds.get(&key).copied());
         let (subject, others) = match in_adds {
             Some(s) => {
                 // a re-add of a base record keeps its base position masked by dels
                 let d = &self.state[rel as usize].out[&actor];
-                let others = d.adds_naming(s).any(|k| k != key) || self.base_names(cx, rel, actor, s, None)?;
+                let others =
+                    d.adds_naming(s).any(|k| k != key) || self.rd(|g, cx| g.base_names(cx, rel, actor, s, None))?;
                 let st = &mut self.state[rel as usize];
                 st.out.get_mut(&actor).unwrap().remove_add(key);
                 st.side.remove(&(actor, key));
@@ -1858,22 +1832,12 @@ impl Graph {
             }
             None => {
                 let deleted = self.state[rel as usize].out.get(&actor).is_some_and(|d| d.dels.contains_key(&key));
-                let base = if deleted {
-                    None
-                } else {
-                    match self.base_out(cx, rel, actor)? {
-                        Some(l) => match l.find_key(cx, key)? {
-                            Some(p) => Some((p, l.subject(cx, p)?)),
-                            None => None,
-                        },
-                        None => None,
-                    }
-                };
+                let base = if deleted { None } else { self.rd(|g, cx| g.base_at(cx, rel, actor, key))? };
                 match base {
                     Some((p, s)) => {
                         // asked before the delete lands in dels, so the base scan skips
                         // this position instead of decoding keys to check dels
-                        let others = self.out_names_other(cx, rel, actor, s, Some(p))?;
+                        let others = self.rd(|g, cx| g.out_names_other(cx, rel, actor, s, Some(p)))?;
                         self.state[rel as usize].out.entry(actor).or_default().del(key, s);
                         (s, others)
                     }
@@ -1890,8 +1854,109 @@ impl Graph {
             }
             self.pairs[rel as usize] -= 1;
         }
-        self.maybe_compact(cx, rel, actor, subject)?;
+        self.maybe_compact(rel, actor, subject)?;
         Ok(Some(subject))
+    }
+
+    /// Reads ahead what applying `recs` will read, so a batch waits on disk
+    /// once per dependency level rather than once per read: passes over
+    /// every op until one is clean, pinning the pages into `hold`, which the
+    /// caller keeps until it has applied the batch to every copy. Best
+    /// effort: a read it didn't foresee, the write makes itself
+    /// ([`Graph::rd`]). Does nothing over a store that keeps whole files.
+    pub fn plan(&self, recs: &[&Rec], hold: &mut Hold) {
+        if !self.engine.paged() || self.base.is_none() {
+            return;
+        }
+        hold.page_limit = hold.page_limit.min(self.engine.job_limit());
+        let r = self.engine.read_blocking(hold, |cx| {
+            for &rec in recs {
+                if let Rec::Apply { ops, .. } = rec {
+                    for op in ops {
+                        // a miss in one op mustn't hide the next one's pages
+                        let _ = self.plan_op(cx, op);
+                    }
+                }
+            }
+            Ok(())
+        });
+        if let Err(e) = r {
+            tracing::debug!(error = %e, "a write plan stopped; the writes read for themselves");
+        }
+    }
+
+    /// The reads `add_` or `delete_` make for `op`, without its changes.
+    fn plan_op(&self, cx: &ReadCx<'_>, op: &crate::segment::Op) -> R<()> {
+        use crate::segment::Op as SOp;
+        let uri = match op {
+            SOp::Add { uri, .. } | SOp::Delete { uri, .. } => uri,
+        };
+        let Some((did, coll, rkey_s)) = parse_uri(uri) else { return Ok(()) };
+        let Some(rel) = self.rels.by_collection(coll) else { return Ok(()) };
+        let rec = self.rels.owner_rel(rel).unwrap_or(rel);
+        let (key, _) = key_of(rkey_s);
+        // a DID the write will intern gets an id past every base list's
+        let new = self.n_ids();
+        let a = self.id_of(did).unwrap_or(new);
+        let mut pend = Ok(());
+        match op {
+            SOp::Delete { .. } => {
+                if let Some(Some(l)) = item(&mut pend, self.plan_remove(cx, rec, a, key)) {
+                    if rec != rel {
+                        item(&mut pend, self.plan_remove(cx, rel, l, key));
+                    }
+                }
+            }
+            SOp::Add { subject, list, .. } => {
+                let s = self.id_of(subject).unwrap_or(new);
+                let l = list.as_deref().map(|l| self.id_of(l).unwrap_or(new));
+                if let Some(Some(h)) = item(&mut pend, self.out_get(cx, rec, a, key)) {
+                    item(&mut pend, self.plan_remove(cx, rec, a, key));
+                    if l.is_some() {
+                        item(&mut pend, self.plan_remove(cx, rel, h, key));
+                    }
+                }
+                match l {
+                    None => {
+                        item(&mut pend, self.in_contains(cx, rel, s, a));
+                    }
+                    Some(l) => {
+                        item(&mut pend, self.in_contains(cx, rec, l, a));
+                        item(&mut pend, self.out_get(cx, rel, l, key));
+                        item(&mut pend, self.in_contains(cx, rel, s, l));
+                    }
+                }
+            }
+        }
+        pend
+    }
+
+    /// The reads `remove_id` makes; the subject it would remove.
+    fn plan_remove(&self, cx: &ReadCx<'_>, rel: RelId, actor: u32, key: u64) -> R<Option<u32>> {
+        let d = self.state[rel as usize].out.get(&actor);
+        if let Some(&s) = d.and_then(|d| d.adds.get(&key)) {
+            self.base_names(cx, rel, actor, s, None)?;
+            return Ok(Some(s));
+        }
+        if d.is_some_and(|d| d.dels.contains_key(&key)) {
+            return Ok(None);
+        }
+        match self.base_at(cx, rel, actor, key)? {
+            Some((p, s)) => {
+                self.out_names_other(cx, rel, actor, s, Some(p))?;
+                Ok(Some(s))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Where base record `key` of `actor` is, and its subject.
+    fn base_at(&self, cx: &ReadCx<'_>, rel: RelId, actor: u32, key: u64) -> R<Option<(usize, u32)>> {
+        let Some(l) = self.base_out(cx, rel, actor)? else { return Ok(None) };
+        match l.find_key(cx, key)? {
+            Some(p) => Ok(Some((p, l.subject(cx, p)?))),
+            None => Ok(None),
+        }
     }
 
     // ------------------------------------------------------------ accessors for the admin API
@@ -1950,7 +2015,7 @@ impl Graph {
         }
     }
 
-    fn maybe_compact(&mut self, cx: &ReadCx<'_>, rel: RelId, actor: u32, subject: u32) -> R<()> {
+    fn maybe_compact(&mut self, rel: RelId, actor: u32, subject: u32) -> Result<()> {
         let min = self.compact_min;
         if min == 0 {
             return Ok(());
@@ -1958,10 +2023,11 @@ impl Graph {
         let r = rel as usize;
         let out_n = self.state[r].out.get(&actor).map_or(0, |d| d.adds.len() + d.dels.len());
         let out_due = out_n >= min
-            && out_n as f64 > self.base_out(cx, rel, actor)?.map_or(0, |l| l.len()) as f64 * self.merge_ratio;
+            && out_n as f64
+                > self.rd(|g, cx| Ok(g.base_out(cx, rel, actor)?.map_or(0, |l| l.len())))? as f64 * self.merge_ratio;
         if out_due {
             let t = self.obs.merge_start();
-            let v = self.out_all(cx, rel, actor)?;
+            let v = self.rd(|g, cx| g.out_all(cx, rel, actor))?;
             let mut buf = Vec::new();
             if v.is_empty() {
                 buf.push(0);
@@ -1977,10 +2043,11 @@ impl Graph {
         }
         let in_n = self.state[r].inn.get(&subject).map_or(0, |d| d.adds.len() + d.dels.len());
         let in_due = in_n >= min
-            && in_n as f64 > self.base_in(cx, rel, subject)?.map_or(0, |l| l.len()) as f64 * self.merge_ratio;
+            && in_n as f64
+                > self.rd(|g, cx| Ok(g.base_in(cx, rel, subject)?.map_or(0, |l| l.len())))? as f64 * self.merge_ratio;
         if in_due {
             let t = self.obs.merge_start();
-            let v = self.in_set(cx, rel, subject)?;
+            let v = self.rd(|g, cx| g.in_set(cx, rel, subject))?;
             let mut buf = Vec::new();
             if v.is_empty() {
                 buf.push(0);

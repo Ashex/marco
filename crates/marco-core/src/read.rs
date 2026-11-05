@@ -41,6 +41,20 @@ pub struct Pending;
 /// The result of a read inside a pass.
 pub type R<T> = Result<T, Pending>;
 
+thread_local!(static ASYNC_THREAD: Cell<bool> = const { Cell::new(false) });
+
+/// Marks this thread as one that must never wait on disk (a tokio runtime
+/// worker): in debug builds, [`Engine::read_blocking`] and
+/// [`Engine::fetch_blocking`] panic on it.
+pub fn mark_async_thread() {
+    ASYNC_THREAD.with(|c| c.set(true));
+}
+
+/// Whether [`mark_async_thread`] marked this thread.
+pub fn on_async_thread() -> bool {
+    ASYNC_THREAD.with(|c| c.get())
+}
+
 /// Pages, as a pass records them: [`PageSet::insert`] is a push that skips a
 /// repeat of the last page, and the sets a pass hands out
 /// ([`Misses::pages`], [`Hold`]) are sorted and unique.
@@ -338,22 +352,83 @@ pub struct Hold {
     /// page of a file kept whole, which needs no pin).
     frames: Vec<u32>,
     cache: Option<Arc<Cache>>,
+    /// Most pins it takes; pages past that rely on the cache's small queue.
+    max_pins: usize,
+    /// Most pages one pass may need at once ([`Hold::request`]).
+    pub(crate) page_limit: usize,
+    /// Fetch rounds run and pages they asked for, over the hold's life.
+    pub(crate) rounds: u32,
+    pub(crate) fetched: u64,
 }
 
+/// Pins a request holds at most (8 MiB of pages): with 64 requests on the
+/// miss pool, pins stay under 512 MiB.
+pub const MAX_PINS: usize = 2048;
+
 impl Hold {
-    /// A hold that pins what a missing pass touched.
+    /// A hold that pins what a missing pass touched, up to [`MAX_PINS`].
     pub fn new() -> Hold {
-        Hold { keep: true, pins: PageSet::default(), frames: Vec::new(), cache: None }
+        Hold::with_max_pins(MAX_PINS)
+    }
+
+    /// A hold that pins up to `max` pages.
+    pub fn with_max_pins(max: usize) -> Hold {
+        Hold {
+            keep: true,
+            pins: PageSet::default(),
+            frames: Vec::new(),
+            cache: None,
+            max_pins: max,
+            page_limit: usize::MAX,
+            rounds: 0,
+            fetched: 0,
+        }
+    }
+
+    /// A blocking job's hold on `engine` (tools, admin jobs, a write's
+    /// reads, checkpoints): a pass that needs more than half the cache at
+    /// once fails with [`StorageError::TooBig`], since it could never finish.
+    pub fn job(engine: &Engine) -> Hold {
+        let mut h = Hold::new();
+        h.page_limit = engine.job_limit();
+        h
+    }
+
+    /// A request's hold on `engine`: up to [`MAX_PINS`] pins, and a pass
+    /// that needs more than [`Engine::page_limit`] pages at once fails with
+    /// [`StorageError::TooBig`] rather than thrash.
+    pub fn request(engine: &Engine) -> Hold {
+        let mut h = Hold::new();
+        h.page_limit = engine.page_limit();
+        h
     }
 
     /// A hold that pins nothing.
     pub fn none() -> Hold {
-        Hold { keep: false, pins: PageSet::default(), frames: Vec::new(), cache: None }
+        let mut h = Hold::with_max_pins(0);
+        h.keep = false;
+        h
+    }
+
+    /// Whether it holds as many pins as it takes.
+    pub(crate) fn full(&self) -> bool {
+        self.pins.len() >= self.max_pins
     }
 
     /// Pages pinned.
     pub fn pins(&self) -> &PageSet {
         &self.pins
+    }
+
+    /// Fetch rounds run through this hold.
+    pub fn rounds(&self) -> u32 {
+        self.rounds
+    }
+
+    /// Pages those rounds asked for: what the request read from disk, or
+    /// waited on another reader to read.
+    pub fn fetched(&self) -> u64 {
+        self.fetched
     }
 
     /// Unpins everything.
@@ -372,7 +447,8 @@ impl Hold {
         self.frames.clear();
     }
 
-    /// Takes pins already made on `(page, frame)`s that aren't held yet.
+    /// Takes pins already made on `(page, frame)`s that aren't held yet;
+    /// past its limit, it drops them at once instead.
     pub(crate) fn add(&mut self, mut add: Vec<(PageId, u32)>, cache: Option<&Arc<Cache>>) {
         if add.is_empty() {
             return;
@@ -381,6 +457,21 @@ impl Hold {
             (None, Some(c)) => self.cache = Some(c.clone()),
             (Some(a), Some(b)) => assert!(Arc::ptr_eq(a, b), "a Hold is used on two engines"),
             _ => {}
+        }
+        let room = self.max_pins.saturating_sub(self.pins.len());
+        if add.len() > room {
+            let over = add.split_off(room);
+            if let Some(c) = cache {
+                let guard = crossbeam_epoch::pin();
+                for (_, f) in over {
+                    if f != NO_FRAME {
+                        c.unpin(f, &guard);
+                    }
+                }
+            }
+            if add.is_empty() {
+                return;
+            }
         }
         add.extend(self.pins.0.iter().copied().zip(self.frames.iter().copied()));
         add.sort_unstable_by_key(|x| x.0);
@@ -411,6 +502,8 @@ impl fmt::Debug for Hold {
 #[derive(Debug)]
 pub struct Misses {
     pub(crate) pages: PageSet,
+    /// Pages the pass found in memory, when its hold keeps pins (0 otherwise).
+    pub(crate) touched: usize,
 }
 
 impl Misses {
@@ -418,6 +511,11 @@ impl Misses {
     /// without a page recorded, which is a bug.
     pub fn pages(&self) -> &PageSet {
         &self.pages
+    }
+
+    /// Pages the pass needed at once: those it found and those it missed.
+    pub fn needed(&self) -> usize {
+        self.touched + self.pages.len()
     }
 }
 
@@ -443,7 +541,8 @@ impl fmt::Display for BadPage {
 
 /// Why a blocking read failed. A request that gets one fails whole (a batch
 /// too: a partial answer would read as "no edge"); RPCs map `Checksum` to
-/// `data_loss` and the rest to `unavailable`.
+/// `data_loss`, `TooBig` to `resource_exhausted` and the rest to
+/// `unavailable`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StorageError {
     /// The page failed its sum.
@@ -455,6 +554,9 @@ pub enum StorageError {
     /// A pass returned [`Pending`] without recording a page, so there was
     /// nothing to fetch: a bug in a [`Blocks`] implementation or a caller.
     NoPage,
+    /// A pass needed more pages at once than a request may hold
+    /// ([`Engine::page_limit`]): it would only thrash.
+    TooBig { pages: usize, limit: usize },
 }
 
 impl StorageError {
@@ -465,6 +567,7 @@ impl StorageError {
             StorageError::Eio(_) => "eio",
             StorageError::Short(_) => "short",
             StorageError::NoPage => "no_page",
+            StorageError::TooBig { .. } => "too_big",
         }
     }
 }
@@ -476,6 +579,12 @@ impl fmt::Display for StorageError {
                 write!(f, "{p}: {}", self.kind())
             }
             StorageError::NoPage => f.write_str("a pass was pending without a missing page"),
+            StorageError::TooBig { pages, limit } => write!(
+                f,
+                "this request needs {} MiB of pages at once, more than the {} MiB one may hold",
+                (*pages as u64 * PAGE as u64).div_ceil(1 << 20),
+                (*limit as u64 * PAGE as u64) >> 20,
+            ),
         }
     }
 }

@@ -109,7 +109,10 @@ console's Settings page shows each one's value and where it came from.
 | `--tombstone-days` | `MARCO_TOMBSTONE_DAYS` | 7 | Checkpoints drop tombstones older than this. |
 | `--merge-ratio` | `MARCO_MERGE_RATIO` | 0.125 | With `--compact-min`, a list's delta merges past this share of its base. |
 | `--compact-min` | `MARCO_COMPACT_MIN` | 0 | Merge a list's delta inside the write past this many entries. 0 leaves it to checkpoints. |
-| `--no-prefault` | `MARCO_NO_PREFAULT` | off | Don't map the snapshot's pages in after open. |
+| `--no-prefault` | `MARCO_NO_PREFAULT` | off | Don't map the snapshot's pages in after open. With `--storage engine`, don't load every page at open when `--memory` holds them all. |
+| `--storage` | `MARCO_STORAGE` | `mmap` | How the snapshot is read: `mmap` (the kernel's page cache) or `engine` (`O_DIRECT` into marco's own cache of `--memory` bytes, every page checked against its sum). |
+| `--memory` | `MARCO_MEMORY` | | With `--storage engine`, required: the store's budget (`13GiB`, `6G`), its pinned sections, page cache and tables. It must hold the pinned sections plus 2 GiB, or marco won't start. The graph's deltas and the process live outside it. |
+| `--miss-threads` | `MARCO_MISS_THREADS` | 64 | With `--storage engine`, the threads a request that misses the cache moves to. A request that waits over a second for one gets `resource_exhausted`. |
 | `--trace-ratio` | `MARCO_TRACE_RATIO` | 0 | The share of ops that get a span, 0 to 1. |
 | `--otlp URL` | `MARCO_OTLP` | | An OTLP/HTTP collector's base URL for spans. |
 | `--ui-dir` | `MARCO_UI_DIR` | the embedded build | A built console and docs (`ui/dist`) to serve instead of the ones built into the binary. |

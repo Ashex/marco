@@ -13,7 +13,7 @@ use marco_proto::v1::*;
 
 use crate::app::{App, JobState, Status, Verify};
 use crate::auth::Caller;
-use crate::graph_svc::{bad, dir_of, dir_pb, rel_id, run};
+use crate::graph_svc::{bad, dir_of, dir_pb, rel_id, run_admin as run};
 
 pub struct AdminApi(pub Arc<App>);
 
@@ -382,7 +382,7 @@ impl svc::Admin for AdminApi {
                     shard: k as u32,
                     lo,
                     hi: f.map_or(lo, |f| f.meta.hi),
-                    size_bytes: f.map_or(0, |f| f.file.len() as u64),
+                    size_bytes: f.map_or(0, |f| f.file.len()),
                     written_ms: f.map_or(0, |f| f.meta.written_ms),
                     file: f.map_or_else(String::new, |f| f.name.clone()),
                     checkpoint: f.map_or(0, |f| f.meta.checkpoint),
@@ -406,7 +406,7 @@ impl svc::Admin for AdminApi {
             shards,
             merge_ratio: g.merge_ratio,
             job: job_pb(&app.job()).into(),
-            directory_bytes: snap.dir.file.len() as u64,
+            directory_bytes: snap.dir.file.len(),
             directory_verify: vword(0).word().into(),
             ..Default::default()
         })
@@ -414,7 +414,7 @@ impl svc::Admin for AdminApi {
 
     async fn get_storage(
         &self,
-        _: RequestContext,
+        ctx: RequestContext,
         req: ServiceRequest<'_, GetStorageRequest>,
     ) -> ServiceResult<GetStorageResponse> {
         let by_size = match req.by {
@@ -449,15 +449,19 @@ impl svc::Admin for AdminApi {
                 g.for_each_delta(r, dir, |id, a, d| changed.push((r, dir, id, a as u64, d as u64)));
             }
         }
-        let now = run(&g, |cx| {
-            changed
+        drop(g);
+        let lists: Vec<(RelId, Dir, u32)> = changed.iter().map(|&(r, dir, id, _, _)| (r, dir, id)).collect();
+        let now = run(&self.0, &ctx, "Admin/GetStorage", move |g, cx| {
+            lists
                 .iter()
-                .map(|&(r, dir, id, _, _)| match dir {
+                .map(|&(r, dir, id)| match dir {
                     Dir::Out => g.out_count(cx, r, id),
                     Dir::In => g.in_count(cx, r, id),
                 })
                 .collect::<R<Vec<u64>>>()
-        })?;
+        })
+        .await?;
+        let g = self.0.graph();
         // (changed / base, changed, the list, its base length)
         let mut lists: Vec<_> = changed
             .into_iter()
@@ -535,7 +539,7 @@ impl svc::Admin for AdminApi {
             let rel = rel_id(&g, req.rel)?;
             (rel, g.snapshot().map_or(0, |s| s.manifest.checkpoint ^ s.dir.meta.build))
         };
-        match self.0.list_stats.get(build, self.0.cfg.snapshot.clone()) {
+        match self.0.list_stats.get(build, self.0.cfg.snapshot.clone(), self.0.engine.clone()) {
             crate::liststats::Answer::Computing(progress) => {
                 Response::ok(GetListStatsResponse { ready: false, progress, ..Default::default() })
             }
@@ -608,7 +612,7 @@ impl svc::Admin for AdminApi {
 
     async fn get_actor(
         &self,
-        _: RequestContext,
+        ctx: RequestContext,
         req: ServiceRequest<'_, GetActorRequest>,
     ) -> ServiceResult<GetActorResponse> {
         let did = req.actor.trim().to_string();
@@ -626,7 +630,8 @@ impl svc::Admin for AdminApi {
             return Response::ok(GetActorResponse { did, status, list, ..Default::default() });
         };
         let w = g.shard_width().max(1);
-        let rel = |cx: &ReadCx<'_>, r: RelId| -> R<ActorRelation> {
+        drop(g);
+        let rel = move |g: &Graph, cx: &ReadCx<'_>, r: RelId| -> R<ActorRelation> {
             let out = g.out_count(cx, r, id)?;
             let inn = g.in_count(cx, r, id)?;
             let mutual = if out.min(inn) == 0 || out.min(inn) > 1_000_000 {
@@ -657,30 +662,40 @@ impl svc::Admin for AdminApi {
                 ..Default::default()
             })
         };
-        let rels = run(&g, |cx| (0..g.relations().len() as RelId).map(|r| rel(cx, r)).collect::<R<Vec<_>>>())?;
+        let rels = run(&self.0, &ctx, "Admin/GetActor", move |g, cx| {
+            let mut pend = Ok(());
+            let rels: Vec<Option<ActorRelation>> = (0..g.relations().len() as RelId)
+                .map(|r| crate::graph_svc::item(&mut pend, rel(g, cx, r).map(Some)))
+                .collect();
+            pend?;
+            Ok(rels.into_iter().flatten().collect::<Vec<_>>())
+        })
+        .await?;
         Response::ok(GetActorResponse { did, known: true, id, shard: id / w, status, rels, list, ..Default::default() })
     }
 
     async fn list_edges(
         &self,
-        _: RequestContext,
+        ctx: RequestContext,
         req: ServiceRequest<'_, ListEdgesRequest>,
     ) -> ServiceResult<ListEdgesResponse> {
+        let req = req.to_owned_message();
         let g = self.0.graph();
-        let rel = rel_id(&g, req.rel)?;
+        let rel = rel_id(&g, &req.rel)?;
         let dir = dir_of(&req.dir)?;
         let lim = if req.limit == 0 { 50 } else { req.limit.min(500) } as usize;
-        let Some(id) = g.id_of(req.actor) else { return Response::ok(ListEdgesResponse::default()) };
-        let after = match (dir, req.cursor) {
+        let Some(id) = g.id_of(&req.actor) else { return Response::ok(ListEdgesResponse::default()) };
+        let after = match (dir, req.cursor.as_str()) {
             (Dir::In, c) if !c.is_empty() => Some(g.id_of(c).ok_or_else(|| bad("cursor isn't a DID in this graph"))?),
             _ => None,
         };
-        let (edges, cursor, total) = run(&g, |cx| {
+        drop(g);
+        let (edges, cursor, total) = run(&self.0, &ctx, "Admin/ListEdges", move |g, cx| {
             let mut edges = Vec::new();
             let mut cursor = String::new();
             let total = match dir {
                 Dir::Out => {
-                    let before = (!req.cursor.is_empty()).then(|| key_of(req.cursor).0);
+                    let before = (!req.cursor.is_empty()).then(|| key_of(&req.cursor).0);
                     let page = g.out_page(cx, rel, id, lim, before)?;
                     if page.len() == lim {
                         cursor = page.last().and_then(|&(k, _)| g.rkey_string(rel, id, k)).unwrap_or_default();
@@ -703,8 +718,13 @@ impl svc::Admin for AdminApi {
                     if page.len() == lim {
                         cursor = page.last().and_then(|&x| g.did_of(x)).unwrap_or_default();
                     }
-                    for x in page {
-                        let k = g.out_find_subject(cx, rel, x, id)?;
+                    let mut pend = Ok(());
+                    let keys: Vec<Option<u64>> = page
+                        .iter()
+                        .map(|&x| crate::graph_svc::item(&mut pend, g.out_find_subject(cx, rel, x, id)))
+                        .collect();
+                    pend?;
+                    for (x, k) in page.into_iter().zip(keys) {
                         edges.push(Edge {
                             did: g.did_of(x).unwrap_or_default(),
                             id: x,
@@ -719,13 +739,14 @@ impl svc::Admin for AdminApi {
                 }
             };
             Ok((edges, cursor, total))
-        })?;
+        })
+        .await?;
         Response::ok(ListEdgesResponse { edges, cursor, total, ..Default::default() })
     }
 
     async fn resolve_uri(
         &self,
-        _: RequestContext,
+        ctx: RequestContext,
         req: ServiceRequest<'_, ResolveUriRequest>,
     ) -> ServiceResult<ResolveUriResponse> {
         let uri = req.uri.trim();
@@ -747,7 +768,8 @@ impl svc::Admin for AdminApi {
         r.actor_id = owner;
         r.shard = owner / w;
         let base = r;
-        let r = run(&g, |cx| {
+        drop(g);
+        let r = run(&self.0, &ctx, "Admin/ResolveUri", move |g, cx| {
             let mut r = base.clone();
             // a list relation's record is its owner's; its edge is in the list's log
             let rec = g.relations().owner_rel(rel).unwrap_or(rel);
@@ -775,7 +797,8 @@ impl svc::Admin for AdminApi {
             r.subject_in_count = g.in_count(cx, rel, s)?;
             r.subject_in_stored = stored(g.list_stored(rel, Dir::In, s));
             Ok(r)
-        })?;
+        })
+        .await?;
         Response::ok(r)
     }
 

@@ -16,12 +16,64 @@ use prometheus::{
 pub static RPC_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
     register_histogram_vec!(
         "marco_rpc_seconds",
-        "RPC time in the server, request decoded to response encoded, by method",
-        &["rpc"],
+        "RPC time in the server, request decoded to response encoded, by method and path: fast (served on its \
+         worker, nothing missing) or pool (moved to the miss pool)",
+        &["rpc", "path"],
         exponential_buckets(1e-6, 2.0, 24).unwrap()
     )
     .unwrap()
 });
+
+pub static REQUEST_PAGES: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        "marco_store_request_pages",
+        "Pages a request read from disk (or waited on another's read of), by method",
+        &["rpc"],
+        vec![0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 4096.0, 16384.0]
+    )
+    .unwrap()
+});
+
+pub static REQUEST_ROUNDS: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        "marco_store_request_rounds",
+        "Fetch rounds a request waited on disk for, by method",
+        &["rpc"],
+        vec![0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 16.0, 32.0]
+    )
+    .unwrap()
+});
+
+pub static POOL_BUSY: LazyLock<IntGauge> =
+    LazyLock::new(|| register_int_gauge!("marco_store_miss_pool_busy", "Requests on the miss pool's threads").unwrap());
+
+pub static POOL_WAIT: LazyLock<Histogram> = LazyLock::new(|| {
+    register_histogram!(
+        "marco_store_miss_pool_wait_seconds",
+        "How long a request that missed waited for a miss pool thread",
+        exponential_buckets(1e-6, 2.0, 22).unwrap()
+    )
+    .unwrap()
+});
+
+pub static BUSY: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "marco_store_busy_total",
+        "Requests refused because no miss pool thread was free within a second (or their deadline)"
+    )
+    .unwrap()
+});
+
+tokio::task_local! {
+    /// The path label of the RPC this task is serving: a handler that moves
+    /// to the miss pool sets it.
+    pub static PATH: std::cell::Cell<&'static str>;
+}
+
+/// Labels the RPC this task serves as having gone through the miss pool.
+pub fn set_path(path: &'static str) {
+    let _ = PATH.try_with(|p| p.set(path));
+}
 
 pub static RPC_ERRORS: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
@@ -88,6 +140,11 @@ pub fn init(version: &str, commit: &str) {
     BUILD.with_label_values(&[version, commit]).set(1);
     let _ = prometheus::register(Box::new(prometheus::process_collector::ProcessCollector::for_self()));
     LazyLock::force(&RPC_SECONDS);
+    LazyLock::force(&REQUEST_PAGES);
+    LazyLock::force(&REQUEST_ROUNDS);
+    LazyLock::force(&POOL_BUSY);
+    LazyLock::force(&POOL_WAIT);
+    LazyLock::force(&BUSY);
     LazyLock::force(&RPC_ERRORS);
     LazyLock::force(&CACHED);
     LazyLock::force(&READY);
@@ -106,10 +163,18 @@ pub fn rpc_name(path: &str) -> Option<&str> {
 }
 
 pub async fn time_rpcs(req: Request, next: Next) -> Response {
+    // a worker that hasn't parked yet isn't marked; one serving an RPC is
+    marco_core::read::mark_async_thread();
     let Some(rpc) = rpc_name(req.uri().path()).map(str::to_string) else { return next.run(req).await };
     let t = Instant::now();
-    let res = next.run(req).await;
-    RPC_SECONDS.with_label_values(&[&rpc]).observe(t.elapsed().as_secs_f64());
+    let path = std::cell::Cell::new("fast");
+    let (res, path) = PATH
+        .scope(path, async move {
+            let res = next.run(req).await;
+            (res, PATH.with(|p| p.get()))
+        })
+        .await;
+    RPC_SECONDS.with_label_values(&[&rpc, path]).observe(t.elapsed().as_secs_f64());
     let grpc_err = res.headers().get("grpc-status").is_some_and(|v| v != "0");
     if !res.status().is_success() || grpc_err {
         RPC_ERRORS.with_label_values(&[&rpc, res.status().as_str()]).inc();

@@ -11,6 +11,7 @@ pub mod ingest;
 pub mod liststats;
 pub mod metrics;
 pub mod peer;
+pub mod pool;
 pub mod series;
 pub mod synth;
 pub mod sys;
@@ -96,6 +97,22 @@ pub async fn serve_ops(app: &Arc<App>) -> Result<Option<SocketAddr>> {
     let r = marco_ops::read_router(Some(refresh)).route("/healthz", axum::routing::get(|| async { "ok\n" }));
     tokio::spawn(async move { axum::serve(l, r).await });
     Ok(Some(local))
+}
+
+/// The server's runtime: `threads` workers (one per core by default),
+/// each marked so a blocking read on one panics in debug builds
+/// ([`marco_core::read::mark_async_thread`]). Only workers park, so the
+/// park hooks mark them and leave the blocking pool's threads alone; the
+/// RPC middleware marks a worker that hasn't parked yet.
+pub fn runtime(threads: Option<usize>) -> std::io::Result<tokio::runtime::Runtime> {
+    let mut b = tokio::runtime::Builder::new_multi_thread();
+    if let Some(n) = threads {
+        b.worker_threads(n);
+    }
+    b.enable_all()
+        .on_thread_park(marco_core::read::mark_async_thread)
+        .on_thread_unpark(marco_core::read::mark_async_thread)
+        .build()
 }
 
 /// Binds both listeners and serves them on the current runtime.

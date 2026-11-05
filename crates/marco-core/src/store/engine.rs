@@ -163,6 +163,23 @@ impl PagedFile {
         self.state.pinned(name)
     }
 
+    /// Where pinned section `name` is: the buffer it was read into
+    /// ([`PagedFile::pinned_buf`]) and its bytes there. Sections with no
+    /// paged section between them share a buffer, in file order.
+    pub fn pinned_at(&self, name: &str) -> Option<(usize, std::ops::Range<usize>)> {
+        let p = self.state.pinned.iter().find(|p| p.name == name)?;
+        Some((p.buf, p.off..p.off + p.len))
+    }
+
+    pub fn pinned_buf(&self, i: usize) -> &[u8] {
+        &self.state.bufs[i]
+    }
+
+    /// Paged sections' pages: what loading the file whole takes.
+    pub fn paged_pages(&self) -> u64 {
+        self.state.paged.iter().map(|r| (r.end - r.start) as u64).sum()
+    }
+
     /// Page `i` of the paged section `name`.
     pub fn page(&self, name: &str, i: u32) -> Option<PageId> {
         let s = self.state.footer.section(name)?;
@@ -215,6 +232,51 @@ impl Drop for PagedFile {
             inner.bad.lock().unwrap().retain(|p, _| p.file != self.id);
             cache.unborrow(self.borrowed);
         }
+    }
+}
+
+/// A file kept whole in an engine ([`Engine::add_mapped`]): unregistered
+/// when dropped, so a shared engine lets go of a checkpoint's old files with
+/// the store that held them. Its id is never used again.
+pub struct Resident {
+    inner: Arc<Inner>,
+    id: FileId,
+    map: Option<Arc<memmap2::Mmap>>,
+}
+
+impl Resident {
+    pub fn id(&self) -> FileId {
+        self.id
+    }
+}
+
+impl Drop for Resident {
+    fn drop(&mut self) {
+        {
+            let guard = crossbeam_epoch::pin();
+            self.inner.table.remove(self.id, &guard);
+        }
+        self.inner.bad.lock().unwrap().retain(|p, _| p.file != self.id);
+        // The table's entry holds the mapping too, and is destroyed by whichever
+        // thread next collects the epoch, often a worker's pass. Wait for that
+        // here (a store usually drops on a thread of its own, never wait on a
+        // worker) so the munmap, which takes a while for a big file, happens on
+        // this one.
+        let Some(map) = self.map.take() else { return };
+        if crate::read::on_async_thread() {
+            return;
+        }
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while Arc::strong_count(&map) > 1 && std::time::Instant::now() < until {
+            crossbeam_epoch::pin().flush();
+            std::thread::sleep(Duration::from_micros(200));
+        }
+    }
+}
+
+impl std::fmt::Debug for Resident {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Resident").field("id", &self.id).finish()
     }
 }
 
@@ -433,9 +495,16 @@ impl Engine {
     }
 
     /// Registers the FORMAT 6 file its caller mapped whole and reads its
-    /// pinned sections from. It is never evicted or freed.
-    pub fn add_mapped(&self, name: impl Into<String>, map: Arc<memmap2::Mmap>, footer: PagedFooter) -> FileId {
-        self.add_resident(name.into(), Bytes::Shared(map), Some(footer))
+    /// pinned sections from, until the handle drops.
+    pub fn add_mapped(&self, name: impl Into<String>, map: Arc<memmap2::Mmap>, footer: PagedFooter) -> Resident {
+        let id = self.add_resident(name.into(), Bytes::Shared(map.clone()), Some(footer));
+        Resident { inner: self.inner.clone(), id, map: Some(map) }
+    }
+
+    /// Whether files are read a page at a time through a cache
+    /// ([`Engine::register`]) rather than kept whole.
+    pub fn paged(&self) -> bool {
+        self.inner.cache.is_some()
     }
 
     /// A registered file's name.
@@ -608,8 +677,9 @@ impl Engine {
             }
             cx.into_sets()
         };
+        let touched_n = touched.len();
         self.hold_touched(&guard, hold, touched);
-        Err(Misses { pages })
+        Err(Misses { pages, touched: touched_n })
     }
 
     /// Pins pages a missing pass read into `hold`, under the pass's guard. A
@@ -620,6 +690,9 @@ impl Engine {
         }
         let mut add = Vec::new();
         for p in touched.iter() {
+            if hold.full() {
+                break;
+            }
             if hold.pins.contains(p) {
                 continue;
             }
@@ -645,6 +718,12 @@ impl Engine {
 
     fn classify(&self, p: PageId, guard: &Guard, hold: &mut Hold, add: &mut Vec<(PageId, u32)>) -> Class {
         let Some(e) = self.inner.table.get(p.file, guard) else {
+            // A file dropped since the pass that named it (a checkpoint switched
+            // the copies over): nothing to fetch, and the next pass, on the
+            // published copy, names what it needs.
+            if p.file.0 < self.inner.next_id.load(Relaxed) && self.name(p.file).is_some() {
+                return Class::Here;
+            }
             let file = self.name(p.file).map_or_else(|| format!("file {}", p.file.0), str::to_string);
             return Class::Bad(StorageError::Short(BadPage { file, section: None, page: p.page }));
         };
@@ -694,7 +773,13 @@ impl Engine {
     /// [`Engine::verify`] reads it clean. The first error in page order is
     /// returned, after every read this call started is done.
     pub fn fetch_blocking(&self, m: Misses, hold: &mut Hold) -> Result<(), StorageError> {
-        let mut todo: Vec<PageId> = m.pages().iter().collect();
+        debug_assert!(!crate::read::on_async_thread(), "a blocking fetch on a tokio runtime thread");
+        hold.rounds += 1;
+        hold.fetched += m.pages().len() as u64;
+        self.fetch(m.pages().iter().collect(), hold, false)
+    }
+
+    fn fetch(&self, mut todo: Vec<PageId>, hold: &mut Hold, main: bool) -> Result<(), StorageError> {
         if todo.is_empty() {
             return Err(StorageError::NoPage);
         }
@@ -726,7 +811,7 @@ impl Engine {
             let (Some(cache), Some(io)) = (&self.inner.cache, &self.inner.io) else {
                 unreachable!("only paged files miss");
             };
-            todo = self.fetch_round(cache, io, &need, hold)?;
+            todo = self.fetch_round(cache, io, &need, hold, main)?;
         }
     }
 
@@ -739,6 +824,7 @@ impl Engine {
         io: &IoPool,
         need: &[PageId],
         hold: &mut Hold,
+        main: bool,
     ) -> Result<Vec<PageId>, StorageError> {
         // Pages another reader is already fetching need no frame here: without
         // this a herd missing one page would each evict for it.
@@ -803,7 +889,7 @@ impl Engine {
             }
             cache.free_unpublished(&failed);
             self.inner.counters.fetched.fetch_add(ok.len() as u64, Relaxed);
-            cache.admit(&ok, hold.keep as u32);
+            cache.admit(&ok, hold.keep as u32, main);
             let guard = self.pin();
             let mut add = Vec::new();
             for ((p, f, _, fl), r) in claims.iter().zip(results) {
@@ -911,7 +997,7 @@ impl Engine {
     pub fn read<T>(&self, f: impl Fn(&ReadCx<'_>) -> R<T>) -> Result<T, StorageError> {
         match self.pass(&mut Hold::none(), &f) {
             Ok(t) => Ok(t),
-            Err(_) => self.read_blocking(&mut Hold::new(), f),
+            Err(m) => self.resume_blocking(&mut Hold::job(self), Some(m), f),
         }
     }
 
@@ -919,29 +1005,134 @@ impl Engine {
     /// between: the loop every reader that may wait on disk runs. Never call
     /// it on a tokio worker. A request runs as many rounds as it needs; one
     /// whose missing set stops shrinking for 16 rounds is logged and counted
-    /// as a sign of a bug.
+    /// as a sign of a bug. A pass that needs more pages than the hold's
+    /// limit ([`Hold::request`]) fails with [`StorageError::TooBig`].
     pub fn read_blocking<T>(&self, hold: &mut Hold, f: impl Fn(&ReadCx<'_>) -> R<T>) -> Result<T, StorageError> {
+        self.resume_blocking(hold, None, f)
+    }
+
+    /// [`Engine::read_blocking`] for a read whose first pass ran elsewhere
+    /// and missed `first` (a fast pass on a tokio worker): fetches those,
+    /// then runs passes as `read_blocking` does.
+    pub fn resume_blocking<T>(
+        &self,
+        hold: &mut Hold,
+        mut first: Option<Misses>,
+        f: impl Fn(&ReadCx<'_>) -> R<T>,
+    ) -> Result<T, StorageError> {
+        debug_assert!(!crate::read::on_async_thread(), "read_blocking on a tokio runtime thread");
         let mut best = usize::MAX;
         let mut flat = 0;
         loop {
-            match self.pass(hold, &f) {
-                Ok(t) => return Ok(t),
-                Err(m) => {
-                    let n = m.pages().len();
-                    if n < best {
-                        best = n;
-                        flat = 0;
-                    } else {
-                        flat += 1;
-                        if flat == 16 {
-                            self.inner.counters.stalled.fetch_add(1, Relaxed);
-                            tracing::warn!(missing = n, "a read's missing pages stopped shrinking for 16 rounds");
+            let m = match first.take() {
+                Some(m) => m,
+                None => match self.pass(hold, &f) {
+                    Ok(t) => return Ok(t),
+                    Err(m) => m,
+                },
+            };
+            if m.needed() > hold.page_limit {
+                return Err(StorageError::TooBig { pages: m.needed(), limit: hold.page_limit });
+            }
+            let n = m.pages().len();
+            if n < best {
+                best = n;
+                flat = 0;
+            } else {
+                flat += 1;
+                if flat == 16 {
+                    self.inner.counters.stalled.fetch_add(1, Relaxed);
+                    tracing::warn!(missing = n, "a read's missing pages stopped shrinking for 16 rounds");
+                }
+            }
+            self.fetch_blocking(m, hold)?
+        }
+    }
+
+    /// Most pages one pass may need at once: half the small queue the
+    /// budget's frames make, or no limit without a cache.
+    pub fn page_limit(&self) -> usize {
+        match &self.inner.cache {
+            Some(c) => (c.room() / 20).max(1),
+            None => usize::MAX,
+        }
+    }
+
+    /// Most pages a blocking job's pass may need at once: half the cache.
+    pub fn job_limit(&self) -> usize {
+        match &self.inner.cache {
+            Some(c) => (c.room() / 2).max(1),
+            None => usize::MAX,
+        }
+    }
+
+    /// Frames the budget holds once the borrowed bytes (pinned sections,
+    /// slots) are taken out.
+    pub fn room(&self) -> usize {
+        self.inner.cache.as_ref().map_or(0, |c| c.room())
+    }
+
+    /// Reads every paged page of `files` into the cache's main queue, if
+    /// those not in memory yet fit in the free frames with the reserve to
+    /// spare: the full-residency load, after which reads of these files
+    /// never miss. Returns whether it loaded them; false (reading nothing)
+    /// when they don't fit or the engine keeps whole files. Best effort: a
+    /// page that fails its read is marked bad, as a fetch would, and the
+    /// rest still load.
+    pub fn load(&self, files: &[&PagedFile]) -> bool {
+        let Some(cache) = &self.inner.cache else { return false };
+        let mut chunks: Vec<Vec<PageId>> = Vec::new();
+        {
+            let guard = self.pin();
+            for f in files {
+                let Some(e) = self.inner.table.get(f.id, &guard) else { continue };
+                for r in &f.state.paged {
+                    let mut chunk = Vec::new();
+                    for q in r.start..r.end {
+                        if e.slots[q as usize].load(Acquire) == NO_FRAME {
+                            chunk.push(PageId::new(f.id, q));
+                            if chunk.len() == 4096 {
+                                chunks.push(std::mem::take(&mut chunk));
+                            }
                         }
                     }
-                    self.fetch_blocking(m, hold)?
+                    if !chunk.is_empty() {
+                        chunks.push(chunk);
+                    }
                 }
             }
         }
+        let want: u64 = chunks.iter().map(|c| c.len() as u64).sum();
+        let b = cache.bytes();
+        let used = b.small_frames + b.main_frames + b.retired_frames;
+        let free = (cache.room() as u64).saturating_sub(used);
+        if want + cache.reserve_frames() as u64 > free {
+            return false;
+        }
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let bad = AtomicU64::new(0);
+        let threads = 8.min(chunks.len()).max(1);
+        std::thread::scope(|s| {
+            for _ in 0..threads {
+                s.spawn(|| loop {
+                    let i = next.fetch_add(1, Relaxed);
+                    let Some(c) = chunks.get(i) else { return };
+                    if self.fetch(c.clone(), &mut Hold::none(), true).is_err() {
+                        // one page at a time, so a bad page doesn't stop its chunk's others
+                        for &p in c {
+                            if self.fetch(vec![p], &mut Hold::none(), true).is_err() {
+                                bad.fetch_add(1, Relaxed);
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        let bad = bad.load(Relaxed);
+        if bad > 0 {
+            tracing::warn!(pages = bad, "loading the snapshot: pages failed their reads and are marked bad");
+        }
+        true
     }
 
     /// Reads every page of `file` past the cache on the background lane and
@@ -984,6 +1175,26 @@ impl Engine {
             }
         }
         bad
+    }
+
+    /// Reads `file`'s pinned sections from disk again and checks them
+    /// against the footer: what [`Engine::verify`] leaves out.
+    pub fn verify_pinned(&self, file: &PagedFile) -> Result<()> {
+        let io = self.inner.io.as_ref().context("this engine has no page cache")?;
+        let st = &file.state;
+        for s in st.footer.sections.iter() {
+            let SectionKind::Pinned { xxh3, .. } = s.kind else { continue };
+            let first = s.off / PAGE as u64;
+            let last = (s.off + s.len()).div_ceil(PAGE as u64).max(first + 1);
+            let buf = read_pages(io, &st.dev, first, (last - first) as usize)
+                .map_err(|e| anyhow::anyhow!("{}: section {}: {e}", st.name, s.name))?;
+            let lo = (s.off - first * PAGE as u64) as usize;
+            let h = xxhash_rust::xxh3::xxh3_64(&buf[lo..lo + s.len() as usize]);
+            if h != xxh3 {
+                bail!("section {} checksum {h:016x}, footer says {xxh3:016x}", s.name);
+            }
+        }
+        Ok(())
     }
 
     /// Pages marked bad, with why.
