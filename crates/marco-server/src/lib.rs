@@ -54,9 +54,10 @@ fn connect(app: &Arc<App>, admin: bool) -> axum::Router {
     router
 }
 
-/// 200 once every expected source has caught up since start, else 503 and why.
+/// 200 once every expected source has caught up since start and reads
+/// aren't failing across the disk, else 503 and why.
 async fn readyz(axum::extract::State(app): axum::extract::State<Arc<App>>) -> (http::StatusCode, String) {
-    match app.readiness() {
+    match app.ready_status() {
         (true, _) => (http::StatusCode::OK, "ready\n".into()),
         (false, why) => (http::StatusCode::SERVICE_UNAVAILABLE, format!("{why}\n")),
     }
@@ -118,6 +119,7 @@ pub fn runtime(threads: Option<usize>) -> std::io::Result<tokio::runtime::Runtim
 /// Binds both listeners and serves them on the current runtime.
 pub async fn serve(app: Arc<App>, ui: Arc<ui::Ui>) -> Result<(SocketAddr, SocketAddr)> {
     metrics::init(VERSION, COMMIT);
+    metrics::watch(&app);
     let api = tokio::net::TcpListener::bind(&app.cfg.api_listen)
         .await
         .with_context(|| format!("bind --listen {}", app.cfg.api_listen))?;

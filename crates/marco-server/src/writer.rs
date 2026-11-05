@@ -597,7 +597,9 @@ impl Writer {
         }
         let Some(snap) = self.spare.as_ref().and_then(|g| g.shared_snapshot()) else { return };
         let policy = self.app.cfg.compaction;
-        let due = snap.compaction_due(&policy, self.app.headroom());
+        let garbage = snap.garbage();
+        self.app.garbage_bytes.store(garbage.iter().map(|g| g.1.pages).sum(), Ordering::Relaxed);
+        let due = marco_core::SharedSnapshot::due_of(garbage, &policy, self.app.headroom());
         if due.is_empty() || self.verifying() {
             return;
         }
@@ -675,6 +677,9 @@ impl Writer {
         let mut old = self.app.publish(g);
         exclusive(&mut old).swap_base(&swap);
         self.spare = Some(old);
+        // only this thread sets it
+        let g = self.app.garbage_bytes.load(Ordering::Relaxed);
+        self.app.garbage_bytes.store(g.saturating_sub(c.before.pages), Ordering::Relaxed);
         crate::metrics::COMPACTION_SHARDS.inc();
         crate::metrics::COMPACTION_BYTES.inc_by(c.bytes);
         crate::metrics::COMPACTION_GARBAGE.inc_by(c.before.bytes());

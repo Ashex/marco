@@ -945,14 +945,24 @@ impl SharedSnapshot {
     /// also as many more, most cached garbage first, as it takes to give
     /// the next checkpoint the free room it needs.
     pub fn compaction_due(&self, p: &CompactPolicy, headroom: Option<Headroom>) -> Vec<(usize, Garbage)> {
+        SharedSnapshot::due_of(self.garbage(), p, headroom)
+    }
+
+    /// Each shard with patches and its garbage (a shard that's one base has
+    /// none). Reads only pinned sections.
+    pub fn garbage(&self) -> Vec<(usize, Garbage)> {
         let store = &self.0.store;
         let si = store.dir.meta.subj_index as usize;
-        let all: Vec<(usize, Garbage)> = store
+        store
             .shards
             .iter()
             .enumerate()
             .filter_map(|(k, f)| f.as_ref().filter(|f| f.parts.len() > 1).map(|f| (k, f.garbage(si))))
-            .collect();
+            .collect()
+    }
+
+    /// [`SharedSnapshot::compaction_due`] over garbage already measured.
+    pub fn due_of(all: Vec<(usize, Garbage)>, p: &CompactPolicy, headroom: Option<Headroom>) -> Vec<(usize, Garbage)> {
         let (mut v, mut rest): (Vec<_>, Vec<_>) = all.into_iter().partition(|(_, g)| g.due(p));
         v.sort_by_key(|g| std::cmp::Reverse(g.1.bytes()));
         if let Some(r) = headroom {

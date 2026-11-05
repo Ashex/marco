@@ -436,8 +436,11 @@ impl StoreFile {
         match self {
             StoreFile::Mapped { file, .. } => file.verify_checksums(),
             StoreFile::Paged { file: f, .. } => {
-                engine.verify_pinned(f)?;
-                match engine.verify(f).into_iter().next() {
+                // every page is read, and marked, even when a pinned section fails
+                let pinned = engine.verify_pinned(f);
+                let pages = engine.verify(f);
+                pinned?;
+                match pages.into_iter().next() {
                     Some((_, e)) => match &e {
                         StorageError::Checksum(b) => {
                             bail!("section {} page {}: checksum", b.section.as_deref().unwrap_or("?"), b.page)

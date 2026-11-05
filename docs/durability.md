@@ -126,7 +126,7 @@ the background so the first reads don't fault (`--no-prefault` skips that).
 ## The ready gate
 
 ```diagram
-caption: "`/readyz` answers 503 with why until every configured source has caught up since start, then 200 for good. Graph reads on the API listener follow it."
+caption: "`/readyz` answers 503 with why until every configured source has caught up since start, then 200 for good, unless the engine's reads are failing across the disk. Graph reads on the API listener follow the sources."
 nodes:
   - { id: start, label: start, sub: open + replay, at: [0, 0], size: [8, 3], tone: muted }
   - { id: catch, label: catching up, sub: "503 · reads unavailable", at: [12, 0], size: [11, 3], tone: amber }

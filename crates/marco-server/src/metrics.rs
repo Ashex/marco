@@ -216,3 +216,308 @@ pub async fn time_rpcs(req: Request, next: Next) -> Response {
     }
     res
 }
+
+/// Where the store's budget is, by part, in bytes: the numbers behind
+/// `marco_store_bytes` and the console's Cache panel.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StoreBytes {
+    pub budget: u64,
+    pub pinned_dir: u64,
+    pub pinned_index: u64,
+    pub pinned_heads: u64,
+    /// Page sums, slots, side tables, statuses and the engine's own tables.
+    pub pinned_tables: u64,
+    pub cache_main: u64,
+    pub cache_small: u64,
+    pub retired: u64,
+    /// Cached pages held by a request (inside main and small).
+    pub pinned_frames: u64,
+    pub free: u64,
+    /// Borrowed by anything but the served snapshot's files: a checkpoint's
+    /// new files before their switch, a job's borrow.
+    pub borrowed: u64,
+    /// Paged bytes in the shards' files that no index names (cached at full
+    /// residency, until compaction), as of the last checkpoint or compaction.
+    pub garbage: u64,
+}
+
+impl StoreBytes {
+    pub fn parts(&self) -> [(&'static str, u64); 12] {
+        [
+            ("budget", self.budget),
+            ("pinned_dir", self.pinned_dir),
+            ("pinned_index", self.pinned_index),
+            ("pinned_heads", self.pinned_heads),
+            ("pinned_tables", self.pinned_tables),
+            ("cache_main", self.cache_main),
+            ("cache_small", self.cache_small),
+            ("retired", self.retired),
+            ("pinned_frames", self.pinned_frames),
+            ("free", self.free),
+            ("borrowed", self.borrowed),
+            ("garbage", self.garbage),
+        ]
+    }
+}
+
+/// The store's budget by part, from the engine's books and the served
+/// snapshot's files.
+pub fn store_bytes(app: &crate::app::App) -> StoreBytes {
+    use marco_core::store::StoreFile;
+    let b = app.engine.bytes();
+    let page = marco_core::store::page::PAGE as u64;
+    let mut s = StoreBytes {
+        budget: b.budget,
+        cache_main: b.main_frames * page,
+        cache_small: b.small_frames * page,
+        retired: b.retired_frames * page,
+        pinned_frames: b.pinned_frames * page,
+        garbage: app.garbage_bytes.load(std::sync::atomic::Ordering::Relaxed),
+        ..Default::default()
+    };
+    if !app.engine.paged() {
+        return s;
+    }
+    let mut files = 0u64;
+    if let Some(snap) = app.graph().snapshot() {
+        for (i, (_, f)) in snap.files().enumerate() {
+            let StoreFile::Paged { file, pinned } = f else { continue };
+            files += file.borrowed();
+            s.pinned_tables += file.borrowed();
+            let Some(p) = pinned else { continue };
+            files += p.borrowed();
+            if i == 0 {
+                s.pinned_dir += p.borrowed();
+                continue;
+            }
+            let (mut idx, mut head) = (0, 0);
+            for (name, len) in p.sections() {
+                if name.ends_with(".idx") {
+                    idx += len as u64;
+                } else if name.ends_with(".head") {
+                    head += len as u64;
+                }
+            }
+            s.pinned_index += idx;
+            s.pinned_heads += head;
+            s.pinned_tables += p.borrowed().saturating_sub(idx + head);
+        }
+    }
+    s.pinned_tables += b.tables;
+    s.borrowed = b.borrowed.saturating_sub(files);
+    s.free =
+        b.budget.saturating_sub(b.borrowed + b.tables + (b.main_frames + b.small_frames + b.retired_frames) * page);
+    s
+}
+
+static WATCHED: std::sync::Mutex<std::sync::Weak<crate::app::App>> = std::sync::Mutex::new(std::sync::Weak::new());
+
+/// Makes `app` the one whose engine the store metrics describe.
+pub fn watch(app: &std::sync::Arc<crate::app::App>) {
+    *WATCHED.lock().unwrap() = std::sync::Arc::downgrade(app);
+    LazyLock::force(&STORE_METRICS);
+}
+
+static STORE_METRICS: LazyLock<()> = LazyLock::new(|| {
+    let _ = prometheus::register(Box::new(StoreMetrics::new()));
+});
+
+/// The engine's metrics, read from it at each scrape (§13 of the storage
+/// design): where the budget is, lookups by structure, the I/O lanes, read
+/// errors, the policy's evictions.
+struct StoreMetrics {
+    descs: Vec<prometheus::core::Desc>,
+}
+
+const STORE_FAMILIES: [(&str, &str, &[&str]); 13] = [
+    ("marco_store_bytes", "Where the store's budget is, by part (bytes)", &["part"]),
+    (
+        "marco_store_lookups_total",
+        "Page lookups by structure, hit or miss, and the queue a hit was in",
+        &["structure", "result", "queue"],
+    ),
+    ("marco_store_io_seconds", "Device read latency per read call, by lane (request, background)", &["queue"]),
+    ("marco_store_io_bytes_total", "Bytes read from the device, by lane", &["queue"]),
+    ("marco_store_io_queue_depth", "Reads waiting for an I/O thread, by lane", &["queue"]),
+    (
+        "marco_store_read_errors_total",
+        "Page reads that failed (checksum, eio, short) or took a retry to succeed (eio_retried)",
+        &["kind"],
+    ),
+    ("marco_store_bad_pages", "Pages marked bad: their requests fail until a verify reads them clean", &[]),
+    (
+        "marco_store_failing_pages",
+        "Distinct pages whose reads failed on the device in the last 60 s; 64 take /readyz down",
+        &[],
+    ),
+    ("marco_store_evictions_total", "Frames the policy evicted, by queue", &["queue"]),
+    ("marco_store_ghost_hits_total", "Misses the ghost remembered, sent straight to the main queue", &[]),
+    (
+        "marco_store_write_through_pages_total",
+        "Pages checkpoints and compactions wrote into the cache as they wrote them, or let go",
+        &["result"],
+    ),
+    ("marco_store_past_pages_total", "Pages read past the cache into a job's own memory (compaction, list stats)", &[]),
+    (
+        "marco_store_stalled_requests_total",
+        "Requests whose missing pages stopped shrinking for 16 rounds: a bug signal",
+        &[],
+    ),
+];
+
+impl StoreMetrics {
+    fn new() -> StoreMetrics {
+        let descs = STORE_FAMILIES
+            .iter()
+            .map(|(n, h, l)| {
+                prometheus::core::Desc::new(
+                    n.to_string(),
+                    h.to_string(),
+                    l.iter().map(|s| s.to_string()).collect(),
+                    Default::default(),
+                )
+                .unwrap()
+            })
+            .collect();
+        StoreMetrics { descs }
+    }
+}
+
+fn family(i: usize, t: prometheus::proto::MetricType) -> prometheus::proto::MetricFamily {
+    let mut f = prometheus::proto::MetricFamily::default();
+    f.set_name(STORE_FAMILIES[i].0.into());
+    f.set_help(STORE_FAMILIES[i].1.into());
+    f.set_field_type(t);
+    f
+}
+
+fn metric(labels: &[(&str, &str)]) -> prometheus::proto::Metric {
+    let mut m = prometheus::proto::Metric::default();
+    m.set_label(
+        labels
+            .iter()
+            .map(|(k, v)| {
+                let mut l = prometheus::proto::LabelPair::default();
+                l.set_name(k.to_string());
+                l.set_value(v.to_string());
+                l
+            })
+            .collect(),
+    );
+    m
+}
+
+fn gauge(f: &mut prometheus::proto::MetricFamily, labels: &[(&str, &str)], v: f64) {
+    let mut m = metric(labels);
+    let mut g = prometheus::proto::Gauge::default();
+    g.set_value(v);
+    m.set_gauge(g);
+    f.mut_metric().push(m);
+}
+
+fn counter(f: &mut prometheus::proto::MetricFamily, labels: &[(&str, &str)], v: u64) {
+    let mut m = metric(labels);
+    let mut c = prometheus::proto::Counter::default();
+    c.set_value(v as f64);
+    m.set_counter(c);
+    f.mut_metric().push(m);
+}
+
+impl prometheus::core::Collector for StoreMetrics {
+    fn desc(&self) -> Vec<&prometheus::core::Desc> {
+        self.descs.iter().collect()
+    }
+
+    fn collect(&self) -> Vec<prometheus::proto::MetricFamily> {
+        use marco_core::read::{Found, Structure};
+        use prometheus::proto::MetricType::{COUNTER, GAUGE, HISTOGRAM};
+        let Some(app) = WATCHED.lock().unwrap().upgrade() else { return Vec::new() };
+        let e = &app.engine;
+        let st = e.stats();
+        let mut out = Vec::with_capacity(STORE_FAMILIES.len());
+
+        let mut f = family(0, GAUGE);
+        for (part, v) in store_bytes(&app).parts() {
+            gauge(&mut f, &[("part", part)], v as f64);
+        }
+        out.push(f);
+
+        let mut f = family(1, COUNTER);
+        for s in Structure::ALL {
+            for h in Found::ALL {
+                let (result, queue) = match h {
+                    Found::Small => ("hit", "small"),
+                    Found::Main => ("hit", "main"),
+                    Found::Other => ("hit", "none"),
+                    Found::Miss => ("miss", "none"),
+                };
+                counter(
+                    &mut f,
+                    &[("structure", s.name()), ("result", result), ("queue", queue)],
+                    st.lookups[s as usize][h as usize],
+                );
+            }
+        }
+        out.push(f);
+
+        let lat = e.io_latency();
+        let (depth_r, depth_b) = e.io_depth();
+        let lanes = ["request", "background"];
+        let mut h = family(2, HISTOGRAM);
+        let mut bytes = family(3, COUNTER);
+        let mut depth = family(4, GAUGE);
+        for (i, l) in lat.iter().enumerate() {
+            let mut m = metric(&[("queue", lanes[i])]);
+            let mut hist = prometheus::proto::Histogram::default();
+            hist.set_sample_count(l.count);
+            hist.set_sample_sum(l.nanos as f64 / 1e9);
+            let mut cum = 0;
+            let mut bs = Vec::new();
+            for (k, &n) in l.buckets.iter().take(marco_core::store::io::IO_BUCKETS).enumerate() {
+                cum += n;
+                let mut b = prometheus::proto::Bucket::default();
+                b.set_cumulative_count(cum);
+                b.set_upper_bound((1u64 << k) as f64 / 1e6);
+                bs.push(b);
+            }
+            hist.set_bucket(bs);
+            m.set_histogram(hist);
+            h.mut_metric().push(m);
+            counter(&mut bytes, &[("queue", lanes[i])], l.bytes);
+            gauge(&mut depth, &[("queue", lanes[i])], [depth_r, depth_b][i] as f64);
+        }
+        out.extend([h, bytes, depth]);
+
+        let mut f = family(5, COUNTER);
+        for (kind, n) in
+            [("checksum", st.checksum), ("eio", st.eio), ("short", st.short), ("eio_retried", st.eio_retried)]
+        {
+            counter(&mut f, &[("kind", kind)], n);
+        }
+        out.push(f);
+        let mut f = family(6, GAUGE);
+        gauge(&mut f, &[], st.bad_pages as f64);
+        out.push(f);
+        let mut f = family(7, GAUGE);
+        gauge(&mut f, &[], e.failing_pages(marco_core::store::engine::STORM_WINDOW) as f64);
+        out.push(f);
+        let mut f = family(8, COUNTER);
+        counter(&mut f, &[("queue", "small")], st.evict_small);
+        counter(&mut f, &[("queue", "main")], st.evict_main);
+        out.push(f);
+        let mut f = family(9, COUNTER);
+        counter(&mut f, &[], st.ghost_hits);
+        out.push(f);
+        let mut f = family(10, COUNTER);
+        counter(&mut f, &[("result", "published")], st.written_through);
+        counter(&mut f, &[("result", "skipped")], st.write_through_skipped);
+        out.push(f);
+        let mut f = family(11, COUNTER);
+        counter(&mut f, &[], st.past_pages);
+        out.push(f);
+        let mut f = family(12, COUNTER);
+        counter(&mut f, &[], st.stalled_requests);
+        out.push(f);
+        out
+    }
+}

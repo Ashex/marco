@@ -131,7 +131,10 @@ trying the console and the API without data.
 
 - `/healthz`: `ok` while the process is up.
 - `/readyz`: 200 `ready` once every configured source has caught up since start, else 503 with
-  why ([the ready gate](durability.md#the-ready-gate)).
+  why ([the ready gate](durability.md#the-ready-gate)). With `--storage engine` it also answers 503
+  `storage failing` while 64 or more distinct pages have failed their reads on the device (EIO
+  after retries, or short) in the last 60 s: the disk is going. A few bad pages leave it ready; their
+  requests fail with `data_loss` or `unavailable` naming the page.
 
 ## Metrics
 
@@ -141,7 +144,7 @@ A scraper that can't send the token reads the same text from `--ops-listen`, whi
 
 | Metric | Labels | |
 |---|---|---|
-| `marco_rpc_seconds` | `rpc` | RPC time in the server, request decoded to response encoded |
+| `marco_rpc_seconds` | `rpc`, `path` | RPC time in the server, request decoded to response encoded; `path` is `fast` (served on its worker) or `pool` (moved to the miss pool) |
 | `marco_rpc_errors_total` | `rpc`, `status` | RPCs that failed |
 | `marco_proxy_header_refused_total` | | Connections from `--proxy-protocol-from` closed for a missing or bad PROXY v2 header |
 | `marco_op_seconds` | `op`, `rel` | API op latency: `has`, `relationships`, `out_list`, `in_list`, `counts`, `intersect`, `filter`, `add`, `delete` |
@@ -168,6 +171,16 @@ A scraper that can't send the token reads the same text from `--ops-listen`, whi
 | `marco_store_checkpoint_bytes` | `part` | The last checkpoint's bytes: `patch` (changed lists), `pinned` (the patches' indexes and tables), `base` (new bases) |
 | `marco_store_compaction_shards_total`, `marco_store_compaction_bytes_total`, `marco_store_compaction_garbage_bytes_total` | | Shards compacted, the bytes they wrote, the garbage they cleared |
 | `marco_store_compaction_seconds` | | One shard's compaction |
+| `marco_store_bytes` | `part` | With `--storage engine`, where the budget is: `budget`, `pinned_dir`, `pinned_index`, `pinned_heads`, `pinned_tables`, `cache_main`, `cache_small`, `retired`, `pinned_frames`, `free`, `borrowed`, `garbage` |
+| `marco_store_lookups_total` | `structure`, `result`, `queue` | Page lookups by structure (`out_small`, `out_subj`, `out_rkey`, `out_bysubj`, `in_small`, `in_blocks`), `hit` or `miss`, and the queue a hit was in |
+| `marco_store_request_pages`, `marco_store_request_rounds` | `rpc` | Pages a request read from disk, and the rounds it waited |
+| `marco_store_miss_pool_busy`, `marco_store_miss_pool_wait_seconds`, `marco_store_busy_total` | | The miss pool's threads in use, the wait for one, and requests refused after a second |
+| `marco_store_io_seconds`, `marco_store_io_bytes_total`, `marco_store_io_queue_depth` | `queue` | Device reads by lane (`request`, `background`): latency per read call, bytes, reads waiting |
+| `marco_store_read_errors_total` | `kind` | Failed page reads: `checksum`, `eio`, `short`, and `eio_retried` (a retry fixed it) |
+| `marco_store_bad_pages`, `marco_store_failing_pages` | | Pages marked bad, and distinct pages failing on the device in the last 60 s |
+| `marco_store_evictions_total`, `marco_store_ghost_hits_total` | `queue` | Frames evicted by queue, and misses the ghost sent straight to main |
+| `marco_store_write_through_pages_total` | `result` | Pages checkpoints and compactions put in the cache as they wrote them (`published`), or let go (`skipped`) |
+| `marco_store_past_pages_total` | | Pages compactions and list stats read past the cache |
 | `marco_delta_entries`, `marco_delta_lists` | `rel`, `dir` | Unmerged delta entries, and lists with a delta |
 | `marco_merges_total`, `marco_merge_bytes_total` | `rel`, `dir` | List deltas merged, and the bytes they wrote |
 | `marco_merge_seconds` | `dir` | Time to merge one list's delta |
@@ -187,6 +200,7 @@ marco_ready == 0                                                   # not ready s
 max by (source) (marco_ingest_behind_microseconds) / 1e6 > 30      # a source falling behind
 rate(marco_segment_errors_total[5m]) > 0                           # segments not landing
 increase(marco_checkpoint_errors_total[1h]) > 0
+marco_store_bad_pages > 0                                          # a page needs a rebuild or a restored file
 histogram_quantile(0.99, sum by (le, rpc) (rate(marco_rpc_seconds_bucket[5m])))
 ```
 

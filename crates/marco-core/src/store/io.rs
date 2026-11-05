@@ -454,6 +454,74 @@ pub(crate) enum Lane {
     Background,
 }
 
+/// Upper bounds of the latency buckets: 2^k µs for k in 0..IO_BUCKETS
+/// (1 µs to about 1 s), then +Inf.
+pub const IO_BUCKETS: usize = 21;
+const IO_SHARDS: usize = 16;
+
+#[repr(align(128))]
+#[derive(Default)]
+struct IoShard {
+    count: AtomicU64,
+    nanos: AtomicU64,
+    bytes: AtomicU64,
+    buckets: [AtomicU64; IO_BUCKETS + 1],
+}
+
+/// A lane's read latencies, per read call, summed over shards so 64 I/O
+/// threads don't share one cache line.
+#[derive(Default)]
+pub(crate) struct IoHist {
+    shards: [IoShard; IO_SHARDS],
+}
+
+/// A lane's reads: how many, how long, how many bytes, and how their
+/// latencies fall into [`IO_BUCKETS`] (the last bucket is past them).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IoLatency {
+    pub count: u64,
+    pub nanos: u64,
+    pub bytes: u64,
+    pub buckets: Vec<u64>,
+}
+
+impl IoHist {
+    fn observe(&self, nanos: u64, bytes: u64) {
+        let s = &self.shards[shard()];
+        s.count.fetch_add(1, Relaxed);
+        s.nanos.fetch_add(nanos, Relaxed);
+        s.bytes.fetch_add(bytes, Relaxed);
+        let us = nanos / 1000;
+        let b = if us <= 1 { 0 } else { (64 - (us - 1).leading_zeros()) as usize }.min(IO_BUCKETS);
+        s.buckets[b].fetch_add(1, Relaxed);
+    }
+
+    pub fn snapshot(&self) -> IoLatency {
+        let mut out = IoLatency { buckets: vec![0; IO_BUCKETS + 1], ..Default::default() };
+        for s in &self.shards {
+            out.count += s.count.load(Relaxed);
+            out.nanos += s.nanos.load(Relaxed);
+            out.bytes += s.bytes.load(Relaxed);
+            for (o, b) in out.buckets.iter_mut().zip(&s.buckets) {
+                *o += b.load(Relaxed);
+            }
+        }
+        out
+    }
+}
+
+fn shard() -> usize {
+    use std::cell::Cell;
+    thread_local!(static ME: Cell<usize> = const { Cell::new(usize::MAX) });
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    ME.with(|m| {
+        if m.get() == usize::MAX {
+            m.set(NEXT.fetch_add(1, Relaxed) as usize % IO_SHARDS);
+        }
+        m.get()
+    })
+}
+
 /// The pool's counters.
 #[derive(Default)]
 pub(crate) struct IoCounters {
@@ -462,6 +530,8 @@ pub(crate) struct IoCounters {
     pub background_pages: AtomicU64,
     pub eio_retried: AtomicU64,
     pub io_nanos: AtomicU64,
+    /// Per lane, request then background.
+    pub lanes: [IoHist; 2],
 }
 
 struct Batch {
@@ -522,6 +592,12 @@ impl IoPool {
 
     pub fn stats(&self) -> &IoCounters {
         &self.shared.stats
+    }
+
+    /// Reads waiting on each lane now: request, background.
+    pub fn depth(&self) -> (usize, usize) {
+        let q = self.shared.q.lock().unwrap();
+        (q.request.len(), q.background.len())
     }
 
     /// Runs `runs` on `lane` and waits for all of them; per run, per page,
@@ -604,7 +680,9 @@ fn worker(s: &PoolShared) {
         if job.lane == Lane::Background {
             s.stats.background_pages.fetch_add(job.run.frames.len() as u64, Relaxed);
         }
-        s.stats.io_nanos.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+        let ns = t.elapsed().as_nanos() as u64;
+        s.stats.io_nanos.fetch_add(ns, Relaxed);
+        s.stats.lanes[job.lane as usize].observe(ns, (job.run.frames.len() * PAGE) as u64);
         let mut st = job.batch.st.lock().unwrap();
         st.1[job.idx] = out;
         st.0 -= 1;

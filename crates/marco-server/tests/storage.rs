@@ -482,7 +482,7 @@ fn faults_reach_the_client_named() {
         assert!(msg.contains(&fy) && msg.ends_with("checksum"), "{msg}");
         assert!(!g.list_out(out(x.clone())).await.unwrap().into_owned().edges.is_empty());
         assert!(s.app.engine.stats().bad_pages > 0);
-        let (ready, _) = s.app.readiness();
+        let (ready, _) = s.app.ready_status();
         assert!(ready, "isolated bad pages leave marco ready");
         let ok = g
             .has(HasRequest { rel: "follow".into(), from: did(0), to: did(1), ..Default::default() })

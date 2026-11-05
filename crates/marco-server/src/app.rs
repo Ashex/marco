@@ -90,6 +90,10 @@ pub struct Config {
     pub background: marco_core::store::io::Rate,
 }
 
+/// Distinct pages failing on the device within the storm window that take
+/// `/readyz` down.
+pub const STORM_PAGES: usize = 64;
+
 /// Memory a store budget must leave the cache beyond the pinned tier.
 pub const MIN_CACHE: u64 = 2 << 30;
 
@@ -334,6 +338,9 @@ pub struct App {
     pub cached_bytes: AtomicU64,
     /// Open loaded every page: the budget holds the whole snapshot.
     pub resident: AtomicBool,
+    /// Paged bytes in the shards' files no index names, as of the last
+    /// checkpoint or compaction.
+    pub garbage_bytes: AtomicU64,
 }
 
 pub fn now_ms() -> i64 {
@@ -552,6 +559,7 @@ impl App {
             open_seconds,
             cached_bytes: AtomicU64::new(0),
             resident: AtomicBool::new(resident),
+            garbage_bytes: AtomicU64::new(0),
         });
         if let Some(spare) = spare {
             let tx = writer::spawn(app.clone(), spare, writer::Init { cursors, segment: last, ops });
@@ -729,6 +737,17 @@ impl App {
             return (true, String::new());
         }
         (false, format!("catching up: {}", behind.join(", ")))
+    }
+
+    /// What `/readyz` says: [`App::readiness`], unless reads are failing on
+    /// the device across many pages, which means the disk is going. Isolated
+    /// bad pages leave marco ready: their requests fail, the rest serve.
+    pub fn ready_status(&self) -> (bool, String) {
+        let n = self.engine.failing_pages(marco_core::store::engine::STORM_WINDOW);
+        if n >= STORM_PAGES {
+            return (false, format!("storage failing: {n} pages failed their reads in the last 60 s"));
+        }
+        self.readiness()
     }
 
     pub fn is_ready(&self) -> bool {

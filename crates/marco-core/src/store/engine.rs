@@ -217,6 +217,11 @@ impl PinnedSections {
         &self.bufs[i]
     }
 
+    /// Each section's name and length.
+    pub fn sections(&self) -> impl Iterator<Item = (&str, usize)> {
+        self.at.iter().map(|p| (p.name.as_str(), p.len))
+    }
+
     /// Bytes they hold against the budget.
     pub fn borrowed(&self) -> u64 {
         self.borrowed
@@ -547,7 +552,37 @@ struct Inner {
     by_path: Mutex<HashMap<PathBuf, Weak<PagedFile>>>,
     flights: Box<[FlightShard]>,
     bad: Mutex<FxHashMap<PageId, StorageError>>,
+    /// Pages whose reads failed on the device (EIO past its retries, or
+    /// short), with when: what the storm rule counts.
+    failing: Mutex<std::collections::VecDeque<(std::time::Instant, PageId)>>,
     counters: Counters,
+}
+
+/// How far back [`Engine::failing_pages`] looks: the `/readyz` storm rule.
+pub const STORM_WINDOW: Duration = Duration::from_secs(60);
+
+/// Failures [`Inner::failing`] keeps at most: past the storm rule's 64.
+const FAILING_KEPT: usize = 4096;
+
+impl Inner {
+    /// Counts a page that failed its read, and keeps device failures for
+    /// the storm rule.
+    fn failed(&self, p: PageId, e: &StorageError) {
+        let c = &self.counters;
+        match e {
+            StorageError::Checksum(_) => &c.checksum,
+            StorageError::Eio(_) => &c.eio,
+            _ => &c.short,
+        }
+        .fetch_add(1, Relaxed);
+        if matches!(e, StorageError::Eio(_) | StorageError::Short(_)) {
+            let mut f = self.failing.lock().unwrap();
+            if f.len() == FAILING_KEPT {
+                f.pop_front();
+            }
+            f.push_back((std::time::Instant::now(), p));
+        }
+    }
 }
 
 /// The page store, one per process, shared by every reader.
@@ -614,6 +649,7 @@ impl Engine {
                 by_path: Mutex::new(HashMap::new()),
                 flights: (0..FLIGHT_SHARDS).map(|_| Mutex::new(FxHashMap::default())).collect(),
                 bad: Mutex::new(FxHashMap::default()),
+                failing: Mutex::new(Default::default()),
                 counters: Counters::default(),
             }),
         }
@@ -1136,13 +1172,7 @@ impl Engine {
                 None => private.add(*p, frames[i]),
                 Some(e) => {
                     bad.push(frames[i]);
-                    let c = &self.inner.counters;
-                    match e {
-                        StorageError::Checksum(_) => &c.checksum,
-                        StorageError::Eio(_) => &c.eio,
-                        _ => &c.short,
-                    }
-                    .fetch_add(1, Relaxed);
+                    self.inner.failed(*p, &e);
                     if self.inner.table.get(p.file, &self.pin()).is_some() {
                         self.inner.bad.lock().unwrap().insert(*p, e.clone());
                     }
@@ -1250,13 +1280,7 @@ impl Engine {
                     Ok(()) => ok.push(*f),
                     Err(e) => {
                         failed.push(*f);
-                        let c = &self.inner.counters;
-                        match e {
-                            StorageError::Checksum(_) => &c.checksum,
-                            StorageError::Eio(_) => &c.eio,
-                            _ => &c.short,
-                        }
-                        .fetch_add(1, Relaxed);
+                        self.inner.failed(*p, e);
                         // a file dropped meanwhile has already cleared its marks
                         if self.inner.table.get(p.file, &self.pin()).is_some() {
                             self.inner.bad.lock().unwrap().insert(*p, e.clone());
@@ -1558,6 +1582,9 @@ impl Engine {
                         _ if page_sum(bytes, seed) != want => Some(StorageError::Checksum(st.bad(page))),
                         _ => None,
                     };
+                    if let Some(e) = &e {
+                        self.inner.failed(id, e);
+                    }
                     let mut b = self.inner.bad.lock().unwrap();
                     match e {
                         Some(e) => {
@@ -1593,6 +1620,34 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    /// Distinct pages whose reads failed on the device (EIO past its
+    /// retries, or short) in the last `window`: 64 in [`STORM_WINDOW`] is the
+    /// storm that takes `/readyz` down, since it means the disk is going.
+    pub fn failing_pages(&self, window: Duration) -> usize {
+        let now = std::time::Instant::now();
+        let mut f = self.inner.failing.lock().unwrap();
+        while f.front().is_some_and(|(t, _)| now.duration_since(*t) > STORM_WINDOW.max(window)) {
+            f.pop_front();
+        }
+        let mut pages: Vec<PageId> = f.iter().filter(|(t, _)| now.duration_since(*t) <= window).map(|x| x.1).collect();
+        pages.sort_unstable();
+        pages.dedup();
+        pages.len()
+    }
+
+    /// Reads waiting on the I/O pool's lanes now: request, background.
+    pub fn io_depth(&self) -> (usize, usize) {
+        self.inner.io.as_ref().map_or((0, 0), |io| io.depth())
+    }
+
+    /// Each lane's reads so far, request then background.
+    pub fn io_latency(&self) -> [crate::store::io::IoLatency; 2] {
+        match &self.inner.io {
+            Some(io) => [io.stats().lanes[0].snapshot(), io.stats().lanes[1].snapshot()],
+            None => Default::default(),
+        }
     }
 
     /// Pages marked bad, with why.
