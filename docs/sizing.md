@@ -28,11 +28,12 @@ methods, the raw tables and the runs behind each one.
 
 | Page | What it measured |
 |---|---|
-| [P0 results](p0-results.html) | The bulk build, the snapshot's size by part, open, engine reads, correctness |
-| [P1 results](p1-results.html) | Durability, kill -9, Jetstream lag, write and read targets under ingest, checkpoint cost |
-| [Performance](perf.html) | Every Graph call in-process and through the server, throughput, latency under load, CPU per query |
+| [Build and reads, whole network](p0-results.html) | The bulk build, the snapshot's size by part, open, engine reads, correctness |
+| [Durability and restarts, measured](p1-results.html) | Durability, kill -9, Jetstream lag, write and read targets under ingest, checkpoint cost |
+| [Throughput and latency](perf.html) | Every Graph call in-process and through the server, throughput, latency under load, CPU per query |
 | [Read mix](read-mix.html) | Real app traffic turned into marco calls per active user |
-| [Rebuilding from ScyllaDB](scylla-results.html) | scan-scylla on the whole network, the build and the catch-up |
+| [Rebuild from Scylla, measured](scylla-results.html) | scan-scylla on the whole network, the build and the catch-up |
+| [Lists](lists-results.html) | The whole network with lists: size per list edge, the build, list lookups and set operations |
 
 ## Disk
 
@@ -48,8 +49,10 @@ methods, the raw tables and the runs behind each one.
 | List offset indexes | 0.74 GB | |
 | Total | 38.50 GB | 12.98 B |
 
-Lists (listitem) weren't in these snapshots. The design estimates ~1.3 GB for the network's 61M
-list items, about 21 B each ([design: lists](design.html#lists)).
+Lists add 1.58 GB for the network's 60.8M list items, 26.0 B per list edge with every part
+(`listitem`, `listitem.owner` and the list URIs in the directory). A snapshot with follows, blocks
+and lists is 39.99 GB and builds in 127 s ([Lists](lists-results.html)). The other numbers on this
+page are follows and blocks only.
 
 Plan for twice the snapshot on disk. A checkpoint writes new shard files for every shard that
 changed before it deletes the old ones, and 3M ops touch nearly all 64 shards. Change segments
@@ -71,8 +74,7 @@ items weren't part of that run. Their scan output is ~27 B a row on synthetic da
 
 marco maps the snapshot and lets the page cache hold it, so memory is mostly page cache. A box
 with RAM for the whole snapshot serves every read from memory. One with less can keep the in sets
-and indexes hot and pay an NVMe read when an out log misses the cache (~100 µs, the design's
-estimate). Run that box with `--no-prefault`: by default marco reads the whole snapshot through the
+and indexes hot and pay an NVMe read when an out log misses the cache (~100 µs, estimated). Run that box with `--no-prefault`: by default marco reads the whole snapshot through the
 page cache after open and after every checkpoint, which on a smaller box evicts the hot set it
 should keep. During a checkpoint
 the old and new shard files are both mapped, and the RSS reads ~71 GiB on a 61 GiB box because a
@@ -97,7 +99,7 @@ is mostly HTTP/2, the runtime and Connect: marco's own graph code is 16% of the 
 over HTTP/2 takes ~39 µs serially, most of it the round trip, and the server's own time is ~11 µs.
 
 Under open-loop load, an appview-shaped mix sustained 474k requests/s on 16 server threads at p50
-3.69 ms and p99 11.73 ms ([Performance](perf.html)). [Read mix](read-mix.html) turns real app
+3.69 ms and p99 11.73 ms ([Throughput and latency](perf.html)). [Read mix](read-mix.html) turns real app
 traffic into marco calls per active user.
 
 ## Writes
@@ -115,7 +117,7 @@ Writes cost reads more than their own work. Each batch publishes a new copy of t
 reads after it work on a copy whose deltas aren't empty. On perf.html's run, 1,000 synthetic
 writes a second added 2.1 server cores under the mix and pushed `WriteBatch` p99 to 9.76 ms near
 saturation. The other way round, reads that keep every server thread busy slow the writer: one
-apply's p99 went from 318 µs to 4.57 ms ([Performance](perf.html)). A pipeline writing through the
+apply's p99 went from 318 µs to 4.57 ms ([Throughput and latency](perf.html)). A pipeline writing through the
 API at that rate should size for it.
 
 ## Rebuild and restart
@@ -134,7 +136,7 @@ API at that rate should size for it.
 ## Growth
 
 Follows grew ~2.1% and blocks ~4.9% over the last 30 days measured, so the graph is on course for
-about +26% follows and +59% blocks a year. P0 projected 10 times today's network on the same
-design: 29.7B edges, a 385 GB snapshot in 640 shards, a ~19 min build, and a ~78 GB hot set. u32
+about +26% follows and +59% blocks a year. At 10 times today's network the projection is 29.7B
+edges, a 385 GB snapshot in 640 shards, a ~19 min build and a ~78 GB hot set. u32
 ids still fit (454M DIDs of 4.3B), but serving 10x needs a bigger box than this one
-([P0 results](p0-results.html)).
+([Build and reads, whole network](p0-results.html)).

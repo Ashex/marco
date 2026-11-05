@@ -44,7 +44,7 @@ That gives `target/release/marco-load` (the bulk loader) and `target/release/mar
 Without the UI build the server still runs and answers the API, and `/docs` and `/admin` show a
 page saying how to build them. The binary doesn't embed the UI. It reads `ui/dist` from the source
 tree it was compiled in, so a binary copied to another host or into an image needs
-`--ui-dir /path/to/dist` (or `MARCO_UI_DIR`) to serve them (task 971).
+`--ui-dir /path/to/dist` (or `MARCO_UI_DIR`) to serve them.
 
 ## The input format
 

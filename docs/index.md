@@ -34,9 +34,9 @@ Served unchanged at `/docs/<name>.html` and linked from the site.
 
 | Page | What's in it |
 |---|---|
-| [Design](design.html) | Scope, data model, storage layout, lists, the API, durability, size and growth |
-| [P0 results](p0-results.html) | The whole network built from the archive: build, size, open, reads, correctness |
-| [P1 results](p1-results.html) | Durability without a WAL, kill -9 tests, Jetstream lag, checkpoint cost |
-| [Performance](perf.html) | Every Graph query through the server and in-process, throughput, latency, profiles |
+| [Build and reads, whole network](p0-results.html) | The whole network built from the archive: build, size, open, reads, correctness |
+| [Durability and restarts, measured](p1-results.html) | Kill -9 tests, restart, Jetstream lag, checkpoint cost |
+| [Throughput and latency](perf.html) | Every Graph query through the server and in-process, throughput, latency, profiles |
 | [Read mix](read-mix.html) | Real app traffic turned into marco calls per active user |
-| [Rebuilding from ScyllaDB](scylla-results.html) | scan-scylla on the whole network: scan, build, catch-up, correctness |
+| [Rebuild from Scylla, measured](scylla-results.html) | scan-scylla on the whole network: scan, build, catch-up, correctness |
+| [Lists](lists-results.html) | The whole network with lists: size, build, list lookups and set operations |

@@ -31,7 +31,7 @@ facts:
 An edge is a record keyed by its URI, so every way into marco speaks the same two ops: add a URI
 with its subject, or delete a URI. One writer thread applies them in the order they arrive. Live
 follows and blocks are around 30 ops/s and the writer keeps up with ~280k, so it never queues for
-long ([P1 results](p1-results.html)).
+long ([Durability and restarts, measured](p1-results.html)).
 
 ## The write API
 
@@ -88,7 +88,7 @@ Each op that applies gets one result, in order:
 > `timeUs` out is newer than every tombstone and stamp the live tail left, and it re-creates
 > records the network has since deleted. Send each op's time from your source. A delete whose time
 > is older than `--tombstone-days` (7) leaves a tombstone the next checkpoint drops, so it guards
-> against a late create only until then (task 970).
+> against a late create only until then.
 
 ## Cursors
 
@@ -142,8 +142,7 @@ can't catch up a bulk-built snapshot: it would start at the live tail and miss w
 between.
 
 > [!WARNING]
-> Those checks run only for a source with no cursor of its own, and two gaps get past them
-> (task 966). A marco that was down longer than its Jetstream instance's retention resumes from
+> Those checks run only for a source with no cursor of its own, and some gaps get past them. A marco that was down longer than its Jetstream instance's retention resumes from
 > its old cursor anyway and silently misses what the instance dropped. A relay that no longer
 > holds a firehose cursor sends an `OutdatedCursor` notice, which marco only logs. And the
 > snapshot's `time_us` is dropped once the first source has a cursor, so a source under a new
@@ -192,8 +191,8 @@ Two sources overlap: a backfill, or a rebuild's catch-up, hands over ops the liv
 passed. So each key keeps a stamp, the time and source of its last change. From another source,
 an add older than the stamp changes nothing, and so does a delete of a record changed after the
 delete. A key's own source always gets past its stamp, in arrival order, whatever its clock
-says. 2.3% of deletes land within a second of their create ([design](design.html)), and a clock
-that steps back would otherwise strand a source's own deletes. Tombstones still hold against it:
+says. A delete often lands within a second of its create, and a clock that steps back would
+otherwise strand a source's own deletes. Tombstones still hold against it:
 a re-create older than the source's own delete stays deleted. A plain create's stamp costs nothing past the next checkpoint. Only keys
 that were replaced or re-created after a delete keep theirs in the snapshot.
 
@@ -209,6 +208,6 @@ that were replaced or re-created after a delete keep theirs in the snapshot.
 The operator can set the same statuses with `Admin.SetActorStatus` (`active`, `deleted`,
 `takendown`), which is durable when it answers. An operator's status gets no precedence over the
 source's, though. The account's next `#account` event with `active: true` clears an operator's
-takedown or deletion without notice (task 969), so keep your own takedowns in your appview too. A hidden actor shows up nowhere in the
+takedown or deletion without notice, so keep your own takedowns in your appview too. A hidden actor shows up nowhere in the
 [Query API](query-api.md): it has no edges as an actor and is left out of every answer as a
 subject, and `Filter` reports it as dropped by `"status"`.

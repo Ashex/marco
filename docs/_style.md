@@ -17,10 +17,12 @@ the site is too.
 - Every page in `docs/` is published except `index.md`, the repo's reading list.
   `docs/_internal.txt` lists the pages the site leaves out. A published page can't link to one
   (the check fails with "it is internal").
-- The HTML pages in `docs/` (`design.html`, `p0-results.html`, `p1-results.html`, `perf.html`,
+- The HTML pages in `docs/` (`lists-results.html`, `p0-results.html`, `p1-results.html`, `perf.html`,
   `read-mix.html`, `scylla-results.html`) are standalone. The site serves them unchanged at
-  `/docs/<name>.html` and links them (`[P1 results](p1-results.html#the-gate)`), and the check
-  fails on a link to one that doesn't exist. Don't convert them into pages.
+  `/docs/<name>.html` and links them, labelled by what they measure
+  (`[Durability and restarts, measured](p1-results.html)`), and the check fails on a link to one
+  that doesn't exist. Don't convert them into pages. `design.html` is the design record and is
+  internal (`_internal.txt`): the site neither serves nor links it.
 - Working notes, run scripts and raw results that name private hosts, paths or people live in
   `internal/` at the top of the package. That directory is never exported, so nothing outside it
   may link to or name a file in it.
@@ -30,6 +32,23 @@ the site is too.
   32-thread box with 61 GiB of RAM"). `just check-private` greps the whole package.
 - Public Jetstream instances (`jetstream2.us-east.bsky.network`) and `bsky.network` are public
   services and fine to name.
+
+## Current version only
+
+The pages document the marco that's in the tree, nothing earlier.
+
+- No task, CR, decision or phase numbers ("task 966", "CR 1098", "decision 63", "P1"). A
+  limitation is stated as how marco behaves today: "a restart doesn't check the source's
+  retention". `just docs-check` fails on `task N`, `CR N`, `decision N` and `P0`-`P9` in a
+  published page.
+- No history: no "used to", "no longer", "was changed", "now does", "originally", and no
+  comparison with an earlier marco. "Jetstream no longer holds that time" is fine, since it's
+  about the source.
+- No design iterations or rejected alternatives. If a page needs the reasoning, give the current
+  reason in one sentence. The iterations stay in `design.html` and the results pages, which are the
+  project record.
+- Measurements are evidence. Cite them by what they measure ("in the durability tests", "the
+  whole-network build"), not by the phase that ran them.
 
 ## How it is built
 
@@ -214,8 +233,8 @@ touch end to end. Tones mean the same as in diagrams.
 ## Tone and content
 
 - **Operator- and caller-focused.** Write for someone running marco next to an appview or calling
-  its API: what it does, what it costs, what to watch, what to do. Bench logs, design history and
-  rejected alternatives live in the HTML results pages and `design.html`. Link them.
+  its API: what it does, what it costs, what to watch, what to do. Bench logs and methods live in
+  the HTML results pages. Link them as evidence.
 - **Concise.** Short sentences, plain words, active voice. Lead with the point. [Voice](#voice)
   below spells out what that means sentence by sentence.
 - **Round numbers** with their basis: "~1M has/s through the server on 16 threads (measured)".

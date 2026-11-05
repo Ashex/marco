@@ -33,7 +33,7 @@ follows, blocks and list items tables, writes [build input](quickstart.md#the-in
 with `--snapshot` builds it. Then `marco serve --jetstream` replays what changed since the scan
 began. On one ScyllaDB node holding the whole network's follows and blocks (2.97B rows), that took
 6.8 minutes from an empty directory to `/readyz` 200, and the snapshot matched the archive build
-record for record ([the Scylla run](scylla-results.html)). List items weren't part of that run, so
+record for record ([Rebuild from Scylla, measured](scylla-results.html)). List items weren't part of that run, so
 every whole-network number on this page is follows and blocks only.
 
 ## Run it
@@ -85,8 +85,7 @@ names that aren't plain lower-case identifiers are quoted for you.
 
 `--snapshot` builds with the defaults: 64 shards and a by-subject index on lists of 4,096 records
 or more. For anything else, scan with `--keep-spill` (or without `--snapshot`) and run
-`marco-load build --input /data/scan --relations /data/scan/relations.toml --shards N` yourself
-(task 973).
+`marco-load build --input /data/scan --relations /data/scan/relations.toml --shards N` yourself.
 
 ## What it assumes about the tables
 
@@ -141,7 +140,7 @@ arrive, 1,025 files per table, which is the order the build needs.
 |---|---|
 | Client memory | `--memory-gb` (4) caps what all ranges in flight buffer, by lowering `--chunk-rows` (262,144). 20 nodes of 64 shards is 2,560 ranges at once, about 5,000 rows a chunk in 4 GB. A partition is held whole until it ends, so a very long list adds its size on top. The budget counts the chunks only. The whole-network run peaked at 9.0 GB RSS at 2 ranges in flight per shard and 11.5 GB at 8, both under the default 4 GB. |
 | Scan output | About the rows compressed with zstd: 66.4 GB for the whole network's follows and blocks, 22 B a row, in `--out`. A list item's row also carries its list's URI (~70 B raw), and the tests' synthetic items took 27 B a row. Put it on local NVMe. |
-| Build spill | The build's own in-pass spill, about 23.7 GB for the whole network, goes beside the snapshot in `<snapshot>.spill`. scan-scylla has no `--tmp` to move it (task 973). |
+| Build spill | The build's own in-pass spill, about 23.7 GB for the whole network, goes beside the snapshot in `<snapshot>.spill`. scan-scylla has no `--tmp` to move it. |
 | Peak | About 128 GB at once: the scan output, the build spill and the snapshot being written. |
 | Open files | One per bucket per table (1,025 each), plus a connection per shard per node. The scan raises its soft limit to the hard one and stops with a message if that's still too few. |
 | Snapshot | 38.5 GB, built from the scan output in 114 s on 32 threads. `--snapshot` deletes the scan output after (`--keep-spill` keeps it). |

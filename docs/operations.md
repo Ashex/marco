@@ -35,7 +35,7 @@ before it deletes the old ones), and RAM for the hot part of the snapshot in pag
 > [!WARNING]
 > Run one `marco serve` per snapshot directory. Nothing locks it, so two writable processes on one
 > directory (an overlapping rolling restart, say) delete each other's temp files and write the
-> same segment numbers (task 968). Stop the old process before the new one opens the directory.
+> same segment numbers. Stop the old process before the new one opens the directory.
 
 ## Listeners and auth
 
@@ -47,7 +47,7 @@ before it deletes the old ones), and RAM for the hot part of the snapshot in pag
 | `/metrics`, `/debug/*` | no | token or proxy login |
 | `/admin` (console) | no | the page is open, its data needs a login |
 | `/docs`, `/healthz`, `/readyz` | open | open |
-| `POST /v1/traces` (a bench OTLP sink that counts bytes and drops them) | no | open (task 972) |
+| `POST /v1/traces` (a bench OTLP sink that counts bytes and drops them) | no | open |
 
 The token is the contents of `--admin-token-file`, at least 16 characters, sent as
 `Authorization: Bearer <token>`. Without a token file or a proxy header, Admin and Graph writes
@@ -88,7 +88,7 @@ console's Settings page shows each one's value and where it came from.
 | `--no-prefault` | `MARCO_NO_PREFAULT` | off | Don't map the snapshot's pages in after open. |
 | `--trace-ratio` | `MARCO_TRACE_RATIO` | 0 | The share of ops that get a span, 0 to 1. |
 | `--otlp URL` | `MARCO_OTLP` | | An OTLP/HTTP collector's base URL for spans. |
-| `--ui-dir` | `MARCO_UI_DIR` | the build tree's `ui/dist` | A built console and docs. Set it anywhere but the source tree: the default is the absolute path the binary was compiled in (task 971). |
+| `--ui-dir` | `MARCO_UI_DIR` | the build tree's `ui/dist` | A built console and docs. Set it anywhere but the source tree: the default is the absolute path the binary was compiled in. |
 
 `marco synth --out DIR [--actors N] [--shards N]` writes a synthetic snapshot with fake DIDs, for
 trying the console and the API without data.
@@ -150,9 +150,9 @@ increase(marco_checkpoint_errors_total[1h]) > 0
 histogram_quantile(0.99, sum by (le, rpc) (rate(marco_rpc_seconds_bucket[5m])))
 ```
 
-A lag of a few seconds is usually the source's. On the P1 run, two public Jetstream instances
+A lag of a few seconds is usually the source's. In the durability tests, two public Jetstream instances
 differed by up to 53 s while marco's own share of the lag stayed under 205 ms, so compare against
-another instance before blaming marco ([P1 results](p1-results.html)). marco doesn't ship a
+another instance before blaming marco ([Durability and restarts, measured](p1-results.html)). marco doesn't ship a
 Grafana dashboard yet.
 
 ## Profiling and tracing
@@ -171,7 +171,7 @@ go tool pprof -http :8080 cpu.pb.gz
 Spans go to `--otlp` (an OTLP/HTTP collector's base URL) for the share of ops `--trace-ratio`
 picks, 0 by default. Tracing off costs one atomic load an op. At 1% it doesn't show on one core
 and costs 2% of all-thread throughput, and at 100% it adds ~1.2 µs an op
-([P0 results](p0-results.html)). The console's Requests page changes the ratio live.
+([Build and reads, whole network](p0-results.html)). The console's Requests page changes the ratio live.
 
 ## The console
 

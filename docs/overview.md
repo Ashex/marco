@@ -125,12 +125,12 @@ source's cursor, and a checkpoint folds the segments into new shard files now an
 
 | | Measured | Page |
 |---|---|---|
-| Edges, whole network | 2.74B follows, 227M blocks | [P0 results](p0-results.html) |
-| Snapshot | 38.5 GB, 13.0 B an edge, 64 shards | [P0 results](p0-results.html) |
-| Bulk build from an export | 115 s, 10.6 GB peak RSS | [P0 results](p0-results.html) |
-| `Has` through the server, 16 threads | 1.05M/s | [Performance](perf.html) |
-| kill -9 to `/readyz` 200 | 381-595 ms (p50 by run) | [P1 results](p1-results.html) |
-| Scylla to `/readyz` 200 | 6.8 min | [Rebuilding from ScyllaDB](scylla-results.html) |
+| Edges, whole network | 2.74B follows, 227M blocks | [Build and reads, whole network](p0-results.html) |
+| Snapshot | 38.5 GB, 13.0 B an edge, 64 shards | [Build and reads, whole network](p0-results.html) |
+| Bulk build from an export | 115 s, 10.6 GB peak RSS | [Build and reads, whole network](p0-results.html) |
+| `Has` through the server, 16 threads | 1.05M/s | [Throughput and latency](perf.html) |
+| kill -9 to `/readyz` 200 | 381-595 ms (p50 by run) | [Durability and restarts, measured](p1-results.html) |
+| Scylla to `/readyz` 200 | 6.8 min | [Rebuild from Scylla, measured](scylla-results.html) |
 
 All of these are on one 32-thread box with 61 GiB of RAM and one NVMe drive.
 [Sizing and performance](sizing.md) has the rest.

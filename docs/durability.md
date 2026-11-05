@@ -47,7 +47,7 @@ The cost is that a restart needs its source reachable and still holding the curs
 keeps about 36 h), and an API writer has to replay from its own cursor
 ([Writing and ingest](ingest.md#cursors)). marco doesn't check the first part on a restart: a
 marco down for longer than the source's retention resumes anyway and misses what the source
-dropped ([the warning](ingest.md#the-built-in-consumer), task 966). Rebuild after an outage that
+dropped ([the warning](ingest.md#the-built-in-consumer)). Rebuild after an outage that
 long.
 
 ## Change segments
@@ -68,12 +68,12 @@ consumer up to 10 s to hand over what it read, then writes a last segment, so it
 > [!WARNING]
 > While segment writes fail (a full disk, I/O errors), marco keeps applying and acknowledging
 > writes, holds them in memory and retries the segment. A kill in that window loses everything
-> since the last segment that landed, which can be far more than 5 s (task 967). Alert on
+> since the last segment that landed, which can be far more than 5 s. Alert on
 > `marco_segment_errors_total` and fix the disk before restarting.
 
 Only one `marco serve` may use a snapshot directory. Nothing locks it, so two writable processes
 on one directory (say, an overlapping rolling restart) delete each other's temp files and write
-the same segment numbers (task 968). Stop the old process before starting the new one.
+the same segment numbers. Stop the old process before starting the new one.
 
 ## Checkpoints
 
@@ -97,7 +97,7 @@ hand.
 On the whole network a checkpoint took 29 s and wrote 37.71 GB (63 of 64 shards, since 3M ops
 touch nearly every shard). Reads stay up, but `Relationships` p99 roughly triples for those 30 s
 while the rewrite streams through the page cache, and `Has` barely moves. At today's write rate
-that's about once a day ([P1 results](p1-results.html)).
+that's about once a day ([Durability and restarts, measured](p1-results.html)).
 
 ## Restart
 
@@ -128,7 +128,7 @@ edges:
 
 - A source counts as caught up once it reports a lag under 1 s. Lag is now, by marco's clock,
   minus the newest applied event's time. So a source that's itself behind keeps a restarted marco
-  unready: on the P1 run one public Jetstream instance had a p99 of 49.9 s. If that happens, follow
+  unready: in the durability tests one public Jetstream instance had a p99 of 49.9 s. If that happens, follow
   another instance, or run with `--serve-before-ready` and watch `marco_ingest_lag_seconds`.
 - Before ready, Graph reads on the API listener answer `unavailable` ("catching up:
   jetstream:…"). `--serve-before-ready` answers them anyway. Either way they're counted in
@@ -142,7 +142,7 @@ edges:
 
 ## kill -9
 
-The P1 gate killed marco 94 times mid-ingest against the whole-network snapshot, at random, just
+The durability tests killed marco 94 times mid-ingest against the whole-network snapshot, at random, just
 after a segment, 30 ms before one, and in the middle of checkpoints, then compared every key the
 capture touched against the expected state:
 
@@ -154,7 +154,7 @@ capture touched against the expected state:
 
 Checkpoints cut short by a kill left the old snapshot whole, and the next start replayed from
 it. The firehose run can't time readiness because its fake relay replays frames with their
-recorded times. Details, timelines and the method: [P1 results](p1-results.html).
+recorded times. Details, timelines and the method: [Durability and restarts, measured](p1-results.html).
 
 If the writer or segment thread panics, the process aborts. A writer that keeps answering writes
 no segment will hold would be worse than a restart.

@@ -49,7 +49,7 @@ curl -s localhost:7300/marco.v1.Graph/Has -H 'content-type: application/json' \
 - An actor that's taken down or deleted ([statuses](ingest.md#account-statuses)) is hidden: as an
   actor it has no edges, and as a subject it's left out of every list and answer. Counts are the
   exception today. `Counts` and Intersect's `aLen`/`bLen` still count hidden actors, so a follower
-  count can include taken-down accounts that `ListIn` leaves out (task 969).
+  count can include taken-down accounts that `ListIn` leaves out.
 - Until marco is ready, every Graph read on the API listener answers `unavailable` with why
   ("catching up: jetstream:…"), unless it runs with `--serve-before-ready`
   ([the ready gate](durability.md#the-ready-gate)). The console's copy of Graph on the admin
@@ -89,7 +89,7 @@ record naming the other (`outUri`) and the other's record naming the actor (`inU
 Answers come in the request's order. `rels` empty means every relation between actors (`follow`
 and `block` by default). This is the call a profile's viewer state and a
 feed's hydration make. 50 others × 2 relations take ~30 µs in the engine and ~100 µs over HTTP/2
-([Performance](perf.html)).
+([Throughput and latency](perf.html)).
 
 ## ListOut and ListIn
 
@@ -131,7 +131,7 @@ count).
 
 `rels` empty means every relation, list relations included. `outRecords` and `outSubjects`
 differ when an actor has two records naming the same subject (about 0.14% of follows). Hidden
-actors are counted in all three (task 969).
+actors are counted in all three.
 
 ## Intersect
 
@@ -159,7 +159,7 @@ Two sides, each a `(rel, dir, actor)`, combined with `SET_OP_AND` (the default) 
 - A cursor that isn't a DID in the graph is `invalid_argument`. A side whose actor marco doesn't
   know, or that's hidden, is empty, so AND gives nothing and AND_NOT gives all of `a`.
 - The cost is the smaller side: a random viewer's mutuals take ~0.6 µs on the engine, and an
-  account following 886k takes ~8 ms ([Performance](perf.html)).
+  account following 886k takes ~8 ms ([Throughput and latency](perf.html)).
 
 ## Filter
 

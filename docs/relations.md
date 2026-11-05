@@ -21,7 +21,7 @@ facts:
   - { value: "3", label: default relations, note: "follow · block · listitem", tone: accent }
   - { value: "0", label: lines of code to add one, note: a TOML entry and a rebuild }
   - { value: "255", label: relations at most, note: "companions included", tone: muted }
-  - { value: "43k", label: listitems refused, note: "their list is in another repo", tone: rust }
+  - { value: "42k", label: listitems dropped, note: "list in another repo or subject not a DID", tone: rust }
 ```
 
 A relation is a record collection whose records name a subject DID. marco reads the subject from
@@ -114,11 +114,12 @@ it answers needs them. A list exists in marco while it has items.
 A listitem names three things: its owner (the repo), its list and its member. The list gets an id
 in the directory like an actor, so the list-to-member edge reuses the out log and the in set as
 they are. A delete only names the owner and the rkey, so the companion `listitem.owner` keeps
-each record as owner to list. Finding a delete's record is then two binary searches, where trying
-each of the owner's lists would take up to 550 (the most lists one owner has).
+each record as owner to list. Finding a delete's record is then two binary searches, however many
+lists the owner has.
 
-Some lists repeat a member: 7.5% of listitem records repeat a (list, member) pair, and one list
-holds 640k records for 119 members. So counts and member pages count members. `Counts` returns
+Some lists repeat a member: the network's 60.8M listitem records hold 56.3M distinct (list,
+member) pairs, and the biggest list has 698,510 records for 483,679 members
+([Lists](lists-results.html)). So counts and member pages count members. `Counts` returns
 `outSubjects` (distinct members) beside `outRecords`, and `ListOut` with `distinct` keeps each
 member's oldest record, as the appview does. `Has(list, did)` returns the member's oldest
 listitem.
@@ -139,4 +140,5 @@ A create or update whose subject isn't a DID gets the same treatment (`reason="b
 Emptying the key keeps the live graph where a rebuild would end: a record updated into something
 marco can't hold is gone in both.
 
-The archive had 43,382 such listitems out of 60.8M ([design: lists](design.html#lists)).
+The whole-network build dropped 41,988 of 60.8M listitems because their subject wasn't a DID or
+their list was in another repo ([Lists](lists-results.html)).

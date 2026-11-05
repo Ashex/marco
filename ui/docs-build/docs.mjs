@@ -72,11 +72,12 @@ export function publishedFiles() {
   return walk(DOCS_DIR).sort()
 }
 
-/** The standalone HTML pages in docs/ (design, results), served unchanged at /docs/<name>.html. */
+/** The standalone HTML pages in docs/ (results), served unchanged at /docs/<name>.html; _internal.txt leaves some out. */
 export function htmlPages() {
+  const internal = new Set(internalDocs())
   return fs
     .readdirSync(DOCS_DIR)
-    .filter((f) => f.endsWith('.html'))
+    .filter((f) => f.endsWith('.html') && !internal.has(f))
     .sort()
 }
 
@@ -238,7 +239,8 @@ function makeMd(ctx) {
       else if (p.endsWith('.html')) {
         // a standalone page in docs/, served as is next to the site (htmlPages)
         const name = path.relative(DOCS_DIR, path.resolve(path.dirname(path.join(DOCS_DIR, ctx.file)), p)).replace(/\\/g, '/')
-        if (!htmlPages().includes(name)) ctx.errors.push(`${ctx.file}: link ${JSON.stringify(href)}: no docs/${name}`)
+        if (!htmlPages().includes(name))
+          ctx.errors.push(`${ctx.file}: link ${JSON.stringify(href)}: no docs/${name}${internalDocs().includes(name) ? ' (it is internal: docs/_internal.txt)' : ''}`)
         else if (anchor && !fs.readFileSync(path.join(DOCS_DIR, name), 'utf8').includes(`id="${anchor}"`)) ctx.errors.push(`${ctx.file}: link ${JSON.stringify(href)}: no #${anchor} in ${name}`)
         t.attrSet('href', `/docs/${name}${anchor ? `#${anchor}` : ''}`)
       } else ctx.errors.push(`${ctx.file}: link ${JSON.stringify(href)}: link other pages by their .md file (e.g. cluster.md#resharding)`)
