@@ -97,9 +97,12 @@ hand.
 Old versions of changed lists stay in the shard's files as garbage. Once a shard's files hold
 1.43× what its index still names and at least 64 MiB of garbage (`--compaction-ratio`,
 `--compaction-min-garbage-mb`), a compaction rewrites its base and patches as one base with the same
-lists, at most `--compaction-rate-mb` (200 MB/s), one shard at a time after each checkpoint. Its
+lists, paced by `--background-io` (200 MB/s), one shard at a time after each checkpoint. Its
 manifest rename is its commit, and the served copies swap the shard in place. A checkpoint that
-comes due stops it, and a crash leaves either the old files or the new base, never a mix.
+comes due stops it, and a crash leaves either the old files or the new base, never a mix. With
+`--storage engine` and a `--memory` that holds the whole snapshot, old versions stay cached too, so
+compaction also takes the shards holding the most of them until the next checkpoint's patches fit
+in what's free.
 
 On the whole network, a day of the archive's follows, blocks and list items (2.75M ops) made a
 checkpoint of 20 s on a warm page cache: 11 s replaying the day, 9 s writing 65 patches. They held

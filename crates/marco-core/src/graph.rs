@@ -52,7 +52,9 @@ use crate::store::{Manifest, ShardFile, Store, DEFAULT_SHARDS};
 use crate::varint::u32_at;
 
 mod checkpoint;
-pub use checkpoint::{BaseSwap, CheckpointReport, CompactPolicy, Compacted, Garbage, COMPACTION_STOPPED, SPACE_FILL};
+pub use checkpoint::{
+    BaseSwap, CheckpointReport, CompactPolicy, Compacted, Garbage, Headroom, COMPACTION_STOPPED, SPACE_FILL,
+};
 
 /// Out logs at least this long get a by-subject index in a snapshot.
 pub const DEFAULT_SUBJ_INDEX: usize = 4096;

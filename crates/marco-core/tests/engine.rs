@@ -25,7 +25,14 @@ fn a_miss_is_fetched_once_then_hits() {
     let path = write_tagged(d.path(), "shard-000-00000001.marco", 7, 40);
     let e = plain(8 * MIB, None);
     let f = e.register(&path).unwrap();
-    assert_eq!(f.pinned("t.head"), Some(&b"file 7"[..]));
+    assert!(!f.has_pinned());
+    let pinned = e.pinned(&f).unwrap();
+    assert_eq!(pinned.get("t.head"), Some(&b"file 7"[..]));
+    assert!(f.has_pinned() && Arc::ptr_eq(&pinned, &e.pinned(&f).unwrap()), "kept while a handle lives");
+    let with = e.bytes().borrowed;
+    drop(pinned);
+    assert!(!f.has_pinned());
+    assert!(e.bytes().borrowed < with, "and returned when the last goes");
     assert_eq!(f.page(SECTION, 39), Some(PageId::new(f.id(), 39)));
     assert_eq!(f.page(SECTION, 40), None);
     assert!(Arc::ptr_eq(&f, &e.register(&path).unwrap()), "one registration per file");
@@ -38,7 +45,11 @@ fn a_miss_is_fetched_once_then_hits() {
     let s = e.stats();
     assert_eq!(s.fetched, 4);
     // 3-5 are one coalesced read, 20 another
-    assert_eq!(s.reads, 2 + 3, "two reads for the pages; the last page, the footer and the pinned run at registration");
+    assert_eq!(
+        s.reads,
+        2 + 4,
+        "two reads for the pages; the last page, the footer and the sums at registration, and t.head"
+    );
     drop(hold);
     assert!(hits(&e, &f, 4) && hits(&e, &f, 20));
 
@@ -383,14 +394,16 @@ fn corruption_on_disk_is_caught() {
     assert_eq!(err.to_string(), "f.marco t.pages page 17: checksum");
     read(&e, &f, 11, &[16, 18], &mut Hold::new()).unwrap();
 
-    // a bad pinned section fails the open, naming it
+    // a bad pinned section fails their read, naming it
     let p2 = write_tagged(d.path(), "g.marco", 12, 4);
     let mut bytes = std::fs::read(&p2).unwrap();
     bytes[4 * 4096 + 1] ^= 1;
     std::fs::write(&p2, &bytes).unwrap();
-    let err = e.register(&p2).unwrap_err().to_string();
+    let g = e.register(&p2).unwrap();
+    let before = e.bytes().borrowed;
+    let err = format!("{:#}", e.pinned(&g).unwrap_err());
     assert!(err.contains("section t.head checksum"), "{err}");
-    assert_eq!(e.bytes().borrowed, f.borrowed(), "a failed open returns what it borrowed");
+    assert_eq!(e.bytes().borrowed, before, "a failed read returns what it borrowed");
 }
 
 #[test]
@@ -513,4 +526,91 @@ fn a_borrow_leaves_the_cache_a_group() {
     let b = e.borrow(room).unwrap();
     read(&e, &f, 23, &[1, 2, 3], &mut Hold::new()).unwrap();
     drop(b);
+}
+
+/// A read past the cache gets checked pages on the background lane without
+/// putting them in the cache or counting a use of the ones there, and its
+/// frames go back when it ends; a bad page fails it as a fetch would.
+#[test]
+fn reads_past_the_cache_leave_it_as_it_was() {
+    let d = tempfile::tempdir().unwrap();
+    let path = write_tagged(d.path(), "f.marco", 3, 64);
+    let e = plain(8 * MIB, None);
+    let f = e.register(&path).unwrap();
+    read(&e, &f, 3, &[1], &mut Hold::new()).unwrap();
+    let before = e.stats();
+    let ids: Vec<PageId> = (0..64).map(|p| PageId::new(f.id(), p)).collect();
+    let sum = e
+        .read_past(|cx| {
+            let mut ok = true;
+            for id in &ids {
+                ok &= cx.page(*id).is_ok();
+            }
+            if !ok {
+                return Err(marco_core::read::Pending);
+            }
+            for id in &ids {
+                check(cx.page(*id)?, 3, id.page, 1);
+            }
+            Ok(ids.len())
+        })
+        .unwrap();
+    assert_eq!(sum, 64);
+    let s = e.stats();
+    assert_eq!((s.past_pages - before.past_pages, s.fetched - before.fetched), (63, 0), "page 1 was cached");
+    assert!(s.background_pages >= 63);
+    assert!(hits(&e, &f, 1) && !hits(&e, &f, 2), "nothing new in the cache");
+    settle(&e);
+    let b = e.bytes();
+    assert_eq!(b.small_frames + b.main_frames, 1);
+    assert_eq!(b.free_frames + b.small_frames + b.main_frames, b.committed / 4096, "every frame back: {b:?}");
+
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[9 * 4096 + 7] ^= 1;
+    let p2 = d.path().join("g.marco");
+    std::fs::write(&p2, &bytes).unwrap();
+    let g = e.register(&p2).unwrap();
+    let err = e.read_past(|cx| cx.page(PageId::new(g.id(), 9)).map(|_| ())).unwrap_err();
+    assert_eq!(err.to_string(), "g.marco t.pages page 9: checksum");
+    assert_eq!(e.stats().bad_pages, 1);
+}
+
+/// Pages staged as a file is written land in the cache, in the small queue,
+/// once the file is registered and the stage published; an unpublished
+/// stage gives its frames back.
+#[test]
+fn written_through_pages_are_cached_once_published() {
+    use marco_core::snapshot::{FileKind, PagedWriter};
+    let d = tempfile::tempdir().unwrap();
+    let e = plain(8 * MIB, None);
+    let write = |name: &str, publish: bool| {
+        let p = d.path().join(name);
+        let mut w = PagedWriter::with_salt(&p, FileKind::Base, 77).unwrap();
+        w.write_through(e.stage(1).unwrap());
+        let body: Vec<u8> = (0..20).flat_map(|i| page_bytes(5, i)).collect();
+        w.paged(SECTION, 0, &body).unwrap();
+        w.pinned("t.head", b"x").unwrap();
+        let (_, stage) = w.finish_staged("shard", &serde_json::json!({})).unwrap();
+        let stage = stage.unwrap();
+        assert_eq!(stage.len(), 20);
+        let f = e.register(&p).unwrap();
+        let n = if publish { e.publish(stage, &f) } else { 0 };
+        (f, n)
+    };
+    let (f, n) = write("a.marco", true);
+    assert_eq!(n, 20);
+    let before = e.stats();
+    read(&e, &f, 5, &(0..20).collect::<Vec<_>>(), &mut Hold::new()).unwrap();
+    assert_eq!(e.stats().fetched, before.fetched, "no reads: every page was written through");
+    assert_eq!(e.bytes().small_frames, 20);
+    let (g, _) = write("b.marco", false);
+    settle(&e);
+    assert!(!hits(&e, &g, 0));
+    let b = e.bytes();
+    assert_eq!(
+        b.free_frames + b.small_frames + b.main_frames,
+        b.committed / 4096,
+        "the stage's frames came back: {b:?}"
+    );
+    assert_eq!(e.stats().written_through, 20);
 }

@@ -33,7 +33,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use marco_core::store::{remove_unlisted, Manifest};
 use marco_core::{segment, Compacted, Graph, Rec};
 
@@ -70,6 +70,8 @@ pub struct Rewritten {
     patch_bytes: u64,
     pinned_bytes: u64,
     base_bytes: u64,
+    /// Pages written through into the engine's cache.
+    written_through: u64,
     /// The new copies to serve, or why opening them failed after the commit.
     switch: Result<Switch, String>,
     /// What failed in the cleanup after the commit.
@@ -260,6 +262,7 @@ impl Writer {
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     self.cut(Vec::new());
                     self.stop_compaction();
+                    self.wait_checkpoint(&rx);
                     return;
                 }
             }
@@ -297,20 +300,46 @@ impl Writer {
             if !applies.is_empty() {
                 self.apply(applies, &mut waiters);
             }
+            if shutdown {
+                // the writes go into a segment now; the reply waits until nothing
+                // else writes the snapshot
+                self.cut(Vec::new());
+                self.stop_compaction();
+                self.wait_checkpoint(&rx);
+                self.cut(waiters);
+                return;
+            }
             let now = Instant::now();
-            if !waiters.is_empty() || now >= self.deadline || shutdown {
+            if !waiters.is_empty() || now >= self.deadline {
                 self.cut(waiters);
                 self.deadline = now + self.interval;
             }
             self.app.durability.lock().unwrap().pending_ops = self.buf_ops;
-            if shutdown {
-                self.stop_compaction();
-                return;
-            }
             let due = self.ops_since_ckpt + self.buf_ops >= self.app.cfg.checkpoint_ops
                 || (self.ckpt_at.elapsed() >= self.app.cfg.checkpoint_age && self.ops_since_ckpt + self.buf_ops > 0);
             if checkpoint || due {
                 self.start_checkpoint(checkpoint);
+            }
+        }
+    }
+
+    /// Waits for a running checkpoint's thread to report, so nothing writes
+    /// the snapshot once the writer has gone. What else comes meanwhile is
+    /// dropped, as it would be after the return.
+    fn wait_checkpoint(&mut self, rx: &mpsc::Receiver<Req>) {
+        while self.ckpt_running {
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(Req::Rewritten(r)) => {
+                    self.ckpt_running = false;
+                    let r = *r;
+                    if let Ok(r) = &r {
+                        self.app.durability.lock().unwrap().checkpoint = r.manifest.checkpoint;
+                    }
+                    self.finish_job(r.map(|_| ()));
+                }
+                Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                // every sender is gone, the checkpoint thread's too
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
             }
         }
     }
@@ -514,8 +543,9 @@ impl Writer {
             crate::metrics::CHECKPOINT_BYTES.with_label_values(&[part]).set(b as i64);
         }
         eprintln!(
-            "marco: checkpoint {} committed in {:.1} s: {} shards, R {} B patch, P_new {} B pinned, {} B new bases",
-            r.manifest.checkpoint, r.seconds, r.shards, r.patch_bytes, r.pinned_bytes, r.base_bytes
+            "marco: checkpoint {} committed in {:.1} s: {} shards, R {} B patch, P_new {} B pinned, {} B new bases, \
+             {} pages written through",
+            r.manifest.checkpoint, r.seconds, r.shards, r.patch_bytes, r.pinned_bytes, r.base_bytes, r.written_through
         );
         if let Some(e) = r.cleanup {
             self.note_error("cleanup after commit", e);
@@ -532,10 +562,17 @@ impl Writer {
         let (mut g, mut t) = (sw.g, sw.twin);
         g.quiet = true;
         t.quiet = true;
+        let mut skipped = None;
         for (_, recs) in since.iter().filter(|(k, _)| *k > sw.last) {
-            apply_planned(&mut g, Some(&mut t), recs);
+            skipped = skipped.or(apply_planned(&mut g, Some(&mut t), recs));
         }
-        apply_planned(&mut g, Some(&mut t), &self.buf);
+        skipped = skipped.or(apply_planned(&mut g, Some(&mut t), &self.buf));
+        if let Some(e) = skipped {
+            // the served copies applied it; the new ones would lack it
+            self.note_error("reopen after commit", e.clone());
+            self.finish_job(Err(anyhow!("committed checkpoint {}; reopen failed: {e}", r.manifest.checkpoint)));
+            return;
+        }
         g.quiet = false;
         t.quiet = false;
         let old = (self.app.publish(Arc::new(g)), self.spare.replace(Arc::new(t)));
@@ -560,7 +597,7 @@ impl Writer {
         }
         let Some(snap) = self.spare.as_ref().and_then(|g| g.shared_snapshot()) else { return };
         let policy = self.app.cfg.compaction;
-        let due = snap.compaction_due(&policy);
+        let due = snap.compaction_due(&policy, self.app.headroom());
         if due.is_empty() || self.verifying() {
             return;
         }
@@ -575,9 +612,8 @@ impl Writer {
                     if s.load(Ordering::Relaxed) || ab.load(Ordering::Relaxed) || verifying(&app) {
                         break;
                     }
-                    let r =
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| snap.compact(path, k, &policy, &ab)))
-                            .unwrap_or_else(|_| Err(anyhow!("the compaction thread panicked")));
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| snap.compact(path, k, &ab)))
+                        .unwrap_or_else(|_| Err(anyhow!("the compaction thread panicked")));
                     // another shard's compaction may still go: a shard that keeps failing
                     // mustn't hold up the rest. One that found the snapshot moved stops it.
                     let stale = r.as_ref().err().is_some_and(|e| {
@@ -664,7 +700,7 @@ impl Writer {
                 .spawn(move || {
                     let file = &f.base().file;
                     file.populate();
-                    if let marco_core::store::StoreFile::Paged(p) = file {
+                    if let marco_core::store::StoreFile::Paged { file: p, .. } = file {
                         engine.load(&[&**p]);
                     }
                 })
@@ -703,13 +739,20 @@ fn rewrite(app: &App, id: u64, upto: u64, cursors: BTreeMap<String, String>) -> 
         std::thread::sleep(Duration::from_millis(5));
     }
     let g = open_replayed(cfg, &app.engine, Some(upto))?.graph;
-    let rep = g.write_checkpoint(&cfg.snapshot, id, upto, cursors)?;
+    let mut rep = g.write_checkpoint(&cfg.snapshot, id, upto, cursors)?;
     drop(g);
+    // the new files stay registered, their written-through pages cached, until
+    // the new copies open them
+    let written = std::mem::take(&mut rep.files);
     let manifest = rep.manifest;
     let (bytes, shards) = (rep.file_bytes, rep.patches + rep.bases);
     let cleanup = remove_unlisted(&cfg.snapshot, &manifest, false).err().map(|e| format!("{e:#}"));
     let switch = (|| -> Result<Switch> {
         let r = open_replayed(cfg, &app.engine, None)?;
+        // the served copies applied that op: keep serving them
+        if let Some(e) = &r.skipped {
+            bail!("replaying the segments after the cut: {e}");
+        }
         if cfg.prefault {
             // before the switch: the new files' first reads would fault (or miss) every page
             if let Some(s) = r.graph.snapshot() {
@@ -726,6 +769,7 @@ fn rewrite(app: &App, id: u64, upto: u64, cursors: BTreeMap<String, String>) -> 
         Ok(Switch { g: r.graph, twin, last: r.last, segments_after: (r.segments, seg_bytes) })
     })()
     .map_err(|e| format!("{e:#}"));
+    drop(written);
     Ok(Rewritten {
         manifest,
         seconds: t.elapsed().as_secs_f64(),
@@ -734,6 +778,7 @@ fn rewrite(app: &App, id: u64, upto: u64, cursors: BTreeMap<String, String>) -> 
         patch_bytes: rep.patch_bytes,
         pinned_bytes: rep.pinned_bytes,
         base_bytes: rep.base_bytes,
+        written_through: rep.written_through,
         switch,
         cleanup,
     })

@@ -26,6 +26,8 @@ use std::sync::Arc;
 
 pub use crossbeam_epoch::Guard;
 
+use rustc_hash::FxHashMap;
+
 use crate::store::cache::{Cache, NO_FRAME};
 pub use crate::store::engine::Engine;
 use crate::store::page::{Page, PageId, PAGE};
@@ -101,6 +103,113 @@ pub struct ReadStats {
     pub pages: u32,
     /// Those that found the page missing.
     pub misses: u32,
+}
+
+/// The paged structure a lookup reads, for the hit ratios by structure.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum Structure {
+    OutSmall,
+    OutSubj,
+    OutRkey,
+    OutBysubj,
+    InSmall,
+    InBlocks,
+    /// Pages read by anything else (tests, tools).
+    #[default]
+    Other,
+}
+
+impl Structure {
+    pub const ALL: [Structure; 7] = [
+        Structure::OutSmall,
+        Structure::OutSubj,
+        Structure::OutRkey,
+        Structure::OutBysubj,
+        Structure::InSmall,
+        Structure::InBlocks,
+        Structure::Other,
+    ];
+
+    /// Its metric label.
+    pub fn name(self) -> &'static str {
+        ["out_small", "out_subj", "out_rkey", "out_bysubj", "in_small", "in_blocks", "other"][self as usize]
+    }
+
+    /// The structure of a paged section, from its name (`r0.out.subj`).
+    pub fn of_section(name: &str) -> Structure {
+        let part = name.split_once('.').map_or(name, |(_, p)| p);
+        match part {
+            "out.small" => Structure::OutSmall,
+            "out.subj" => Structure::OutSubj,
+            "out.rkey" => Structure::OutRkey,
+            "out.bysubj" => Structure::OutBysubj,
+            "in.small" => Structure::InSmall,
+            "in.blocks" => Structure::InBlocks,
+            _ => Structure::Other,
+        }
+    }
+}
+
+/// How a lookup came out: found in the small queue, in main, in memory
+/// otherwise (a file kept whole, or a page read past the cache), or missing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Found {
+    Small,
+    Main,
+    Other,
+    Miss,
+}
+
+impl Found {
+    pub const ALL: [Found; 4] = [Found::Small, Found::Main, Found::Other, Found::Miss];
+}
+
+/// Lookups by structure and how they came out, `[structure][found]`.
+pub type LookupCounts = [[u32; 4]; 7];
+
+/// Pages a hold read past the cache ([`Hold::past`]): each in a frame of
+/// the budget that's never published, so nobody else reads it, freed when
+/// the hold drops.
+pub(crate) struct Private {
+    at: FxHashMap<PageId, u32>,
+    pub(crate) cache: Arc<Cache>,
+}
+
+impl Private {
+    pub(crate) fn new(cache: Arc<Cache>) -> Private {
+        Private { at: FxHashMap::default(), cache }
+    }
+
+    #[inline]
+    fn get(&self, p: PageId) -> Option<&Page> {
+        let &f = self.at.get(&p)?;
+        // SAFETY: the frame is this hold's alone until it drops, and a slice
+        // can't outlive the ReadCx that borrows the hold.
+        Some(unsafe { self.cache.page(f) })
+    }
+
+    pub(crate) fn has(&self, p: PageId) -> bool {
+        self.at.contains_key(&p)
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.at.len()
+    }
+
+    /// Takes frame `f`, which holds page `p`.
+    pub(crate) fn add(&mut self, p: PageId, f: u32) {
+        self.at.insert(p, f);
+    }
+}
+
+impl Drop for Private {
+    fn drop(&mut self) {
+        let frames: Vec<u32> = self.at.values().copied().collect();
+        self.cache.unstage(&frames);
+        self.cache.free_unpublished(&frames);
+    }
 }
 
 /// One pass's view of the store. Built by [`Engine::pass`] (or directly, by
@@ -180,9 +289,12 @@ pub struct ReadCx<'g> {
     held: &'g PageSet,
     /// The last page served, so a run of blocks in one page counts once.
     last: Cell<Option<PageId>>,
+    /// Pages its hold read past the cache, looked in after the cache.
+    private: Option<&'g Private>,
     missing: RefCell<PageSet>,
     touched: RefCell<PageSet>,
     stats: Cell<ReadStats>,
+    by: [[Cell<u32>; 4]; 7],
 }
 
 impl<'g> ReadCx<'g> {
@@ -190,19 +302,27 @@ impl<'g> ReadCx<'g> {
     /// [`Engine::pin`] on the same engine. It keeps no record of the pages it
     /// serves (as [`Hold::none`]).
     pub fn new(engine: &'g Engine, guard: &'g Guard) -> ReadCx<'g> {
-        ReadCx::with(engine, guard, false, &NO_PAGES)
+        ReadCx::with(engine, guard, false, &NO_PAGES, None)
     }
 
-    pub(crate) fn with(engine: &'g Engine, guard: &'g Guard, keep_touched: bool, held: &'g PageSet) -> ReadCx<'g> {
+    pub(crate) fn with(
+        engine: &'g Engine,
+        guard: &'g Guard,
+        keep_touched: bool,
+        held: &'g PageSet,
+        private: Option<&'g Private>,
+    ) -> ReadCx<'g> {
         ReadCx {
             guard,
             engine,
             keep_touched,
             held,
             last: Cell::new(None),
+            private,
             missing: RefCell::new(PageSet::default()),
             touched: RefCell::new(PageSet::default()),
             stats: Cell::new(ReadStats::default()),
+            by: Default::default(),
         }
     }
 
@@ -211,25 +331,42 @@ impl<'g> ReadCx<'g> {
     /// end is missing too: the fetch reports why ([`StorageError`]).
     #[inline]
     pub fn page(&self, p: PageId) -> R<&'g Page> {
+        self.page_of(p, Structure::Other)
+    }
+
+    /// [`ReadCx::page`] for a page of structure `s`, counted under it.
+    #[inline]
+    pub fn page_of(&self, p: PageId, s: Structure) -> R<&'g Page> {
         let mut st = self.stats.get();
         st.pages += 1;
-        let bump = self.last.get() != Some(p) && !self.held.contains(p);
+        // a read past the cache isn't a use: it mustn't keep pages cached
+        let bump = self.private.is_none() && self.last.get() != Some(p) && !self.held.contains(p);
         self.last.set(Some(p));
-        let r = match self.engine.lookup(p, self.guard, bump) {
-            Some(page) => {
+        let found = self.engine.lookup(p, self.guard, bump).or_else(|| Some((self.private?.get(p)?, Found::Other)));
+        let r = match found {
+            Some((page, how)) => {
                 if self.keep_touched {
                     self.touched.borrow_mut().insert(p);
                 }
+                let c = &self.by[s as usize][how as usize];
+                c.set(c.get() + 1);
                 Ok(page)
             }
             None => {
                 st.misses += 1;
                 self.missing.borrow_mut().insert(p);
+                let c = &self.by[s as usize][Found::Miss as usize];
+                c.set(c.get() + 1);
                 Err(Pending)
             }
         };
         self.stats.set(st);
         r
+    }
+
+    /// Lookups so far by structure and how they came out.
+    pub fn lookups(&self) -> LookupCounts {
+        std::array::from_fn(|s| std::array::from_fn(|h| self.by[s][h].get()))
     }
 
     /// Nothing has been missing so far: a pass whose closure succeeds is
@@ -359,6 +496,8 @@ pub struct Hold {
     /// Fetch rounds run and pages they asked for, over the hold's life.
     pub(crate) rounds: u32,
     pub(crate) fetched: u64,
+    /// Pages it read past the cache, if it reads that way ([`Hold::past`]).
+    pub(crate) private: Option<Box<Private>>,
 }
 
 /// Pins a request holds at most (8 MiB of pages): with 64 requests on the
@@ -382,6 +521,7 @@ impl Hold {
             page_limit: usize::MAX,
             rounds: 0,
             fetched: 0,
+            private: None,
         }
     }
 
@@ -401,6 +541,23 @@ impl Hold {
         let mut h = Hold::new();
         h.page_limit = engine.page_limit();
         h
+    }
+
+    /// A blocking job's hold that reads past the cache, on the background
+    /// lane ([`Engine::read_past`]): what it misses is read into memory of its
+    /// own, borrowed from the budget until the hold drops, and never enters
+    /// the cache; what's cached it reads without counting a use. For scans
+    /// that would otherwise flush the cache (list stats, compaction).
+    pub fn past(engine: &Engine) -> Hold {
+        let mut h = Hold::none();
+        h.page_limit = engine.job_limit();
+        h.private = engine.cache().map(|c| Box::new(Private::new(c.clone())));
+        h
+    }
+
+    /// Whether it reads past the cache ([`Hold::past`]).
+    pub fn is_past(&self) -> bool {
+        self.private.is_some()
     }
 
     /// A hold that pins nothing.

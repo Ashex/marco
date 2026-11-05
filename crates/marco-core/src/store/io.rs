@@ -488,7 +488,7 @@ struct PoolShared {
     work: Condvar,
     space: Condvar,
     cap: usize,
-    bucket: TokenBucket,
+    bucket: Arc<TokenBucket>,
     stats: IoCounters,
 }
 
@@ -499,7 +499,7 @@ pub(crate) struct IoPool {
 }
 
 impl IoPool {
-    pub fn new(threads: usize, cap: usize, bucket: TokenBucket) -> IoPool {
+    pub fn new(threads: usize, cap: usize, bucket: Arc<TokenBucket>) -> IoPool {
         let shared = Arc::new(PoolShared {
             q: Mutex::new(Queues::default()),
             work: Condvar::new(),
@@ -774,7 +774,7 @@ mod tests {
 
     #[test]
     fn runs_read_pages_and_stop_at_the_end() {
-        let pool = IoPool::new(2, 4, TokenBucket::new(Rate::UNLIMITED));
+        let pool = IoPool::new(2, 4, Arc::new(TokenBucket::new(Rate::UNLIMITED)));
         let f = mem_file(5);
         let (b1, f1) = bufs(3);
         let (b2, f2) = bufs(3);
@@ -797,7 +797,7 @@ mod tests {
         let f = fault.open(Path::new("/d/f")).unwrap();
         fault.eio("f", [2], Times::Always);
         fault.eio("f", [0], Times::Next(2));
-        let pool = IoPool::new(1, 4, TokenBucket::new(Rate::UNLIMITED));
+        let pool = IoPool::new(1, 4, Arc::new(TokenBucket::new(Rate::UNLIMITED)));
         let (_b, fr) = bufs(4);
         let out = pool.run(vec![Run { file: f, page: 0, frames: fr }], Lane::Request);
         assert_eq!(out[0], [PageRead::Retried, PageRead::Retried, PageRead::Eio, PageRead::Retried]);
@@ -842,7 +842,7 @@ mod tests {
         let e = t.elapsed().as_secs_f64();
         assert!((0.12..1.0).contains(&e), "{e}");
 
-        let pool = IoPool::new(1, 64, TokenBucket::new(Rate { bytes_per_s: 0, ops_per_s: 20 }));
+        let pool = IoPool::new(1, 64, Arc::new(TokenBucket::new(Rate { bytes_per_s: 0, ops_per_s: 20 })));
         let f = mem_file(1);
         let pool = Arc::new(pool);
         let bg = {

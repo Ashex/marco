@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 
@@ -36,6 +36,7 @@ use crate::snapshot::{
     encode_tombs, rel_section, FileKind, PagedFooter, PagedWriter, RelStats, SectionKind, ShardMeta, Side,
     PAGED_FORMAT,
 };
+use crate::store::engine::{PagedFile, Stage};
 use crate::store::page::PAGE;
 use crate::store::{now_ms, shard_file, Manifest, ShardFile, ShardFiles, Store};
 
@@ -72,6 +73,12 @@ pub struct CheckpointReport {
     /// a set's block.
     pub blocks_written: u64,
     pub blocks_kept: u64,
+    /// Pages written through into the engine's cache as they were written.
+    pub written_through: u64,
+    /// The files written, registered with the snapshot's engine (when it
+    /// has a cache) so their written-through pages stay cached until the
+    /// new snapshot opens them.
+    pub files: Vec<Arc<PagedFile>>,
 }
 
 impl CheckpointReport {
@@ -103,6 +110,9 @@ struct ShardOut {
     /// A base's file bytes.
     bytes: u64,
     blocks: BlockCounts,
+    /// The file registered with the engine, its written-through pages
+    /// published, when the engine has a cache.
+    reg: Option<(Arc<PagedFile>, u64)>,
 }
 
 #[derive(Default)]
@@ -150,7 +160,8 @@ impl Graph {
     /// Writes a file for each shard that changed under `checkpoint`'s names,
     /// a patch where the shard has files and a base where it has none, then
     /// the manifest naming them and the unchanged ones. The manifest's rename
-    /// is the commit; the caller deletes the files it no longer names.
+    /// is the commit; the caller deletes the files it no longer names. One
+    /// that fails before its commit deletes the files it wrote.
     pub fn write_checkpoint(
         &self,
         path: &Path,
@@ -159,6 +170,39 @@ impl Graph {
         cursors: BTreeMap<String, String>,
     ) -> Result<CheckpointReport> {
         let t = Instant::now();
+        let rep = match self.write_shards(path, checkpoint, segment, cursors) {
+            Ok(rep) => rep,
+            Err(e) => {
+                // its files' names are this checkpoint's alone, unless the id was
+                // refused as one the committed snapshot already uses
+                let committed: std::collections::HashSet<String> = self
+                    .snapshot()
+                    .map(|s| s.manifest.shards.values().flat_map(ShardFiles::files).map(str::to_string).collect())
+                    .unwrap_or_default();
+                for k in 0..self.n_shards() {
+                    let name = shard_file(k, checkpoint);
+                    if !committed.contains(&name) {
+                        let _ = std::fs::remove_file(path.join(name));
+                    }
+                }
+                return Err(e);
+            }
+        };
+        crate::store::sync_dir(path)?;
+        rep.manifest.write(path)?;
+        obs::snapshot_timed("checkpoint", t.elapsed().as_secs_f64());
+        Ok(rep)
+    }
+
+    /// [`Graph::write_checkpoint`] up to its commit: the shard files and the
+    /// manifest to commit.
+    fn write_shards(
+        &self,
+        path: &Path,
+        checkpoint: u64,
+        segment: u64,
+        cursors: BTreeMap<String, String>,
+    ) -> Result<CheckpointReport> {
         let Some(store) = self.snapshot() else { bail!("no snapshot to checkpoint over") };
         if checkpoint <= store.manifest.checkpoint {
             bail!("checkpoint {checkpoint} isn't past the committed {}", store.manifest.checkpoint);
@@ -199,7 +243,7 @@ impl Graph {
                         loop {
                             let i = next.fetch_add(1, Ordering::Relaxed);
                             let Some(&k) = todo.get(i) else { return Ok(v) };
-                            v.push(self.write_shard_file(path, store, k, checkpoint)?);
+                            v.push(self.write_shard_file(path, store, k, checkpoint, threads)?);
                         }
                     })
                 })
@@ -224,17 +268,25 @@ impl Graph {
             }
             rep.blocks_written += o.blocks.written;
             rep.blocks_kept += o.blocks.kept;
+            if let Some((f, n)) = o.reg {
+                rep.written_through += n;
+                rep.files.push(f);
+            }
             m.shards.insert(o.shard as u32, o.files);
         }
-        crate::store::sync_dir(path)?;
-        m.write(path)?;
-        obs::snapshot_timed("checkpoint", t.elapsed().as_secs_f64());
         rep.manifest = m;
         Ok(rep)
     }
 
     /// Shard `k`'s file for `checkpoint`: a patch over its files, or a base.
-    fn write_shard_file(&self, path: &Path, store: &Store, k: usize, checkpoint: u64) -> Result<ShardOut> {
+    fn write_shard_file(
+        &self,
+        path: &Path,
+        store: &Store,
+        k: usize,
+        checkpoint: u64,
+        share: usize,
+    ) -> Result<ShardOut> {
         let w = self.width;
         let old = store.shards.get(k).and_then(|f| f.as_deref());
         let lo = k as u32 * w;
@@ -258,13 +310,14 @@ impl Graph {
         };
         let mut blocks = BlockCounts::default();
         if let Some(f) = patch_over {
-            let mut wr = PagedWriter::create(&file, FileKind::Patch { base: f.base().file.footer().salt })?;
+            let mut wr = writer(store, &file, FileKind::Patch { base: f.base().file.footer().salt }, share)?;
             match self.write_shard_patch(&mut wr, lo, hi, f, &mut blocks) {
                 Ok(body) => {
-                    let footer = wr.finish("shard", &meta(body))?;
+                    let (footer, stage) = wr.finish_staged("shard", &meta(body))?;
+                    let reg = stage.map(|st| register_through(store, &file, st)).transpose()?;
                     let mut files = f.files();
                     files.patches.push(name);
-                    return Ok(ShardOut { shard: k, files, patch: true, footer, bytes: 0, blocks });
+                    return Ok(ShardOut { shard: k, files, patch: true, footer, bytes: 0, blocks, reg });
                 }
                 // a patch that would pass a space's cap: the shard gets a base
                 Err(e) if format!("{e:#}").contains(CAP_ERROR) => {
@@ -279,16 +332,17 @@ impl Graph {
             }
         }
         debug_assert!(patch_over.is_none());
-        let mut wr = PagedWriter::create(&file, FileKind::Base)?;
-        let footer = match self.write_shard_body(&mut wr, lo, hi, old, true) {
-            Ok(body) => wr.finish("shard", &meta(body))?,
+        let mut wr = writer(store, &file, FileKind::Base, share)?;
+        let (footer, stage) = match self.write_shard_body(&mut wr, lo, hi, old, true) {
+            Ok(body) => wr.finish_staged("shard", &meta(body))?,
             Err(e) => {
                 wr.abandon();
                 return Err(e.context(format!("shard {k}'s base")));
             }
         };
+        let reg = stage.map(|st| register_through(store, &file, st)).transpose()?;
         let bytes = std::fs::metadata(&file).map_or(0, |x| x.len());
-        Ok(ShardOut { shard: k, files: ShardFiles::base(name), patch: false, footer, bytes, blocks })
+        Ok(ShardOut { shard: k, files: ShardFiles::base(name), patch: false, footer, bytes, blocks, reg })
     }
 
     /// A shard's sections for ids lo..hi, every list re-encoded from what
@@ -688,7 +742,8 @@ pub struct BaseSwap(Arc<Base>);
 
 // ---------------------------------------------------------------- compaction
 
-/// When a shard is worth compacting.
+/// When a shard is worth compacting. Compactions write on the engine's
+/// background lane ([`crate::read::Engine::background`]).
 #[derive(Clone, Copy, Debug)]
 pub struct CompactPolicy {
     /// Compact once a shard's files are this many times its live bytes; 0
@@ -696,14 +751,46 @@ pub struct CompactPolicy {
     pub ratio: f64,
     /// ... and hold at least this many bytes of garbage.
     pub min_garbage: u64,
-    /// Bytes a second a compaction writes at most; 0 unpaced.
-    pub rate: u64,
 }
 
 impl Default for CompactPolicy {
     fn default() -> CompactPolicy {
-        CompactPolicy { ratio: 1.43, min_garbage: 64 << 20, rate: 200_000_000 }
+        CompactPolicy { ratio: 1.43, min_garbage: 64 << 20 }
     }
+}
+
+/// The cache's side of compaction when the budget holds the whole snapshot:
+/// garbage pages stay cached, so the free room the next checkpoint needs
+/// for its patches and their pinned sections (P_new + R) has to be cleared
+/// by compacting (decision 67).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Headroom {
+    /// Bytes of the budget neither cached nor borrowed now.
+    pub free: u64,
+    /// What the next checkpoint will take of them: the last one's P_new + R.
+    pub need: u64,
+}
+
+/// Registers `file`, just written, and publishes the pages `stage` holds
+/// for it. If that fails, it registers without them: their pages are then
+/// read on their first miss. Returns the pages published.
+fn register_through(store: &Store, file: &Path, stage: Stage) -> Result<(Arc<PagedFile>, u64)> {
+    match store.engine.register_staged(file, stage) {
+        Ok(r) => Ok(r),
+        Err(_) => Ok((store.engine.register(file)?, 0)),
+    }
+}
+
+/// A file the engine reads through its cache, written through into it as
+/// it's written and paced on its background lane.
+/// `share`: writers at once, which split the stages' quarter of the cache.
+fn writer(store: &Store, file: &Path, kind: FileKind, share: usize) -> Result<PagedWriter> {
+    let mut w = PagedWriter::create(file, kind)?;
+    if let Some(st) = store.engine.stage(share) {
+        w.write_through(st);
+    }
+    w.pace(store.engine.background().clone());
+    Ok(w)
 }
 
 /// A shard's files against what its newest index still names.
@@ -715,6 +802,9 @@ pub struct Garbage {
     pub live: u64,
     /// The fullest space's share of its cap.
     pub fill: f64,
+    /// Bytes of paged pages no index names: what stays in the cache, at
+    /// full residency, until a compaction.
+    pub pages: u64,
 }
 
 impl Garbage {
@@ -789,7 +879,21 @@ impl ShardFile {
             }
         }
         let pinned: u64 = self.newest().sections().iter().filter(|s| !s.is_paged()).map(|s| s.len()).sum();
-        Garbage { disk: self.len(), live: live_pages * PAGE as u64 + pinned, fill: self.fullest_space().1 }
+        let all_pages: u64 = self
+            .parts
+            .iter()
+            .flat_map(|p| p.file.sections())
+            .filter_map(|s| match s.kind {
+                SectionKind::Paged { pages, .. } => Some(pages as u64),
+                SectionKind::Pinned { .. } => None,
+            })
+            .sum();
+        Garbage {
+            disk: self.len(),
+            live: live_pages * PAGE as u64 + pinned,
+            fill: self.fullest_space().1,
+            pages: all_pages.saturating_sub(live_pages) * PAGE as u64,
+        }
     }
 }
 
@@ -837,18 +941,35 @@ fn compact_name(path: &Path, m: &Manifest, k: usize, checkpoint: u64) -> String 
 
 impl SharedSnapshot {
     /// The shards with patches whose garbage `p` says to compact, most
-    /// garbage first.
-    pub fn compaction_due(&self, p: &CompactPolicy) -> Vec<(usize, Garbage)> {
+    /// garbage first. With `headroom` (the budget holds the whole snapshot),
+    /// also as many more, most cached garbage first, as it takes to give
+    /// the next checkpoint the free room it needs.
+    pub fn compaction_due(&self, p: &CompactPolicy, headroom: Option<Headroom>) -> Vec<(usize, Garbage)> {
         let store = &self.0.store;
         let si = store.dir.meta.subj_index as usize;
-        let mut v: Vec<(usize, Garbage)> = store
+        let all: Vec<(usize, Garbage)> = store
             .shards
             .iter()
             .enumerate()
             .filter_map(|(k, f)| f.as_ref().filter(|f| f.parts.len() > 1).map(|f| (k, f.garbage(si))))
-            .filter(|(_, g)| g.due(p))
             .collect();
+        let (mut v, mut rest): (Vec<_>, Vec<_>) = all.into_iter().partition(|(_, g)| g.due(p));
         v.sort_by_key(|g| std::cmp::Reverse(g.1.bytes()));
+        if let Some(r) = headroom {
+            let mut short = r.need.saturating_sub(r.free + v.iter().map(|g| g.1.pages).sum::<u64>());
+            // compacting can't make the room: rewriting every shard for part of it isn't worth it
+            if rest.iter().map(|g| g.1.pages).sum::<u64>() < short {
+                short = 0;
+            }
+            rest.sort_by_key(|g| std::cmp::Reverse(g.1.pages));
+            for g in rest.into_iter().filter(|g| g.1.pages > 0) {
+                if short == 0 {
+                    break;
+                }
+                short = short.saturating_sub(g.1.pages);
+                v.push(g);
+            }
+        }
         v
     }
 
@@ -856,10 +977,11 @@ impl SharedSnapshot {
     /// lists and pinned sections, commits a manifest naming it, and opens it
     /// in the snapshot's engine. The committed manifest must still be the
     /// one this snapshot read, give or take earlier compactions of other
-    /// shards: a checkpoint in between fails it. Writes at most `p.rate`
-    /// bytes a second, and gives up with [`COMPACTION_STOPPED`] once `stop`
+    /// shards: a checkpoint in between fails it. Reads the old files past
+    /// the cache, writes the new one through into it, both on the engine's
+    /// background lane, and gives up with [`COMPACTION_STOPPED`] once `stop`
     /// is set, leaving nothing behind.
-    pub fn compact(&self, path: &Path, k: usize, p: &CompactPolicy, stop: &AtomicBool) -> Result<Compacted> {
+    pub fn compact(&self, path: &Path, k: usize, stop: &AtomicBool) -> Result<Compacted> {
         let t = Instant::now();
         let store = &self.0.store;
         let f = store.shards.get(k).and_then(|f| f.clone()).with_context(|| format!("no shard {k}"))?;
@@ -871,15 +993,25 @@ impl SharedSnapshot {
         }
         let name = compact_name(path, &committed, k, committed.checkpoint);
         let file = path.join(&name);
-        let mut w = PagedWriter::create(&file, FileKind::Base)?;
-        if let Err(e) = write_compacted(store, &f, &mut w, p.rate, t, stop) {
+        let mut w = writer(store, &file, FileKind::Base, 1)?;
+        if let Err(e) = write_compacted(store, &f, &mut w, stop) {
             w.abandon();
             return Err(e);
         }
         let mut meta = f.meta.clone();
         meta.written_ms = now_ms();
-        w.finish("shard", &meta)?;
+        let (_, stage) = w.finish_staged("shard", &meta)?;
         let bytes = std::fs::metadata(&file).map_or(0, |m| m.len());
+        // registered now, so the pages written through stay cached for the open below
+        let written = match stage {
+            Some(stage) => {
+                let (reg, _) = register_through(store, &file, stage).inspect_err(|_| {
+                    let _ = std::fs::remove_file(&file);
+                })?;
+                Some(reg)
+            }
+            None => None,
+        };
         // the manifest again, now that the write is done: nothing else commits
         // while a compaction runs, but a stale one must not land
         let mut m = Manifest::read(path)?;
@@ -892,6 +1024,7 @@ impl SharedSnapshot {
         m.write(path)?;
         let opened = ShardFile::open(path, k as u32, &m.shards[&(k as u32)], &store.dir.meta, &store.engine)
             .with_context(|| format!("reopen shard {k} after its compaction"))?;
+        drop(written);
         obs::snapshot_timed("compact", t.elapsed().as_secs_f64());
         Ok(Compacted {
             shard: k,
@@ -905,30 +1038,14 @@ impl SharedSnapshot {
     }
 }
 
-/// Shard `f`'s lists, read through `store`'s engine, written as a base with
-/// its pinned sections copied.
-fn write_compacted(
-    store: &Store,
-    f: &ShardFile,
-    w: &mut PagedWriter,
-    rate: u64,
-    t0: Instant,
-    stop: &AtomicBool,
-) -> Result<()> {
+/// Shard `f`'s lists, read through `store`'s engine past its cache, written
+/// as a base with its pinned sections copied.
+fn write_compacted(store: &Store, f: &ShardFile, w: &mut PagedWriter, stop: &AtomicBool) -> Result<()> {
     let si = store.dir.meta.subj_index as usize;
     let n = f.meta.hi - f.meta.lo;
-    let mut paced = 0u64;
-    let mut pace = |w: &PagedWriter| -> Result<()> {
+    let pace = |_: &PagedWriter| -> Result<()> {
         if stop.load(Ordering::Relaxed) {
             bail!(COMPACTION_STOPPED);
-        }
-        if rate == 0 || w.pos() < paced + (1 << 20) {
-            return Ok(());
-        }
-        paced = w.pos();
-        let due = Duration::from_secs_f64(paced as f64 / rate as f64);
-        if let Some(d) = due.checked_sub(t0.elapsed()) {
-            std::thread::sleep(d);
         }
         Ok(())
     };
@@ -942,7 +1059,7 @@ fn write_compacted(
                 }
                 let v = store
                     .engine
-                    .read(|cx| side.list(cx, local)?.map_or(Ok(Vec::new()), |l| l.to_vec(cx)))
+                    .read_past(|cx| side.list(cx, local)?.map_or(Ok(Vec::new()), |l| l.to_vec(cx)))
                     .map_err(|e| anyhow::Error::new(e).context("compaction read"))?;
                 if v.is_empty() {
                     continue;
@@ -962,7 +1079,7 @@ fn write_compacted(
                 }
                 let v = store
                     .engine
-                    .read(|cx| side.set(cx, local)?.map_or(Ok(Vec::new()), |l| l.to_vec(cx)))
+                    .read_past(|cx| side.set(cx, local)?.map_or(Ok(Vec::new()), |l| l.to_vec(cx)))
                     .map_err(|e| anyhow::Error::new(e).context("compaction read"))?;
                 if v.is_empty() {
                     continue;

@@ -110,13 +110,13 @@ console's Settings page shows each one's value and where it came from.
 | `--tombstone-days` | `MARCO_TOMBSTONE_DAYS` | 7 | Checkpoints drop tombstones older than this. |
 | `--compaction-ratio` | `MARCO_COMPACTION_RATIO` | 1.43 | Compact a shard once its files are this many times what its index still names. 0: only when a space nears its cap. |
 | `--compaction-min-garbage-mb` | `MARCO_COMPACTION_MIN_GARBAGE_MB` | 64 | …and it holds at least this much garbage. |
-| `--compaction-rate-mb` | `MARCO_COMPACTION_RATE_MB` | 200 | MB a second a compaction writes at most. 0: unpaced. |
+| `--background-io` | `MARCO_BACKGROUND_IO` | `200,5000` | The pace of background I/O, MB a second then operations a second (0: unpaced): compactions, checkpoint writes, verify and list stats. Requests go first. |
 | `--merge-ratio` | `MARCO_MERGE_RATIO` | 0.125 | With `--compact-min`, a list's delta merges past this share of its base. |
 | `--compact-min` | `MARCO_COMPACT_MIN` | 0 | Merge a list's delta inside the write past this many entries. 0 leaves it to checkpoints. |
 | `--no-prefault` | `MARCO_NO_PREFAULT` | off | Don't map the snapshot's pages in after open. With `--storage engine`, don't load every page at open when `--memory` holds them all. |
 | `--mmap-advice` | `MARCO_MMAP_ADVICE` | `default` | With `--storage mmap`, `random` maps the snapshot with MADV_RANDOM: a fault reads its own page, with no readahead around it. |
 | `--storage` | `MARCO_STORAGE` | `mmap` | How the snapshot is read: `mmap` (the kernel's page cache) or `engine` (`O_DIRECT` into marco's own cache of `--memory` bytes, every page checked against its sum). |
-| `--memory` | `MARCO_MEMORY` | | With `--storage engine`, required: the store's budget (`13GiB`, `6G`), its pinned sections, page cache and tables. It must hold the pinned sections plus 2 GiB, or marco won't start. The graph's deltas and the process live outside it. |
+| `--memory` | `MARCO_MEMORY` | | With `--storage engine`, required: the store's budget (`13GiB`, `6G`), its pinned sections, page cache and tables. It must hold the pinned sections, the shards' index and heads a second time (a checkpoint reads them again beside the old until its switch), and 2 GiB more, or marco won't start. The graph's deltas and the process live outside it. |
 | `--miss-threads` | `MARCO_MISS_THREADS` | 64 | With `--storage engine`, the threads a request that misses the cache moves to. A request that waits over a second for one gets `resource_exhausted`. |
 | `--trace-ratio` | `MARCO_TRACE_RATIO` | 0 | The share of ops that get a span, 0 to 1. |
 | `--otlp URL` | `MARCO_OTLP` | | An OTLP/HTTP collector's base URL for spans. |

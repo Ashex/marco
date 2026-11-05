@@ -301,13 +301,17 @@ async fn compactions_swap_shards_in_under_writes() {
     let mut c = cfg(&snap);
     c.segment_interval = Duration::from_millis(20);
     c.checkpoint_ops = 150;
-    c.compaction = marco_core::CompactPolicy { ratio: 1.0, min_garbage: 0, rate: 0 };
+    c.compaction = marco_core::CompactPolicy { ratio: 1.0, min_garbage: 0 };
     let app = App::open(c).unwrap();
     feed(&app, &s, 0, s.len()).await;
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     while app.job().running || app.durability.lock().unwrap().compactions == 0 {
         assert!(std::time::Instant::now() < deadline, "no compaction");
         tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    if app.durability.lock().unwrap().checkpoint < 2 {
+        // the writes can all land before a second checkpoint comes due
+        app.checkpoint().await.unwrap();
     }
     assert_eq!(dump(&app.graph()), want, "a compacted shard reads as its base and patches did");
     let d = app.durability.lock().unwrap().clone();

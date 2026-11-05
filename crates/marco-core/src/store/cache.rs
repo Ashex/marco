@@ -401,6 +401,10 @@ struct Group {
     /// the free list (or, draining, back from the epoch).
     busy: u32,
     cap: u32,
+    /// Frames of the group holding written-through pages not yet published
+    /// ([`Cache::alloc_staged`]): a drain can't take them back, so a borrow
+    /// leaves the group alone.
+    staged: u32,
     /// A draining group's frames back from use, for an aborted drain.
     drained: Vec<u32>,
 }
@@ -436,6 +440,14 @@ impl Policy {
     /// What's spoken for once every borrow in progress completes.
     fn claimed(&self) -> u64 {
         self.used() + self.pending - (self.draining * GROUP) as u64
+    }
+
+    /// The most that's spoken for between now and every borrow in progress
+    /// completing: a draining group holds its memory until it's released, and
+    /// a borrow that takes less than its groups mustn't let anyone spend the
+    /// rest before then.
+    fn held(&self) -> u64 {
+        self.used().max(self.claimed())
     }
 
     fn small_target(&self) -> usize {
@@ -532,7 +544,7 @@ impl Cache {
             .map(|_| {
                 let cap = left.min(GROUP_FRAMES);
                 left -= cap;
-                Group { state: GState::Off, busy: 0, cap, drained: Vec::new() }
+                Group { state: GState::Off, busy: 0, cap, staged: 0, drained: Vec::new() }
             })
             .collect();
         let total = total as usize;
@@ -593,6 +605,16 @@ impl Cache {
         // SAFETY: the frame stays allocated for the caller's guard (see above),
         // and it was written before its slot was published (Release/Acquire).
         unsafe { &*(self.arena.frame(f) as *const Page) }
+    }
+
+    /// Which queue frame `f` is in, for a lookup's hit counts.
+    #[inline]
+    pub fn found(&self, f: u32) -> crate::read::Found {
+        match self.frames[f as usize].queue.load(Relaxed) {
+            Q_SMALL => crate::read::Found::Small,
+            Q_MAIN => crate::read::Found::Main,
+            _ => crate::read::Found::Other,
+        }
     }
 
     pub(crate) fn frame_ptr(&self, f: u32) -> *mut u8 {
@@ -712,7 +734,7 @@ impl Cache {
 
     /// Commits the next group if the budget has room.
     fn commit(&self, p: &mut Policy) -> bool {
-        if p.claimed() + GROUP as u64 > self.limit {
+        if p.held() + GROUP as u64 > self.limit {
             return false;
         }
         let Some(g) = p.groups.iter().position(|g| g.state == GState::Off && g.cap > 0) else {
@@ -836,6 +858,34 @@ impl Cache {
     /// After waiting [`STALL`] it calls `stall` once (the caller gives up its
     /// own pins, so waiting readers can't deadlock on each other's).
     pub fn alloc(&self, table: &FileTable, want: usize, stall: &mut dyn FnMut()) -> Vec<u32> {
+        self.alloc_until(table, want, stall, None, false)
+    }
+
+    /// Up to `want` frames for pages only their holder reads: a writer's
+    /// ([`crate::store::engine::Stage`]) or a read past the cache's. As
+    /// [`Cache::alloc`], but gives up (returning none) at `until` rather than
+    /// wait on readers, and marks the frames staged until [`Cache::unstage`],
+    /// so no borrow waits on them.
+    pub fn alloc_staged(&self, table: &FileTable, want: usize, until: Instant) -> Vec<u32> {
+        self.alloc_until(table, want, &mut || {}, Some(until), true)
+    }
+
+    /// Frames from [`Cache::alloc_staged`] that are published or freed now.
+    pub fn unstage(&self, frames: &[u32]) {
+        let mut p = self.policy.lock().unwrap();
+        for &f in frames {
+            p.groups[(f / GROUP_FRAMES) as usize].staged -= 1;
+        }
+    }
+
+    fn alloc_until(
+        &self,
+        table: &FileTable,
+        want: usize,
+        stall: &mut dyn FnMut(),
+        until: Option<Instant>,
+        staged: bool,
+    ) -> Vec<u32> {
         let start = Instant::now();
         let mut waited = false;
         let mut stalled = false;
@@ -851,6 +901,12 @@ impl Cache {
                         Some(f) => out.push(f),
                         None if self.commit(&mut p) => {}
                         None => break,
+                    }
+                }
+                if staged {
+                    // in the same hold of the lock, so no borrow picks these groups to drain
+                    for &f in &out {
+                        p.groups[(f / GROUP_FRAMES) as usize].staged += 1;
                     }
                 }
                 let reserve = p.reserve();
@@ -869,7 +925,7 @@ impl Cache {
                 out
             };
             self.retire(&guard, retire);
-            if !got.is_empty() {
+            if !got.is_empty() || until.is_some_and(|u| Instant::now() >= u) {
                 return got;
             }
             guard.flush();
@@ -970,11 +1026,21 @@ impl Cache {
     /// if even an empty cache couldn't make the room.
     pub fn borrow(&self, table: &FileTable, bytes: u64, timeout: Duration) -> Result<(), String> {
         let mut draining: Vec<usize> = Vec::new();
-        {
+        let start = Instant::now();
+        loop {
             let mut p = self.policy.lock().unwrap();
-            if p.claimed() + bytes <= self.limit {
+            if p.held() + bytes <= self.limit {
                 p.borrowed += bytes;
                 return Ok(());
+            }
+            if p.claimed() + bytes <= self.limit {
+                // the room comes once other borrows' drains release their groups
+                if start.elapsed() > timeout {
+                    return Err(format!("other borrows' drains didn't make room for {bytes} bytes in {timeout:?}"));
+                }
+                drop(p);
+                self.wait_reclaim();
+                continue;
             }
             // the cache keeps at least one group of the budget
             let left =
@@ -994,6 +1060,19 @@ impl Cache {
             if need > on.len() {
                 return refuse();
             }
+            on.retain(|&g| p.groups[g].staged == 0);
+            if need > on.len() {
+                // staged frames go back when their stage publishes or their read
+                // ends: wait for groups to clear rather than refuse
+                if start.elapsed() > timeout {
+                    return Err(format!(
+                        "couldn't find {need} groups free of staged frames for {bytes} bytes in {timeout:?}"
+                    ));
+                }
+                drop(p);
+                self.wait_reclaim();
+                continue;
+            }
             on.sort_by_key(|&g| p.groups[g].busy);
             draining.extend_from_slice(&on[..need]);
             for &g in &draining {
@@ -1012,6 +1091,7 @@ impl Cache {
                 }
             }
             p.free = keep;
+            break;
         }
         let start = Instant::now();
         loop {

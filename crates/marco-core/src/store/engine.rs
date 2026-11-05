@@ -20,7 +20,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use rustc_hash::FxHashMap;
 
-use crate::read::{BadPage, Guard, Hold, Misses, PageSet, ReadCx, ReadStats, StorageError, R};
+use crate::read::{BadPage, Found, Guard, Hold, LookupCounts, Misses, PageSet, ReadCx, ReadStats, StorageError, R};
 use crate::snapshot::{sums_section, Bytes, PagedFooter, SectionKind, TRAILER};
 use crate::store::cache::{Cache, CacheBytes, Entry, FileTable, GROUP, NO_FRAME};
 use crate::store::io::{
@@ -89,7 +89,8 @@ struct PagedRange {
     end: u32,
     tag: u64,
     section: usize,
-    sums: usize,
+    /// Its sums: the buffer and byte offset in [`FileState::sums`].
+    sums: (usize, usize),
 }
 
 pub(crate) struct FileState {
@@ -98,16 +99,12 @@ pub(crate) struct FileState {
     footer: PagedFooter,
     pages: u32,
     paged: Vec<PagedRange>,
-    pinned: Vec<PinnedAt>,
-    bufs: Vec<AlignedBuf>,
+    /// The `.sums` sections, the only pinned ones a file keeps for as long
+    /// as it's registered; the rest are [`PinnedSections`].
+    sums: Vec<AlignedBuf>,
 }
 
 impl FileState {
-    fn pinned(&self, name: &str) -> Option<&[u8]> {
-        let p = self.pinned.iter().find(|p| p.name == name)?;
-        Some(&self.bufs[p.buf][p.off..p.off + p.len])
-    }
-
     fn range(&self, page: u32) -> Option<&PagedRange> {
         let i = self.paged.partition_point(|r| r.start <= page).checked_sub(1)?;
         let r = &self.paged[i];
@@ -117,9 +114,8 @@ impl FileState {
     /// Page `page`'s seed and expected sum, if it's in a paged section.
     fn sum(&self, page: u32) -> Option<(u64, u32)> {
         let r = self.range(page)?;
-        let p = &self.pinned[r.sums];
-        let at = p.off + 4 * (page - r.start) as usize;
-        let sum = u32::from_le_bytes(self.bufs[p.buf][at..at + 4].try_into().expect("4 bytes"));
+        let at = r.sums.1 + 4 * (page - r.start) as usize;
+        let sum = u32::from_le_bytes(self.sums[r.sums.0][at..at + 4].try_into().expect("4 bytes"));
         Some((self.footer.salt ^ r.tag ^ page as u64, sum))
     }
 
@@ -132,16 +128,18 @@ impl FileState {
     }
 }
 
-/// A FORMAT 6 file registered with an engine. Its pinned sections stay in
-/// memory, counted in the budget, until the last handle drops; then its
+/// A FORMAT 6 file registered with an engine. Its page sums and slots stay
+/// in memory, counted in the budget, until the last handle drops; then its
 /// cached pages are freed (a pinned one at its last unpin) and its id is
-/// never used again.
+/// never used again. Its other pinned sections are read separately
+/// ([`Engine::pinned`]), only for as long as something reads them.
 pub struct PagedFile {
     inner: Arc<Inner>,
     id: FileId,
     key: PathBuf,
     state: Arc<FileState>,
     borrowed: u64,
+    pinned: Mutex<Weak<PinnedSections>>,
 }
 
 impl PagedFile {
@@ -156,23 +154,6 @@ impl PagedFile {
 
     pub fn footer(&self) -> &PagedFooter {
         &self.state.footer
-    }
-
-    /// A pinned section's bytes.
-    pub fn pinned(&self, name: &str) -> Option<&[u8]> {
-        self.state.pinned(name)
-    }
-
-    /// Where pinned section `name` is: the buffer it was read into
-    /// ([`PagedFile::pinned_buf`]) and its bytes there. Sections with no
-    /// paged section between them share a buffer, in file order.
-    pub fn pinned_at(&self, name: &str) -> Option<(usize, std::ops::Range<usize>)> {
-        let p = self.state.pinned.iter().find(|p| p.name == name)?;
-        Some((p.buf, p.off..p.off + p.len))
-    }
-
-    pub fn pinned_buf(&self, i: usize) -> &[u8] {
-        &self.state.bufs[i]
     }
 
     /// Paged sections' pages: what loading the file whole takes.
@@ -194,10 +175,65 @@ impl PagedFile {
         self.state.pages
     }
 
-    /// Bytes this file holds against the budget: its pinned sections and its
+    /// Bytes this file holds against the budget: its page sums and its
     /// slots.
     pub fn borrowed(&self) -> u64 {
         self.borrowed
+    }
+
+    /// Whether its pinned sections are in memory now.
+    pub fn has_pinned(&self) -> bool {
+        self.pinned.lock().unwrap().strong_count() > 0
+    }
+}
+
+/// A file's pinned sections other than its page sums: what a shard's newest
+/// file and the directory are read through. Counted in the budget until the
+/// last handle drops, so an older patch's index and heads go once no store
+/// reads it as its shard's newest.
+pub struct PinnedSections {
+    at: Vec<PinnedAt>,
+    bufs: Vec<AlignedBuf>,
+    cache: Option<Arc<Cache>>,
+    borrowed: u64,
+}
+
+impl PinnedSections {
+    /// A section's bytes.
+    pub fn get(&self, name: &str) -> Option<&[u8]> {
+        let p = self.at.iter().find(|p| p.name == name)?;
+        Some(&self.bufs[p.buf][p.off..p.off + p.len])
+    }
+
+    /// Where section `name` is: the buffer it was read into
+    /// ([`PinnedSections::buf`]) and its bytes there. Sections with nothing
+    /// else between them share a buffer, in file order.
+    pub fn at(&self, name: &str) -> Option<(usize, std::ops::Range<usize>)> {
+        let p = self.at.iter().find(|p| p.name == name)?;
+        Some((p.buf, p.off..p.off + p.len))
+    }
+
+    pub fn buf(&self, i: usize) -> &[u8] {
+        &self.bufs[i]
+    }
+
+    /// Bytes they hold against the budget.
+    pub fn borrowed(&self) -> u64 {
+        self.borrowed
+    }
+}
+
+impl Drop for PinnedSections {
+    fn drop(&mut self) {
+        if let Some(c) = &self.cache {
+            c.unborrow(self.borrowed);
+        }
+    }
+}
+
+impl std::fmt::Debug for PinnedSections {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PinnedSections").field("sections", &self.at.len()).field("bytes", &self.borrowed).finish()
     }
 }
 
@@ -299,6 +335,95 @@ impl Drop for Borrow {
     }
 }
 
+/// How long a read past the cache waits for frames of its own before it
+/// reads through the cache instead.
+const PAST_WAIT: Duration = Duration::from_millis(50);
+
+/// Frames staged in a [`Stage`] at a time before it allocates more.
+const STAGE_CHUNK: usize = 64;
+
+/// How long a [`Stage`] waits for frames before it lets a page go.
+const STAGE_WAIT: Duration = Duration::from_millis(2);
+
+/// Pages a writer puts into the cache as it writes them (write-through): a
+/// checkpoint's patches and new bases, a compaction's base. Each page is
+/// copied into a frame of the budget that nobody can read until
+/// [`Engine::publish`] makes it its file's page, once the file is written
+/// and registered. A stage holds at most a quarter of the cache's frames,
+/// and gives up a page rather than wait more than a moment for a frame, so
+/// it never holds readers up; a page it lets go is read from disk on its
+/// first miss like any other. Dropping it unpublished frees its frames.
+pub struct Stage {
+    inner: Arc<Inner>,
+    cap: usize,
+    /// (page of the file, frame)
+    pages: Vec<(u32, u32)>,
+    spare: Vec<u32>,
+    skipped: u64,
+    /// No frame came: the rest of the file isn't staged.
+    gave_up: bool,
+    /// Budget borrowed when the stage began for its file's registration
+    /// (sums and slots), since a borrow can't take back the groups its own
+    /// frames sit in ([`Engine::register_staged`]).
+    prepaid: u64,
+}
+
+impl Stage {
+    /// Copies page `page` of the file being written into a frame, if one
+    /// comes within a moment.
+    pub fn put(&mut self, page: u32, bytes: &Page) {
+        let cache = self.inner.cache.as_ref().expect("a stage has a cache");
+        if self.gave_up || self.pages.len() >= self.cap {
+            self.skipped += 1;
+            return;
+        }
+        if self.spare.is_empty() {
+            let want = STAGE_CHUNK.min(self.cap - self.pages.len());
+            self.spare = cache.alloc_staged(&self.inner.table, want, std::time::Instant::now() + STAGE_WAIT);
+        }
+        let Some(f) = self.spare.pop() else {
+            // frames are short: waiting for each page would slow the write down
+            self.gave_up = true;
+            self.skipped += 1;
+            return;
+        };
+        // SAFETY: an allocated, unpublished frame is this stage's alone.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), cache.frame_ptr(f), PAGE) };
+        self.pages.push((page, f));
+    }
+
+    /// Pages staged so far.
+    pub fn len(&self) -> usize {
+        self.pages.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pages.is_empty()
+    }
+}
+
+impl Drop for Stage {
+    fn drop(&mut self) {
+        let Some(cache) = &self.inner.cache else { return };
+        // pages never published (the file wasn't registered) were let go too
+        let skipped = self.skipped + self.pages.len() as u64;
+        let mut frames: Vec<u32> = self.pages.drain(..).map(|x| x.1).collect();
+        frames.append(&mut self.spare);
+        cache.unstage(&frames);
+        cache.free_unpublished(&frames);
+        cache.unborrow(self.prepaid);
+        if skipped > 0 {
+            self.inner.counters.write_through_skipped.fetch_add(skipped, Relaxed);
+        }
+    }
+}
+
+impl std::fmt::Debug for Stage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Stage").field("pages", &self.pages.len()).field("skipped", &self.skipped).finish()
+    }
+}
+
 /// One read in progress: every other reader that misses the page waits on it
 /// instead of reading it again.
 struct Flight {
@@ -334,6 +459,7 @@ struct Stripe {
     passes: AtomicU64,
     pages: AtomicU64,
     misses: AtomicU64,
+    by: [[AtomicU64; 4]; 7],
 }
 
 #[derive(Default)]
@@ -345,6 +471,9 @@ struct Counters {
     eio: AtomicU64,
     short: AtomicU64,
     stalled: AtomicU64,
+    written_through: AtomicU64,
+    write_through_skipped: AtomicU64,
+    past_pages: AtomicU64,
 }
 
 fn stripe() -> usize {
@@ -394,6 +523,15 @@ pub struct EngineStats {
     pub stalled_requests: u64,
     /// Nanoseconds the I/O threads spent in reads.
     pub io_nanos: u64,
+    /// Pages a writer put into the cache as it wrote them ([`Stage`]), and
+    /// pages it couldn't (no frame within its wait, or past its cap).
+    pub written_through: u64,
+    pub write_through_skipped: u64,
+    /// Pages read past the cache into a job's own memory ([`Hold::past`]).
+    pub past_pages: u64,
+    /// Lookups by structure and how they came out, `[structure][found]`
+    /// ([`Structure`], [`Found`]).
+    pub lookups: [[u64; 4]; 7],
 }
 
 struct Inner {
@@ -401,6 +539,9 @@ struct Inner {
     next_id: AtomicU32,
     cache: Option<Arc<Cache>>,
     io: Option<IoPool>,
+    /// Paces background I/O: the I/O pool's background lane, and writes
+    /// that ask ([`Engine::background`]).
+    bucket: Arc<TokenBucket>,
     device: Option<Arc<dyn Device>>,
     borrow_timeout: Duration,
     by_path: Mutex<HashMap<PathBuf, Weak<PagedFile>>>,
@@ -430,7 +571,12 @@ enum Class {
 impl Engine {
     /// An engine that keeps whole files in memory and has no page cache.
     pub fn new() -> Engine {
-        Engine::build(None, None, None, Duration::ZERO)
+        Engine::paced(Rate::default())
+    }
+
+    /// [`Engine::new`] with background writes paced at `background`.
+    pub fn paced(background: Rate) -> Engine {
+        Engine::build(None, None, None, Duration::ZERO, Arc::new(TokenBucket::new(background)))
     }
 
     /// An engine with a page cache of `cfg.memory` bytes. Fails if that
@@ -444,17 +590,25 @@ impl Engine {
                 GROUP + GROUP / PAGE * crate::store::cache::FRAME_META
             );
         }
-        let io = IoPool::new(cfg.io_threads, cfg.queue, TokenBucket::new(cfg.background));
-        Ok(Engine::build(Some(Arc::new(cache)), Some(io), Some(cfg.device), cfg.borrow_timeout))
+        let bucket = Arc::new(TokenBucket::new(cfg.background));
+        let io = IoPool::new(cfg.io_threads, cfg.queue, bucket.clone());
+        Ok(Engine::build(Some(Arc::new(cache)), Some(io), Some(cfg.device), cfg.borrow_timeout, bucket))
     }
 
-    fn build(cache: Option<Arc<Cache>>, io: Option<IoPool>, device: Option<Arc<dyn Device>>, t: Duration) -> Engine {
+    fn build(
+        cache: Option<Arc<Cache>>,
+        io: Option<IoPool>,
+        device: Option<Arc<dyn Device>>,
+        t: Duration,
+        bucket: Arc<TokenBucket>,
+    ) -> Engine {
         Engine {
             inner: Arc::new(Inner {
                 table: FileTable::new(),
                 next_id: AtomicU32::new(0),
                 cache,
                 io,
+                bucket,
                 device,
                 borrow_timeout: t,
                 by_path: Mutex::new(HashMap::new()),
@@ -501,6 +655,10 @@ impl Engine {
         Resident { inner: self.inner.clone(), id, map: Some(map) }
     }
 
+    pub(crate) fn cache(&self) -> Option<&Arc<Cache>> {
+        self.inner.cache.as_ref()
+    }
+
     /// Whether files are read a page at a time through a cache
     /// ([`Engine::register`]) rather than kept whole.
     pub fn paged(&self) -> bool {
@@ -521,9 +679,15 @@ impl Engine {
     /// Opens the FORMAT 6 file at `path` through the engine's device, or
     /// returns the handle already open for it: a snapshot and the checkpoint
     /// replaying it share files, pinned sections and cached pages. Reads the
-    /// footer and every pinned section, checks their sums, and takes their
-    /// bytes and the file's slots from the budget.
+    /// footer and the page sums, checks them, and takes their bytes and the
+    /// file's slots from the budget. The other pinned sections are
+    /// [`Engine::pinned`]'s.
     pub fn register(&self, path: &Path) -> Result<Arc<PagedFile>> {
+        self.register_with(path, &mut 0)
+    }
+
+    /// [`Engine::register`], taking what it borrows from `prepaid` first.
+    fn register_with(&self, path: &Path, prepaid: &mut u64) -> Result<Arc<PagedFile>> {
         let (Some(cache), Some(io), Some(dev)) = (&self.inner.cache, &self.inner.io, &self.inner.device) else {
             bail!("this engine keeps whole files in memory: it has no page cache");
         };
@@ -535,11 +699,12 @@ impl Engine {
         let at = |e: String| format!("{}: {e}", path.display());
         let file = dev.open(path).with_context(|| format!("open {}", path.display()))?;
         let len = file.len();
-        let last = read_pages(io, &file, len / PAGE as u64 - u64::from(len >= PAGE as u64), 1).map_err(at);
+        let last =
+            read_pages(io, &file, len / PAGE as u64 - u64::from(len >= PAGE as u64), 1, Lane::Request).map_err(at);
         let last = last.map_err(anyhow::Error::msg)?;
         let r = PagedFooter::footer_range(len, &last[PAGE - TRAILER..]).with_context(|| path.display().to_string())?;
         let first = r.start / PAGE as u64;
-        let fp = read_pages(io, &file, first, (r.end.div_ceil(PAGE as u64) - first) as usize)
+        let fp = read_pages(io, &file, first, (r.end.div_ceil(PAGE as u64) - first) as usize, Lane::Request)
             .map_err(at)
             .map_err(anyhow::Error::msg)?;
         let lo = (r.start - first * PAGE as u64) as usize;
@@ -547,59 +712,27 @@ impl Engine {
             .with_context(|| path.display().to_string())?;
         drop(fp);
 
-        // Pinned sections in runs between paged ones, a buffer each.
-        let mut runs: Vec<(u64, u64, Vec<usize>)> = Vec::new();
-        let mut gap = true;
-        for (i, s) in footer.sections.iter().enumerate() {
-            if s.is_paged() {
-                gap = true;
-                continue;
-            }
-            match runs.last_mut() {
-                Some(r) if !gap => {
-                    r.1 = s.off + s.len();
-                    r.2.push(i);
-                }
-                _ => runs.push((s.off, s.off + s.len(), vec![i])),
-            }
-            gap = false;
-        }
         let pages = (len / PAGE as u64) as u32;
-        let page_span = |(a, b): (u64, u64)| (a / PAGE as u64, b.div_ceil(PAGE as u64).max(a / PAGE as u64 + 1));
-        let pinned_bytes: u64 =
-            runs.iter().map(|r| (page_span((r.0, r.1)).1 - page_span((r.0, r.1)).0) * PAGE as u64).sum();
-        let borrowed = pinned_bytes + 4 * pages as u64;
-        cache.borrow(&self.inner.table, borrowed, self.inner.borrow_timeout).map_err(|e| anyhow::anyhow!(at(e)))?;
-        let undo = scopeguard(|| cache.unborrow(borrowed));
-        let mut bufs = Vec::with_capacity(runs.len());
-        let mut pinned = Vec::new();
-        for (a, b, secs) in &runs {
-            let (p0, p1) = page_span((*a, *b));
-            let buf = read_pages(io, &file, p0, (p1 - p0) as usize).map_err(at).map_err(anyhow::Error::msg)?;
-            for &i in secs {
-                let s = &footer.sections[i];
-                let off = (s.off - p0 * PAGE as u64) as usize;
-                let len = s.len() as usize;
-                if let SectionKind::Pinned { xxh3, .. } = s.kind {
-                    let h = xxhash_rust::xxh3::xxh3_64(&buf[off..off + len]);
-                    if h != xxh3 {
-                        bail!("{}: section {} checksum {h:016x}, footer says {xxh3:016x}", path.display(), s.name);
-                    }
-                }
-                pinned.push(PinnedAt { name: s.name.clone(), buf: bufs.len(), off, len });
-            }
-            bufs.push(buf);
+        let sums = Pinned::plan(&footer, true);
+        let borrowed = sums.bytes() + 4 * pages as u64;
+        let paid = borrowed.min(*prepaid);
+        *prepaid -= paid;
+        if let Err(e) = cache.borrow(&self.inner.table, borrowed - paid, self.inner.borrow_timeout) {
+            cache.unborrow(paid);
+            bail!(at(e));
         }
+        let undo = scopeguard(|| cache.unborrow(borrowed));
+        let (bufs, at_) = sums.read(io, &file, &footer, Lane::Request).with_context(|| path.display().to_string())?;
         let mut paged = Vec::new();
         for (i, s) in footer.sections.iter().enumerate() {
             if let SectionKind::Paged { pages, .. } = s.kind {
-                let sums = pinned.iter().position(|p| p.name == sums_section(&s.name)).context("no sums")?;
+                let p = at_.iter().find(|p| p.name == sums_section(&s.name)).context("no sums")?;
                 let start = s.first_page();
-                paged.push(PagedRange { start, end: start + pages, tag: s.tag(), section: i, sums });
+                paged.push(PagedRange { start, end: start + pages, tag: s.tag(), section: i, sums: (p.buf, p.off) });
             }
         }
         undo.disarm();
-        let state = Arc::new(FileState { name: name.clone(), dev: file, footer, pages, paged, pinned, bufs });
+        let state = Arc::new(FileState { name: name.clone(), dev: file, footer, pages, paged, sums: bufs });
         let id = self.next_id();
         let slots = (0..pages).map(|_| AtomicU32::new(NO_FRAME)).collect();
         self.inner.table.insert(
@@ -607,7 +740,14 @@ impl Engine {
             &name,
             Entry { dropped: Default::default(), slots, data: EntryData::Paged(state.clone()) },
         );
-        let f = Arc::new(PagedFile { inner: self.inner.clone(), id, key: key.clone(), state, borrowed });
+        let f = Arc::new(PagedFile {
+            inner: self.inner.clone(),
+            id,
+            key: key.clone(),
+            state,
+            borrowed,
+            pinned: Mutex::new(Weak::new()),
+        });
         // Opened without the lock held, so two registrations can race: the
         // first one in wins, and the loser's handle drops, freeing its id.
         let mut by_path = self.inner.by_path.lock().unwrap();
@@ -617,6 +757,112 @@ impl Engine {
         }
         by_path.insert(key, Arc::downgrade(&f));
         Ok(f)
+    }
+
+    /// `f`'s pinned sections other than its page sums, read and checked
+    /// against the footer the first time they're asked for, and kept until
+    /// the last handle drops. Their bytes come from the budget, giving back
+    /// groups of frames first if it's full. Never call it holding pins.
+    pub fn pinned(&self, f: &PagedFile) -> Result<Arc<PinnedSections>> {
+        let (Some(cache), Some(io)) = (&self.inner.cache, &self.inner.io) else {
+            bail!("this engine keeps whole files in memory: it has no page cache");
+        };
+        let mut slot = f.pinned.lock().unwrap();
+        if let Some(p) = slot.upgrade() {
+            return Ok(p);
+        }
+        let st = &f.state;
+        let plan = Pinned::plan(&st.footer, false);
+        let bytes = plan.bytes();
+        cache
+            .borrow(&self.inner.table, bytes, self.inner.borrow_timeout)
+            .map_err(|e| anyhow::anyhow!("{}: {e}", st.name))?;
+        let undo = scopeguard(|| cache.unborrow(bytes));
+        let (bufs, at) = plan.read(io, &st.dev, &st.footer, Lane::Request).with_context(|| st.name.clone())?;
+        undo.disarm();
+        let p = Arc::new(PinnedSections { at, bufs, cache: Some(cache.clone()), borrowed: bytes });
+        *slot = Arc::downgrade(&p);
+        Ok(p)
+    }
+
+    /// A stage for writing a file through into the cache ([`Stage`]), or
+    /// None for an engine that keeps whole files.
+    /// `share`: stages that run at once, which split a quarter of the cache.
+    pub fn stage(&self, share: usize) -> Option<Stage> {
+        let cache = self.inner.cache.as_ref()?;
+        let cap = cache.room() / 4 / share.max(1);
+        if cap == 0 {
+            return None;
+        }
+        // sums and slots, 8 B a page, plus a page of rounding for each sums run
+        let prepaid = 8 * cap as u64 + 32 * PAGE as u64;
+        cache.borrow(&self.inner.table, prepaid, self.inner.borrow_timeout).ok()?;
+        Some(Stage {
+            inner: self.inner.clone(),
+            cap,
+            pages: Vec::new(),
+            spare: Vec::new(),
+            skipped: 0,
+            gave_up: false,
+            prepaid,
+        })
+    }
+
+    /// [`Engine::register`] for the file `stage` was written into, paying
+    /// for the registration from what the stage borrowed when it began, then
+    /// [`Engine::publish`]. Returns the pages published.
+    pub fn register_staged(&self, path: &Path, mut stage: Stage) -> Result<(Arc<PagedFile>, u64)> {
+        let f = self.register_with(path, &mut stage.prepaid)?;
+        let n = self.publish(stage, &f);
+        Ok((f, n))
+    }
+
+    /// Makes the pages `stage` holds the cached pages of `file`, the file
+    /// they were written into, in the small queue as a fetched page would
+    /// be. A page that doesn't match its sum (it can't, unless the writer
+    /// staged the wrong page) or that `file` already has is dropped. Returns
+    /// the pages published.
+    pub fn publish(&self, mut stage: Stage, file: &PagedFile) -> u64 {
+        let Some(cache) = &self.inner.cache else { return 0 };
+        let pages = std::mem::take(&mut stage.pages);
+        let st = &file.state;
+        let guard = self.pin();
+        let Some(e) = self.inner.table.get(file.id, &guard) else {
+            stage.pages = pages;
+            return 0;
+        };
+        let mut ok = Vec::with_capacity(pages.len());
+        let mut drop_ = Vec::new();
+        for &(page, f) in &pages {
+            let good = st.sum(page).is_some_and(|(seed, want)| {
+                // SAFETY: the frame is still the stage's alone.
+                page_sum(unsafe { cache.page(f) }, seed) == want
+            });
+            debug_assert!(good || st.sum(page).is_none(), "staged page {page} of {} doesn't match its sum", st.name);
+            if good && e.slots[page as usize].load(Acquire) == NO_FRAME {
+                cache.own(f, PageId::new(file.id, page));
+                ok.push((page, f));
+            } else {
+                drop_.push(f);
+            }
+        }
+        let frames: Vec<u32> = ok.iter().map(|x| x.1).collect();
+        cache.unstage(&frames);
+        cache.unstage(&drop_);
+        cache.free_unpublished(&drop_);
+        cache.admit(&frames, 0, false);
+        for &(page, f) in &ok {
+            let slot = &e.slots[page as usize];
+            if slot.compare_exchange(NO_FRAME, f, SeqCst, Relaxed).is_err() {
+                cache.drop_frame(f);
+            } else if e.dropped.load(SeqCst) {
+                let _ = slot.compare_exchange(f, NO_FRAME, SeqCst, Relaxed);
+                cache.drop_frame(f);
+            }
+            cache.unpin(f, &guard);
+        }
+        self.inner.counters.written_through.fetch_add(ok.len() as u64, Relaxed);
+        ok.len() as u64
     }
 
     /// Takes `bytes` of the budget for memory outside the cache, giving back
@@ -630,7 +876,7 @@ impl Engine {
     /// Page `p`, if it's in memory, valid while `guard` is. `bump` counts it
     /// as a use for the eviction policy.
     #[inline]
-    pub(crate) fn lookup<'g>(&'g self, p: PageId, guard: &'g Guard, bump: bool) -> Option<&'g Page> {
+    pub(crate) fn lookup<'g>(&'g self, p: PageId, guard: &'g Guard, bump: bool) -> Option<(&'g Page, Found)> {
         let e = self.inner.table.get(p.file, guard)?;
         match &e.data {
             EntryData::Paged(_) => {
@@ -644,20 +890,27 @@ impl Engine {
                 }
                 // SAFETY: f came from a slot loaded under `guard`, so its frame
                 // isn't reused before the guard is gone.
-                Some(unsafe { c.page(f) })
+                Some((unsafe { c.page(f) }, c.found(f)))
             }
             EntryData::Resident { bytes, .. } => {
                 let off = p.offset() as usize;
-                bytes.get(off..off + PAGE)?.try_into().ok()
+                Some((bytes.get(off..off + PAGE)?.try_into().ok()?, Found::Other))
             }
         }
     }
 
-    fn count(&self, st: ReadStats) {
+    fn count(&self, st: ReadStats, by: &LookupCounts) {
         let s = &self.inner.counters.stripes[stripe()];
         s.passes.fetch_add(1, Relaxed);
         s.pages.fetch_add(st.pages as u64, Relaxed);
         s.misses.fetch_add(st.misses as u64, Relaxed);
+        for (a, b) in s.by.iter().zip(by) {
+            for (x, &n) in a.iter().zip(b) {
+                if n > 0 {
+                    x.fetch_add(n as u64, Relaxed);
+                }
+            }
+        }
     }
 
     /// One pass of `f`. Never waits. Ok if `f` succeeded and nothing was
@@ -666,10 +919,9 @@ impl Engine {
     pub fn pass<T>(&self, hold: &mut Hold, f: impl FnOnce(&ReadCx<'_>) -> R<T>) -> Result<T, Misses> {
         let guard = self.pin();
         let (pages, touched) = {
-            let cx = ReadCx::with(self, &guard, hold.keep, &hold.pins);
+            let cx = ReadCx::with(self, &guard, hold.keep, &hold.pins, hold.private.as_deref());
             let r = f(&cx);
-            let st = cx.stats();
-            self.count(st);
+            self.count(cx.stats(), &cx.lookups());
             if cx.clean() {
                 if let Ok(t) = r {
                     return Ok(t);
@@ -776,7 +1028,135 @@ impl Engine {
         debug_assert!(!crate::read::on_async_thread(), "a blocking fetch on a tokio runtime thread");
         hold.rounds += 1;
         hold.fetched += m.pages().len() as u64;
+        if hold.private.is_some() {
+            return self.fetch_past(m.pages().iter().collect(), hold);
+        }
         self.fetch(m.pages().iter().collect(), hold, false)
+    }
+
+    /// Reads `todo` past the cache into `hold`'s own memory on the
+    /// background lane ([`Hold::past`]), checking each page as a fetch does.
+    fn fetch_past(&self, todo: Vec<PageId>, hold: &mut Hold) -> Result<(), StorageError> {
+        if todo.is_empty() {
+            return Err(StorageError::NoPage);
+        }
+        let (Some(cache), Some(io)) = (&self.inner.cache, &self.inner.io) else {
+            unreachable!("only paged files miss");
+        };
+        let mut need: Vec<(PageId, Arc<FileState>)> = Vec::new();
+        let mut err: Option<(PageId, StorageError)> = None;
+        {
+            let guard = self.pin();
+            let private = hold.private.as_deref().expect("a hold that reads past the cache");
+            for p in todo {
+                if private.has(p) {
+                    continue;
+                }
+                let Some(e) = self.inner.table.get(p.file, &guard) else { continue };
+                let EntryData::Paged(st) = &e.data else { continue };
+                if st.range(p.page).is_none() {
+                    err.get_or_insert((p, StorageError::Short(st.bad(p.page))));
+                    continue;
+                }
+                if let Some(e) = self.inner.bad.lock().unwrap().get(&p) {
+                    err.get_or_insert((p, e.clone()));
+                    continue;
+                }
+                need.push((p, st.clone()));
+            }
+        }
+        if let Some((_, e)) = err {
+            return Err(e);
+        }
+        if need.is_empty() {
+            return Ok(());
+        }
+        let held = hold.private.as_deref().map_or(0, |p| p.len());
+        if held + need.len() > hold.page_limit {
+            // past what a job may hold: through the cache, as any reader would
+            return self.fetch(need.into_iter().map(|x| x.0).collect(), hold, false);
+        }
+        let mut frames = Vec::with_capacity(need.len());
+        let until = std::time::Instant::now() + PAST_WAIT;
+        while frames.len() < need.len() {
+            let got = cache.alloc_staged(&self.inner.table, need.len() - frames.len(), until);
+            if got.is_empty() {
+                break;
+            }
+            frames.extend(got);
+        }
+        if frames.len() < need.len() {
+            // the cache is short of frames that aren't someone's alone: read
+            // these through it instead, as any reader would
+            cache.unstage(&frames);
+            cache.free_unpublished(&frames);
+            return self.fetch(need.into_iter().map(|x| x.0).collect(), hold, false);
+        }
+        let mut runs: Vec<Run> = Vec::new();
+        let mut at: Vec<(usize, usize)> = Vec::with_capacity(need.len());
+        for (i, (p, st)) in need.iter().enumerate() {
+            let extend = i > 0
+                && need[i - 1].0.file == p.file
+                && need[i - 1].0.page + 1 == p.page
+                && runs.last().is_some_and(|r| r.frames.len() < MAX_RUN);
+            if !extend {
+                runs.push(Run { file: st.dev.clone(), page: p.page, frames: Vec::new() });
+            }
+            let n = runs.len() - 1;
+            at.push((n, runs[n].frames.len()));
+            runs[n].frames.push(crate::store::io::FramePtr(cache.frame_ptr(frames[i])));
+        }
+        let out = io.run(runs, Lane::Background);
+        let private = hold.private.as_deref_mut().expect("a hold that reads past the cache");
+        let mut bad = Vec::new();
+        for (i, ((p, st), (r, k))) in need.iter().zip(at).enumerate() {
+            let (seed, want) = st.sum(p.page).expect("a paged page");
+            // SAFETY: the frame is this read's alone.
+            let page = unsafe { cache.page(frames[i]) };
+            let mut e = match out[r][k] {
+                PageRead::Eio => Some(StorageError::Eio(st.bad(p.page))),
+                PageRead::Short => Some(StorageError::Short(st.bad(p.page))),
+                _ if page_sum(page, seed) != want => Some(StorageError::Checksum(st.bad(p.page))),
+                _ => None,
+            };
+            if let Some(StorageError::Checksum(_)) = e {
+                // once more before it's called bad, as a fetch does
+                let again = Run {
+                    file: st.dev.clone(),
+                    page: p.page,
+                    frames: vec![crate::store::io::FramePtr(cache.frame_ptr(frames[i]))],
+                };
+                let ok = matches!(io.run(vec![again], Lane::Background)[0][0], PageRead::Ok | PageRead::Retried);
+                // SAFETY: as above.
+                if ok && page_sum(unsafe { cache.page(frames[i]) }, seed) == want {
+                    e = None;
+                }
+            }
+            match e {
+                None => private.add(*p, frames[i]),
+                Some(e) => {
+                    bad.push(frames[i]);
+                    let c = &self.inner.counters;
+                    match e {
+                        StorageError::Checksum(_) => &c.checksum,
+                        StorageError::Eio(_) => &c.eio,
+                        _ => &c.short,
+                    }
+                    .fetch_add(1, Relaxed);
+                    if self.inner.table.get(p.file, &self.pin()).is_some() {
+                        self.inner.bad.lock().unwrap().insert(*p, e.clone());
+                    }
+                    err.get_or_insert((*p, e));
+                }
+            }
+        }
+        cache.unstage(&bad);
+        cache.free_unpublished(&bad);
+        self.inner.counters.past_pages.fetch_add((need.len() - bad.len()) as u64, Relaxed);
+        match err {
+            Some((_, e)) => Err(e),
+            None => Ok(()),
+        }
     }
 
     fn fetch(&self, mut todo: Vec<PageId>, hold: &mut Hold, main: bool) -> Result<(), StorageError> {
@@ -1001,6 +1381,24 @@ impl Engine {
         }
     }
 
+    /// [`Engine::read`] past the cache ([`Hold::past`]): what's cached is
+    /// read without counting a use, and what isn't is read on the background
+    /// lane into memory that goes when the read ends. For scans (list stats,
+    /// compaction) that would otherwise push the served pages out.
+    pub fn read_past<T>(&self, f: impl Fn(&ReadCx<'_>) -> R<T>) -> Result<T, StorageError> {
+        let mut hold = Hold::past(self);
+        match self.pass(&mut hold, &f) {
+            Ok(t) => Ok(t),
+            Err(m) => self.resume_blocking(&mut hold, Some(m), f),
+        }
+    }
+
+    /// The token bucket background I/O goes through (`--background-io`):
+    /// writes that should yield to requests take from it as they go.
+    pub fn background(&self) -> &Arc<TokenBucket> {
+        &self.inner.bucket
+    }
+
     /// Runs passes of `f` until one is clean, fetching what each missed in
     /// between: the loop every reader that may wait on disk runs. Never call
     /// it on a tokio worker. A request runs as many rounds as it needs; one
@@ -1186,7 +1584,7 @@ impl Engine {
             let SectionKind::Pinned { xxh3, .. } = s.kind else { continue };
             let first = s.off / PAGE as u64;
             let last = (s.off + s.len()).div_ceil(PAGE as u64).max(first + 1);
-            let buf = read_pages(io, &st.dev, first, (last - first) as usize)
+            let buf = read_pages(io, &st.dev, first, (last - first) as usize, Lane::Background)
                 .map_err(|e| anyhow::anyhow!("{}: section {}: {e}", st.name, s.name))?;
             let lo = (s.off - first * PAGE as u64) as usize;
             let h = xxhash_rust::xxh3::xxh3_64(&buf[lo..lo + s.len() as usize]);
@@ -1228,6 +1626,16 @@ impl Engine {
         s.eio = c.eio.load(Relaxed);
         s.short = c.short.load(Relaxed);
         s.stalled_requests = c.stalled.load(Relaxed);
+        s.written_through = c.written_through.load(Relaxed);
+        s.write_through_skipped = c.write_through_skipped.load(Relaxed);
+        s.past_pages = c.past_pages.load(Relaxed);
+        for x in &c.stripes {
+            for (a, b) in s.lookups.iter_mut().zip(&x.by) {
+                for (y, z) in a.iter_mut().zip(b) {
+                    *y += z.load(Relaxed);
+                }
+            }
+        }
         s.bad_pages = self.inner.bad.lock().unwrap().len() as u64;
         if let Some(io) = &self.inner.io {
             let x = io.stats();
@@ -1250,6 +1658,80 @@ impl Engine {
     }
 }
 
+/// Which pinned sections of a file to read, as runs of them with nothing
+/// else between: one read and one buffer per run.
+struct Pinned {
+    runs: Vec<(u64, u64, Vec<usize>)>,
+}
+
+impl Pinned {
+    /// The page sums with `sums`, else every other pinned section.
+    fn plan(footer: &PagedFooter, sums: bool) -> Pinned {
+        let mut runs: Vec<(u64, u64, Vec<usize>)> = Vec::new();
+        let mut gap = true;
+        for (i, s) in footer.sections.iter().enumerate() {
+            if s.is_paged() || s.name.ends_with(".sums") != sums {
+                gap = true;
+                continue;
+            }
+            match runs.last_mut() {
+                Some(r) if !gap => {
+                    r.1 = s.off + s.len();
+                    r.2.push(i);
+                }
+                _ => runs.push((s.off, s.off + s.len(), vec![i])),
+            }
+            gap = false;
+        }
+        Pinned { runs }
+    }
+
+    fn span((a, b): (u64, u64)) -> (u64, u64) {
+        (a / PAGE as u64, b.div_ceil(PAGE as u64).max(a / PAGE as u64 + 1))
+    }
+
+    /// The bytes the runs' buffers take: whole pages.
+    fn bytes(&self) -> u64 {
+        self.runs
+            .iter()
+            .map(|r| {
+                let (a, b) = Pinned::span((r.0, r.1));
+                (b - a) * PAGE as u64
+            })
+            .sum()
+    }
+
+    /// Reads the runs and checks each section against the footer's xxh3.
+    fn read(
+        &self,
+        io: &IoPool,
+        file: &Arc<dyn DevFile>,
+        footer: &PagedFooter,
+        lane: Lane,
+    ) -> Result<(Vec<AlignedBuf>, Vec<PinnedAt>)> {
+        let mut bufs = Vec::with_capacity(self.runs.len());
+        let mut at = Vec::new();
+        for (a, b, secs) in &self.runs {
+            let (p0, p1) = Pinned::span((*a, *b));
+            let buf = read_pages(io, file, p0, (p1 - p0) as usize, lane).map_err(anyhow::Error::msg)?;
+            for &i in secs {
+                let s = &footer.sections[i];
+                let off = (s.off - p0 * PAGE as u64) as usize;
+                let len = s.len() as usize;
+                if let SectionKind::Pinned { xxh3, .. } = s.kind {
+                    let h = xxhash_rust::xxh3::xxh3_64(&buf[off..off + len]);
+                    if h != xxh3 {
+                        bail!("section {} checksum {h:016x}, footer says {xxh3:016x}", s.name);
+                    }
+                }
+                at.push(PinnedAt { name: s.name.clone(), buf: bufs.len(), off, len });
+            }
+            bufs.push(buf);
+        }
+        Ok((bufs, at))
+    }
+}
+
 fn flight_shard(p: PageId) -> usize {
     (((p.file.0 as u64) << 32 | p.page as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 58) as usize % FLIGHT_SHARDS
 }
@@ -1258,16 +1740,16 @@ fn file_name(path: &Path) -> String {
     path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned())
 }
 
-/// Reads `n` pages from page `first` of `file` on the request lane, retrying
-/// EIO as fetches do.
-fn read_pages(io: &IoPool, file: &Arc<dyn DevFile>, first: u64, n: usize) -> Result<AlignedBuf, String> {
+/// Reads `n` pages from page `first` of `file` on `lane`, retrying EIO as
+/// fetches do.
+fn read_pages(io: &IoPool, file: &Arc<dyn DevFile>, first: u64, n: usize, lane: Lane) -> Result<AlignedBuf, String> {
     let mut buf = AlignedBuf::new(n * PAGE);
     let frames = buf.frames();
     let mut runs = Vec::new();
     for (i, c) in frames.chunks(MAX_RUN).enumerate() {
         runs.push(Run { file: file.clone(), page: (first + (i * MAX_RUN) as u64) as u32, frames: c.to_vec() });
     }
-    for (i, r) in io.run(runs, Lane::Request).iter().enumerate() {
+    for (i, r) in io.run(runs, lane).iter().enumerate() {
         for (k, how) in r.iter().enumerate() {
             let page = first + (i * MAX_RUN + k) as u64;
             match how {

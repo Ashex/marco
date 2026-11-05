@@ -1,5 +1,8 @@
 //! `set_mmap_random` marks snapshot mappings MADV_RANDOM (VmFlags `rr` in smaps); off, they aren't.
 
+use std::sync::Arc;
+
+use marco_core::read::Engine;
 use marco_core::{snapshot::set_mmap_random, Graph, Relations};
 
 fn flags_of(file: &str) -> Vec<String> {
@@ -28,10 +31,12 @@ fn random_advice_reaches_the_mapping() {
     g.write_snapshot(&dir.path().join("plain.marco")).unwrap();
     g.write_snapshot(&dir.path().join("random.marco")).unwrap();
 
+    // mapped whole whatever MARCO_STORAGE says: the advice is mmap's
+    let mmap = Arc::new(Engine::new());
     set_mmap_random(false);
-    let plain = Graph::open(&dir.path().join("plain.marco")).unwrap();
+    let plain = Graph::open_on(&dir.path().join("plain.marco"), &mmap).unwrap();
     set_mmap_random(true);
-    let random = Graph::open(&dir.path().join("random.marco")).unwrap();
+    let random = Graph::open_on(&dir.path().join("random.marco"), &mmap).unwrap();
     set_mmap_random(false);
 
     let (p, r) = (flags_of("plain.marco"), flags_of("random.marco"));

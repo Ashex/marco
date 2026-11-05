@@ -182,7 +182,7 @@ fn twenty_checkpoints_match_a_full_rebuild() {
     g.write_snapshot(&path).unwrap();
     let mut g = reopen(&path);
     let stop = AtomicBool::new(false);
-    let policy = CompactPolicy { ratio: 1.0, min_garbage: 0, rate: 0 };
+    let policy = CompactPolicy { ratio: 1.0, min_garbage: 0 };
     let (mut kept, mut written, mut compactions) = (0, 0, 0);
     for ckpt in 1..=20u64 {
         {
@@ -192,8 +192,8 @@ fn twenty_checkpoints_match_a_full_rebuild() {
         if ckpt % 5 == 0 {
             // compact every shard with patches under the deltas, and swap it in
             let snap = g.shared_snapshot().unwrap();
-            for (k, garbage) in snap.compaction_due(&policy) {
-                let c = snap.compact(&path, k, &policy, &stop).unwrap();
+            for (k, garbage) in snap.compaction_due(&policy, None) {
+                let c = snap.compact(&path, k, &stop).unwrap();
                 assert_eq!(c.before, garbage);
                 let swap = g.compacted(k, &c.was, c.file.clone(), c.manifest.clone()).unwrap();
                 g.swap_base(&swap);
@@ -330,8 +330,8 @@ fn a_compaction_stops_and_refuses_a_stale_snapshot() {
     g.write_checkpoint(&path, 1, 0, Default::default()).unwrap();
     let g = reopen(&path);
     let snap = g.shared_snapshot().unwrap();
-    let policy = CompactPolicy { ratio: 1.0, min_garbage: 0, rate: 0 };
-    assert_eq!(snap.compaction_due(&policy).len(), 1);
+    let policy = CompactPolicy { ratio: 1.0, min_garbage: 0 };
+    assert_eq!(snap.compaction_due(&policy, None).len(), 1);
     let listing = |p: &Path| {
         let mut v: Vec<String> =
             std::fs::read_dir(p).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into()).collect();
@@ -339,14 +339,14 @@ fn a_compaction_stops_and_refuses_a_stale_snapshot() {
         v
     };
     let before = listing(&path);
-    let e = snap.compact(&path, 0, &policy, &AtomicBool::new(true)).err().unwrap();
+    let e = snap.compact(&path, 0, &AtomicBool::new(true)).err().unwrap();
     assert_eq!(e.to_string(), marco_core::COMPACTION_STOPPED);
     assert_eq!(listing(&path), before, "a stopped compaction leaves nothing");
 
     let mut g2 = reopen(&path);
     g2.add(&format!("at://{}/{}/{}", did(1), COLLS[0], tid(1001)), &did(4)).unwrap();
     g2.write_checkpoint(&path, 2, 0, Default::default()).unwrap();
-    let e = snap.compact(&path, 0, &policy, &AtomicBool::new(false)).err().unwrap();
+    let e = snap.compact(&path, 0, &AtomicBool::new(false)).err().unwrap();
     assert!(e.to_string().contains("changed since"), "{e:#}");
     assert!(reopen(&path).manifest().unwrap().shards[&0].patches.len() == 2);
 }
@@ -378,9 +378,9 @@ fn a_crash_on_either_side_of_a_compactions_commit() {
         std::fs::copy(e.path(), pre.join(e.file_name())).unwrap();
     }
     let snap = g.shared_snapshot().unwrap();
-    let policy = CompactPolicy { ratio: 1.0, min_garbage: 0, rate: 0 };
-    let (k, _) = snap.compaction_due(&policy)[0];
-    let c = snap.compact(&path, k, &policy, &AtomicBool::new(false)).unwrap();
+    let policy = CompactPolicy { ratio: 1.0, min_garbage: 0 };
+    let (k, _) = snap.compaction_due(&policy, None)[0];
+    let c = snap.compact(&path, k, &AtomicBool::new(false)).unwrap();
 
     // after the commit, before the old files are removed
     let after = reopen(&path);
@@ -444,8 +444,7 @@ fn a_compaction_unmaps_the_old_files() {
     drop(g);
     let mut g = reopen(&path);
     let snap = g.shared_snapshot().unwrap();
-    let policy = CompactPolicy { ratio: 1.0, min_garbage: 0, rate: 0 };
-    let c = snap.compact(&path, 0, &policy, &AtomicBool::new(false)).unwrap();
+    let c = snap.compact(&path, 0, &AtomicBool::new(false)).unwrap();
     let old: Vec<String> = c.was.files().map(|f| path.join(f).display().to_string()).collect();
     let swap = g.compacted(0, &c.was, c.file.clone(), c.manifest.clone()).unwrap();
     g.swap_base(&swap);
@@ -522,4 +521,44 @@ fn snapshots_record_their_layout() {
     reopen(&path);
     let st = Store::open(&path).unwrap();
     assert_eq!(st.dir.meta.layout, marco_core::format6::LAYOUT);
+}
+
+/// When the budget holds the whole snapshot, garbage stays cached: past the
+/// garbage policy, compaction also takes shards, most cached garbage first,
+/// until the next checkpoint's room is clear.
+#[test]
+fn compaction_clears_cached_garbage_for_the_next_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("g");
+    let mut g = Graph::new(Relations::bsky_default());
+    g.shards = 4;
+    for a in 0..40u32 {
+        for i in 0..300u64 {
+            g.add(&format!("at://{}/{}/{}", did(a), COLLS[0], tid(a as u64 * 1000 + i)), &did(i as u32)).unwrap();
+        }
+    }
+    g.write_snapshot(&path).unwrap();
+    let mut g = reopen(&path);
+    // every actor's list changes: big garbage in every shard, more where more changed
+    for a in 0..40u32 {
+        for i in 0..(1 + a as u64 % 4) * 40 {
+            g.delete(&format!("at://{}/{}/{}", did(a), COLLS[0], tid(a as u64 * 1000 + i))).unwrap();
+        }
+    }
+    g.write_checkpoint(&path, 1, 0, Default::default()).unwrap();
+    let g = reopen(&path);
+    let snap = g.shared_snapshot().unwrap();
+    let never = CompactPolicy { ratio: 0.0, min_garbage: u64::MAX };
+    assert!(snap.compaction_due(&never, None).is_empty());
+    let all = snap.compaction_due(&CompactPolicy { ratio: 1.0, min_garbage: 0 }, None);
+    let cached = all.iter().filter(|(_, x)| x.pages > 0).count();
+    assert!(cached > 1, "{all:?}");
+    let most = all.iter().max_by_key(|(_, x)| x.pages).unwrap().0;
+    let room = |free, need| Some(marco_core::Headroom { free, need });
+    assert!(snap.compaction_due(&never, room(1 << 30, 1 << 20)).is_empty(), "room enough");
+    let one = snap.compaction_due(&never, room(0, 1));
+    assert_eq!(one.iter().map(|x| x.0).collect::<Vec<_>>(), [most], "the most cached garbage first");
+    let total: u64 = all.iter().map(|(_, x)| x.pages).sum();
+    assert_eq!(snap.compaction_due(&never, room(0, total)).len(), cached, "as many as it takes");
+    assert!(snap.compaction_due(&never, room(0, total + 1)).is_empty(), "none when they can't make the room");
 }

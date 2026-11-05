@@ -25,7 +25,7 @@ use crate::read::{Engine, StorageError};
 use crate::snapshot::{
     rel_section, BaseDir, DirRanges, FileKind, Meta, PagedFooter, PagedSection, ShardMeta, PAGED_FORMAT,
 };
-use crate::store::engine::{PagedFile, Resident};
+use crate::store::engine::{PagedFile, PinnedSections, Resident};
 use crate::store::page::{FileId, PAGE};
 
 pub mod cache;
@@ -262,11 +262,18 @@ impl Storage {
     /// An engine for this storage: one that keeps whole files for mmap,
     /// one with a page cache of the budget for the engine.
     pub fn engine(&self) -> Result<Arc<Engine>> {
+        self.engine_paced(io::Rate::default())
+    }
+
+    /// [`Storage::engine`] with background I/O paced at `background`
+    /// (`--background-io`).
+    pub fn engine_paced(&self, background: io::Rate) -> Result<Arc<Engine>> {
         match self {
-            Storage::Mmap => Ok(Arc::new(Engine::new())),
+            Storage::Mmap => Ok(Arc::new(Engine::paced(background))),
             Storage::Engine { memory, max_frames } => {
                 let mut cfg = crate::store::engine::Config::new(*memory);
                 cfg.max_frames = *max_frames;
+                cfg.background = background;
                 Ok(Arc::new(Engine::with_config(cfg)?))
             }
         }
@@ -310,18 +317,26 @@ impl Pin {
 }
 
 /// A snapshot file as a store holds it: mapped whole and kept whole in the
-/// engine, or registered with an engine that reads it a page at a time.
+/// engine, or registered with an engine that reads it a page at a time. A
+/// registered file's pinned sections are there only when the store reads
+/// them: the directory and each shard's newest file.
 pub enum StoreFile {
     Mapped { file: MappedFile, reg: Option<Resident> },
-    Paged(Arc<PagedFile>),
+    Paged { file: Arc<PagedFile>, pinned: Option<Arc<PinnedSections>> },
 }
 
 impl StoreFile {
-    /// Opens `path` the way `engine` reads: registered with it, or mapped
-    /// (and kept whole in it, with `register`).
-    fn open(path: &Path, engine: &Engine, register: bool) -> Result<StoreFile> {
+    /// Opens `path` the way `engine` reads: registered with it, its pinned
+    /// sections read too with `pinned`, or mapped (and kept whole in it,
+    /// with `register`).
+    fn open(path: &Path, engine: &Engine, register: bool, pinned: bool) -> Result<StoreFile> {
         if engine.paged() {
-            return Ok(StoreFile::Paged(engine.register(path)?));
+            let file = engine.register(path)?;
+            let pinned = match pinned {
+                true => Some(engine.pinned(&file).with_context(|| path.display().to_string())?),
+                false => None,
+            };
+            return Ok(StoreFile::Paged { file, pinned });
         }
         let file = MappedFile::open(path)?;
         let reg = register.then(|| engine.add_mapped(file.name.clone(), file.map.clone(), file.footer.clone()));
@@ -331,14 +346,14 @@ impl StoreFile {
     pub fn name(&self) -> &str {
         match self {
             StoreFile::Mapped { file, .. } => &file.name,
-            StoreFile::Paged(f) => f.name(),
+            StoreFile::Paged { file, .. } => file.name(),
         }
     }
 
     pub fn footer(&self) -> &PagedFooter {
         match self {
             StoreFile::Mapped { file, .. } => &file.footer,
-            StoreFile::Paged(f) => f.footer(),
+            StoreFile::Paged { file, .. } => file.footer(),
         }
     }
 
@@ -350,7 +365,7 @@ impl StoreFile {
     pub fn id(&self) -> Option<FileId> {
         match self {
             StoreFile::Mapped { reg, .. } => reg.as_ref().map(Resident::id),
-            StoreFile::Paged(f) => Some(f.id()),
+            StoreFile::Paged { file, .. } => Some(file.id()),
         }
     }
 
@@ -358,7 +373,7 @@ impl StoreFile {
     pub fn len(&self) -> u64 {
         match self {
             StoreFile::Mapped { file, .. } => file.len() as u64,
-            StoreFile::Paged(f) => f.pages() as u64 * PAGE as u64,
+            StoreFile::Paged { file, .. } => file.pages() as u64 * PAGE as u64,
         }
     }
 
@@ -371,16 +386,21 @@ impl StoreFile {
         let off = self.footer().section(name).filter(|s| !s.is_paged())?.off;
         match self {
             StoreFile::Mapped { file, .. } => Some(Pin { buf: 0, range: file.pinned_range(name)?, off }),
-            StoreFile::Paged(f) => f.pinned_at(name).map(|(buf, range)| Pin { buf, range, off }),
+            StoreFile::Paged { pinned, .. } => pinned.as_ref()?.at(name).map(|(buf, range)| Pin { buf, range, off }),
         }
     }
 
     /// A pinned section's bytes.
     #[inline]
     pub fn pinned(&self, p: &Pin) -> &[u8] {
+        if p.range.is_empty() {
+            return &[];
+        }
         match self {
             StoreFile::Mapped { file, .. } => &file.bytes()[p.range.clone()],
-            StoreFile::Paged(f) => &f.pinned_buf(p.buf)[p.range.clone()],
+            StoreFile::Paged { pinned, .. } => {
+                &pinned.as_ref().expect("pinned sections read").buf(p.buf)[p.range.clone()]
+            }
         }
     }
 
@@ -388,7 +408,7 @@ impl StoreFile {
     pub fn mapped(&self) -> Option<&[u8]> {
         match self {
             StoreFile::Mapped { file, .. } => Some(file.bytes()),
-            StoreFile::Paged(_) => None,
+            StoreFile::Paged { .. } => None,
         }
     }
 
@@ -396,7 +416,16 @@ impl StoreFile {
     pub fn buf(&self, buf: usize) -> &[u8] {
         match self {
             StoreFile::Mapped { file, .. } => file.bytes(),
-            StoreFile::Paged(f) => f.pinned_buf(buf),
+            StoreFile::Paged { pinned, .. } => pinned.as_ref().expect("pinned sections read").buf(buf),
+        }
+    }
+
+    /// Bytes its pinned sections other than the page sums hold against the
+    /// engine's budget (0 when mapped, or not read).
+    pub fn pinned_bytes(&self) -> u64 {
+        match self {
+            StoreFile::Paged { pinned: Some(p), .. } => p.borrowed(),
+            _ => 0,
         }
     }
 
@@ -406,7 +435,7 @@ impl StoreFile {
     pub fn verify_checksums(&self, engine: &Engine) -> Result<()> {
         match self {
             StoreFile::Mapped { file, .. } => file.verify_checksums(),
-            StoreFile::Paged(f) => {
+            StoreFile::Paged { file: f, .. } => {
                 engine.verify_pinned(f)?;
                 match engine.verify(f).into_iter().next() {
                     Some((_, e)) => match &e {
@@ -444,7 +473,7 @@ pub struct DirFile {
 
 impl DirFile {
     pub fn open(path: &Path, engine: &Engine) -> Result<DirFile> {
-        let file = StoreFile::open(path, engine, false)?;
+        let file = StoreFile::open(path, engine, false, true)?;
         if file.footer().kind != "dir" {
             bail!("{} isn't a directory file", path.display());
         }
@@ -518,9 +547,11 @@ impl ShardFile {
     pub fn open(dir: &Path, k: u32, files: &ShardFiles, d: &Meta, engine: &Engine) -> Result<ShardFile> {
         let mut parts: Vec<ShardPart> = Vec::with_capacity(1 + files.patches.len());
         let mut metas: Vec<ShardMeta> = Vec::with_capacity(parts.capacity());
-        for name in files.files() {
+        let last = files.patches.len();
+        for (i, name) in files.files().enumerate() {
             let p = dir.join(name);
-            let file = StoreFile::open(&p, engine, true)?;
+            // only the newest file's pinned sections are the shard's
+            let file = StoreFile::open(&p, engine, true, i == last)?;
             let footer = file.footer();
             let meta: ShardMeta =
                 serde_json::from_value(footer.meta.clone()).with_context(|| format!("{} meta", p.display()))?;
@@ -764,7 +795,7 @@ impl Store {
     pub fn paged_files(&self) -> Vec<&PagedFile> {
         self.files()
             .filter_map(|(_, f)| match f {
-                StoreFile::Paged(p) => Some(&**p),
+                StoreFile::Paged { file, .. } => Some(&**file),
                 StoreFile::Mapped { .. } => None,
             })
             .collect()
@@ -773,6 +804,13 @@ impl Store {
     /// Paged pages in the snapshot: what full residency takes.
     pub fn paged_pages(&self) -> u64 {
         self.paged_files().iter().map(|f| f.paged_pages()).sum()
+    }
+
+    /// What the shards' newest files' pinned sections hold against the
+    /// budget: what a checkpoint that patches every shard reads again
+    /// beside them until its switch.
+    pub fn shard_pinned_bytes(&self) -> u64 {
+        self.shards.iter().flatten().map(|s| s.newest().pinned_bytes()).sum()
     }
 
     /// Reads every page into the engine's cache if the budget holds them

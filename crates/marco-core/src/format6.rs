@@ -234,6 +234,8 @@ pub struct SpacePart {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Space {
     parts: Vec<SpacePart>,
+    /// What its pages hold, for the lookup counts.
+    kind: crate::read::Structure,
 }
 
 impl Space {
@@ -246,7 +248,7 @@ impl Space {
             }
             next = p.first.checked_add(p.pages).context("a space past 2^32 pages")?;
         }
-        Ok(Space { parts })
+        Ok(Space { parts, kind: crate::read::Structure::Other })
     }
 
     /// The space of section `name` over `files` (the base, then its patches),
@@ -263,7 +265,9 @@ impl Space {
                 parts.push(SpacePart { first, pages, file, file_page: s.first_page() });
             }
         }
-        Space::new(parts)
+        let mut sp = Space::new(parts)?;
+        sp.kind = crate::read::Structure::of_section(name);
+        Ok(sp)
     }
 
     pub fn pages(&self) -> u32 {
@@ -291,7 +295,7 @@ impl Space {
     /// The bytes from offset `at` to the end of its page.
     #[inline]
     pub fn tail<'g>(&self, cx: &ReadCx<'g>, at: u64) -> R<&'g [u8]> {
-        let page = cx.page(self.page((at / PAGE as u64) as u32))?;
+        let page = cx.page_of(self.page((at / PAGE as u64) as u32), self.kind)?;
         Ok(&page[(at % PAGE as u64) as usize..])
     }
 

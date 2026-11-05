@@ -136,9 +136,10 @@ struct Serve {
     /// …and its garbage is at least this many MiB.
     #[arg(long, env = "MARCO_COMPACTION_MIN_GARBAGE_MB", default_value_t = 64)]
     compaction_min_garbage_mb: u64,
-    /// MB a second a compaction writes at most (0: unpaced).
-    #[arg(long, env = "MARCO_COMPACTION_RATE_MB", default_value_t = 200)]
-    compaction_rate_mb: u64,
+    /// The pace of background I/O, MB a second and operations a second (0: unpaced): compactions,
+    /// checkpoint writes, verify and list stats. Requests always go first.
+    #[arg(long, env = "MARCO_BACKGROUND_IO", default_value = "200,5000", value_parser = parse_rate)]
+    background_io: marco_core::store::io::Rate,
     /// Don't map the snapshot's pages in after open (they then fault in as reads touch them). On
     /// --storage engine: don't load every page at open when --memory holds them all.
     #[arg(long, env = "MARCO_NO_PREFAULT")]
@@ -208,7 +209,7 @@ fn flags(m: &ArgMatches, s: &Serve) -> Vec<FlagInfo> {
         ("tombstone_days", s.tombstone_days.to_string()),
         ("compaction_ratio", s.compaction_ratio.to_string()),
         ("compaction_min_garbage_mb", s.compaction_min_garbage_mb.to_string()),
-        ("compaction_rate_mb", s.compaction_rate_mb.to_string()),
+        ("background_io", format!("{},{}", s.background_io.bytes_per_s / 1_000_000, s.background_io.ops_per_s)),
         ("no_prefault", s.no_prefault.to_string()),
         ("storage", s.storage.clone()),
         ("memory", s.memory.clone().unwrap_or_else(|| "—".into())),
@@ -230,6 +231,15 @@ fn flags(m: &ArgMatches, s: &Serve) -> Vec<FlagInfo> {
             FlagInfo { name: format!("--{}", id.replace('_', "-")), value, source: source.into() }
         })
         .collect()
+}
+
+/// `MB,IOPS` (`200,5000`), or `MB` alone with no cap on operations.
+fn parse_rate(v: &str) -> Result<marco_core::store::io::Rate, String> {
+    let (mb, ops) = v.split_once(',').unwrap_or((v, "0"));
+    let n = |x: &str| {
+        x.trim().parse::<u64>().map_err(|_| format!("{v:?}: MB a second, then operations a second (200,5000)"))
+    };
+    Ok(marco_core::store::io::Rate { bytes_per_s: n(mb)? * 1_000_000, ops_per_s: n(ops)? })
 }
 
 /// An http(s) origin with no path, trailing slash dropped.
@@ -344,8 +354,8 @@ fn main() -> Result<()> {
                 compaction: marco_core::CompactPolicy {
                     ratio: s.compaction_ratio.max(0.0),
                     min_garbage: s.compaction_min_garbage_mb << 20,
-                    rate: s.compaction_rate_mb * 1_000_000,
                 },
+                background: s.background_io,
                 tombstone_ttl: std::time::Duration::from_secs_f64(s.tombstone_days.max(0.0) * 86_400.0),
                 expected_sources: source.iter().map(|s| s.name.clone()).collect(),
                 storage,

@@ -86,7 +86,9 @@ pub async fn run(a: Args) -> Result<serde_json::Value> {
         prefault: false,
         checkpoint_ops: u64::MAX,
         checkpoint_age: Duration::from_secs(365 * 86_400),
-        compaction: CompactPolicy { ratio: 0.0, min_garbage: u64::MAX, rate: 0 },
+        compaction: CompactPolicy { ratio: 0.0, min_garbage: u64::MAX },
+        // the compactions it times are unpaced
+        background: marco_core::store::io::Rate::UNLIMITED,
         ..Config::new(snap.clone())
     })?;
     let open_s = t.elapsed().as_secs_f64();
@@ -174,7 +176,7 @@ pub async fn run(a: Args) -> Result<serde_json::Value> {
     let mut garbage: Vec<(usize, marco_core::Garbage)> =
         store.shards.iter().enumerate().filter_map(|(k, f)| f.as_ref().map(|f| (k, f.garbage(si)))).collect();
     let (disk, live): (u64, u64) = garbage.iter().fold((0, 0), |(d, l), (_, g)| (d + g.disk, l + g.live));
-    let due = g.shared_snapshot().unwrap().compaction_due(&CompactPolicy::default()).len();
+    let due = g.shared_snapshot().unwrap().compaction_due(&CompactPolicy::default(), None).len();
     // what the patches hold, by section, before any compaction replaces them
     let mut patch_sections: std::collections::BTreeMap<String, u64> = Default::default();
     for f in store.shards.iter().flatten() {
@@ -195,12 +197,10 @@ pub async fn run(a: Args) -> Result<serde_json::Value> {
     let mut compactions = Vec::new();
     let snapshot = g.shared_snapshot().unwrap();
     drop(g);
-    let unpaced = CompactPolicy { ratio: 1.0, min_garbage: 0, rate: 0 };
     for &(k, before) in garbage.iter().take(a.compact) {
         let (s, p) = (snapshot.clone(), snap.clone());
         let c =
-            tokio::task::spawn_blocking(move || s.compact(&p, k, &unpaced, &std::sync::atomic::AtomicBool::new(false)))
-                .await??;
+            tokio::task::spawn_blocking(move || s.compact(&p, k, &std::sync::atomic::AtomicBool::new(false))).await??;
         compactions.push(serde_json::json!({
             "shard": k, "seconds": c.seconds, "bytes": c.bytes,
             "before_disk": before.disk, "before_live": before.live, "garbage": before.bytes(),

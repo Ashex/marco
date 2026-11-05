@@ -1,6 +1,6 @@
 //! List lengths over the snapshot, for the Relations page: one pass over
-//! every list header, on a mapping of its own so the graph's lock isn't held,
-//! cached per snapshot build.
+//! every list header, on a store of its own so the graph's lock isn't held,
+//! read past the cache on the background lane, cached per snapshot build.
 
 use std::collections::{BTreeMap, BinaryHeap};
 use std::ops::Range;
@@ -200,7 +200,8 @@ fn compute(path: &std::path::Path, engine: &Arc<Engine>, done: &AtomicUsize, tot
                             for (dist, is_out) in [(&mut *out, true), (&mut *inn, false)] {
                                 for lo in (0..n).step_by(CHUNK as usize) {
                                     let ids = lo..(lo + CHUNK).min(n);
-                                    let lens = store.engine.read(|cx| lens(cx, f, r, subj, is_out, ids.clone()))?;
+                                    let lens =
+                                        store.engine.read_past(|cx| lens(cx, f, r, subj, is_out, ids.clone()))?;
                                     for (local, len) in lens {
                                         *dist.by_len.entry(len).or_default() += 1;
                                         if len >= subj as u64 {

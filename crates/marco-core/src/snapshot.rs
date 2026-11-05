@@ -32,6 +32,7 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -236,7 +237,7 @@ pub enum Bytes {
     Map(memmap2::Mmap),
     /// A mapping other owners read too: a FORMAT 6 file's pinned sections
     /// are read from the same mapping the engine serves its pages from.
-    Shared(std::sync::Arc<memmap2::Mmap>),
+    Shared(Arc<memmap2::Mmap>),
     Owned(Vec<u8>),
 }
 
@@ -1459,7 +1460,14 @@ pub struct PagedWriter {
     open: Option<Open>,
     tmp: PathBuf,
     path: PathBuf,
+    /// Where paged pages go as they're written ([`PagedWriter::write_through`]).
+    stage: Option<crate::store::engine::Stage>,
+    /// The bucket writes take from, and the position paid for so far.
+    pace: Option<(Arc<crate::store::io::TokenBucket>, u64)>,
 }
+
+/// Bytes a paced writer writes between takes from its bucket.
+const PACE_STEP: u64 = 1 << 20;
 
 impl PagedWriter {
     /// A file at `path`, with a random salt; [`PagedWriter::finish`] renames it
@@ -1483,7 +1491,30 @@ impl PagedWriter {
             open: None,
             tmp,
             path: path.to_path_buf(),
+            stage: None,
+            pace: None,
         })
+    }
+
+    /// Copies every paged page into `stage` as it's written, for
+    /// [`crate::store::engine::Engine::publish`] once the file is in place
+    /// ([`PagedWriter::finish_staged`]).
+    pub fn write_through(&mut self, stage: crate::store::engine::Stage) {
+        self.stage = Some(stage);
+    }
+
+    /// Paces the writes through `bucket` (background I/O), a MiB at a time.
+    pub fn pace(&mut self, bucket: Arc<crate::store::io::TokenBucket>) {
+        self.pace = Some((bucket, self.pos));
+    }
+
+    fn paced(&mut self) {
+        if let Some((b, paid)) = &mut self.pace {
+            if self.pos >= *paid + PACE_STEP {
+                b.take(self.pos - *paid);
+                *paid = self.pos;
+            }
+        }
     }
 
     pub fn salt(&self) -> u64 {
@@ -1504,6 +1535,7 @@ impl PagedWriter {
         let pad = self.pos.next_multiple_of(align) - self.pos;
         self.f.write(&vec![0u8; pad as usize])?;
         self.pos += pad;
+        self.paced();
         Ok(())
     }
 
@@ -1535,6 +1567,7 @@ impl PagedWriter {
         hasher.update(bytes);
         self.f.write(bytes)?;
         self.pos += bytes.len() as u64;
+        self.paced();
         Ok(())
     }
 
@@ -1574,9 +1607,13 @@ impl PagedWriter {
         debug_assert_eq!(*off % PAGE as u64, 0);
         for (page, p) in ((self.pos / PAGE as u64) as u32..).zip(pages) {
             sums.extend_from_slice(&page_sum(&p.0, page_seed(self.salt, tag, page)).to_le_bytes());
+            if let Some(st) = &mut self.stage {
+                st.put(page, &p.0);
+            }
         }
         self.f.write_pages(pages)?;
         self.pos += (pages.len() * PAGE) as u64;
+        self.paced();
         Ok(())
     }
 
@@ -1598,7 +1635,16 @@ impl PagedWriter {
 
     /// Writes the sums sections and the footer, fsyncs and renames the file
     /// into place. Returns the footer as written.
-    pub fn finish(mut self, kind: &str, meta: &impl Serialize) -> Result<PagedFooter> {
+    pub fn finish(self, kind: &str, meta: &impl Serialize) -> Result<PagedFooter> {
+        Ok(self.finish_staged(kind, meta)?.0)
+    }
+
+    /// [`PagedWriter::finish`], handing back the pages written through.
+    pub fn finish_staged(
+        mut self,
+        kind: &str,
+        meta: &impl Serialize,
+    ) -> Result<(PagedFooter, Option<crate::store::engine::Stage>)> {
         if let Some(Open::Pinned { name, .. } | Open::Paged { name, .. }) = &self.open {
             bail!("section {name} still open");
         }
@@ -1614,13 +1660,18 @@ impl PagedWriter {
             sections: std::mem::take(&mut self.sections),
         };
         footer.validate(self.pos)?;
-        self.f.write(&footer.encode(self.pos)?)?;
+        let tail = footer.encode(self.pos)?;
+        self.f.write(&tail)?;
+        self.pos += tail.len() as u64;
+        if let Some((b, paid)) = self.pace.take() {
+            b.take(self.pos.saturating_sub(paid));
+        }
         let f = self.f.finish()?;
         drop(f);
         std::fs::rename(&self.tmp, &self.path)?;
         let parent = self.path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
         File::open(parent)?.sync_all()?;
-        Ok(footer)
+        Ok((footer, self.stage.take()))
     }
 }
 

@@ -85,6 +85,9 @@ pub struct Config {
     pub miss_threads: usize,
     /// When shards are compacted, after open and after each checkpoint.
     pub compaction: marco_core::CompactPolicy,
+    /// The pace of background I/O (`--background-io`): compactions,
+    /// checkpoint writes, verify and list stats.
+    pub background: marco_core::store::io::Rate,
 }
 
 /// Memory a store budget must leave the cache beyond the pinned tier.
@@ -113,6 +116,7 @@ impl Config {
             storage: Storage::from_env().unwrap_or_else(|e| panic!("{e:#}")),
             miss_threads: 64,
             compaction: marco_core::CompactPolicy::default(),
+            background: marco_core::store::io::Rate::default(),
         }
     }
 }
@@ -142,17 +146,35 @@ impl Outcome {
 
 /// Applies one op.
 pub fn apply_op(g: &mut Graph, op: &Op) -> Outcome {
+    apply_op_noting(g, op, &mut None)
+}
+
+/// Whether `e` came from a page the store couldn't read, rather than from
+/// the op itself.
+fn is_storage(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.is::<marco_core::read::StorageError>())
+}
+
+/// [`apply_op`], keeping the first error a bad page caused in `storage`.
+fn apply_op_noting(g: &mut Graph, op: &Op, storage: &mut Option<String>) -> Outcome {
+    let mut fail = |e: anyhow::Error| {
+        let m = format!("{e:#}");
+        if storage.is_none() && is_storage(&e) {
+            *storage = Some(m.clone());
+        }
+        Outcome::Error(e.to_string())
+    };
     match op {
         Op::Add { uri, subject, list, time_us } => match g.add_rec(uri, subject, list.as_deref(), *time_us) {
             Ok(Added::Added) => Outcome::Added,
             Ok(Added::Exists) => Outcome::Exists,
             Ok(Added::Deleted) => Outcome::Deleted,
-            Err(e) => Outcome::Error(e.to_string()),
+            Err(e) => fail(e),
         },
         Op::Delete { uri, time_us } => match g.delete_at(uri, *time_us) {
             Ok(Removed::Subject(s)) => Outcome::Removed(s),
             Ok(Removed::NotFound) => Outcome::NotFound,
-            Err(e) => Outcome::Error(e.to_string()),
+            Err(e) => fail(e),
         },
     }
 }
@@ -165,14 +187,23 @@ pub enum Applied {
 /// Applies one record: the writer, the second copy, a restart's replay and
 /// a checkpoint's replay all go through here, so they agree.
 pub fn apply_rec(g: &mut Graph, rec: &Rec) -> Applied {
+    apply_rec_noting(g, rec, &mut None)
+}
+
+fn apply_rec_noting(g: &mut Graph, rec: &Rec, storage: &mut Option<String>) -> Applied {
     match rec {
         Rec::Apply { source, ops, .. } => {
             // a stamp holds only against other sources: the record's own source applies in order
             g.set_source(source);
-            Applied::Ops(ops.iter().map(|op| apply_op(g, op)).collect())
+            Applied::Ops(ops.iter().map(|op| apply_op_noting(g, op, storage)).collect())
         }
         Rec::Status { did, status, time_us, .. } => {
-            Applied::Status(g.set_status(did, *status, *time_us).map_err(|e| e.to_string()))
+            Applied::Status(g.set_status(did, *status, *time_us).map_err(|e| {
+                if storage.is_none() && is_storage(&e) {
+                    *storage = Some(format!("{e:#}"));
+                }
+                e.to_string()
+            }))
         }
     }
 }
@@ -301,6 +332,8 @@ pub struct App {
     pub started: Instant,
     pub open_seconds: f64,
     pub cached_bytes: AtomicU64,
+    /// Open loaded every page: the budget holds the whole snapshot.
+    pub resident: AtomicBool,
 }
 
 pub fn now_ms() -> i64 {
@@ -333,12 +366,16 @@ pub struct Replayed {
     pub ops: u64,
     /// The newest segment replayed (the snapshot's, with none).
     pub last: u64,
+    /// The first op skipped on a bad page, if one was.
+    pub skipped: Option<String>,
 }
 
 /// Applies `recs` in order to `g`, and to its twin `t` if given, planning
 /// each run of them first so their reads wait on disk once per dependency
 /// level ([`Graph::plan`]); the plan's pins last through both applies.
-pub fn apply_planned(g: &mut Graph, mut t: Option<&mut Graph>, recs: &[Rec]) {
+/// Returns the first error a bad page caused: that op was skipped.
+pub fn apply_planned(g: &mut Graph, mut t: Option<&mut Graph>, recs: &[Rec]) -> Option<String> {
+    let mut storage = None;
     let mut at = 0;
     while at < recs.len() {
         let mut ops = 0;
@@ -350,13 +387,14 @@ pub fn apply_planned(g: &mut Graph, mut t: Option<&mut Graph>, recs: &[Rec]) {
         let mut hold = Hold::new();
         g.plan(&recs[at..end].iter().collect::<Vec<_>>(), &mut hold);
         for r in &recs[at..end] {
-            apply_rec(g, r);
+            apply_rec_noting(g, r, &mut storage);
             if let Some(t) = t.as_deref_mut() {
-                apply_rec(t, r);
+                apply_rec_noting(t, r, &mut storage);
             }
         }
         at = end;
     }
+    storage
 }
 
 /// Ops a replay plans at once.
@@ -373,6 +411,7 @@ pub fn open_replayed(cfg: &Config, engine: &Arc<Engine>, upto: Option<u64>) -> R
     let m = g.manifest().context("no manifest")?.clone();
     let mut cursors = m.cursors.clone();
     let (mut n, mut ops, mut last) = (0u32, 0u64, m.segment);
+    let mut skipped = None;
     g.quiet = true;
     for (k, p) in segment::list(path)? {
         if k <= m.segment {
@@ -388,19 +427,26 @@ pub fn open_replayed(cfg: &Config, engine: &Arc<Engine>, upto: Option<u64>) -> R
         if s.header.build != m.build {
             bail!("{} belongs to another snapshot", p.display());
         }
-        apply_planned(&mut g, None, &s.records);
+        if let Some(e) = apply_planned(&mut g, None, &s.records) {
+            // a checkpoint folds these segments in: an op skipped now would be lost
+            if upto.is_some() {
+                bail!("replaying {}: {e}", p.display());
+            }
+            eprintln!("marco: replaying {}: an op skipped on a bad page: {e}", p.display());
+            skipped.get_or_insert(e);
+        }
         ops += s.records.iter().map(|r| r.ops() as u64).sum::<u64>();
         cursors = s.header.cursors;
         last = k;
         n += 1;
     }
     g.quiet = false;
-    Ok(Replayed { graph: g, cursors, segments: n, ops, last })
+    Ok(Replayed { graph: g, cursors, segments: n, ops, last, skipped })
 }
 
 impl App {
     pub fn open(cfg: Config) -> Result<Arc<App>> {
-        let engine = cfg.storage.engine()?;
+        let engine = cfg.storage.engine_paced(cfg.background)?;
         App::open_on(cfg, engine)
     }
 
@@ -414,26 +460,32 @@ impl App {
                 eprintln!("marco: removing leftovers in {}: {e:#}", cfg.snapshot.display());
             }
         }
-        let Replayed { graph: g, cursors, segments: segs, ops, last } = open_replayed(&cfg, &engine, None)?;
-        if let (Storage::Engine { memory, max_frames: None }, Some(s)) = (&cfg.storage, g.snapshot()) {
-            // twice the pinned tier: a checkpoint registers each dirty shard's patch,
-            // whose index and heads are the shard's whole, beside the old until the switch
+        let Replayed { graph: g, cursors, segments: segs, ops, last, .. } = open_replayed(&cfg, &engine, None)?;
+        let mut resident = false;
+        if let (Storage::Engine { memory, max_frames }, Some(s)) = (&cfg.storage, g.snapshot()) {
+            // a checkpoint that patches every shard reads each one's index and heads
+            // again beside the old until its switch; the directory it never rewrites
             let pinned = engine.bytes().borrowed;
-            let min = 2 * pinned + MIN_CACHE;
-            if min > *memory {
+            let again = s.shard_pinned_bytes();
+            let min = pinned + again + MIN_CACHE;
+            if min > *memory && max_frames.is_none() {
                 bail!(
-                    "--memory {} MiB is too small: this snapshot's pinned tier takes {} MiB, a checkpoint needs it \
-                     twice, and the cache needs {} MiB more; give it at least {} MiB",
+                    "--memory {} MiB is too small: this snapshot's pinned tier takes {} MiB, a checkpoint reads {} \
+                     MiB of it again, and the cache needs {} MiB more; give it at least {} MiB",
                     memory >> 20,
                     pinned >> 20,
+                    again >> 20,
                     MIN_CACHE >> 20,
                     min.div_ceil(1 << 20)
                 );
             }
-            warn_cgroup(*memory);
+            if max_frames.is_none() {
+                warn_cgroup(*memory);
+            }
             if cfg.prefault {
                 let t = Instant::now();
-                if s.load() {
+                resident = s.load();
+                if resident {
                     eprintln!(
                         "marco: loaded {} MiB of pages in {:.1} s",
                         (s.paged_pages() * marco_core::store::page::PAGE as u64) >> 20,
@@ -499,6 +551,7 @@ impl App {
             started: Instant::now(),
             open_seconds,
             cached_bytes: AtomicU64::new(0),
+            resident: AtomicBool::new(resident),
         });
         if let Some(spare) = spare {
             let tx = writer::spawn(app.clone(), spare, writer::Init { cursors, segment: last, ops });
@@ -859,6 +912,26 @@ impl App {
         if let Some(s) = self.graph().shared_snapshot() {
             std::thread::Builder::new().name("marco-prefault".into()).spawn(move || s.populate()).ok();
         }
+    }
+
+    /// When open loaded the whole snapshot into the cache:
+    /// the free room in the budget, and what the next checkpoint will take
+    /// of it (the last one's P_new + R). Compaction clears cached garbage
+    /// to keep the first above the second.
+    pub fn headroom(&self) -> Option<marco_core::Headroom> {
+        if !self.resident.load(Ordering::Relaxed) {
+            return None;
+        }
+        let room = self.engine.room() as u64;
+        let b = self.engine.bytes();
+        // every frame of a committed group that isn't on the free list: cached,
+        // retired, or a stage's or a past read's
+        let used = (b.committed / marco_core::store::page::PAGE as u64).saturating_sub(b.free_frames);
+        let d = self.durability.lock().unwrap();
+        Some(marco_core::Headroom {
+            free: room.saturating_sub(used) * marco_core::store::page::PAGE as u64,
+            need: d.checkpoint_patch_bytes + d.checkpoint_pinned_bytes,
+        })
     }
 
     pub(crate) fn snapshot_files(&self) -> usize {

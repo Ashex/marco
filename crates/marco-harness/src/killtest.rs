@@ -312,7 +312,11 @@ pub async fn run(a: Args) -> Result<bool> {
                         }
                     }
                     When::DuringRewrite => {
-                        if rewrite_at.is_none() && started.elapsed() >= random.min(Duration::from_millis(1500)) {
+                        // the admin listener answers once open is done, which on a cold engine takes a while
+                        if rewrite_at.is_none()
+                            && !body.is_empty()
+                            && started.elapsed() >= random.min(Duration::from_millis(1500))
+                        {
                             admin(m.admin).checkpoint(CheckpointRequest::default()).await.context("Checkpoint")?;
                             rewrite_at = Some(Instant::now());
                             kill_at = Some(Instant::now() + Duration::from_millis(rng.below(300)));
@@ -320,7 +324,11 @@ pub async fn run(a: Args) -> Result<bool> {
                     }
                     When::DuringCompaction => {
                         let done = metric(&body, "marco_checkpoint_seconds_count");
-                        if rewrite_at.is_none() && started.elapsed() >= random.min(Duration::from_millis(1500)) {
+                        // the admin listener answers once open is done, which on a cold engine takes a while
+                        if rewrite_at.is_none()
+                            && !body.is_empty()
+                            && started.elapsed() >= random.min(Duration::from_millis(1500))
+                        {
                             admin(m.admin).checkpoint(CheckpointRequest::default()).await.context("Checkpoint")?;
                             rewrite_at = Some(Instant::now());
                             ckpts = done;
