@@ -449,6 +449,44 @@ impl<'a> Entries<'a> {
 
 // ---------------------------------------------------------------- writing a shard
 
+/// Weights a build lays small lists out by (Q4, the heat-ordered layout):
+/// each shard's small lists go hottest first, so the lists a skewed load
+/// reads share pages. Per actor id: how often it's a viewer and how often a
+/// subject. Out lists order by viewer weight, then subject weight; in sets
+/// the other way round; ties, and every list with no weight, stay in id
+/// order. Patches and compaction keep id order.
+#[derive(Clone, Debug, Default)]
+pub struct Heat {
+    pub viewer: Vec<u32>,
+    pub subject: Vec<u32>,
+}
+
+impl Heat {
+    fn key(&self, id: u32, out: bool) -> u64 {
+        let w = |v: &Vec<u32>| v.get(id as usize).copied().unwrap_or(0) as u64;
+        let (a, b) = if out { (w(&self.viewer), w(&self.subject)) } else { (w(&self.subject), w(&self.viewer)) };
+        (a << 32) | b
+    }
+}
+
+/// Small lists held back for a heat-ordered layout: placed at finish.
+#[derive(Default)]
+struct HeatHeld {
+    lists: Vec<(u64, u32, u32, u32)>,
+    bytes: Vec<u8>,
+}
+
+/// Places held small lists hottest first, then sets their entries.
+fn place_hot(held: HeatHeld, small: &mut Packer, entries: &mut [u32], rel: usize, part: &str) -> Result<()> {
+    let mut lists = held.lists;
+    lists.sort_unstable_by_key(|&(key, local, _, _)| (std::cmp::Reverse(key), local));
+    for (_, local, at, len) in lists {
+        let off = small_offset(small.put(&held.bytes[at as usize..(at + len) as usize]), rel, part)?;
+        entries[local as usize] = Entry::Small(off).encode();
+    }
+    Ok(())
+}
+
 /// One relation's out side of one shard, built list by list in id order:
 /// small lists packed into pages, big lists into their columns and heads.
 /// The rkey column is the biggest, so it's streamed into the file as its
@@ -467,6 +505,8 @@ pub struct OutSections {
     buf: Vec<u8>,
     pub bytes: OutBytes,
     pub layout: Layout,
+    heat: Option<(std::sync::Arc<Heat>, u32)>,
+    held: HeatHeld,
 }
 
 /// What a relation's lists came to in one shard or a whole snapshot.
@@ -560,7 +600,16 @@ impl OutSections {
             buf: Vec::new(),
             bytes: OutBytes::default(),
             layout: Layout::default(),
+            heat: None,
+            held: HeatHeld::default(),
         }
+    }
+
+    /// Lays this shard's small lists out by `heat` (`lo` is the shard's
+    /// first actor id) instead of in id order.
+    pub fn with_heat(mut self, heat: std::sync::Arc<Heat>, lo: u32) -> OutSections {
+        self.heat = Some((heat, lo));
+        self
     }
 
     /// Opens the streamed rkey section.
@@ -586,8 +635,15 @@ impl OutSections {
         if edges.len() <= WHOLE {
             self.buf.clear();
             crate::outlog::encode(edges, self.subj_index, &mut self.buf, &mut self.bytes);
-            let at = small_offset(self.small.put(&self.buf), self.rel, "out.small")?;
             self.layout.small_lists += 1;
+            if let Some((h, lo)) = &self.heat {
+                let at = self.held.bytes.len() as u32;
+                self.held.lists.push((h.key(lo + local, true), local, at, self.buf.len() as u32));
+                self.held.bytes.extend_from_slice(&self.buf);
+                put_entry(&mut self.entries, local, Entry::Small(0));
+                return Ok(Default::default());
+            }
+            let at = small_offset(self.small.put(&self.buf), self.rel, "out.small")?;
             put_entry(&mut self.entries, local, Entry::Small(at));
             return Ok(Default::default());
         }
@@ -632,6 +688,8 @@ impl OutSections {
         }
         w.write_pages(&self.rkey.take_all())?;
         w.end_paged()?;
+        let held = std::mem::take(&mut self.held);
+        place_hot(held, &mut self.small, &mut self.entries, self.rel, "out.small")?;
         let r = self.rel;
         let l = &mut self.layout;
         let f = self.first;
@@ -667,6 +725,8 @@ pub struct InSections {
     entries: Vec<u32>,
     buf: Vec<u8>,
     pub layout: InLayout,
+    heat: Option<(std::sync::Arc<Heat>, u32)>,
+    held: HeatHeld,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -713,7 +773,15 @@ impl InSections {
             entries: Vec::new(),
             buf: Vec::new(),
             layout: InLayout::default(),
+            heat: None,
+            held: HeatHeld::default(),
         }
+    }
+
+    /// Lays this shard's small sets out by `heat`, as [`OutSections::with_heat`].
+    pub fn with_heat(mut self, heat: std::sync::Arc<Heat>, lo: u32) -> InSections {
+        self.heat = Some((heat, lo));
+        self
     }
 
     /// The set of shard-local id `local`, after every id before it: `ids`
@@ -730,8 +798,15 @@ impl InSections {
         if ids.len() <= WHOLE {
             self.buf.clear();
             crate::inset::encode(ids, &mut self.buf);
-            let at = small_offset(self.small.put(&self.buf), self.rel, "in.small")?;
             self.layout.small_sets += 1;
+            if let Some((h, lo)) = &self.heat {
+                let at = self.held.bytes.len() as u32;
+                self.held.lists.push((h.key(lo + local, false), local, at, self.buf.len() as u32));
+                self.held.bytes.extend_from_slice(&self.buf);
+                put_entry(&mut self.entries, local, Entry::Small(0));
+                return Ok((0, 0));
+            }
+            let at = small_offset(self.small.put(&self.buf), self.rel, "in.small")?;
             put_entry(&mut self.entries, local, Entry::Small(at));
             return Ok((0, 0));
         }
@@ -764,6 +839,8 @@ impl InSections {
         if self.entries.len() > n as usize {
             bail!("a set past the shard's {n} ids");
         }
+        let held = std::mem::take(&mut self.held);
+        place_hot(held, &mut self.small, &mut self.entries, self.rel, "in.small")?;
         let r = self.rel;
         let l = &mut self.layout;
         let [fs, fb] = self.first;
@@ -1280,6 +1357,23 @@ mod tests {
     /// writer reads back as FORMAT 5's codecs say, list by list.
     #[test]
     fn a_shard_reads_back_as_format_5() {
+        shard_round_trip(None);
+    }
+
+    /// Weights on a few ids: their small lists come first, hottest first,
+    /// and every list still reads back.
+    #[test]
+    fn a_heat_ordered_shard_reads_back_the_same() {
+        let mut viewer = vec![0u32; 3000];
+        let mut subject = vec![0u32; 3000];
+        for (i, id) in (0..3000).step_by(7).enumerate() {
+            viewer[id] = 1 + (i as u32 * 37) % 30;
+            subject[id] = (i as u32 * 11) % 500;
+        }
+        shard_round_trip(Some(std::sync::Arc::new(Heat { viewer, subject })));
+    }
+
+    fn shard_round_trip(heat: Option<std::sync::Arc<Heat>>) {
         let d = tempfile::tempdir().unwrap();
         let p = d.path().join("shard-000-00000000.marco");
         let mut s = 0xfeed_beefu64;
@@ -1313,6 +1407,9 @@ mod tests {
         }
         let mut w = PagedWriter::create(&p, FileKind::Base).unwrap();
         let mut o = OutSections::new(0, subj_index);
+        if let Some(h) = &heat {
+            o = o.with_heat(h.clone(), 0);
+        }
         o.begin(&mut w).unwrap();
         for (i, (id, l)) in outs.iter().enumerate() {
             o.push(*id, l).unwrap();
@@ -1323,6 +1420,9 @@ mod tests {
         assert!(o.push(0, &outs[0].1).is_err(), "lists in id order");
         let (bytes, layout) = o.finish(&mut w, n_ids).unwrap();
         let mut inn = InSections::new(0);
+        if let Some(h) = &heat {
+            inn = inn.with_heat(h.clone(), 0);
+        }
         for (id, v) in &ins {
             inn.push(*id, v).unwrap();
         }
@@ -1378,6 +1478,27 @@ mod tests {
         }
         assert!(out.list(&cx, n_ids).unwrap().is_none());
         assert!(cx.clean());
+        if let Some(h) = heat {
+            // small lists by offset: their keys descend, ties in id order
+            let order = |small: Vec<(u32, u32)>, out: bool| {
+                let mut v: Vec<(u32, u64, u32)> = small.into_iter().map(|(id, at)| (at, h.key(id, out), id)).collect();
+                v.sort_unstable();
+                assert!(v[0].1 > 0, "a hot list first");
+                for w in v.windows(2) {
+                    assert!(w[0].1 > w[1].1 || (w[0].1 == w[1].1 && w[0].2 < w[1].2), "{:?} before {:?}", w[0], w[1]);
+                }
+            };
+            let small = |e: &Entries<'_>| {
+                (0..n_ids)
+                    .filter_map(|id| match e.get(id) {
+                        Some(Entry::Small(at)) => Some((id, at)),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            };
+            order(small(&out.entries), true);
+            order(small(&inn.entries), false);
+        }
     }
 
     #[test]

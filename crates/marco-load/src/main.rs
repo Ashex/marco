@@ -84,6 +84,10 @@ enum Cmd {
         /// Snapshot format: 6, which the server reads (paged, written with O_DIRECT), or 5, for compare6.
         #[arg(long, default_value_t = marco_core::snapshot::PAGED_FORMAT)]
         format: u32,
+        /// Lay each shard's small lists out hottest first by these weights (`did<TAB>weight`): out lists by
+        /// viewers, then subjects; in sets by subjects, then viewers. Off by default.
+        #[arg(long, num_args = 2, value_names = ["VIEWERS", "SUBJECTS"])]
+        heat: Option<Vec<PathBuf>>,
     },
     Open {
         #[arg(long)]
@@ -127,6 +131,7 @@ fn main() -> Result<()> {
             retention_hours,
             allow_gap,
             format,
+            heat,
         } => {
             let rels = match relations {
                 Some(p) => marco_core::Relations::parse_toml(&std::fs::read_to_string(p)?)?,
@@ -147,6 +152,7 @@ fn main() -> Result<()> {
                 deletes,
                 cursors,
                 format,
+                heat: heat.map(|h| (h[0].clone(), h[1].clone())),
             };
             let r = build::build(&o)?;
             let _ = std::fs::remove_dir(&tmp);

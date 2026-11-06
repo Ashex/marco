@@ -532,6 +532,8 @@ pub(crate) struct IoCounters {
     pub io_nanos: AtomicU64,
     /// Per lane, request then background.
     pub lanes: [IoHist; 2],
+    /// Per lane, how long reads waited in the queue for an I/O thread.
+    pub waits: [IoHist; 2],
 }
 
 struct Batch {
@@ -544,6 +546,7 @@ struct Job {
     lane: Lane,
     idx: usize,
     batch: Arc<Batch>,
+    queued: Instant,
 }
 
 #[derive(Default)]
@@ -621,7 +624,7 @@ impl IoPool {
                     }
                     q = self.shared.space.wait(q).unwrap();
                 }
-                let job = Job { run, lane, idx, batch: batch.clone() };
+                let job = Job { run, lane, idx, batch: batch.clone(), queued: Instant::now() };
                 match lane {
                     Lane::Request => q.request.push_back(job),
                     Lane::Background => q.background.push_back(job),
@@ -676,6 +679,7 @@ fn worker(s: &PoolShared) {
         // both lanes' submitters wait on it
         s.space.notify_all();
         let t = Instant::now();
+        s.stats.waits[job.lane as usize].observe(t.duration_since(job.queued).as_nanos() as u64, 0);
         let out = read_run(&job.run, &s.stats);
         if job.lane == Lane::Background {
             s.stats.background_pages.fetch_add(job.run.frames.len() as u64, Relaxed);

@@ -274,6 +274,23 @@ impl Storage {
                 let mut cfg = crate::store::engine::Config::new(*memory);
                 cfg.max_frames = *max_frames;
                 cfg.background = background;
+                // knobs for the storage measurements, not flags: the I/O pool's
+                // size (E7), and EIO on pages of a file (E6: `FILE:P,P,...`)
+                if let Some(n) = std::env::var("MARCO_IO_THREADS").ok().filter(|v| !v.trim().is_empty()) {
+                    cfg.io_threads = n.trim().parse().context("MARCO_IO_THREADS")?;
+                }
+                if let Some(f) = std::env::var("MARCO_FAULT_EIO").ok().filter(|v| !v.trim().is_empty()) {
+                    let (file, pages) = f.trim().split_once(':').context("MARCO_FAULT_EIO is FILE:P,P,...")?;
+                    let pages: Vec<u32> = pages
+                        .split(',')
+                        .map(|p| p.trim().parse())
+                        .collect::<Result<_, _>>()
+                        .context("MARCO_FAULT_EIO")?;
+                    let fault = io::Fault::new(io::default_device());
+                    fault.eio(file, pages, io::Times::Always);
+                    tracing::warn!(file, "MARCO_FAULT_EIO: reads of some of its pages fail");
+                    cfg.device = fault;
+                }
                 Ok(Arc::new(Engine::with_config(cfg)?))
             }
         }

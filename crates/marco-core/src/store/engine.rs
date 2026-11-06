@@ -1668,6 +1668,14 @@ impl Engine {
         }
     }
 
+    /// Per lane, how long reads waited for an I/O thread (`bytes` unused).
+    pub fn io_queue_wait(&self) -> [crate::store::io::IoLatency; 2] {
+        match &self.inner.io {
+            Some(io) => [io.stats().waits[0].snapshot(), io.stats().waits[1].snapshot()],
+            None => Default::default(),
+        }
+    }
+
     /// Pages marked bad, with why.
     pub fn bad_pages(&self) -> Vec<(PageId, StorageError)> {
         let mut v: Vec<_> = self.inner.bad.lock().unwrap().iter().map(|(p, e)| (*p, e.clone())).collect();

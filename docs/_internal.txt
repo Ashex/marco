@@ -4,3 +4,4 @@
 index.md                # the repo's reading list of every page
 design.html             # the design record: iterations and alternatives, not the current version
 storage.html            # the storage engine design: no mmap, no page cache
+storage-results.html    # the storage engine measured against mmap: every gate of storage.html §14

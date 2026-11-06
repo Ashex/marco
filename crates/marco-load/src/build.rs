@@ -23,7 +23,7 @@ use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
@@ -31,7 +31,7 @@ use rayon::prelude::*;
 use serde::Serialize;
 
 use marco_core::did::{classify, DidRef, Radix};
-use marco_core::format6::{InLayout, InSections, Layout, OutSections, SetWriter6};
+use marco_core::format6::{Heat, InLayout, InSections, Layout, OutSections, SetWriter6};
 use marco_core::inset;
 use marco_core::outlog::{self, OutBytes};
 use marco_core::rkey::key_of;
@@ -61,6 +61,28 @@ pub struct Opts {
     pub cursors: BTreeMap<String, String>,
     /// The snapshot format: 5 (what the server reads) or 6 (paged).
     pub format: u32,
+    /// FORMAT 6: lay small lists out hottest first by these weights,
+    /// `did<TAB>weight` files of viewers and subjects ([`Heat`]).
+    pub heat: Option<(PathBuf, PathBuf)>,
+}
+
+/// `did<TAB>weight` lines as weights by actor id; DIDs the directory
+/// doesn't have are skipped.
+fn read_heat(dir: &Dir, path: &Path) -> Result<(Vec<u32>, u64)> {
+    use std::io::BufRead;
+    let mut w = vec![0u32; dir.len()];
+    let mut found = 0u64;
+    let f = std::io::BufReader::new(std::fs::File::open(path).with_context(|| format!("{}", path.display()))?);
+    for line in f.split(b'\n') {
+        let line = line?;
+        let Some(tab) = line.iter().position(|&b| b == b'\t') else { continue };
+        let Some(id) = dir.lookup(&line[..tab]) else { continue };
+        let v: u32 =
+            std::str::from_utf8(&line[tab + 1..])?.trim().parse().with_context(|| format!("{}", path.display()))?;
+        w[id as usize] = v;
+        found += 1;
+    }
+    Ok((w, found))
 }
 
 /// The cursor key for the time (µs) an input's records are current to:
@@ -247,6 +269,10 @@ pub struct Report {
     /// Stamped into the manifest from the input's cursors.json.
     pub cursors: BTreeMap<String, String>,
     pub format: u32,
+    /// With a heat-ordered layout: the viewers and subjects whose weights
+    /// the directory had.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heat: Option<(u64, u64)>,
     /// FORMAT 6: per relation, how its lists were laid out.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub layout: Vec<RelLayout>,
@@ -1015,12 +1041,16 @@ fn out_shard6(
     hi: u32,
     o: &Opts,
     spills: &[Spill],
+    heat: Option<&Arc<Heat>>,
     c: &Counters,
 ) -> Result<Vec<(RelReport, Layout)>> {
     let mut reps = Vec::new();
     for (ri, (mode, rel_files)) in files.iter().enumerate() {
         let mut rr = RelReport::default();
         let mut sec = OutSections::new(ri, o.subj_index);
+        if let Some(h) = heat {
+            sec = sec.with_heat(h.clone(), lo);
+        }
         sec.begin(w)?;
         let mut side: Vec<(u32, u64, String)> = Vec::new();
         let mut held: Vec<ChunkOut> = Vec::new();
@@ -1088,12 +1118,16 @@ fn in_shard6(
     lo: u32,
     hi: u32,
     spills: &[Spill],
+    heat: Option<&Arc<Heat>>,
     c: &Counters,
 ) -> Result<Vec<(RelReport, InLayout)>> {
     let mut reps = Vec::new();
     for (ri, sp) in spills.iter().enumerate() {
         let mut rr = RelReport::default();
         let mut sec = InSections::new(ri);
+        if let Some(h) = heat {
+            sec = sec.with_heat(h.clone(), lo);
+        }
         for b in 0..sp.subs {
             let bo = in_bucket(&sp.paths[k * sp.subs + b], lo, c, Some(&mut sec))?;
             rr.add_in(&bo);
@@ -1182,6 +1216,16 @@ pub fn build(o: &Opts) -> Result<Report> {
     };
     rep.phases.push(c.phase("directory", t));
     metrics::set("dids", n as f64);
+    let heat = match &o.heat {
+        Some(_) if !paged => bail!("a heat-ordered layout is FORMAT 6's"),
+        Some((v, s)) => {
+            let (viewer, nv) = read_heat(&dir, v)?;
+            let (subject, ns) = read_heat(&dir, s)?;
+            rep.heat = Some((nv, ns));
+            Some(Arc::new(Heat { viewer, subject }))
+        }
+        None => None,
+    };
 
     // each file's actor id range, from its first and last repo (or list)
     let files: Vec<RelFiles> = per_rel
@@ -1236,7 +1280,7 @@ pub fn build(o: &Opts) -> Result<Report> {
                 .into_iter()
                 .map(|r| (r, Layout::default()))
                 .collect()),
-            ShardWriter::F6(w) => out_shard6(w, &files, &dir, ranges[k].0, ranges[k].1, o, &spills, &c),
+            ShardWriter::F6(w) => out_shard6(w, &files, &dir, ranges[k].0, ranges[k].1, o, &spills, heat.as_ref(), &c),
         })
         .collect::<Result<_>>()?;
     let outs: Vec<Vec<RelReport>> = outs
@@ -1270,7 +1314,7 @@ pub fn build(o: &Opts) -> Result<Report> {
                 .into_iter()
                 .map(|r| (r, InLayout::default()))
                 .collect()),
-            ShardWriter::F6(w) => in_shard6(w, k, ranges[k].0, ranges[k].1, &spills, &c),
+            ShardWriter::F6(w) => in_shard6(w, k, ranges[k].0, ranges[k].1, &spills, heat.as_ref(), &c),
         })
         .collect::<Result<_>>()?;
     let ins: Vec<Vec<RelReport>> = ins
@@ -1555,6 +1599,7 @@ mod tests {
             deletes: Some(DeletesOut { dir: tmp.path().join("deletes"), since_us: 0 }),
             cursors: [("time_us".to_string(), "1730000000000000".to_string())].into(),
             format: PAGED_FORMAT,
+            heat: None,
         };
         let rep = build(&o).unwrap();
         let f = &rep.rels[0];
@@ -1692,6 +1737,7 @@ mod tests {
                     deletes: None,
                     cursors: BTreeMap::new(),
                     format,
+                    heat: None,
                 };
                 (build(&o).unwrap(), out)
             };
@@ -1725,6 +1771,34 @@ mod tests {
             g.write_snapshot(&w).unwrap();
             let c = crate::compare6::compare(&a, &w).unwrap();
             assert_eq!(c.out_records, r5.rels.iter().map(|r| r.out_records).sum::<u64>());
+
+            // heat-ordered: the same lists, laid out differently
+            let (v, s) = (tmp.path().join("viewers.tsv"), tmp.path().join("subjects.tsv"));
+            let tsv =
+                |n: u64, w: u64| (0..n).map(|i| format!("{}\t{}\n", did(i * 3), 1 + (i * w) % 30)).collect::<String>();
+            std::fs::write(&v, tsv(200, 7) + "did:plc:notinthesnapshotxxxxxx\t9\n").unwrap();
+            std::fs::write(&s, tsv(400, 13)).unwrap();
+            let hot = tmp.path().join(format!("hot-{subj_index}"));
+            let o = Opts {
+                input: input.clone(),
+                out: hot.clone(),
+                tmp: tmp.path().join("spill"),
+                rels: Relations::bsky_default(),
+                subj_index,
+                shards: 4,
+                sub_buckets: 2,
+                deletes: None,
+                cursors: BTreeMap::new(),
+                format: PAGED_FORMAT,
+                heat: Some((v, s)),
+            };
+            let rh = build(&o).unwrap();
+            let (nv, ns) = rh.heat.unwrap();
+            assert!(nv > 100 && nv <= 200 && ns > 100 && ns <= 400, "DIDs not in the snapshot are skipped: {nv} {ns}");
+            let c = crate::compare6::compare(&a, &hot).unwrap();
+            assert_eq!(c.out_records, r5.rels.iter().map(|r| r.out_records).sum::<u64>());
+            let shard0 = |d: &Path| std::fs::read(d.join(marco_core::store::shard_file(0, 0))).unwrap();
+            assert_ne!(shard0(&b), shard0(&hot), "a different layout");
         }
     }
 
@@ -1745,6 +1819,7 @@ mod tests {
             deletes: None,
             cursors: BTreeMap::new(),
             format: PAGED_FORMAT,
+            heat: None,
         };
         let rep = build(&o).unwrap();
         (rep, Graph::open(&out).unwrap())

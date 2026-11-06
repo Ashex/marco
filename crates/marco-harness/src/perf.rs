@@ -972,12 +972,55 @@ fn scrape_parse(text: &str, hists: &[&str], counters: &[&str]) -> BTreeMap<Strin
         if counters.contains(&name) {
             *out.entry(name.to_string()).or_default().entry("value".into()).or_default() += v;
         }
+        let labels = || key.split_once('{').map_or("", |x| x.1.trim_end_matches('}'));
+        if SCRAPE_BY_LABEL.contains(&name) {
+            *out.entry(name.to_string()).or_default().entry(labels().to_string()).or_default() += v;
+        }
+        if let Some(part) = name.strip_prefix("marco_rpc_seconds_") {
+            // the path label apart, for the hit-only latency (E9)
+            let l = labels();
+            if let Some(p) = l.split("path=\"").nth(1).and_then(|r| r.split('"').next()) {
+                let k = if part == "bucket" {
+                    l.split("le=\"").nth(1).and_then(|r| r.split('"').next()).unwrap_or("").to_string()
+                } else {
+                    part.to_string()
+                };
+                *out.entry(format!("marco_rpc_seconds:path={p}")).or_default().entry(k).or_default() += v;
+            }
+        }
     }
     out
 }
 
-const SCRAPE_HISTS: [&str; 4] =
-    ["marco_ingest_lag_seconds", "marco_ingest_apply_seconds", "marco_rpc_seconds", "marco_segment_write_seconds"];
+/// Families kept per label set (the label string is the key): the engine's
+/// counters, and its per-RPC page and round sums.
+const SCRAPE_BY_LABEL: [&str; 15] = [
+    "marco_store_lookups_total",
+    "marco_store_bytes_used_total",
+    "marco_store_io_bytes_total",
+    "marco_store_io_seconds_count",
+    "marco_store_io_seconds_sum",
+    "marco_store_busy_total",
+    "marco_store_evictions_total",
+    "marco_store_ghost_hits_total",
+    "marco_store_read_errors_total",
+    "marco_store_request_pages_sum",
+    "marco_store_request_pages_count",
+    "marco_store_request_rounds_sum",
+    "marco_store_request_rounds_count",
+    "marco_store_miss_pool_wait_seconds_sum",
+    "marco_store_miss_pool_wait_seconds_count",
+];
+
+const SCRAPE_HISTS: [&str; 7] = [
+    "marco_ingest_lag_seconds",
+    "marco_ingest_apply_seconds",
+    "marco_rpc_seconds",
+    "marco_segment_write_seconds",
+    "marco_store_miss_pool_wait_seconds",
+    "marco_store_io_seconds",
+    "marco_store_io_queue_wait_seconds",
+];
 const SCRAPE_COUNTERS: [&str; 2] = ["marco_ingest_ops_total", "marco_ingest_events_total"];
 
 struct Scraper {
@@ -1038,8 +1081,11 @@ impl Ctx {
             (Some(s), Some(a)) => s.take().await.map(|b| scrape_delta(a, &b)),
             _ => None,
         };
+        let end_unix =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
         json!({
             "window_secs": secs,
+            "end_unix": end_unix,
             "client": {"cpu_s": cpu, "threads": self.client_threads, "cores_used": cpu / secs,
                        "util": cpu / secs / self.client_threads.max(1) as f64, "mem": mem_of(None)},
             "server": self.server_pid.map(|p| json!({"pid": p, "cpu_s": server_cpu, "cores_used": server_cpu.map(|c| c / secs), "mem": mem_of(Some(p))})),
@@ -1801,5 +1847,13 @@ mod tests {
         assert_eq!(m["marco_rpc_seconds"]["0.001"], 7.0);
         assert_eq!(m["marco_rpc_seconds"]["count"], 3.0);
         assert_eq!(m["marco_ingest_ops_total"]["value"], 10.0);
+        let text = "marco_rpc_seconds_bucket{rpc=\"a\",path=\"fast\",le=\"0.001\"} 3\n\
+                    marco_rpc_seconds_bucket{rpc=\"b\",path=\"fast\",le=\"0.001\"} 4\n\
+                    marco_rpc_seconds_count{rpc=\"b\",path=\"pool\"} 2\n\
+                    marco_store_bytes_used_total{structure=\"in_small\"} 9\n";
+        let m = scrape_parse(text, &SCRAPE_HISTS, &SCRAPE_COUNTERS);
+        assert_eq!(m["marco_rpc_seconds:path=fast"]["0.001"], 7.0);
+        assert_eq!(m["marco_rpc_seconds:path=pool"]["count"], 2.0);
+        assert_eq!(m["marco_store_bytes_used_total"]["structure=\"in_small\""], 9.0);
     }
 }

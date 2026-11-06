@@ -329,7 +329,7 @@ struct StoreMetrics {
     descs: Vec<prometheus::core::Desc>,
 }
 
-const STORE_FAMILIES: [(&str, &str, &[&str]); 14] = [
+const STORE_FAMILIES: [(&str, &str, &[&str]); 15] = [
     ("marco_store_bytes", "Where the store's budget is, by part (bytes)", &["part"]),
     (
         "marco_store_lookups_total",
@@ -368,6 +368,7 @@ const STORE_FAMILIES: [(&str, &str, &[&str]); 14] = [
         "Bytes of lists and blocks requests decoded, by structure, each block once per pass: bytes read over this is the read amplification",
         &["structure"],
     ),
+    ("marco_store_io_queue_wait_seconds", "How long reads waited in the queue for an I/O thread, by lane", &["queue"]),
 ];
 
 impl StoreMetrics {
@@ -428,6 +429,26 @@ fn counter(f: &mut prometheus::proto::MetricFamily, labels: &[(&str, &str)], v: 
     f.mut_metric().push(m);
 }
 
+/// One lane's [`marco_core::store::io::IoLatency`] as a histogram: buckets of 2^k µs.
+fn io_hist(labels: &[(&str, &str)], l: &marco_core::store::io::IoLatency) -> prometheus::proto::Metric {
+    let mut m = metric(labels);
+    let mut hist = prometheus::proto::Histogram::default();
+    hist.set_sample_count(l.count);
+    hist.set_sample_sum(l.nanos as f64 / 1e9);
+    let mut cum = 0;
+    let mut bs = Vec::new();
+    for (k, &n) in l.buckets.iter().take(marco_core::store::io::IO_BUCKETS).enumerate() {
+        cum += n;
+        let mut b = prometheus::proto::Bucket::default();
+        b.set_cumulative_count(cum);
+        b.set_upper_bound((1u64 << k) as f64 / 1e6);
+        bs.push(b);
+    }
+    hist.set_bucket(bs);
+    m.set_histogram(hist);
+    m
+}
+
 impl prometheus::core::Collector for StoreMetrics {
     fn desc(&self) -> Vec<&prometheus::core::Desc> {
         self.descs.iter().collect()
@@ -472,22 +493,7 @@ impl prometheus::core::Collector for StoreMetrics {
         let mut bytes = family(3, COUNTER);
         let mut depth = family(4, GAUGE);
         for (i, l) in lat.iter().enumerate() {
-            let mut m = metric(&[("queue", lanes[i])]);
-            let mut hist = prometheus::proto::Histogram::default();
-            hist.set_sample_count(l.count);
-            hist.set_sample_sum(l.nanos as f64 / 1e9);
-            let mut cum = 0;
-            let mut bs = Vec::new();
-            for (k, &n) in l.buckets.iter().take(marco_core::store::io::IO_BUCKETS).enumerate() {
-                cum += n;
-                let mut b = prometheus::proto::Bucket::default();
-                b.set_cumulative_count(cum);
-                b.set_upper_bound((1u64 << k) as f64 / 1e6);
-                bs.push(b);
-            }
-            hist.set_bucket(bs);
-            m.set_histogram(hist);
-            h.mut_metric().push(m);
+            h.mut_metric().push(io_hist(&[("queue", lanes[i])], l));
             counter(&mut bytes, &[("queue", lanes[i])], l.bytes);
             gauge(&mut depth, &[("queue", lanes[i])], [depth_r, depth_b][i] as f64);
         }
@@ -526,6 +532,11 @@ impl prometheus::core::Collector for StoreMetrics {
         let mut f = family(13, COUNTER);
         for s in Structure::ALL {
             counter(&mut f, &[("structure", s.name())], st.bytes_used[s as usize]);
+        }
+        out.push(f);
+        let mut f = family(14, HISTOGRAM);
+        for (i, l) in e.io_queue_wait().iter().enumerate() {
+            f.mut_metric().push(io_hist(&[("queue", lanes[i])], l));
         }
         out.push(f);
         out

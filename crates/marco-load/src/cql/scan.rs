@@ -553,6 +553,7 @@ pub fn run(a: &Args) -> Result<Value> {
             deletes: None,
             cursors,
             format: marco_core::snapshot::PAGED_FORMAT,
+            heat: None,
         };
         let b = crate::build::build(&o)?;
         let _ = std::fs::remove_dir(&tmp);
