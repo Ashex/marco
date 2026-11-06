@@ -18,7 +18,9 @@
 use anyhow::Result;
 
 use crate::format6::{Packer, Space};
-use crate::read::{Blocks, Pending, ReadCx, R};
+use std::ops::Range;
+
+use crate::read::{need_each, Blocks, Pending, ReadCx, Use, R};
 use crate::varint::{self, u32_at, u64_padded};
 
 pub const BLOCK: usize = 128;
@@ -121,6 +123,49 @@ pub fn decode_block(bytes: &[u8], first: u32, k: usize, out: &mut [u32; BLOCK]) 
         }
         word += 1;
     }
+}
+
+/// The bytes a block of `k` ids takes from the start of `bytes`, as
+/// [`encode_block`] wrote it: what a decode of it uses.
+pub fn block_bytes(bytes: &[u8], k: usize) -> usize {
+    let m = k.saturating_sub(1);
+    if m == 0 || bytes.is_empty() {
+        return 0;
+    }
+    let l = bytes[0] as usize;
+    let lower = (m * l).div_ceil(8);
+    let up = 1 + lower;
+    // the upper bits end one past the m-th set bit (encode_block's
+    // m + (maxd >> l) + 1 bits)
+    let mut seen = 0;
+    for (i, &x) in bytes.get(up..).unwrap_or(&[]).iter().enumerate() {
+        let c = x.count_ones() as usize;
+        if seen + c >= m {
+            let mut x = x;
+            for _ in 0..m - seen - 1 {
+                x &= x - 1;
+            }
+            let last = 8 * i + x.trailing_zeros() as usize;
+            return (up + (last + 2).div_ceil(8)).min(bytes.len());
+        }
+        seen += c;
+    }
+    bytes.len()
+}
+
+/// The bytes the set [`encode`] wrote at the start of `bytes` takes.
+pub fn encoded_len(bytes: &[u8]) -> usize {
+    let mut pos = 0;
+    let n = varint::get(bytes, &mut pos) as usize;
+    if n <= SMALL {
+        return pos + varint::len_of(&bytes[pos..], n);
+    }
+    let nb = n.div_ceil(BLOCK);
+    let body = &bytes[pos..];
+    let (start, last) = if nb == 1 { (4, 0) } else { (8 * nb, u32_at(body, 4 * nb + 4 * (nb - 1)) as usize) };
+    let k = n - (nb - 1) * BLOCK;
+    let at = start + last;
+    pos + at + block_bytes(&body[at..], k)
 }
 
 #[derive(Clone, Copy)]
@@ -412,13 +457,27 @@ pub struct SplitIn<'g> {
 /// nothing for a block of one id.
 pub struct SetBlocks<'s, 'g>(&'s SplitIn<'g>);
 
-impl<'g> Blocks<'g> for SetBlocks<'_, 'g> {
-    fn block(&self, cx: &ReadCx<'g>, b: usize) -> R<&'g [u8]> {
+impl<'g> SetBlocks<'_, 'g> {
+    /// Block b's bytes, not counted as used: for [`Blocks::need`] and
+    /// prefetches.
+    fn fetch(&self, cx: &ReadCx<'g>, b: usize) -> R<&'g [u8]> {
         let s = self.0;
         if s.block_len(b) == 1 {
             return Ok(&[]);
         }
         s.space.tail(cx, s.at(b) as u64)
+    }
+}
+
+impl<'g> Blocks<'g> for SetBlocks<'_, 'g> {
+    fn block(&self, cx: &ReadCx<'g>, b: usize) -> R<&'g [u8]> {
+        let t = self.fetch(cx, b)?;
+        cx.used(t, self.0.space.kind(), Use::Set(self.0.block_len(b) as u32));
+        Ok(t)
+    }
+
+    fn need(&self, cx: &ReadCx<'g>, bs: Range<usize>) -> R<()> {
+        need_each(bs, |b| self.fetch(cx, b).is_ok())
     }
 }
 
@@ -548,7 +607,7 @@ impl<'g> SplitIn<'g> {
             let Some(b) = self.block_for(x, from) else { continue };
             from = b;
             if last != Some(b) && self.first(b) != x {
-                ok &= self.blocks().block(cx, b).is_ok();
+                ok &= self.blocks().fetch(cx, b).is_ok();
                 last = Some(b);
             }
         }
@@ -602,7 +661,11 @@ impl<'g> PagedIn<'g> {
         blocks: &'g Space,
     ) -> R<PagedIn<'g>> {
         match e {
-            crate::format6::Entry::Small(at) => Ok(PagedIn::Whole(InList::parse(small.tail(cx, at as u64)?))),
+            crate::format6::Entry::Small(at) => {
+                let t = small.tail(cx, at as u64)?;
+                cx.used(t, small.kind(), Use::InList);
+                Ok(PagedIn::Whole(InList::parse(t)))
+            }
             crate::format6::Entry::Head(at) => {
                 let h = head.get(at as usize..).ok_or(Pending)?;
                 SplitIn::parse(h, blocks).map(PagedIn::Split).ok_or(Pending)
@@ -700,6 +763,9 @@ mod tests {
     fn check(ids: &[u32]) {
         let mut enc = Vec::new();
         encode(ids, &mut enc);
+        let mut padded = enc.clone();
+        padded.extend_from_slice(&[0xff, 0x80, 1, 0, 0xff, 0xff]);
+        assert_eq!(encoded_len(&padded), enc.len(), "{} ids", ids.len());
         let l = InList::parse(&enc);
         assert_eq!(l.len(), ids.len());
         assert_eq!(l.to_vec(), ids);
@@ -725,6 +791,22 @@ mod tests {
         l.intersect_sorted(&probes, usize::MAX, &mut got);
         let want: Vec<u32> = probes.iter().copied().filter(|p| ids.binary_search(p).is_ok()).collect();
         assert_eq!(got, want);
+    }
+
+    #[test]
+    fn block_bytes_match_the_encoder() {
+        let mut s = 0x2545f4914f6cdd1du64;
+        for k in [1usize, 2, 3, 8, 64, 127, 128] {
+            for spread in [1u64, 3, 1000, 1 << 24, 1 << 31] {
+                let mut v: Vec<u32> = (0..k).map(|_| (rng(&mut s) % spread) as u32).collect();
+                v.sort_unstable();
+                let mut enc = Vec::new();
+                encode_block(&v, &mut enc);
+                let len = enc.len();
+                enc.extend_from_slice(&[0xff; 9]);
+                assert_eq!(block_bytes(&enc, k), len, "k {k} spread {spread}");
+            }
+        }
     }
 
     #[test]

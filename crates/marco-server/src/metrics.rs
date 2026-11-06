@@ -329,7 +329,7 @@ struct StoreMetrics {
     descs: Vec<prometheus::core::Desc>,
 }
 
-const STORE_FAMILIES: [(&str, &str, &[&str]); 13] = [
+const STORE_FAMILIES: [(&str, &str, &[&str]); 14] = [
     ("marco_store_bytes", "Where the store's budget is, by part (bytes)", &["part"]),
     (
         "marco_store_lookups_total",
@@ -362,6 +362,11 @@ const STORE_FAMILIES: [(&str, &str, &[&str]); 13] = [
         "marco_store_stalled_requests_total",
         "Requests whose missing pages stopped shrinking for 16 rounds: a bug signal",
         &[],
+    ),
+    (
+        "marco_store_bytes_used_total",
+        "Bytes of lists and blocks requests decoded, by structure, each block once per pass: bytes read over this is the read amplification",
+        &["structure"],
     ),
 ];
 
@@ -517,6 +522,11 @@ impl prometheus::core::Collector for StoreMetrics {
         out.push(f);
         let mut f = family(12, COUNTER);
         counter(&mut f, &[], st.stalled_requests);
+        out.push(f);
+        let mut f = family(13, COUNTER);
+        for s in Structure::ALL {
+            counter(&mut f, &[("structure", s.name())], st.bytes_used[s as usize]);
+        }
         out.push(f);
         out
     }

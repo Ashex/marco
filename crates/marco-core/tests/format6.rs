@@ -521,3 +521,69 @@ fn the_paged_writer_writes_direct_where_it_can() {
     }
     assert_eq!(footer.pinned(&file, "c").unwrap(), &vec![9u8; 5 * PAGE + 77][..]);
 }
+
+#[test]
+fn bytes_used_counts_each_decoded_block_once_per_pass() {
+    // these spaces are built bare, so every page counts as Structure::Other
+    let total = |u: [u64; 7]| u.iter().sum::<u64>();
+    let mut r = Rng(0x5eed);
+    let (big, small) = (random_set(&mut r, 9000), random_set(&mut r, 40));
+    let s = In::build(vec![big.clone(), small.clone()]);
+    let (mut blocks, mut head) = (Packer::new(0), Vec::new());
+    inset::encode_split(&big, &mut blocks, &mut head).unwrap();
+    let mut small_bytes = Vec::new();
+    inset::encode(&small, &mut small_bytes);
+    let e = s.pages.engine(|_| true);
+    let used = |f: &dyn Fn(&ReadCx<'_>) -> R<()>| {
+        let g = e.pin();
+        let cx = ReadCx::new(&e, &g);
+        f(&cx).unwrap();
+        cx.bytes_used()
+    };
+    let u = used(&|cx| {
+        for _ in 0..2 {
+            s.open(cx, 0)?.to_vec(cx)?;
+            s.open(cx, 0)?.contains(cx, big[4000])?;
+        }
+        Ok(())
+    });
+    assert_eq!(total(u), blocks.bytes, "every block once, though decoded twice or more");
+    let u = used(&|cx| s.open(cx, 1)?.to_vec(cx).map(|_| ()));
+    assert_eq!(total(u), small_bytes.len() as u64);
+    let u = total(used(&|cx| s.open(cx, 0)?.contains(cx, big[4000] + 1).map(|_| ())));
+    assert!(u > 0 && u < 200, "one block: {u}");
+    let u = used(&|cx| match s.open(cx, 0)? {
+        PagedIn::Split(l) => {
+            use marco_core::read::Blocks;
+            l.blocks().need(cx, 0..big.len().div_ceil(BLOCK))
+        }
+        PagedIn::Whole(_) => unreachable!(),
+    });
+    assert_eq!(u, [0; 7], "need() reads blocks without using them");
+
+    let list = random_list(&mut r, 5000);
+    let o = Out::build(vec![list.clone()], 64);
+    let (mut subj, mut rkey, mut bysubj) = (Packer::new(0), Packer::new(0), Packer::new(0));
+    let cols = SplitCols { subj: &mut subj, rkey: &mut rkey, bysubj: &mut bysubj };
+    outlog::encode_split(&list, 64, cols, &mut Vec::new(), &mut OutBytes::default()).unwrap();
+    let e = o.pages.engine(|_| true);
+    let g = e.pin();
+    let cx = ReadCx::new(&e, &g);
+    o.open(&cx, 0).unwrap().to_vec(&cx).unwrap();
+    assert_eq!(total(cx.bytes_used()), subj.bytes + rkey.bytes);
+    o.open(&cx, 0).unwrap().subjects_sorted(&cx, &mut Vec::new()).unwrap();
+    assert_eq!(total(cx.bytes_used()), subj.bytes + rkey.bytes + bysubj.bytes);
+    drop(cx);
+    drop(g);
+
+    // the engine adds a request's clean passes, not a job's or a missing one
+    assert_eq!(e.stats().bytes_used, [0; 7]);
+    e.pass(&mut Hold::none(), |cx| o.open(cx, 0)?.to_vec(cx).map(|_| ())).unwrap();
+    let after = e.stats().bytes_used;
+    assert_eq!(total(after), subj.bytes + rkey.bytes);
+    e.pass(&mut Hold::new(), |cx| o.open(cx, 0)?.to_vec(cx).map(|_| ())).unwrap();
+    assert_eq!(e.stats().bytes_used, after, "a job's pass isn't a request's");
+    let none = o.pages.engine(|_| false);
+    assert!(none.pass(&mut Hold::none(), |cx| o.open(cx, 0)?.to_vec(cx).map(|_| ())).is_err());
+    assert_eq!(none.stats().bytes_used, [0; 7], "a pass that missed decoded nothing it serves");
+}

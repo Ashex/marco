@@ -92,7 +92,12 @@ fn store_metrics_and_the_storm_rule() {
             sample(&m, "marco_store_lookups_total", r#"structure="out_small",result="miss",queue="none""#).unwrap();
         assert!(hits > 0.0 && misses > 0.0, "out_small: {hits} hits, {misses} misses");
         assert!(sample(&m, "marco_store_io_seconds_count", r#"queue="request""#).unwrap() > 0.0);
-        assert!(sample(&m, "marco_store_io_bytes_total", r#"queue="request""#).unwrap() > 0.0);
+        let read = sample(&m, "marco_store_io_bytes_total", r#"queue="request""#).unwrap();
+        assert!(read > 0.0);
+        // 200 lists of about 8 records: each counted once, from its own section
+        let used = sample(&m, "marco_store_bytes_used_total", r#"structure="out_small""#).unwrap();
+        assert!(used > 200.0 * 8.0 * 4.0 && used < read, "{used} bytes used of {read} read");
+        assert_eq!(sample(&m, "marco_store_bytes_used_total", r#"structure="other""#), Some(0.0));
         assert_eq!(sample(&m, "marco_store_bad_pages", ""), Some(0.0));
         assert_eq!(get(s.admin, "/readyz").await.0, 200);
 

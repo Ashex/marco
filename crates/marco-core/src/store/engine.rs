@@ -20,7 +20,9 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use rustc_hash::FxHashMap;
 
-use crate::read::{BadPage, Found, Guard, Hold, LookupCounts, Misses, PageSet, ReadCx, ReadStats, StorageError, R};
+use crate::read::{
+    BadPage, Found, Guard, Hold, LookupCounts, Misses, PageSet, ReadCx, ReadStats, StorageError, UsedBytes, R,
+};
 use crate::snapshot::{sums_section, Bytes, PagedFooter, SectionKind, TRAILER};
 use crate::store::cache::{Cache, CacheBytes, Entry, FileTable, GROUP, NO_FRAME};
 use crate::store::io::{
@@ -465,6 +467,7 @@ struct Stripe {
     pages: AtomicU64,
     misses: AtomicU64,
     by: [[AtomicU64; 4]; 7],
+    used: [AtomicU64; 7],
 }
 
 #[derive(Default)]
@@ -537,6 +540,9 @@ pub struct EngineStats {
     /// Lookups by structure and how they came out, `[structure][found]`
     /// ([`Structure`], [`Found`]).
     pub lookups: [[u64; 4]; 7],
+    /// Bytes requests' clean passes decoded, by structure
+    /// ([`ReadCx::bytes_used`]).
+    pub bytes_used: UsedBytes,
 }
 
 struct Inner {
@@ -949,17 +955,29 @@ impl Engine {
         }
     }
 
+    fn count_used(&self, used: &UsedBytes) {
+        let s = &self.inner.counters.stripes[stripe()];
+        for (x, &n) in s.used.iter().zip(used) {
+            if n > 0 {
+                x.fetch_add(n, Relaxed);
+            }
+        }
+    }
+
     /// One pass of `f`. Never waits. Ok if `f` succeeded and nothing was
     /// missing; otherwise the pages that were, after pinning the pages the
     /// pass touched into `hold` (before the guard drops).
     pub fn pass<T>(&self, hold: &mut Hold, f: impl FnOnce(&ReadCx<'_>) -> R<T>) -> Result<T, Misses> {
         let guard = self.pin();
         let (pages, touched) = {
-            let cx = ReadCx::with(self, &guard, hold.keep, &hold.pins, hold.private.as_deref());
+            let cx = ReadCx::with(self, &guard, hold.keep, &hold.pins, hold.private.as_deref(), hold.count_used);
             let r = f(&cx);
             self.count(cx.stats(), &cx.lookups());
             if cx.clean() {
                 if let Ok(t) = r {
+                    if hold.count_used {
+                        self.count_used(&cx.bytes_used());
+                    }
                     return Ok(t);
                 }
             }
@@ -1689,6 +1707,9 @@ impl Engine {
                 for (y, z) in a.iter_mut().zip(b) {
                     *y += z.load(Relaxed);
                 }
+            }
+            for (y, z) in s.bytes_used.iter_mut().zip(&x.used) {
+                *y += z.load(Relaxed);
             }
         }
         s.bad_pages = self.inner.bad.lock().unwrap().len() as u64;

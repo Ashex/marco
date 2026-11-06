@@ -169,6 +169,43 @@ impl Found {
 /// Lookups by structure and how they came out, `[structure][found]`.
 pub type LookupCounts = [[u32; 4]; 7];
 
+/// What a decode used of the bytes a [`ReadCx`] served, for bytes used by
+/// structure ([`ReadCx::bytes_used`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Use {
+    /// All of the slice.
+    Whole,
+    /// The first n varints.
+    Varints(u32),
+    /// An in-set block of k ids ([`crate::inset::block_bytes`]).
+    Set(u32),
+    /// A by-subject block of k entries: k positions, then a set block.
+    BySubj(u32),
+    /// A small out list, given subj_index.
+    OutList(usize),
+    /// A small in set.
+    InList,
+}
+
+impl Use {
+    fn len(self, b: &[u8]) -> usize {
+        match self {
+            Use::Whole => b.len(),
+            Use::Varints(n) => crate::varint::len_of(b, n as usize),
+            Use::Set(k) => crate::inset::block_bytes(b, k as usize),
+            Use::BySubj(k) => {
+                let p = 4 * k as usize;
+                p.min(b.len()) + b.get(p..).map_or(0, |r| crate::inset::block_bytes(r, k as usize))
+            }
+            Use::OutList(si) => crate::outlog::encoded_len(b, si),
+            Use::InList => crate::inset::encoded_len(b),
+        }
+    }
+}
+
+/// Bytes decoded by structure, [`Structure`] order.
+pub type UsedBytes = [u64; 7];
+
 /// Pages a hold read past the cache ([`Hold::past`]): each in a frame of
 /// the budget that's never published, so nobody else reads it, freed when
 /// the hold drops.
@@ -295,6 +332,11 @@ pub struct ReadCx<'g> {
     touched: RefCell<PageSet>,
     stats: Cell<ReadStats>,
     by: [[Cell<u32>; 4]; 7],
+    /// Record what decodes use ([`ReadCx::bytes_used`]).
+    count_used: bool,
+    /// (where the bytes start, how many were used, structure). Addresses,
+    /// not slices: a slice would make ReadCx invariant in 'g.
+    used: RefCell<Vec<(usize, u32, Structure)>>,
 }
 
 impl<'g> ReadCx<'g> {
@@ -302,7 +344,7 @@ impl<'g> ReadCx<'g> {
     /// [`Engine::pin`] on the same engine. It keeps no record of the pages it
     /// serves (as [`Hold::none`]).
     pub fn new(engine: &'g Engine, guard: &'g Guard) -> ReadCx<'g> {
-        ReadCx::with(engine, guard, false, &NO_PAGES, None)
+        ReadCx::with(engine, guard, false, &NO_PAGES, None, true)
     }
 
     pub(crate) fn with(
@@ -311,6 +353,7 @@ impl<'g> ReadCx<'g> {
         keep_touched: bool,
         held: &'g PageSet,
         private: Option<&'g Private>,
+        count_used: bool,
     ) -> ReadCx<'g> {
         ReadCx {
             guard,
@@ -323,7 +366,36 @@ impl<'g> ReadCx<'g> {
             touched: RefCell::new(PageSet::default()),
             stats: Cell::new(ReadStats::default()),
             by: Default::default(),
+            count_used,
+            used: RefCell::new(Vec::new()),
         }
+    }
+
+    /// Records that a decode used `how` of `bytes`, which this pass served
+    /// from a page of structure `s`. A block counts once per pass however
+    /// often it's decoded, keyed by where its bytes start.
+    #[inline]
+    pub(crate) fn used(&self, bytes: &[u8], s: Structure, how: Use) {
+        if self.count_used && !bytes.is_empty() {
+            self.used.borrow_mut().push((bytes.as_ptr() as usize, how.len(bytes) as u32, s));
+        }
+    }
+
+    /// Bytes the pass's decodes used so far, by structure: what requests
+    /// actually read of the lists and blocks their pages hold, against which
+    /// the bytes read from disk are an amplification.
+    pub fn bytes_used(&self) -> UsedBytes {
+        let mut out = [0u64; 7];
+        let mut used = self.used.borrow_mut();
+        if used.is_empty() {
+            return out;
+        }
+        used.sort_unstable_by_key(|u| u.0);
+        used.dedup_by_key(|u| u.0);
+        for &(_, n, s) in used.iter() {
+            out[s as usize] += n as u64;
+        }
+        out
     }
 
     /// Page `p`, if it's in memory; otherwise records it as missing and
@@ -419,15 +491,21 @@ pub trait Blocks<'g> {
     /// Registers every missing page among blocks `bs`, then returns
     /// [`Pending`] if there was one. Doesn't stop at the first.
     fn need(&self, cx: &ReadCx<'g>, bs: Range<usize>) -> R<()> {
-        let mut ok = true;
-        for b in bs {
-            ok &= self.block(cx, b).is_ok();
-        }
-        if ok {
-            Ok(())
-        } else {
-            Err(Pending)
-        }
+        need_each(bs, |b| self.block(cx, b).is_ok())
+    }
+}
+
+/// [`Blocks::need`] over `get`, which reads block b without decoding it and
+/// says whether it was there: every block is tried, Pending if one wasn't.
+pub fn need_each(bs: Range<usize>, mut get: impl FnMut(usize) -> bool) -> R<()> {
+    let mut ok = true;
+    for b in bs {
+        ok &= get(b);
+    }
+    if ok {
+        Ok(())
+    } else {
+        Err(Pending)
     }
 }
 
@@ -498,6 +576,9 @@ pub struct Hold {
     pub(crate) fetched: u64,
     /// Pages it read past the cache, if it reads that way ([`Hold::past`]).
     pub(crate) private: Option<Box<Private>>,
+    /// Its clean passes add to the engine's bytes used: a request's, not a
+    /// job's or a write's.
+    pub(crate) count_used: bool,
 }
 
 /// Pins a request holds at most (8 MiB of pages): with 64 requests on the
@@ -522,6 +603,7 @@ impl Hold {
             rounds: 0,
             fetched: 0,
             private: None,
+            count_used: false,
         }
     }
 
@@ -540,6 +622,7 @@ impl Hold {
     pub fn request(engine: &Engine) -> Hold {
         let mut h = Hold::new();
         h.page_limit = engine.page_limit();
+        h.count_used = true;
         h
     }
 
@@ -552,6 +635,7 @@ impl Hold {
         let mut h = Hold::none();
         h.page_limit = engine.job_limit();
         h.private = engine.cache().map(|c| Box::new(Private::new(c.clone())));
+        h.count_used = false;
         h
     }
 
@@ -560,10 +644,12 @@ impl Hold {
         self.private.is_some()
     }
 
-    /// A hold that pins nothing.
+    /// A hold that pins nothing: a request's fast pass on a worker, or a
+    /// tool's read.
     pub fn none() -> Hold {
         let mut h = Hold::with_max_pins(0);
         h.keep = false;
+        h.count_used = true;
         h
     }
 

@@ -270,6 +270,11 @@ impl Space {
         Ok(sp)
     }
 
+    /// The structure its pages hold.
+    pub fn kind(&self) -> crate::read::Structure {
+        self.kind
+    }
+
     pub fn pages(&self) -> u32 {
         self.parts.last().map_or(0, |p| p.first + p.pages)
     }

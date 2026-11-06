@@ -34,6 +34,23 @@ pub fn len(mut v: u64) -> usize {
     n
 }
 
+/// Bytes the first `n` varints of `b` take (all of `b` if it holds fewer).
+pub fn len_of(b: &[u8], n: usize) -> usize {
+    if n == 0 {
+        return 0;
+    }
+    let mut seen = 0;
+    for (i, &x) in b.iter().enumerate() {
+        if x < 0x80 {
+            seen += 1;
+            if seen == n {
+                return i + 1;
+            }
+        }
+    }
+    b.len()
+}
+
 #[inline]
 pub fn u32_at(b: &[u8], off: usize) -> u32 {
     u32::from_le_bytes(b[off..off + 4].try_into().unwrap())
@@ -75,5 +92,9 @@ mod tests {
         }
         assert_eq!(pos, out.len());
         assert_eq!(out.len(), vals.iter().map(|&v| len(v)).sum::<usize>());
+        for n in 0..=vals.len() {
+            assert_eq!(len_of(&out, n), vals[..n].iter().map(|&v| len(v)).sum::<usize>());
+        }
+        assert_eq!(len_of(&out[..3], 9), 3);
     }
 }

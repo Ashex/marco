@@ -19,7 +19,7 @@ use std::ops::Range;
 use anyhow::Result;
 
 use crate::format6::{Packer, Space};
-use crate::read::{Blocks, Pending, ReadCx, R};
+use crate::read::{need_each, Blocks, Pending, ReadCx, Use, R};
 use crate::varint::{self, u32_at, u64_at};
 
 pub const BLOCK: usize = 128;
@@ -134,6 +134,28 @@ pub fn bytes_of(b: &[u8], subj_index: usize) -> (usize, OutBytes) {
     }
     o.rkeys = b.len() as u64 - o.header - o.skip - o.bysubj - o.subjects;
     (n, o)
+}
+
+/// The bytes the list [`encode`] wrote at the start of `b` takes.
+pub fn encoded_len(b: &[u8], subj_index: usize) -> usize {
+    let mut pos = 0;
+    let n = varint::get(b, &mut pos) as usize;
+    if n == 0 {
+        return pos;
+    }
+    varint::get(b, &mut pos);
+    let nb = n.div_ceil(BLOCK);
+    let offs = pos + 8 * nb;
+    if nb > 1 {
+        pos += 12 * nb;
+    }
+    if n >= subj_index {
+        pos += 4 * n;
+    }
+    let (at, k) =
+        if nb == 1 { (pos, n) } else { (pos + u32_at(b, offs + 4 * (nb - 1)) as usize, n - (nb - 1) * BLOCK) };
+    let keys = at + 4 * k + if nb == 1 { 8 } else { 0 };
+    keys + varint::len_of(&b[keys..], k - 1)
 }
 
 #[derive(Clone, Copy)]
@@ -665,15 +687,30 @@ pub struct RkeyBlocks<'s, 'g>(&'s SplitOut<'g>);
 /// A big list's by-subject blocks as [`Blocks`], each to the end of its page.
 pub struct BySubjBlocks<'s, 'g>(&'s SplitOut<'g>);
 
-impl<'g> Blocks<'g> for SubjBlocks<'_, 'g> {
-    fn block(&self, cx: &ReadCx<'g>, b: usize) -> R<&'g [u8]> {
+// Each column's fetch reads a block without counting it as used, for
+// need(); block() is what decodes call, and counts it.
+
+impl<'g> SubjBlocks<'_, 'g> {
+    fn fetch(&self, cx: &ReadCx<'g>, b: usize) -> R<&'g [u8]> {
         let l = self.0;
         l.sp.subj.slice(cx, l.subj_at(b) as u64, 4 * l.block_len(b))
     }
 }
 
-impl<'g> Blocks<'g> for RkeyBlocks<'_, 'g> {
+impl<'g> Blocks<'g> for SubjBlocks<'_, 'g> {
     fn block(&self, cx: &ReadCx<'g>, b: usize) -> R<&'g [u8]> {
+        let t = self.fetch(cx, b)?;
+        cx.used(t, self.0.sp.subj.kind(), Use::Whole);
+        Ok(t)
+    }
+
+    fn need(&self, cx: &ReadCx<'g>, bs: Range<usize>) -> R<()> {
+        need_each(bs, |b| self.fetch(cx, b).is_ok())
+    }
+}
+
+impl<'g> RkeyBlocks<'_, 'g> {
+    fn fetch(&self, cx: &ReadCx<'g>, b: usize) -> R<&'g [u8]> {
         let l = self.0;
         if l.block_len(b) == 1 {
             return Ok(&[]);
@@ -682,10 +719,34 @@ impl<'g> Blocks<'g> for RkeyBlocks<'_, 'g> {
     }
 }
 
-impl<'g> Blocks<'g> for BySubjBlocks<'_, 'g> {
-    fn block(&self, cx: &ReadCx<'g>, j: usize) -> R<&'g [u8]> {
+impl<'g> Blocks<'g> for RkeyBlocks<'_, 'g> {
+    fn block(&self, cx: &ReadCx<'g>, b: usize) -> R<&'g [u8]> {
+        let t = self.fetch(cx, b)?;
+        cx.used(t, self.0.sp.rkey.kind(), Use::Varints(self.0.block_len(b) as u32 - 1));
+        Ok(t)
+    }
+
+    fn need(&self, cx: &ReadCx<'g>, bs: Range<usize>) -> R<()> {
+        need_each(bs, |b| self.fetch(cx, b).is_ok())
+    }
+}
+
+impl<'g> BySubjBlocks<'_, 'g> {
+    fn fetch(&self, cx: &ReadCx<'g>, j: usize) -> R<&'g [u8]> {
         let l = self.0;
         l.sp.bysubj.tail(cx, l.by_at(j) as u64)
+    }
+}
+
+impl<'g> Blocks<'g> for BySubjBlocks<'_, 'g> {
+    fn block(&self, cx: &ReadCx<'g>, j: usize) -> R<&'g [u8]> {
+        let t = self.fetch(cx, j)?;
+        cx.used(t, self.0.sp.bysubj.kind(), Use::BySubj(self.0.counts[j] as u32 + 1));
+        Ok(t)
+    }
+
+    fn need(&self, cx: &ReadCx<'g>, js: Range<usize>) -> R<()> {
+        need_each(js, |j| self.fetch(cx, j).is_ok())
     }
 }
 
@@ -998,7 +1059,9 @@ impl<'g> PagedOut<'g> {
     ) -> R<PagedOut<'g>> {
         match e {
             crate::format6::Entry::Small(at) => {
-                Ok(PagedOut::Whole(OutList::parse(small.tail(cx, at as u64)?, subj_index)))
+                let t = small.tail(cx, at as u64)?;
+                cx.used(t, small.kind(), Use::OutList(subj_index));
+                Ok(PagedOut::Whole(OutList::parse(t, subj_index)))
             }
             crate::format6::Entry::Head(at) => {
                 let h = head.get(at as usize..).ok_or(Pending)?;
@@ -1128,6 +1191,9 @@ mod tests {
         encode(edges, subj_index, &mut enc, &mut bytes);
         assert_eq!(bytes.total(), enc.len() as u64);
         assert_eq!(bytes_of(&enc, subj_index), (edges.len(), bytes));
+        let mut padded = enc.clone();
+        padded.extend_from_slice(&[0x80, 0x81, 7, 0, 3]);
+        assert_eq!(encoded_len(&padded, subj_index), enc.len());
         let l = OutList::parse(&enc, subj_index);
         assert_eq!(l.to_vec(), edges);
         let mut want: Vec<u32> = edges.iter().map(|e| e.1).collect();
