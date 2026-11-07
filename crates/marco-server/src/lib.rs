@@ -9,6 +9,7 @@ pub mod auth;
 pub mod graph_svc;
 pub mod ingest;
 pub mod liststats;
+pub mod memory;
 pub mod metrics;
 pub mod peer;
 pub mod pool;

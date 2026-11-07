@@ -83,6 +83,9 @@ pub struct Config {
     pub storage: Storage,
     /// Threads a request that misses moves to (`--miss-threads`).
     pub miss_threads: usize,
+    /// The process's memory limit, which the store keeps it under by giving back
+    /// cache ([`crate::memory`]); None: no limit to keep.
+    pub memory_limit: Option<u64>,
     /// When shards are compacted, after open and after each checkpoint.
     pub compaction: marco_core::CompactPolicy,
     /// The pace of background I/O (`--background-io`): compactions,
@@ -119,6 +122,7 @@ impl Config {
             prefault: true,
             storage: Storage::from_env().unwrap_or_else(|e| panic!("{e:#}")),
             miss_threads: 64,
+            memory_limit: None,
             compaction: marco_core::CompactPolicy::default(),
             background: marco_core::store::io::Rate::default(),
         }
@@ -317,6 +321,8 @@ pub struct App {
     /// reads through.
     pub engine: Arc<Engine>,
     pub miss_pool: crate::pool::MissPool,
+    /// What the process holds beside the store, as the memory watcher saw it.
+    pub beside: Arc<crate::memory::Beside>,
     graph: ArcSwap<Graph>,
     tx: Mutex<Option<mpsc::Sender<Req>>>,
     pub recent: Mutex<VecDeque<Recent>>,
@@ -349,16 +355,14 @@ pub fn now_ms() -> i64 {
     marco_core::store::now_ms()
 }
 
-/// Warns when the cgroup's memory limit leaves under 2 GiB beside the store
-/// budget: the deltas, the directory's live DIDs and the request heap live
-/// outside it.
-fn warn_cgroup(memory: u64) {
-    let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/memory.max") else { return };
-    let Ok(limit) = s.trim().parse::<u64>() else { return };
+/// Warns when the memory limit leaves under 2 GiB beside the store budget:
+/// the deltas, the directory's live DIDs and the request heap live outside
+/// it, and what they take past the room comes out of the cache.
+fn warn_limit(memory: u64, limit: u64) {
     if limit.saturating_sub(memory) < MIN_CACHE {
         eprintln!(
-            "marco: warning: the cgroup's memory limit ({} MiB) leaves under {} MiB beside --memory ({} MiB) for the \
-             graph's deltas and the process",
+            "marco: warning: the memory limit ({} MiB) leaves under {} MiB beside --memory ({} MiB) for the \
+             graph's deltas and the process; what they take past it comes out of the cache",
             limit >> 20,
             MIN_CACHE >> 20,
             memory >> 20
@@ -471,6 +475,7 @@ impl App {
         }
         let Replayed { graph: g, cursors, segments: segs, ops, last, .. } = open_replayed(&cfg, &engine, None)?;
         let mut resident = false;
+        let beside = Arc::new(crate::memory::Beside::default());
         if let (Storage::Engine { memory, max_frames }, Some(s)) = (&cfg.storage, g.snapshot()) {
             // a checkpoint that patches every shard reads each one's index and heads
             // again beside the old until its switch; the directory it never rewrites
@@ -488,8 +493,9 @@ impl App {
                     min.div_ceil(1 << 20)
                 );
             }
-            if max_frames.is_none() {
-                warn_cgroup(*memory);
+            if let (None, Some(limit)) = (max_frames, cfg.memory_limit) {
+                warn_limit(*memory, limit);
+                crate::memory::spawn(engine.clone(), *memory, limit, beside.clone());
             }
             if cfg.prefault {
                 let t = Instant::now();
@@ -543,6 +549,7 @@ impl App {
             cfg,
             engine,
             miss_pool,
+            beside,
             graph: ArcSwap::from_pointee(g),
             tx: Mutex::new(None),
             recent: Mutex::new(VecDeque::with_capacity(RECENT)),

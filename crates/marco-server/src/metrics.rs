@@ -162,6 +162,22 @@ pub static COMPACTION_PENDING: LazyLock<IntGauge> = LazyLock::new(|| {
         .unwrap()
 });
 
+pub static BESIDE: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "marco_process_beside_bytes",
+        "What the process holds beside the store: its RSS less the store's books"
+    )
+    .unwrap()
+});
+
+pub static RESERVE_SHORT: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "marco_store_reserve_short_bytes",
+        "What the process holds beside the store past its memory limit's room that the store couldn't give back"
+    )
+    .unwrap()
+});
+
 pub static COMPACTION_SECONDS: LazyLock<Histogram> = LazyLock::new(|| {
     register_histogram!(
         "marco_store_compaction_seconds",
@@ -196,6 +212,8 @@ pub fn init(version: &str, commit: &str) {
     LazyLock::force(&COMPACTION_GARBAGE);
     LazyLock::force(&COMPACTION_SECONDS);
     LazyLock::force(&COMPACTION_PENDING);
+    LazyLock::force(&BESIDE);
+    LazyLock::force(&RESERVE_SHORT);
 }
 
 /// `Graph/Has` from `/marco.v1.Graph/Has`.
@@ -245,10 +263,13 @@ pub struct StoreBytes {
     /// Paged bytes in the shards' files that no index names (cached at full
     /// residency, until compaction), as of the last checkpoint or compaction.
     pub garbage: u64,
+    /// Borrowed for what the process holds beside the store past the room its
+    /// memory limit leaves ([`crate::memory`]).
+    pub reserved: u64,
 }
 
 impl StoreBytes {
-    pub fn parts(&self) -> [(&'static str, u64); 12] {
+    pub fn parts(&self) -> [(&'static str, u64); 13] {
         [
             ("budget", self.budget),
             ("pinned_dir", self.pinned_dir),
@@ -262,6 +283,7 @@ impl StoreBytes {
             ("free", self.free),
             ("borrowed", self.borrowed),
             ("garbage", self.garbage),
+            ("reserved", self.reserved),
         ]
     }
 }
@@ -310,7 +332,8 @@ pub fn store_bytes(app: &crate::app::App) -> StoreBytes {
         }
     }
     s.pinned_tables += b.tables;
-    s.borrowed = b.borrowed.saturating_sub(files);
+    s.reserved = app.beside.reserved.load(std::sync::atomic::Ordering::Relaxed);
+    s.borrowed = b.borrowed.saturating_sub(files + s.reserved);
     s.free =
         b.budget.saturating_sub(b.borrowed + b.tables + (b.main_frames + b.small_frames + b.retired_frames) * page);
     s

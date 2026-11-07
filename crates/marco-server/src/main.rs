@@ -152,6 +152,11 @@ struct Serve {
     /// must hold the pinned tier plus 2 GiB; the graph's deltas and the process live outside it.
     #[arg(long, env = "MARCO_MEMORY", required_if_eq("storage", "engine"))]
     memory: Option<String>,
+    /// The process's memory limit (8GiB; "none" for none). The store gives back cache to keep the process
+    /// under it: what the graph's deltas, a checkpoint and requests take beside --memory, past what the limit
+    /// leaves less 512 MiB, comes out of the cache. Default: the cgroup's memory.max.
+    #[arg(long, env = "MARCO_MEMORY_LIMIT")]
+    memory_limit: Option<String>,
     /// Threads a request that misses the engine's cache moves to.
     #[arg(long, env = "MARCO_MISS_THREADS", default_value_t = 64)]
     miss_threads: usize,
@@ -213,6 +218,7 @@ fn flags(m: &ArgMatches, s: &Serve) -> Vec<FlagInfo> {
         ("no_prefault", s.no_prefault.to_string()),
         ("storage", s.storage.clone()),
         ("memory", s.memory.clone().unwrap_or_else(|| "—".into())),
+        ("memory_limit", s.memory_limit.clone().unwrap_or_else(|| "cgroup".into())),
         ("miss_threads", s.miss_threads.to_string()),
         ("mmap_advice", format!("{:?}", s.mmap_advice).to_lowercase()),
         ("jetstream", s.jetstream.clone().unwrap_or_else(|| "—".into())),
@@ -333,6 +339,11 @@ fn main() -> Result<()> {
                 ("engine", None) => bail!("--storage engine needs --memory"),
                 _ => marco_core::store::Storage::Mmap,
             };
+            let memory_limit = match s.memory_limit.as_deref() {
+                Some("none") => None,
+                Some(l) => Some(marco_core::store::parse_bytes(l).context("--memory-limit")?),
+                None => marco_server::memory::cgroup_limit(),
+            };
             if s.miss_threads == 0 {
                 bail!("--miss-threads must be at least 1");
             }
@@ -360,6 +371,7 @@ fn main() -> Result<()> {
                 expected_sources: source.iter().map(|s| s.name.clone()).collect(),
                 storage,
                 miss_threads: s.miss_threads,
+                memory_limit,
                 ..Config::new(s.snapshot.clone())
             };
             let site = marco_server::ui::Site {
