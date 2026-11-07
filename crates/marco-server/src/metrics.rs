@@ -157,6 +157,11 @@ pub static COMPACTION_GARBAGE: LazyLock<IntCounter> = LazyLock::new(|| {
     register_int_counter!("marco_store_compaction_garbage_bytes_total", "Bytes of garbage compactions cleared").unwrap()
 });
 
+pub static COMPACTION_PENDING: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!("marco_store_compaction_pending", "Shards the running compaction has left, 0 when none runs")
+        .unwrap()
+});
+
 pub static COMPACTION_SECONDS: LazyLock<Histogram> = LazyLock::new(|| {
     register_histogram!(
         "marco_store_compaction_seconds",
@@ -190,6 +195,7 @@ pub fn init(version: &str, commit: &str) {
     LazyLock::force(&COMPACTION_BYTES);
     LazyLock::force(&COMPACTION_GARBAGE);
     LazyLock::force(&COMPACTION_SECONDS);
+    LazyLock::force(&COMPACTION_PENDING);
 }
 
 /// `Graph/Has` from `/marco.v1.Graph/Has`.

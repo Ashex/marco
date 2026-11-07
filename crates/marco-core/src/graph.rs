@@ -1672,9 +1672,12 @@ impl Graph {
     /// No page limit: a limit could stop one copy's op partway where the
     /// other copy, finding the pages in memory, finishes it.
     fn rd<T>(&self, f: impl Fn(&Graph, &ReadCx<'_>) -> R<T>) -> Result<T> {
-        let r = match self.engine.pass(&mut Hold::none(), |cx| f(self, cx)) {
+        let r = match self.engine.pass(&mut Hold::write(), |cx| f(self, cx)) {
             Ok(t) => Ok(t),
-            Err(m) => self.engine.resume_blocking(&mut Hold::new(), Some(m), |cx| f(self, cx)),
+            Err(m) => {
+                self.engine.set_plan_writes(true);
+                self.engine.resume_blocking(&mut Hold::new(), Some(m), |cx| f(self, cx))
+            }
         };
         r.map_err(|e| anyhow::Error::new(e).context("a write's read failed"))
     }
@@ -1878,12 +1881,14 @@ impl Graph {
     /// every op until one is clean, pinning the pages into `hold`, which the
     /// caller keeps until it has applied the batch to every copy. Best
     /// effort: a read it didn't foresee, the write makes itself
-    /// ([`Graph::rd`]). Does nothing over a store that keeps whole files.
+    /// ([`Graph::rd`]). Does nothing over a store that keeps whole files,
+    /// or while writes find what they read in memory ([`Engine::plan_writes`]).
     pub fn plan(&self, recs: &[&Rec], hold: &mut Hold) {
-        if !self.engine.paged() || self.base.is_none() {
+        if !self.engine.paged() || self.base.is_none() || !self.engine.plan_writes() {
             return;
         }
         hold.page_limit = hold.page_limit.min(self.engine.job_limit());
+        let rounds = hold.rounds();
         let r = self.engine.read_blocking(hold, |cx| {
             for &rec in recs {
                 if let Rec::Apply { ops, .. } = rec {
@@ -1895,8 +1900,10 @@ impl Graph {
             }
             Ok(())
         });
-        if let Err(e) = r {
-            tracing::debug!(error = %e, "a write plan stopped; the writes read for themselves");
+        match r {
+            Ok(()) if hold.rounds() == rounds => self.engine.set_plan_writes(false),
+            Ok(()) => {}
+            Err(e) => tracing::debug!(error = %e, "a write plan stopped; the writes read for themselves"),
         }
     }
 

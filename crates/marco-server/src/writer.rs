@@ -21,9 +21,10 @@
 //! shards whose patches have left too much garbage, one at a time, each as
 //! a new base with the same lists, committed by a manifest of its own. The
 //! writer swaps each into both copies as it does a write. A checkpoint that
-//! comes due, or a verify job, stops the compaction after its current
-//! shard; the checkpoint waits for it. A failed checkpoint is retried after
-//! a backoff, a minute doubling to an hour.
+//! comes due gives up the compaction, the shard being compacted included,
+//! and runs once its thread has ended; a verify stops it after its current
+//! shard. A failed checkpoint is retried after a backoff, a minute doubling
+//! to an hour.
 //!
 //! If the writer or segment thread panics, the process aborts: a writer
 //! that answers writes no segment will hold must not keep running.
@@ -216,9 +217,7 @@ fn exclusive(g: &mut Arc<Graph>) -> &mut Graph {
 
 /// A running compaction thread.
 struct Compaction {
-    /// Stop after the shard being compacted.
-    stop: Arc<AtomicBool>,
-    /// Give up the shard being compacted too.
+    /// Give up, the shard being compacted too.
     abort: Arc<AtomicBool>,
     thread: std::thread::JoinHandle<()>,
 }
@@ -291,6 +290,7 @@ impl Writer {
                         if let Some(c) = self.compaction.take() {
                             let _ = c.thread.join();
                         }
+                        crate::metrics::COMPACTION_PENDING.set(0);
                         if let Some(asked) = self.ckpt_wanted.take() {
                             self.start_checkpoint(asked);
                         }
@@ -466,7 +466,8 @@ impl Writer {
             return;
         }
         if let Some(c) = &self.compaction {
-            c.stop.store(true, Ordering::Relaxed);
+            // give up the shard being compacted: finishing it held checkpoints up to a minute and a half
+            c.abort.store(true, Ordering::Relaxed);
             self.ckpt_wanted = Some(asked || self.ckpt_wanted.unwrap_or(false));
             return;
         }
@@ -603,17 +604,22 @@ impl Writer {
         if due.is_empty() || self.verifying() {
             return;
         }
-        let (stop, abort) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
-        let (s, ab, tx, app) = (stop.clone(), abort.clone(), self.tx.clone(), self.app.clone());
+        crate::metrics::COMPACTION_PENDING.set(due.len() as i64);
+        drop(snap);
+        let abort = Arc::new(AtomicBool::new(false));
+        let (ab, tx, app) = (abort.clone(), self.tx.clone(), self.app.clone());
         let thread = std::thread::Builder::new()
             .name("marco-compaction".into())
             .spawn(move || {
                 let path = &app.cfg.snapshot;
                 for (k, _) in due {
                     // a verify reads the files by name, and a compaction removes some
-                    if s.load(Ordering::Relaxed) || ab.load(Ordering::Relaxed) || verifying(&app) {
+                    if ab.load(Ordering::Relaxed) || verifying(&app) {
                         break;
                     }
+                    // the served copy's snapshot, afresh for each shard: one held across the run would keep every
+                    // compacted shard's old files open, and at full residency their cached pages with them
+                    let Some(snap) = app.graph().shared_snapshot() else { break };
                     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| snap.compact(path, k, &ab)))
                         .unwrap_or_else(|_| Err(anyhow!("the compaction thread panicked")));
                     // another shard's compaction may still go: a shard that keeps failing
@@ -636,7 +642,7 @@ impl Writer {
                 let _ = tx.send(Req::CompactionDone);
             })
             .expect("spawn the compaction thread");
-        self.compaction = Some(Compaction { stop, abort, thread });
+        self.compaction = Some(Compaction { abort, thread });
     }
 
     fn verifying(&self) -> bool {
@@ -654,6 +660,7 @@ impl Writer {
 
     /// Swaps a compacted shard into both copies, as a write goes in.
     fn compacted(&mut self, r: Result<Compacted>) {
+        crate::metrics::COMPACTION_PENDING.set((crate::metrics::COMPACTION_PENDING.get() - 1).max(0));
         let c = match r {
             Ok(c) => c,
             Err(e) if e.to_string() == marco_core::COMPACTION_STOPPED => return,

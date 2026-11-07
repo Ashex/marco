@@ -38,7 +38,7 @@ use crate::snapshot::{
 };
 use crate::store::engine::{PagedFile, Stage};
 use crate::store::page::PAGE;
-use crate::store::{now_ms, shard_file, Manifest, ShardFile, ShardFiles, Store};
+use crate::store::{now_ms, shard_file, Manifest, ShardFile, ShardFiles, Store, StoreFile};
 
 /// A space past this share of its cap makes the next checkpoint write the
 /// shard a new base, and makes it a compaction candidate (phase 3a's
@@ -50,6 +50,10 @@ const CAP_ERROR: &str = "build with more shards";
 
 /// The error a compaction stopped by its flag returns.
 pub const COMPACTION_STOPPED: &str = "compaction stopped";
+
+/// At full residency, what compacting may still give back after a round of
+/// compactions: the cached garbage decision 67 allows.
+pub const CACHED_GARBAGE: u64 = 1 << 30;
 
 /// What a checkpoint wrote.
 #[derive(Clone, Debug, Default)]
@@ -805,11 +809,24 @@ pub struct Garbage {
     /// Bytes of paged pages no index names: what stays in the cache, at
     /// full residency, until a compaction.
     pub pages: u64,
+    /// Paged bytes of every file of the shard: what the cache holds of it
+    /// at full residency.
+    pub paged: u64,
+    /// What a rewrite's paged bytes would come to: the base's, scaled by
+    /// the records the shard holds now against the base's.
+    pub fresh: u64,
 }
 
 impl Garbage {
     pub fn bytes(&self) -> u64 {
         self.disk.saturating_sub(self.live)
+    }
+
+    /// What compacting the shard would give back to the cache at full
+    /// residency. More than [`Garbage::pages`]: old versions of lists also
+    /// sit in pages that still hold live ones, and a rewrite packs those.
+    pub fn reclaim(&self) -> u64 {
+        self.paged.saturating_sub(self.fresh)
     }
 
     /// Whether `p` says to compact a shard with patches like this.
@@ -879,20 +896,31 @@ impl ShardFile {
             }
         }
         let pinned: u64 = self.newest().sections().iter().filter(|s| !s.is_paged()).map(|s| s.len()).sum();
-        let all_pages: u64 = self
-            .parts
-            .iter()
-            .flat_map(|p| p.file.sections())
-            .filter_map(|s| match s.kind {
-                SectionKind::Paged { pages, .. } => Some(pages as u64),
-                SectionKind::Pinned { .. } => None,
-            })
-            .sum();
+        let paged_of = |f: &StoreFile| -> u64 {
+            f.sections()
+                .iter()
+                .filter_map(|s| match s.kind {
+                    SectionKind::Paged { pages, .. } => Some(pages as u64),
+                    SectionKind::Pinned { .. } => None,
+                })
+                .sum()
+        };
+        let all_pages: u64 = self.parts.iter().map(|p| paged_of(&p.file)).sum();
+        let records = |m: &ShardMeta| m.stats.iter().map(|r| r.out_records + r.in_pairs).sum::<u64>();
+        let base = &self.parts[0].file;
+        let base_records = serde_json::from_value::<ShardMeta>(base.footer().meta.clone()).map_or(0, |m| records(&m));
+        let fresh = if base_records == 0 {
+            all_pages
+        } else {
+            (paged_of(base) as f64 * records(&self.meta) as f64 / base_records as f64) as u64
+        };
         Garbage {
             disk: self.len(),
             live: live_pages * PAGE as u64 + pinned,
             fill: self.fullest_space().1,
             pages: all_pages.saturating_sub(live_pages) * PAGE as u64,
+            paged: all_pages * PAGE as u64,
+            fresh: fresh.min(all_pages) * PAGE as u64,
         }
     }
 }
@@ -942,8 +970,9 @@ fn compact_name(path: &Path, m: &Manifest, k: usize, checkpoint: u64) -> String 
 impl SharedSnapshot {
     /// The shards with patches whose garbage `p` says to compact, most
     /// garbage first. With `headroom` (the budget holds the whole snapshot),
-    /// also as many more, most cached garbage first, as it takes to give
-    /// the next checkpoint the free room it needs.
+    /// also as many more, most reclaim first, as it takes to give the next
+    /// checkpoint the free room it needs and to bring what compacting could
+    /// still give back under [`CACHED_GARBAGE`] (decision 67).
     pub fn compaction_due(&self, p: &CompactPolicy, headroom: Option<Headroom>) -> Vec<(usize, Garbage)> {
         SharedSnapshot::due_of(self.garbage(), p, headroom)
     }
@@ -966,17 +995,16 @@ impl SharedSnapshot {
         let (mut v, mut rest): (Vec<_>, Vec<_>) = all.into_iter().partition(|(_, g)| g.due(p));
         v.sort_by_key(|g| std::cmp::Reverse(g.1.bytes()));
         if let Some(r) = headroom {
-            let mut short = r.need.saturating_sub(r.free + v.iter().map(|g| g.1.pages).sum::<u64>());
-            // compacting can't make the room: rewriting every shard for part of it isn't worth it
-            if rest.iter().map(|g| g.1.pages).sum::<u64>() < short {
-                short = 0;
-            }
-            rest.sort_by_key(|g| std::cmp::Reverse(g.1.pages));
-            for g in rest.into_iter().filter(|g| g.1.pages > 0) {
-                if short == 0 {
+            let mut short = r.need.saturating_sub(r.free + v.iter().map(|g| g.1.reclaim()).sum::<u64>());
+            rest.retain(|g| g.1.reclaim() > 0);
+            rest.sort_by_key(|g| std::cmp::Reverse(g.1.reclaim()));
+            let mut left: u64 = rest.iter().map(|g| g.1.reclaim()).sum();
+            for g in rest {
+                if short == 0 && left <= CACHED_GARBAGE {
                     break;
                 }
-                short = short.saturating_sub(g.1.pages);
+                short = short.saturating_sub(g.1.reclaim());
+                left -= g.1.reclaim();
                 v.push(g);
             }
         }

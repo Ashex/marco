@@ -320,6 +320,10 @@ pub struct ReadCx<'g> {
     engine: &'g Engine,
     /// Record pages served, for the pass to pin if it misses.
     keep_touched: bool,
+    /// A write's read ([`Hold::write`]): not a use for the eviction policy,
+    /// and its hits aren't counted by queue, so a lookup loads the slot and
+    /// the page and never the frame's state.
+    quiet: bool,
     /// Pages the request already holds: reading them again isn't a new use
     /// for the eviction policy, so a page a request fetched and then reads
     /// doesn't look reused, and one big scan stays in the small queue.
@@ -344,13 +348,14 @@ impl<'g> ReadCx<'g> {
     /// [`Engine::pin`] on the same engine. It keeps no record of the pages it
     /// serves (as [`Hold::none`]).
     pub fn new(engine: &'g Engine, guard: &'g Guard) -> ReadCx<'g> {
-        ReadCx::with(engine, guard, false, &NO_PAGES, None, true)
+        ReadCx::with(engine, guard, false, false, &NO_PAGES, None, true)
     }
 
     pub(crate) fn with(
         engine: &'g Engine,
         guard: &'g Guard,
         keep_touched: bool,
+        quiet: bool,
         held: &'g PageSet,
         private: Option<&'g Private>,
         count_used: bool,
@@ -359,6 +364,7 @@ impl<'g> ReadCx<'g> {
             guard,
             engine,
             keep_touched,
+            quiet,
             held,
             last: Cell::new(None),
             private,
@@ -412,9 +418,12 @@ impl<'g> ReadCx<'g> {
         let mut st = self.stats.get();
         st.pages += 1;
         // a read past the cache isn't a use: it mustn't keep pages cached
-        let bump = self.private.is_none() && self.last.get() != Some(p) && !self.held.contains(p);
+        let bump = !self.quiet && self.private.is_none() && self.last.get() != Some(p) && !self.held.contains(p);
         self.last.set(Some(p));
-        let found = self.engine.lookup(p, self.guard, bump).or_else(|| Some((self.private?.get(p)?, Found::Other)));
+        let found = self
+            .engine
+            .lookup(p, self.guard, bump, !self.quiet)
+            .or_else(|| Some((self.private?.get(p)?, Found::Other)));
         let r = match found {
             Some((page, how)) => {
                 if self.keep_touched {
@@ -562,6 +571,8 @@ impl<'g> Blocks<'g> for PageBlocks<'g> {
 /// Dropping it unpins everything.
 pub struct Hold {
     pub(crate) keep: bool,
+    /// Its passes are a write's reads ([`Hold::write`]).
+    pub(crate) quiet: bool,
     pub(crate) pins: PageSet,
     /// The frame behind each pin, in the order of `pins` ([`NO_FRAME`] for a
     /// page of a file kept whole, which needs no pin).
@@ -595,6 +606,7 @@ impl Hold {
     pub fn with_max_pins(max: usize) -> Hold {
         Hold {
             keep: true,
+            quiet: false,
             pins: PageSet::default(),
             frames: Vec::new(),
             cache: None,
@@ -642,6 +654,17 @@ impl Hold {
     /// Whether it reads past the cache ([`Hold::past`]).
     pub fn is_past(&self) -> bool {
         self.private.is_some()
+    }
+
+    /// The first pass of a write's read, on the writer: pins nothing, and
+    /// reads as quietly as it can. The writer is one thread waiting on each
+    /// load in turn, so the frame's state a request's lookup also loads (for
+    /// the policy and the hit counts) is a cache miss it pays for every page.
+    pub fn write() -> Hold {
+        let mut h = Hold::none();
+        h.quiet = true;
+        h.count_used = false;
+        h
     }
 
     /// A hold that pins nothing: a request's fast pass on a worker, or a

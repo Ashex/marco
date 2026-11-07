@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::*};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::*};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::Duration;
 
@@ -577,6 +577,8 @@ struct Inner {
     /// short), with when: what the storm rule counts.
     failing: Mutex<std::collections::VecDeque<(std::time::Instant, PageId)>>,
     counters: Counters,
+    /// Whether writes should read ahead ([`Engine::plan_writes`]).
+    plan_writes: AtomicBool,
 }
 
 /// How far back [`Engine::failing_pages`] looks: the `/readyz` storm rule.
@@ -672,6 +674,7 @@ impl Engine {
                 bad: Mutex::new(FxHashMap::default()),
                 failing: Mutex::new(Default::default()),
                 counters: Counters::default(),
+                plan_writes: AtomicBool::new(true),
             }),
         }
     }
@@ -720,6 +723,21 @@ impl Engine {
     /// ([`Engine::register`]) rather than kept whole.
     pub fn paged(&self) -> bool {
         self.inner.cache.is_some()
+    }
+
+    /// Whether the writer's next batch should read ahead what it will read
+    /// ([`crate::Graph::plan`]): yes until a plan finds everything in
+    /// memory on its first pass, and again once a write's own read misses.
+    /// When everything is resident, a plan is a third pass over the same
+    /// reads for nothing.
+    pub fn plan_writes(&self) -> bool {
+        self.inner.plan_writes.load(Relaxed)
+    }
+
+    pub fn set_plan_writes(&self, on: bool) {
+        if self.inner.plan_writes.load(Relaxed) != on {
+            self.inner.plan_writes.store(on, Relaxed);
+        }
     }
 
     /// A registered file's name.
@@ -931,9 +949,16 @@ impl Engine {
     }
 
     /// Page `p`, if it's in memory, valid while `guard` is. `bump` counts it
-    /// as a use for the eviction policy.
+    /// as a use for the eviction policy; `queue` says which queue a hit was
+    /// in (else [`Found::Other`]).
     #[inline]
-    pub(crate) fn lookup<'g>(&'g self, p: PageId, guard: &'g Guard, bump: bool) -> Option<(&'g Page, Found)> {
+    pub(crate) fn lookup<'g>(
+        &'g self,
+        p: PageId,
+        guard: &'g Guard,
+        bump: bool,
+        queue: bool,
+    ) -> Option<(&'g Page, Found)> {
         let e = self.inner.table.get(p.file, guard)?;
         match &e.data {
             EntryData::Paged(_) => {
@@ -947,7 +972,7 @@ impl Engine {
                 }
                 // SAFETY: f came from a slot loaded under `guard`, so its frame
                 // isn't reused before the guard is gone.
-                Some((unsafe { c.page(f) }, c.found(f)))
+                Some((unsafe { c.page(f) }, if queue { c.found(f) } else { Found::Other }))
             }
             EntryData::Resident { bytes, .. } => {
                 let off = p.offset() as usize;
@@ -986,7 +1011,7 @@ impl Engine {
         let guard = self.pin();
         let (pages, touched) = {
             let sampled = hold.count_used && sample_used();
-            let cx = ReadCx::with(self, &guard, hold.keep, &hold.pins, hold.private.as_deref(), sampled);
+            let cx = ReadCx::with(self, &guard, hold.keep, hold.quiet, &hold.pins, hold.private.as_deref(), sampled);
             let r = f(&cx);
             self.count(cx.stats(), &cx.lookups());
             if cx.clean() {

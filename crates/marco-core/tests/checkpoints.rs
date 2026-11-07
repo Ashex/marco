@@ -524,8 +524,8 @@ fn snapshots_record_their_layout() {
 }
 
 /// When the budget holds the whole snapshot, garbage stays cached: past the
-/// garbage policy, compaction also takes shards, most cached garbage first,
-/// until the next checkpoint's room is clear.
+/// garbage policy, compaction also takes shards, most reclaim first, until
+/// the next checkpoint's room is clear, and all it can when that's short.
 #[test]
 fn compaction_clears_cached_garbage_for_the_next_checkpoint() {
     let dir = tempfile::tempdir().unwrap();
@@ -551,14 +551,15 @@ fn compaction_clears_cached_garbage_for_the_next_checkpoint() {
     let never = CompactPolicy { ratio: 0.0, min_garbage: u64::MAX };
     assert!(snap.compaction_due(&never, None).is_empty());
     let all = snap.compaction_due(&CompactPolicy { ratio: 1.0, min_garbage: 0 }, None);
-    let cached = all.iter().filter(|(_, x)| x.pages > 0).count();
+    let cached = all.iter().filter(|(_, x)| x.reclaim() > 0).count();
     assert!(cached > 1, "{all:?}");
-    let most = all.iter().max_by_key(|(_, x)| x.pages).unwrap().0;
+    assert!(all.iter().all(|(_, x)| x.reclaim() <= x.paged && x.paged > 0), "{all:?}");
+    let most = all.iter().max_by_key(|(_, x)| x.reclaim()).unwrap().0;
     let room = |free, need| Some(marco_core::Headroom { free, need });
     assert!(snap.compaction_due(&never, room(1 << 30, 1 << 20)).is_empty(), "room enough");
     let one = snap.compaction_due(&never, room(0, 1));
-    assert_eq!(one.iter().map(|x| x.0).collect::<Vec<_>>(), [most], "the most cached garbage first");
-    let total: u64 = all.iter().map(|(_, x)| x.pages).sum();
+    assert_eq!(one.iter().map(|x| x.0).collect::<Vec<_>>(), [most], "the most reclaim first");
+    let total: u64 = all.iter().map(|(_, x)| x.reclaim()).sum();
     assert_eq!(snap.compaction_due(&never, room(0, total)).len(), cached, "as many as it takes");
-    assert!(snap.compaction_due(&never, room(0, total + 1)).is_empty(), "none when they can't make the room");
+    assert_eq!(snap.compaction_due(&never, room(0, total + 1)).len(), cached, "all it can when that's short");
 }

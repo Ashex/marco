@@ -171,6 +171,7 @@ A scraper that can't send the token reads the same text from `--ops-listen`, whi
 | `marco_store_checkpoint_bytes` | `part` | The last checkpoint's bytes: `patch` (changed lists), `pinned` (the patches' indexes and tables), `base` (new bases) |
 | `marco_store_compaction_shards_total`, `marco_store_compaction_bytes_total`, `marco_store_compaction_garbage_bytes_total` | | Shards compacted, the bytes they wrote, the garbage they cleared |
 | `marco_store_compaction_seconds` | | One shard's compaction |
+| `marco_store_compaction_pending` | | Shards the running compaction has left, 0 when none runs |
 | `marco_store_bytes` | `part` | With `--storage engine`, where the budget is: `budget`, `pinned_dir`, `pinned_index`, `pinned_heads`, `pinned_tables`, `cache_main`, `cache_small`, `retired`, `pinned_frames`, `free`, `borrowed`, `garbage` |
 | `marco_store_lookups_total` | `structure`, `result`, `queue` | Page lookups by structure (`out_small`, `out_subj`, `out_rkey`, `out_bysubj`, `in_small`, `in_blocks`), `hit` or `miss`, and the queue a hit was in |
 | `marco_store_request_pages`, `marco_store_request_rounds` | `rpc` | Pages a request read from disk, and the rounds it waited |
