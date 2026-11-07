@@ -92,7 +92,11 @@ pub fn encode_block(vals: &[u32], out: &mut Vec<u8>) {
     }
 }
 
-/// Decodes a block's ids after `first` into `out[1..k]`.
+/// Decodes a block's ids after `first` into `out[1..k]`. Both bit fields
+/// are read as words from `bytes` itself rather than from slices cut to
+/// their length: a block sits inside a page, so a word read almost never
+/// runs off the end, and bits past a field's end are masked or never
+/// reached.
 #[inline]
 pub fn decode_block(bytes: &[u8], first: u32, k: usize, out: &mut [u32; BLOCK]) {
     out[0] = first;
@@ -101,27 +105,141 @@ pub fn decode_block(bytes: &[u8], first: u32, k: usize, out: &mut [u32; BLOCK]) 
         return;
     }
     let l = bytes[0] as usize;
-    let lower = &bytes[1..1 + (m * l).div_ceil(8)];
-    let upper = &bytes[1 + lower.len()..];
+    let up = 1 + (m * l).div_ceil(8);
     let mask = (1u64 << l) - 1;
     let mut i = 0;
     let mut word = 0;
     while i < m {
-        let mut w = u64_padded(upper, word * 8);
+        let mut w = u64_padded(bytes, up + word * 8);
         while w != 0 && i < m {
             let bit = word * 64 + w.trailing_zeros() as usize;
             let high = (bit - i) as u64;
-            let low = if l == 0 {
-                0
-            } else {
-                let lb = i * l;
-                (u64_padded(lower, lb / 8) >> (lb % 8)) & mask
-            };
+            let lb = i * l;
+            let low = (u64_padded(bytes, 1 + lb / 8) >> (lb % 8)) & mask;
             out[i + 1] = first + ((high << l) | low) as u32;
             i += 1;
             w &= w - 1;
         }
         word += 1;
+    }
+}
+
+/// The positions (0 for `first`, then 1..k) of a block's values equal to
+/// `x`, which may repeat, without decoding the block: Elias-Fano's select
+/// on the high parts finds `x`'s bucket in a few words, then only that
+/// bucket's low parts are read. Empty if `x` isn't there.
+pub fn block_find(bytes: &[u8], first: u32, k: usize, x: u32) -> Range<usize> {
+    if x < first {
+        return 0..0;
+    }
+    let m = k - 1;
+    let lead = usize::from(x == first);
+    if m == 0 || bytes.is_empty() {
+        return 0..lead;
+    }
+    let d = (x - first) as u64;
+    let l = bytes[0] as usize;
+    let up = 1 + (m * l).div_ceil(8);
+    let mask = (1u64 << l) - 1;
+    let (h, lo) = (d >> l, d & mask);
+    // p: the bit after the h-th zero, where bucket h starts; i: the ones before it
+    let (mut p, mut i) = (0usize, 0usize);
+    if h > 0 {
+        let mut need = h;
+        let mut word = 0;
+        loop {
+            if i >= m {
+                return 0..lead;
+            }
+            let w = u64_padded(bytes, up + word * 8);
+            let z = (!w).count_ones() as u64;
+            if z < need {
+                need -= z;
+                i += w.count_ones() as usize;
+                word += 1;
+                continue;
+            }
+            let q = select(!w, need as u32 - 1) as usize;
+            i += (w & ((1u64 << q) - 1)).count_ones() as usize;
+            p = word * 64 + q + 1;
+            break;
+        }
+    }
+    let low = |i: usize| {
+        let lb = i * l;
+        (u64_padded(bytes, 1 + lb / 8) >> (lb % 8)) & mask
+    };
+    let mut start = None;
+    while i < m && u64_padded(bytes, up + p / 64 * 8) >> (p % 64) & 1 == 1 {
+        let v = low(i);
+        if v == lo {
+            start.get_or_insert(i);
+        } else if v > lo {
+            break;
+        }
+        i += 1;
+        p += 1;
+    }
+    match start {
+        Some(_) if lead == 1 => 0..i + 1,
+        Some(s) => s + 1..i + 1,
+        None => 0..lead,
+    }
+}
+
+/// The position of the set bit of rank `r` (0-based) in `x`, which has more
+/// than `r`: a byte at a time by popcount, then bit by bit in that byte.
+#[inline]
+fn select(mut x: u64, mut r: u32) -> u32 {
+    let mut off = 0;
+    loop {
+        let c = (x & 0xff).count_ones();
+        if r < c {
+            break;
+        }
+        r -= c;
+        x >>= 8;
+        off += 8;
+    }
+    for _ in 0..r {
+        x &= x - 1;
+    }
+    off + x.trailing_zeros()
+}
+
+/// Membership probes into one block after another, ascending: the first
+/// few into a block find their bucket ([`block_find`]); past
+/// [`BlockProbe::DECODE_AT`] in one block, it decodes the block once and
+/// searches that, which is cheaper for many probes.
+struct BlockProbe {
+    block: usize,
+    probes: usize,
+    k: usize,
+    buf: [u32; BLOCK],
+}
+
+impl BlockProbe {
+    const DECODE_AT: usize = 8;
+
+    fn new() -> BlockProbe {
+        BlockProbe { block: usize::MAX, probes: 0, k: 0, buf: [0; BLOCK] }
+    }
+
+    #[inline]
+    fn has(&mut self, b: usize, bytes: &[u8], first: u32, k: usize, x: u32) -> bool {
+        if b != self.block {
+            (self.block, self.probes, self.k) = (b, 0, 0);
+        }
+        self.probes += 1;
+        if self.k == 0 && self.probes >= BlockProbe::DECODE_AT {
+            decode_block(bytes, first, k, &mut self.buf);
+            self.k = k;
+        }
+        if self.k > 0 {
+            self.buf[..self.k].binary_search(&x).is_ok()
+        } else {
+            !block_find(bytes, first, k, x).is_empty()
+        }
     }
 }
 
@@ -259,12 +377,7 @@ impl<'a> InList<'a> {
             return false;
         }
         let Some(b) = self.block_for(x, 0) else { return false };
-        if self.first(b) == x {
-            return true;
-        }
-        let mut buf = [0u32; BLOCK];
-        let k = self.decode(b, &mut buf);
-        buf[..k].binary_search(&x).is_ok()
+        self.first(b) == x || !block_find(self.block_bytes(b), self.first(b), self.block_len(b), x).is_empty()
     }
 
     pub fn decode_all(&self, out: &mut Vec<u32>) {
@@ -320,8 +433,7 @@ impl<'a> InList<'a> {
             self.small(&mut v);
             return merge_intersect(&v, probes, limit, out);
         }
-        let mut buf = [0u32; BLOCK];
-        let mut cur: Option<(usize, usize)> = None;
+        let mut probe = BlockProbe::new();
         let mut from = 0;
         for &x in probes {
             if out.len() >= limit {
@@ -329,15 +441,7 @@ impl<'a> InList<'a> {
             }
             let Some(b) = self.block_for(x, from) else { continue };
             from = b;
-            let k = match cur {
-                Some((cb, k)) if cb == b => k,
-                _ => {
-                    let k = self.decode(b, &mut buf);
-                    cur = Some((b, k));
-                    k
-                }
-            };
-            if buf[..k].binary_search(&x).is_ok() {
+            if probe.has(b, self.block_bytes(b), self.first(b), self.block_len(b), x) {
                 out.push(x);
             }
         }
@@ -548,9 +652,8 @@ impl<'g> SplitIn<'g> {
         if self.first(b) == x {
             return Ok(true);
         }
-        let mut buf = [0u32; BLOCK];
-        let k = self.decode(cx, b, &mut buf)?;
-        Ok(buf[..k].binary_search(&x).is_ok())
+        let bytes = self.blocks().block(cx, b)?;
+        Ok(!block_find(bytes, self.first(b), self.block_len(b), x).is_empty())
     }
 
     pub fn decode_all(&self, cx: &ReadCx<'g>, out: &mut Vec<u32>) -> R<()> {
@@ -614,8 +717,7 @@ impl<'g> SplitIn<'g> {
         if !ok {
             return Err(Pending);
         }
-        let mut buf = [0u32; BLOCK];
-        let mut cur: Option<(usize, usize)> = None;
+        let mut probe = BlockProbe::new();
         let mut from = 0;
         for &x in probes {
             if out.len() >= limit {
@@ -627,15 +729,7 @@ impl<'g> SplitIn<'g> {
                 out.push(x);
                 continue;
             }
-            let k = match cur {
-                Some((cb, k)) if cb == b => k,
-                _ => {
-                    let k = self.decode(cx, b, &mut buf)?;
-                    cur = Some((b, k));
-                    k
-                }
-            };
-            if buf[..k].binary_search(&x).is_ok() {
+            if probe.has(b, self.blocks().block(cx, b)?, self.first(b), self.block_len(b), x) {
                 out.push(x);
             }
         }
@@ -805,6 +899,29 @@ mod tests {
                 let len = enc.len();
                 enc.extend_from_slice(&[0xff; 9]);
                 assert_eq!(block_bytes(&enc, k), len, "k {k} spread {spread}");
+            }
+        }
+    }
+
+    #[test]
+    fn block_find_matches_a_decode() {
+        let mut s = 0x2545f4914f6cdd1du64;
+        for k in [1usize, 2, 3, 8, 64, 127, 128] {
+            for spread in [1u64, 2, 3, 200, 1000, 1 << 24, 1 << 31] {
+                let mut v: Vec<u32> = (0..k).map(|_| (rng(&mut s) % spread) as u32 + 7).collect();
+                v.sort_unstable();
+                let mut enc = Vec::new();
+                encode_block(&v, &mut enc);
+                // the next block's bytes follow it in a page
+                enc.extend((0..16).map(|_| rng(&mut s) as u8));
+                let mut probes: Vec<u32> = v.iter().flat_map(|&x| [x.saturating_sub(1), x, x + 1]).collect();
+                probes.extend([0, 6, u32::MAX, v[k - 1] + 1000]);
+                probes.extend((0..50).map(|_| (rng(&mut s) % (spread + 20)) as u32));
+                for x in probes {
+                    let want: Vec<usize> = (0..k).filter(|&i| v[i] == x).collect();
+                    let got: Vec<usize> = block_find(&enc, v[0], k, x).collect();
+                    assert_eq!(got, want, "k {k} spread {spread} x {x}");
+                }
             }
         }
     }

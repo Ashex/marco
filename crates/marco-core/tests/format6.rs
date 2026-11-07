@@ -15,6 +15,7 @@ use marco_core::outlog::{self, OutBytes, OutList, OutSpaces, PagedOut, SplitCols
 use marco_core::read::{Engine, Hold, ReadCx, R};
 use marco_core::rkey::NON_TID;
 use marco_core::snapshot::{AlignedPage, Bytes};
+use marco_core::store::engine::USED_SAMPLE;
 use marco_core::store::page::{FileId, PageId, PAGE};
 
 struct Rng(u64);
@@ -576,14 +577,20 @@ fn bytes_used_counts_each_decoded_block_once_per_pass() {
     drop(cx);
     drop(g);
 
-    // the engine adds a request's clean passes, not a job's or a missing one
+    // the engine adds a request's clean passes, one in USED_SAMPLE scaled up, not a job's or a missing one
     assert_eq!(e.stats().bytes_used, [0; 7]);
-    e.pass(&mut Hold::none(), |cx| o.open(cx, 0)?.to_vec(cx).map(|_| ())).unwrap();
+    for _ in 0..USED_SAMPLE {
+        e.pass(&mut Hold::none(), |cx| o.open(cx, 0)?.to_vec(cx).map(|_| ())).unwrap();
+    }
     let after = e.stats().bytes_used;
-    assert_eq!(total(after), subj.bytes + rkey.bytes);
-    e.pass(&mut Hold::new(), |cx| o.open(cx, 0)?.to_vec(cx).map(|_| ())).unwrap();
+    assert_eq!(total(after), (subj.bytes + rkey.bytes) * USED_SAMPLE);
+    for _ in 0..USED_SAMPLE {
+        e.pass(&mut Hold::new(), |cx| o.open(cx, 0)?.to_vec(cx).map(|_| ())).unwrap();
+    }
     assert_eq!(e.stats().bytes_used, after, "a job's pass isn't a request's");
     let none = o.pages.engine(|_| false);
-    assert!(none.pass(&mut Hold::none(), |cx| o.open(cx, 0)?.to_vec(cx).map(|_| ())).is_err());
+    for _ in 0..USED_SAMPLE {
+        assert!(none.pass(&mut Hold::none(), |cx| o.open(cx, 0)?.to_vec(cx).map(|_| ())).is_err());
+    }
     assert_eq!(none.stats().bytes_used, [0; 7], "a pass that missed decoded nothing it serves");
 }

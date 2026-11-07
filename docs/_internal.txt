@@ -5,3 +5,4 @@ index.md                # the repo's reading list of every page
 design.html             # the design record: iterations and alternatives, not the current version
 storage.html            # the storage engine design: no mmap, no page cache
 storage-results.html    # the storage engine measured against mmap: every gate of storage.html §14
+storage-p7.html         # phase 7: why each cutover gate failed and what changed

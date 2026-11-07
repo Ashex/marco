@@ -484,6 +484,21 @@ struct Counters {
     past_pages: AtomicU64,
 }
 
+/// One clean pass in this many, per thread, counts the bytes it decoded,
+/// scaled back up: measuring what a decode used costs about as much as the
+/// decode, which on every pass was 15% of a hit-only load's CPU.
+pub const USED_SAMPLE: u64 = 32;
+
+fn sample_used() -> bool {
+    use std::cell::Cell;
+    thread_local!(static N: Cell<u32> = const { Cell::new(0) });
+    N.with(|n| {
+        let k = n.get().wrapping_add(1);
+        n.set(k);
+        k % USED_SAMPLE as u32 == 0
+    })
+}
+
 fn stripe() -> usize {
     use std::cell::Cell;
     thread_local!(static ME: Cell<usize> = const { Cell::new(usize::MAX) });
@@ -541,7 +556,7 @@ pub struct EngineStats {
     /// ([`Structure`], [`Found`]).
     pub lookups: [[u64; 4]; 7],
     /// Bytes requests' clean passes decoded, by structure
-    /// ([`ReadCx::bytes_used`]).
+    /// ([`ReadCx::bytes_used`]), estimated from one pass in [`USED_SAMPLE`].
     pub bytes_used: UsedBytes,
 }
 
@@ -959,7 +974,7 @@ impl Engine {
         let s = &self.inner.counters.stripes[stripe()];
         for (x, &n) in s.used.iter().zip(used) {
             if n > 0 {
-                x.fetch_add(n, Relaxed);
+                x.fetch_add(n * USED_SAMPLE, Relaxed);
             }
         }
     }
@@ -970,12 +985,13 @@ impl Engine {
     pub fn pass<T>(&self, hold: &mut Hold, f: impl FnOnce(&ReadCx<'_>) -> R<T>) -> Result<T, Misses> {
         let guard = self.pin();
         let (pages, touched) = {
-            let cx = ReadCx::with(self, &guard, hold.keep, &hold.pins, hold.private.as_deref(), hold.count_used);
+            let sampled = hold.count_used && sample_used();
+            let cx = ReadCx::with(self, &guard, hold.keep, &hold.pins, hold.private.as_deref(), sampled);
             let r = f(&cx);
             self.count(cx.stats(), &cx.lookups());
             if cx.clean() {
                 if let Ok(t) = r {
-                    if hold.count_used {
+                    if sampled {
                         self.count_used(&cx.bytes_used());
                     }
                     return Ok(t);

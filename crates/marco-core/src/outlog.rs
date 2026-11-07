@@ -844,6 +844,14 @@ impl<'g> SplitOut<'g> {
         Ok((&b[..4 * k], k))
     }
 
+    /// By-subject block j: its positions (u32s), and which of its entries
+    /// hold `subject`, found without decoding the block.
+    fn by_find(&self, cx: &ReadCx<'g>, j: usize, subject: u32) -> R<(&'g [u8], Range<usize>)> {
+        let k = self.counts[j] as usize + 1;
+        let b = self.by_subject().block(cx, j)?;
+        Ok((&b[..4 * k], crate::inset::block_find(&b[4 * k..], self.fence(j), k, subject)))
+    }
+
     pub fn subject(&self, cx: &ReadCx<'g>, pos: usize) -> R<u32> {
         let b = self.subjects().block(cx, pos / BLOCK)?;
         Ok(u32_at(b, 4 * (pos % BLOCK)))
@@ -889,11 +897,10 @@ impl<'g> SplitOut<'g> {
         if self.nbs > 0 {
             let js = self.by_range(subject);
             self.by_subject().need(cx, js.clone())?;
-            let mut subj = [0u32; BLOCK];
             for j in js.rev() {
-                let (pos, k) = self.by_block(cx, j, &mut subj)?;
-                for i in (0..k).rev() {
-                    if subj[i] == subject && !f(u32_at(pos, 4 * i) as usize) {
+                let (pos, hits) = self.by_find(cx, j, subject)?;
+                for i in hits.rev() {
+                    if !f(u32_at(pos, 4 * i) as usize) {
                         return Ok(());
                     }
                 }
@@ -917,11 +924,10 @@ impl<'g> SplitOut<'g> {
         if self.nbs > 0 {
             let js = self.by_range(subject);
             self.by_subject().need(cx, js.clone())?;
-            let mut subj = [0u32; BLOCK];
             for j in js {
-                let (pos, k) = self.by_block(cx, j, &mut subj)?;
-                for (i, &s) in subj[..k].iter().enumerate() {
-                    if s == subject && !f(u32_at(pos, 4 * i) as usize) {
+                let (pos, hits) = self.by_find(cx, j, subject)?;
+                for i in hits {
+                    if !f(u32_at(pos, 4 * i) as usize) {
                         return Ok(());
                     }
                 }
