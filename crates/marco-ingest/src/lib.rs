@@ -1,4 +1,4 @@
-//! marco's built-in ingest. A consumer reads one source, Jetstream or a
+//! marco's built-in ingest. A consumer reads one source, Jetstream (v1 or v2) or a
 //! relay's `com.atproto.sync.subscribeRepos`, turns each event into edge ops
 //! (add {uri, subject}, delete {uri}) or an actor status, and hands them to a
 //! [`Sink`] in stream order with the event's cursor. The sink checkpoints its
@@ -9,6 +9,7 @@
 pub mod conn;
 pub mod firehose;
 pub mod jetstream;
+pub mod jetstream2;
 pub mod metrics;
 pub mod source;
 pub mod writer;
@@ -79,7 +80,7 @@ pub enum Change {
 /// One decoded event.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Event {
-    /// Jetstream's `time_us` or the relay's `seq`.
+    /// Jetstream v1's `time_us`, Jetstream v2's `seq` or the relay's `seq`.
     pub cursor: u64,
     /// The event's time in µs since the epoch, for lag; 0 when unknown.
     pub time_us: i64,

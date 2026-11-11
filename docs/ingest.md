@@ -9,7 +9,7 @@ summary: "Two ways in: the write API with your pipeline's cursor, or the built-i
 diagram:
   caption: "Every op goes through one writer thread with its source's name and cursor. The cursor is saved with the writes, so after a crash each source resumes where the snapshot's state ends."
   nodes:
-    - { id: js, label: "--jetstream", sub: "cursor: time_us", at: [0, 0], size: [9, 3], tone: muted }
+    - { id: js, label: "--jetstream", sub: "cursor: time_us or seq", at: [0, 0], size: [9, 3], tone: muted }
     - { id: fh, label: "--firehose", sub: "cursor: seq", at: [0, 4.5], size: [9, 3], tone: muted }
     - { id: api, label: WriteBatch · Write, sub: "source api · your cursor", at: [0, 9], size: [9, 3], tone: muted }
     - { id: w, label: writer, sub: "validate · stamp · apply", at: [14, 4.5], size: [9, 3], tone: accent }
@@ -119,33 +119,51 @@ pipeline per marco, or keep your own cursors per pipeline.
 
 ```bash
 marco serve --snapshot snap --memory 13GiB --jetstream wss://jetstream2.us-east.bsky.network
+marco serve --snapshot snap --memory 13GiB \
+  --jetstream wss://jetstream.us-east.bsky.network/xrpc/network.bsky.jetstream.subscribeEvents
 marco serve --snapshot snap --memory 13GiB --firehose wss://bsky.network
 ```
 
-`--jetstream` follows a Jetstream instance (`wss://host` or `wss://host/subscribe`) and asks for
-the relations' collections only. `--firehose` follows a relay's `com.atproto.sync.subscribeRepos`.
-marco follows one of them (the flags conflict), next to the write API.
+`--jetstream` follows a Jetstream instance and asks for the relations' collections only: v1's
+`/subscribe` (`wss://host` or `wss://host/subscribe`), or v2's
+`network.bsky.jetstream.subscribeEvents` when the URL names that path. `--firehose` follows a
+relay's `com.atproto.sync.subscribeRepos`. marco follows one of them (the flags conflict), next to
+the write API.
 
-| | Jetstream | Firehose |
-|---|---|---|
-| Source name | `jetstream:<host>` | `firehose:<host>` |
-| Cursor | `time_us`, Jetstream's receive time | the relay's `seq` |
-| An op's time | the event's `time_us` | the commit's `time` |
-| Resumes from | the durable cursor less 1 s | the durable cursor |
-| From a bulk-built snapshot | its `time_us` | refused without `--allow-gap` |
+| | Jetstream v1 | Jetstream v2 | Firehose |
+|---|---|---|---|
+| Source name | `jetstream:<host>` | `jetstream:<host>` | `firehose:<host>` |
+| Cursor | `time_us`, Jetstream's receive time | the instance's `seq` | the relay's `seq` |
+| An op's time | the event's `time_us` | the event's `witnessedAt` | the commit's `time` |
+| Resumes from | the durable cursor less 1 s | the seq after the durable cursor | the durable cursor |
+| From a bulk-built snapshot | its `time_us` | its `time_us`, as a time cursor | refused without `--allow-gap` |
+| A cursor it no longer holds | starts at its oldest event | stops: `cursor_too_old` | logs `OutdatedCursor` |
+
+Both Jetstream wires keep one cursor under one name. A v2 cursor below 10^15 is a `seq` and one at
+or above is a time, so a marco that followed an instance over v1 resumes from its saved `time_us`
+when pointed at the same instance's v2 path, and saves `seq`s from then on.
 
 On a snapshot whose source has no cursor yet, a bulk-built one with a `time_us`, Jetstream starts
-at that time. Before it does, marco asks the instance for its first event from then, and refuses
-to start if that comes more than 10 minutes later (the instance no longer holds that time), or if
-the time is past `--source-retention-hours` (36). A relay resumes only by `seq`, so a firehose
+at that time. Before it does, marco asks the instance whether it still holds that time, and
+refuses to start if it doesn't, or if the time is past `--source-retention-hours` (36). Over v1 it
+asks for the first event from then and takes one more than 10 minutes later as a gap; over v2 the
+instance says so itself, with `#info OutdatedCursor`. A relay resumes only by `seq`, so a firehose
 can't catch up a bulk-built snapshot: it would start at the live tail and miss what changed in
 between.
 
+A v2 source checks every resume, not only the first. Asked for a `seq` it no longer holds, the
+instance refuses with `CursorTooOld`; asked for a time it no longer holds, it starts at its oldest
+event and says `OutdatedCursor`. Either way the consumer stops in state `cursor_too_old` (Admin
+`ListSources`, and an error in the log) rather than skip what came between, and marco serves the
+graph as it was. With `--allow-gap`, an `OutdatedCursor` is followed anyway. A refused `seq` has
+nothing to follow: rebuild.
+
 > [!WARNING]
-> Those checks run only for a source with no cursor of its own, and some gaps get past them. A marco that was down longer than its Jetstream instance's retention resumes from
-> its old cursor anyway and silently misses what the instance dropped. A relay that no longer
-> holds a firehose cursor sends an `OutdatedCursor` notice, which marco only logs. And the
-> snapshot's `time_us` is dropped once the first source has a cursor, so a source under a new
+> Over v1 and the firehose, those checks run only for a source with no cursor of its own, and some
+> gaps get past them. A marco that was down longer than its v1 Jetstream instance's retention
+> resumes from its old cursor anyway and silently misses what the instance dropped. A relay that
+> no longer holds a firehose cursor sends an `OutdatedCursor` notice, which marco only logs. And
+> the snapshot's `time_us` is dropped once the first source has a cursor, so a source under a new
 > name (another Jetstream host, or switching to the firehose) starts at the live tail. After a
 > long outage, or to change sources, rebuild.
 

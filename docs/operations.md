@@ -97,10 +97,10 @@ console's Settings page shows each one's value and where it came from.
 | `--admin-operators` | `MARCO_ADMIN_OPERATORS` | | The logins the header may name, comma-separated. |
 | `--proxy-protocol-from` | `MARCO_PROXY_PROTOCOL_FROM` | | Addresses (CIDRs) whose connections start with a PROXY v2 header naming the caller. |
 | `--admin-proxy-peers` | `MARCO_ADMIN_PROXY_PEERS` | | The callers (TLV `0xE0`) whose header login is believed, comma-separated. |
-| `--jetstream URL` | `MARCO_JETSTREAM` | | Follow a Jetstream instance. |
+| `--jetstream URL` | `MARCO_JETSTREAM` | | Follow a Jetstream instance: v1 (`wss://host`), or v2 when the URL ends in `/xrpc/network.bsky.jetstream.subscribeEvents`. |
 | `--firehose URL` | `MARCO_FIREHOSE` | | Follow a relay's `subscribeRepos`. Conflicts with `--jetstream`. |
 | `--source-retention-hours` | `MARCO_SOURCE_RETENTION_HOURS` | 36 | How far back the Jetstream instance replays. An older bulk-built snapshot is refused. |
-| `--allow-gap` | `MARCO_ALLOW_GAP` | off | Follow past the retention, or a firehose from a bulk-built snapshot. |
+| `--allow-gap` | `MARCO_ALLOW_GAP` | off | Follow past the retention, a firehose from a bulk-built snapshot, or a Jetstream v2 time it no longer holds. |
 | `--read-only` | `MARCO_READ_ONLY` | off | Refuse every write. Can't follow a source. |
 | `--api-read-only` | `MARCO_API_READ_ONLY` | off | Don't route Graph writes on the API listener (404, token or not). The admin listener and the sources still write. |
 | `--serve-before-ready` | `MARCO_SERVE_BEFORE_READY` | off | Answer Graph reads before ready. |

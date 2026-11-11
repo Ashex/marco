@@ -73,7 +73,7 @@ pub async fn start_point(app: &App, src: &Source, retention: Duration, allow_gap
             hours(age_us),
             src.name
         )),
-        Proto::Jetstream if Duration::from_micros(age_us as u64) > retention => Some(format!(
+        p if p.is_jetstream() && Duration::from_micros(age_us as u64) > retention => Some(format!(
             "the snapshot is current to {:.1} h ago, past {}'s {:.1} h retention (--source-retention-hours): \
              following it would miss what changed in between; rebuild",
             hours(age_us),
@@ -97,6 +97,22 @@ pub async fn start_point(app: &App, src: &Source, retention: Duration, allow_gap
                 }
             }
         }
+        Proto::JetstreamV2 => {
+            let rels = app.graph().relations().clone();
+            match marco_ingest::jetstream2::outdated(&src.url, &rels, t as u64).await {
+                Ok(Some(info)) => Some(format!(
+                    "{} no longer holds the snapshot's time ({:.1} h ago: {info}), and what changed since would be \
+                     missing; rebuild",
+                    src.name,
+                    hours(age_us),
+                )),
+                Ok(None) => None,
+                Err(e) => {
+                    eprintln!("warning: couldn't ask {} how far back it goes ({e:#}); going by the snapshot's age", src.name);
+                    None
+                }
+            }
+        }
     };
     if let Some(msg) = gap {
         if !allow_gap {
@@ -104,26 +120,22 @@ pub async fn start_point(app: &App, src: &Source, retention: Duration, allow_gap
         }
         eprintln!("warning: {msg}");
     }
-    Ok(match src.proto {
-        Proto::Jetstream => Some(t as u64),
-        Proto::Firehose => None,
-    })
+    Ok(src.proto.is_jetstream().then_some(t as u64))
 }
 
 /// Follows `src` into `app` until `stop`, and reports the consumer's state
 /// to the app every 250 ms (readiness, Admin.ListSources). The handle ends
-/// once the consumer has handed the app everything it read. `start`: see
-/// [`start_point`].
+/// once the consumer has handed the app everything it read. `opts.start`:
+/// see [`start_point`].
 pub fn start(
     app: &Arc<App>,
     src: Source,
-    start: Option<u64>,
+    opts: marco_ingest::Options,
     stop: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     app.expect_source(&src.name);
     let rels = app.graph().relations().clone();
     let name = src.name.clone();
-    let opts = marco_ingest::Options { start, ..Default::default() };
     let (st, h) = marco_ingest::run(src, rels, app.clone(), opts, stop);
     let a = app.clone();
     tokio::spawn(async move {

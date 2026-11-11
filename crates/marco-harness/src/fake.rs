@@ -3,8 +3,12 @@
 //! gets the capture from there (Jetstream: the first event at or after it; a
 //! relay: the first after it) and then follows the head; one without gets
 //! the tail from the head on, so a consumer that loses its cursor loses
-//! events here as it would against the real thing. `wantedCollections` is
-//! honoured. At the end it holds the stream open.
+//! events here as it would against the real thing. `wantedCollections` (v1)
+//! and `collections` (v2) are honoured. At the end it holds the stream open.
+//!
+//! Jetstream v2: a seq cursor gets the capture from that seq on, and a time
+//! cursor (at or above [`TIME_CURSOR_MIN`]) from the first message seen at or
+//! after it. Seqs and times are the capture's; it isn't restamped.
 //!
 //! With a rate, Jetstream events are restamped: message i gets `time_us` =
 //! the first subscriber's wall clock + i / rate, which is when the head
@@ -21,6 +25,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use futures::{SinkExt, StreamExt};
+use marco_ingest::jetstream2::TIME_CURSOR_MIN;
 use marco_ingest::Proto;
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::tungstenite::Message;
@@ -99,8 +104,14 @@ impl Fake {
                 };
                 Message::Text(s.into())
             }
+            Proto::JetstreamV2 => Message::Text(String::from_utf8_lossy(&m.bytes).into_owned().into()),
             Proto::Firehose => Message::Binary(m.bytes.clone().into()),
         }
+    }
+
+    /// Messages seen before time `t` (µs).
+    fn before_time(&self, t: u64) -> usize {
+        self.cap.msgs.partition_point(|m| (m.time_us as u64) < t)
     }
 }
 
@@ -130,7 +141,7 @@ fn query(uri: &str) -> (Option<u64>, Vec<String>) {
     for kv in uri.split_once('?').map_or("", |(_, q)| q).split('&') {
         match kv.split_once('=') {
             Some(("cursor", v)) => cursor = v.parse().ok(),
-            Some(("wantedCollections", v)) => wanted.push(v.to_string()),
+            Some(("wantedCollections" | "collections", v)) => wanted.push(v.to_string()),
             _ => {}
         }
     }
@@ -153,6 +164,8 @@ async fn serve(sock: tokio::net::TcpStream, f: Arc<Fake>) -> Result<()> {
         (None, _) if f.rate == 0 => 0,
         (None, _) => f.head(),
         (Some(c), Proto::Jetstream) => f.through(c.saturating_sub(1)),
+        (Some(c), Proto::JetstreamV2) if c >= TIME_CURSOR_MIN => f.before_time(c),
+        (Some(c), Proto::JetstreamV2) => f.through(c.saturating_sub(1)),
         (Some(c), Proto::Firehose) => f.through(c),
     };
     let (mut tx, mut rx) = ws.split();

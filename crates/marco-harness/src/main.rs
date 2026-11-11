@@ -59,7 +59,7 @@ struct SourceArg {
 impl SourceArg {
     fn get(&self) -> (Proto, String) {
         match (&self.jetstream, &self.firehose) {
-            (Some(u), _) => (Proto::Jetstream, u.clone()),
+            (Some(u), _) => (Proto::jetstream(u), u.clone()),
             (_, Some(u)) => (Proto::Firehose, u.clone()),
             _ => unreachable!("clap requires one"),
         }
@@ -416,6 +416,7 @@ async fn bench(snapshot: &Path, capture: &Path, work: &Path) -> Result<()> {
     let f = fake::start(cap.clone(), "127.0.0.1:0", 0).await?;
     let url = match cap.proto {
         Proto::Jetstream => format!("ws://{}/subscribe", f.addr),
+        Proto::JetstreamV2 => format!("ws://{}{}", f.addr, marco_ingest::jetstream2::PATH),
         Proto::Firehose => format!("ws://{}/xrpc/com.atproto.sync.subscribeRepos", f.addr),
     };
     let app = work_app(snapshot, work)?;
@@ -533,6 +534,11 @@ async fn retention(proto: Proto, url: &str) -> Result<()> {
     let rels = marco_core::Relations::bsky_default();
     let u = match proto {
         Proto::Jetstream => marco_ingest::jetstream::subscribe_url(url, &rels, Some(1)),
+        // the oldest time there is: v2 clamps it to the oldest event it holds
+        Proto::JetstreamV2 => {
+            let t = marco_ingest::jetstream2::TIME_CURSOR_MIN;
+            marco_ingest::jetstream2::subscribe_url(url, &rels, Some(t))
+        }
         Proto::Firehose => marco_ingest::firehose::subscribe_url(url, Some(1)),
     };
     let connector = if u.starts_with("wss://") {
@@ -554,6 +560,10 @@ async fn retention(proto: Proto, url: &str) -> Result<()> {
         };
         let ev = match proto {
             Proto::Jetstream => marco_ingest::jetstream::decode(&b, &rels).ok(),
+            Proto::JetstreamV2 => match marco_ingest::jetstream2::decode(&b, &rels, &mut Default::default()) {
+                Ok(marco_ingest::jetstream2::Decoded::Event(ev)) => Some(ev),
+                _ => None,
+            },
             Proto::Firehose => match marco_ingest::firehose::decode(&b, &rels) {
                 Ok(marco_ingest::firehose::Frame::Event(ev)) => Some(ev),
                 Ok(other) => {
