@@ -151,7 +151,8 @@ struct Serve {
     /// for tests that want a starved cache.
     #[arg(long, env = "MARCO_MAX_FRAMES", hide = true)]
     max_frames: Option<u32>,
-    /// Follow a Jetstream instance (wss://host or wss://host/subscribe) for the relations' collections.
+    /// Follow a Jetstream instance for the relations' collections: v1 (wss://host or wss://host/subscribe)
+    /// or v2 (wss://host/xrpc/network.bsky.jetstream.subscribeEvents).
     #[arg(long, env = "MARCO_JETSTREAM", conflicts_with = "firehose")]
     jetstream: Option<String>,
     /// Follow a relay's com.atproto.sync.subscribeRepos (wss://host).
@@ -163,7 +164,7 @@ struct Serve {
     #[arg(long, env = "MARCO_SOURCE_RETENTION_HOURS", default_value_t = 36.0)]
     source_retention_hours: f64,
     /// Follow a bulk-built snapshot past the retention, or from a firehose (which
-    /// starts at the live tail).
+    /// starts at the live tail), or a Jetstream v2 source past a time it no longer holds.
     #[arg(long, env = "MARCO_ALLOW_GAP")]
     allow_gap: bool,
 }
@@ -305,7 +306,7 @@ fn main() -> Result<()> {
                 bail!("--segment-interval and --checkpoint-age must be above 0");
             }
             let source = match (&s.jetstream, &s.firehose) {
-                (Some(u), _) => Some(Source::new(Proto::Jetstream, u)?),
+                (Some(u), _) => Some(Source::new(Proto::jetstream(u), u)?),
                 (_, Some(u)) => Some(Source::new(Proto::Firehose, u)?),
                 _ => None,
             };
@@ -376,7 +377,8 @@ fn main() -> Result<()> {
                         let retention = std::time::Duration::from_secs_f64(s.source_retention_hours.max(0.0) * 3600.0);
                         let start = marco_server::ingest::start_point(&app, &src, retention, s.allow_gap).await?;
                         eprintln!("following {} ({})", src.name, src.url);
-                        Some(marco_server::ingest::start(&app, src, start, stopped))
+                        let opts = marco_ingest::Options { start, allow_gap: s.allow_gap, ..Default::default() };
+                        Some(marco_server::ingest::start(&app, src, opts, stopped))
                     }
                     None => None,
                 };

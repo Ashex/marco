@@ -1,6 +1,7 @@
 //! Captures: a live source's messages as it sent them. Jetstream's are JSON
-//! lines (`.jsonl`); a relay's are frames, each after its length as a u32,
-//! big-endian (`.frames`).
+//! lines (`.jsonl`, v1's or v2's: v2's frames are `{"$type":"message",...}`);
+//! a relay's are frames, each after its length as a u32, big-endian
+//! (`.frames`).
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -10,13 +11,18 @@ use anyhow::{Context, Result};
 use futures::StreamExt;
 use marco_core::Relations;
 use marco_ingest::firehose::{self, Frame};
+use marco_ingest::jetstream2::{self, Decoded};
 use marco_ingest::{jetstream, Change, Kind, Proto};
 use tokio_tungstenite::tungstenite::Message;
 
 /// One message of a capture.
 pub struct Msg {
     pub cursor: u64,
-    /// A Jetstream commit's collection, for `wantedCollections`.
+    /// When the source saw it (µs; Jetstream v2's `witnessedAt`), which a v2
+    /// time cursor goes by. 0 when unknown.
+    pub time_us: i64,
+    /// A Jetstream commit's collection, for `wantedCollections` (v1) and
+    /// `collections` (v2).
     pub collection: Option<String>,
     pub bytes: Vec<u8>,
 }
@@ -31,14 +37,29 @@ impl Capture {
         let b = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
         let rels = Relations::bsky_default();
         let mut msgs = Vec::new();
-        let proto = if path.extension().is_some_and(|e| e == "frames") { Proto::Firehose } else { Proto::Jetstream };
+        let proto = if path.extension().is_some_and(|e| e == "frames") {
+            Proto::Firehose
+        } else if b.starts_with(br#"{"$type":"message""#) {
+            Proto::JetstreamV2
+        } else {
+            Proto::Jetstream
+        };
         match proto {
             Proto::Jetstream => {
                 for line in b.split(|&c| c == b'\n').filter(|l| !l.is_empty()) {
                     let v: serde_json::Value = serde_json::from_slice(line).context("capture line")?;
                     let cursor = v["time_us"].as_u64().context("time_us")?;
                     let collection = v["commit"]["collection"].as_str().map(str::to_string);
-                    msgs.push(Msg { cursor, collection, bytes: line.to_vec() });
+                    msgs.push(Msg { cursor, time_us: cursor as i64, collection, bytes: line.to_vec() });
+                }
+            }
+            Proto::JetstreamV2 => {
+                let mut floor = Default::default();
+                for line in b.split(|&c| c == b'\n').filter(|l| !l.is_empty()) {
+                    let Ok(Decoded::Event(ev)) = jetstream2::decode(line, &rels, &mut floor) else { continue };
+                    let v: serde_json::Value = serde_json::from_slice(line).context("capture line")?;
+                    let collection = v["payload"]["collection"].as_str().map(str::to_string);
+                    msgs.push(Msg { cursor: ev.cursor, time_us: ev.time_us, collection, bytes: line.to_vec() });
                 }
             }
             Proto::Firehose => {
@@ -47,7 +68,7 @@ impl Capture {
                     let n = u32::from_be_bytes(r[..4].try_into().unwrap()) as usize;
                     let f = r.get(4..4 + n).context("short frame")?;
                     if let Ok(Frame::Event(ev)) = firehose::decode(f, &rels) {
-                        msgs.push(Msg { cursor: ev.cursor, collection: None, bytes: f.to_vec() });
+                        msgs.push(Msg { cursor: ev.cursor, time_us: ev.time_us, collection: None, bytes: f.to_vec() });
                     }
                     r = &r[4 + n..];
                 }
@@ -70,6 +91,10 @@ pub struct Args {
 fn bucket(proto: Proto, rels: &Relations, b: &[u8]) -> Option<(usize, usize)> {
     let ev = match proto {
         Proto::Jetstream => jetstream::decode(b, rels).ok()?,
+        Proto::JetstreamV2 => match jetstream2::decode(b, rels, &mut Default::default()).ok()? {
+            Decoded::Event(ev) => ev,
+            _ => return None,
+        },
         Proto::Firehose => match firehose::decode(b, rels).ok()? {
             Frame::Event(ev) => ev,
             _ => return None,
@@ -91,6 +116,7 @@ pub async fn run(a: Args) -> Result<()> {
     let rels = Relations::bsky_default();
     let url = match a.proto {
         Proto::Jetstream => jetstream::subscribe_url(&a.url, &rels, None),
+        Proto::JetstreamV2 => jetstream2::subscribe_url(&a.url, &rels, None),
         Proto::Firehose => firehose::subscribe_url(&a.url, None),
     };
     let connector = if url.starts_with("wss://") {
@@ -129,7 +155,7 @@ pub async fn run(a: Args) -> Result<()> {
             counts[k] += 1;
         }
         match a.proto {
-            Proto::Jetstream => {
+            Proto::Jetstream | Proto::JetstreamV2 => {
                 out.write_all(&bytes)?;
                 out.write_all(b"\n")?;
             }

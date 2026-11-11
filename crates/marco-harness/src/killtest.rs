@@ -15,7 +15,7 @@ use futures::StreamExt;
 use marco_core::relation::parse_uri;
 use marco_core::Relations;
 use marco_ingest::firehose::{self, Frame};
-use marco_ingest::{jetstream, Change, Op, Proto, Source};
+use marco_ingest::{jetstream, jetstream2, Change, Op, Proto, Source};
 use marco_proto::connect::marco::v1::AdminClient;
 use marco_proto::v1::{CheckpointRequest, GetActorRequest, ResolveUriRequest};
 
@@ -49,6 +49,10 @@ fn touched(cap: &Capture) -> (BTreeSet<String>, BTreeSet<String>) {
     for m in &cap.msgs {
         let ev = match cap.proto {
             Proto::Jetstream => jetstream::decode(&m.bytes, &rels).ok(),
+            Proto::JetstreamV2 => match jetstream2::decode(&m.bytes, &rels, &mut Default::default()) {
+                Ok(jetstream2::Decoded::Event(ev)) => Some(ev),
+                _ => None,
+            },
             Proto::Firehose => match firehose::decode(&m.bytes, &rels) {
                 Ok(Frame::Event(ev)) => Some(ev),
                 _ => None,
@@ -240,6 +244,7 @@ pub async fn run(a: Args) -> Result<bool> {
     let fk = fake::start(cap.clone(), "127.0.0.1:0", a.rate).await?;
     let url = match cap.proto {
         Proto::Jetstream => format!("ws://{}/subscribe", fk.addr),
+        Proto::JetstreamV2 => format!("ws://{}{}", fk.addr, jetstream2::PATH),
         Proto::Firehose => format!("ws://{}/xrpc/com.atproto.sync.subscribeRepos", fk.addr),
     };
     let src = Source::new(cap.proto, &url)?;
@@ -410,6 +415,7 @@ async fn finish(
     }
     let url = match cap.proto {
         Proto::Jetstream => "/subscribe",
+        Proto::JetstreamV2 => jetstream2::PATH,
         Proto::Firehose => "/xrpc/com.atproto.sync.subscribeRepos",
     };
     // its own fake, at full speed: the expected state is the whole capture, once

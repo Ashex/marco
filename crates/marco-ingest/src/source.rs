@@ -13,7 +13,10 @@ pub const SNAPSHOT_TIME: &str = "time_us";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Proto {
+    /// v1's `/subscribe`.
     Jetstream,
+    /// v2's `network.bsky.jetstream.subscribeEvents`.
+    JetstreamV2,
     Firehose,
 }
 
@@ -21,6 +24,7 @@ impl Proto {
     pub fn as_str(self) -> &'static str {
         match self {
             Proto::Jetstream => "jetstream",
+            Proto::JetstreamV2 => "jetstream-v2",
             Proto::Firehose => "firehose",
         }
     }
@@ -28,7 +32,30 @@ impl Proto {
     pub fn cursor_kind(self) -> &'static str {
         match self {
             Proto::Jetstream => "time_us",
-            Proto::Firehose => "seq",
+            Proto::JetstreamV2 | Proto::Firehose => "seq",
+        }
+    }
+
+    /// The Jetstream wire a URL names: v2 by its XRPC path, v1 otherwise.
+    pub fn jetstream(url: &str) -> Proto {
+        if url.contains(crate::jetstream2::PATH) {
+            Proto::JetstreamV2
+        } else {
+            Proto::Jetstream
+        }
+    }
+
+    pub fn is_jetstream(self) -> bool {
+        matches!(self, Proto::Jetstream | Proto::JetstreamV2)
+    }
+
+    /// What a source's name starts with, which keys its cursor. Both Jetstream
+    /// wires share one, so a v2 consumer resumes from where a v1 consumer of
+    /// the same instance left off: its saved time is a v2 time cursor.
+    fn family(self) -> &'static str {
+        match self {
+            Proto::Jetstream | Proto::JetstreamV2 => "jetstream",
+            Proto::Firehose => "firehose",
         }
     }
 }
@@ -58,7 +85,7 @@ impl Source {
         if host.is_empty() {
             bail!("{url:?} has no host");
         }
-        Ok(Source { proto, name: format!("{}:{host}", proto.as_str()), url })
+        Ok(Source { proto, name: format!("{}:{host}", proto.family()), url })
     }
 }
 
@@ -172,5 +199,13 @@ mod tests {
         assert_eq!(Source::new(Proto::Jetstream, "ws://127.0.0.1:7/x").unwrap().name, "jetstream:127.0.0.1:7");
         assert!(Source::new(Proto::Jetstream, "ftp://x").is_err());
         assert!(Source::new(Proto::Jetstream, "wss:///x").is_err());
+        let v2 = "wss://js.example/xrpc/network.bsky.jetstream.subscribeEvents";
+        assert_eq!(Proto::jetstream(v2), Proto::JetstreamV2);
+        assert_eq!(Proto::jetstream("wss://js.example"), Proto::Jetstream);
+        assert_eq!(
+            Source::new(Proto::JetstreamV2, v2).unwrap().name,
+            "jetstream:js.example",
+            "one cursor for both wires"
+        );
     }
 }
