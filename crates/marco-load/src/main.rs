@@ -10,6 +10,7 @@
 //! marco-load diff   --a SNAP --b SNAP              two snapshots compared record by record
 //! marco-load scan-scylla --config TOML --out DIR [--snapshot SNAP]   Scylla tables -> build input (-> snapshot)
 //! marco-load fill-scylla --config TOML --input DIR   build input -> Scylla tables (tests, benchmarks)
+//! marco-load scan-hubble --out DIR [--host URL] [--snapshot SNAP]   a sync-API host's repos -> build input (-> snapshot)
 //! ```
 //!
 //! The build's input format is in this crate's README.
@@ -24,9 +25,13 @@ mod build;
 #[cfg(feature = "scylla")]
 mod cql;
 mod diff;
+#[cfg(feature = "hubble")]
+mod hubble;
 mod lists_bench;
 mod metrics;
 mod rows;
+#[cfg(any(feature = "scylla", feature = "hubble"))]
+mod spill;
 mod stats;
 mod sys;
 mod verify;
@@ -99,6 +104,9 @@ enum Cmd {
     /// Load build input into Scylla tables as current state (tests, benchmarks).
     #[cfg(feature = "scylla")]
     FillScylla(cql::fill::Args),
+    /// Fetch every repo a sync-API host lists (Hubble by default) into build input, then optionally build.
+    #[cfg(feature = "hubble")]
+    ScanHubble(Box<hubble::Args>),
 }
 
 fn main() -> Result<()> {
@@ -159,6 +167,8 @@ fn main() -> Result<()> {
         Cmd::ScanScylla(a) => cql::scan::run(&a)?,
         #[cfg(feature = "scylla")]
         Cmd::FillScylla(a) => cql::fill::run(&a)?,
+        #[cfg(feature = "hubble")]
+        Cmd::ScanHubble(a) => hubble::run(&a)?,
     };
     let s = serde_json::to_string_pretty(&report)?;
     if let Some(p) = cli.report {

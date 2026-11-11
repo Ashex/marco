@@ -126,6 +126,36 @@ pub fn read_cursors(input: &Path, retention: std::time::Duration, allow_gap: boo
     Ok(c)
 }
 
+/// A scan's output built into `snap` with the default layout, as a scan's
+/// `--snapshot` does: `rels` are the relations scanned.
+#[cfg(any(feature = "scylla", feature = "hubble"))]
+pub fn build_scanned(
+    input: &Path,
+    snap: &Path,
+    rels: Relations,
+    retention_hours: f64,
+    allow_gap: bool,
+) -> Result<Report> {
+    let retention = std::time::Duration::from_secs_f64(retention_hours.max(0.0) * 3600.0);
+    let cursors = read_cursors(input, retention, allow_gap)?;
+    let tmp = snap.with_extension("spill");
+    let o = Opts {
+        input: input.to_path_buf(),
+        out: snap.to_path_buf(),
+        tmp: tmp.clone(),
+        rels,
+        subj_index: marco_core::graph::DEFAULT_SUBJ_INDEX,
+        shards: marco_core::store::DEFAULT_SHARDS,
+        sub_buckets: 4,
+        deletes: None,
+        cursors,
+        heat: None,
+    };
+    let r = build(&o)?;
+    let _ = std::fs::remove_dir(&tmp);
+    Ok(r)
+}
+
 /// The input directory's cursors file.
 pub const CURSORS: &str = "cursors.json";
 

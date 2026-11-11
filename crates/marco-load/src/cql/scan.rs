@@ -491,19 +491,7 @@ fn clear(dir: &Path, rels: &[String]) -> Result<()> {
     for f in [STATE, PLAN, CURSORS, RELATIONS] {
         let _ = std::fs::remove_file(dir.join(f));
     }
-    for r in rels {
-        let d = dir.join(r);
-        if d.is_dir() {
-            for e in std::fs::read_dir(&d)? {
-                let p = e?.path();
-                if p.to_string_lossy().ends_with(".rb.zst") {
-                    std::fs::remove_file(&p)?;
-                }
-            }
-            let _ = std::fs::remove_dir(&d);
-        }
-    }
-    Ok(())
+    crate::spill::remove_buckets(dir, rels)
 }
 
 /// The relations scanned, for `marco-load build --relations` on the output.
@@ -539,23 +527,7 @@ pub fn run(a: &Args) -> Result<Value> {
     drop(rt);
     marco_core::store::write_atomic(&a.out, RELATIONS, toml::to_string(&relations)?.as_bytes(), true)?;
     if let Some(snap) = &a.snapshot {
-        let retention = Duration::from_secs_f64(a.retention_hours * 3600.0);
-        let cursors = crate::build::read_cursors(&a.out, retention, a.allow_gap)?;
-        let tmp = snap.with_extension("spill");
-        let o = crate::build::Opts {
-            input: a.out.clone(),
-            out: snap.clone(),
-            tmp: tmp.clone(),
-            rels: relations,
-            subj_index: marco_core::graph::DEFAULT_SUBJ_INDEX,
-            shards: marco_core::store::DEFAULT_SHARDS,
-            sub_buckets: 4,
-            deletes: None,
-            cursors,
-            heat: None,
-        };
-        let b = crate::build::build(&o)?;
-        let _ = std::fs::remove_dir(&tmp);
+        let b = crate::build::build_scanned(&a.out, snap, relations, a.retention_hours, a.allow_gap)?;
         report["build"] = serde_json::to_value(b)?;
         if !a.keep_spill {
             clear(&a.out, &rels)?;

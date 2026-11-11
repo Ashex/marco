@@ -67,6 +67,14 @@ in about five minutes. To rebuild from an appview's Scylla instead, start from
 target/release/marco-load scan-scylla --config scylla.toml --out /data/scan --snapshot /data/snap
 ```
 
+Without an appview of your own, `scan-hubble` builds the input from a sync-API mirror's repos
+(Hubble by default). Its catch-up limit, and the rate a whole-network sweep needs, are in
+[Building from Hubble](crates/marco-load/README.md#building-from-hubble):
+
+```bash
+target/release/marco-load scan-hubble --out /data/hubble --snapshot /data/snap --contact you@example.com
+```
+
 The image is `ghcr.io/jazware/marco`. Its entrypoint is `marco`, with the snapshot in
 `/var/lib/marco`:
 

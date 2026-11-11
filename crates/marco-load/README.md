@@ -2,14 +2,16 @@
 
 The bulk loader: it builds a marco snapshot from a directory of exported
 records, without going through the server's write path. It also scans
-ScyllaDB tables into that directory, and carries the measurement commands
-from the P0 and P1 runs.
+ScyllaDB tables or a sync-API host's repos into that directory, and carries
+the measurement commands from the P0 and P1 runs.
 
 ```text
 marco-load build        --input DIR --out SNAP           build input -> snapshot
 marco-load scan-scylla  --config TOML --out DIR [--snapshot SNAP]
                                                          Scylla tables -> build input (-> snapshot)
 marco-load fill-scylla  --config TOML --input DIR        build input -> Scylla tables (tests, benchmarks)
+marco-load scan-hubble  --out DIR [--host URL] [--snapshot SNAP]
+                                                         a sync host's repos -> build input (-> snapshot)
 marco-load diff         --a SNAP --b SNAP                two snapshots, record by record
 marco-load verify       --snapshot SNAP                  checksums, every list decoded, both directions agree
 marco-load open | bench | replay                         the P0 measurements
@@ -23,7 +25,7 @@ them runs. `--report FILE` writes the JSON report that also goes to stdout.
 
 `marco-load build` reads one directory. Any source becomes a marco snapshot
 by writing it, so this is the contract every exporter writes to. The
-ClickHouse archive export and `scan-scylla` are two such exporters.
+ClickHouse archive export, `scan-scylla` and `scan-hubble` are three such exporters.
 
 ```text
 DIR/
@@ -355,3 +357,163 @@ exactly the cross-repo items.
 checks the raw spill holds every row exactly once (the build would hide a
 row committed twice). `MARCO_SCYLLA_OPS` sets their size,
 `MARCO_KILL_ROUNDS` the kill test's rounds.
+
+## Building from Hubble
+
+`scan-hubble` fetches every repo a sync-API host lists and writes the input
+format, so a snapshot can be built with nothing but a public mirror. The
+default host is Hubble (`https://hubble.microcosm.blue`, run by microcosm),
+which mirrors every atproto repo. Any host that serves
+`com.atproto.sync.listRepos` and `com.atproto.sync.getRepo` works with
+`--host`: a PDS for its own accounts, or a relay that serves repos. With
+`--snapshot` it then runs the build and deletes its output.
+
+```text
+  sync host                  scan-hubble                          build               marco serve
+  ┌──────────────┐  listRepos pages,    ┌───────────────┐   ┌──────────┐   ┌────────────────────┐
+  │ listRepos    │── then getRepo per ──▶ DIR/follow/   │──▶│ snapshot │──▶│ --jetstream: start  │
+  │ getRepo (CAR)│   active repo,       │ DIR/block/    │   │ + cursor │   │ at scan start − 10 m│
+  └──────────────┘   ≤ --rate a second  │ DIR/listitem/ │   └──────────┘   └────────────────────┘
+                                        │ cursors.json  │
+                                        └───────────────┘
+```
+
+**How it reads.** It pages `listRepos` (`--page-size`, 1000) and fetches
+each active repo's CAR. The commit names the MST root, and the walk decodes
+only the nodes whose key range can hold a relation's collection, so a
+repo's posts and likes are never decoded. Each record of a relation's
+collection becomes a row, with its subject (and list, for a list
+relation) read from the relation's paths. The rows are current state:
+creates with `time_us` 0. Every relation in `--relations` is scanned. A
+list item naming another repo's list is dropped and counted (`cross_repo`),
+as marco never keeps one. The scan checks that the commit names the DID it
+asked for and that each kept record hashes to its CID. It doesn't verify
+commit signatures: the host is trusted to serve the repos it mirrors.
+
+**Politeness.** `--rate` (5) caps the requests a second to the host:
+`getRepo`, `listRepos` and retries all count. At most `--concurrency` (4)
+repos download at once. A 429 or 503 pauses every request for the host's
+`Retry-After` (or atproto's `RateLimit-Reset`), 10 s without either and
+15 min at most. Other failures (5xx, timeouts, dropped connections) back off
+from 1 s to 60 s, `--retries` (8) attempts a request. A request that runs out
+of attempts stops the scan, and running it again resumes it. The User-Agent
+is `marco-load/<version> (+https://github.com/jazware/marco; contact <--contact>)`:
+set `--contact` so the host's operator can reach you. Hubble is someone
+else's service, so ask its operator before raising `--rate`.
+
+**What's skipped.** The report counts every repo it didn't read, by reason
+(`skipped_repos`):
+
+| Reason | |
+|---|---|
+| `inactive:<status>` | `listRepos` lists it as inactive (deactivated, takendown, …): not fetched |
+| `gone:<error>` | `getRepo` answered 4xx: `RepoNotFound`, `RepoTakendown`, … |
+| `bad_car:<why>` | an unreadable CAR, a commit naming another DID, a missing or malformed MST node |
+| `too_big` | a CAR over `--max-car-mb` (1024) |
+
+and every record of a relation it left out (`skipped_records`):
+`no_subject`, `no_list`, `cross_repo`, `bad_list`, `bad_record` (not
+DAG-CBOR), `missing_block`, `bad_block` (its bytes don't match its CID). A
+subject that isn't a DID is left to the build, which counts it as
+`bad_subject`.
+
+**Resume.** Rows go in the same files as `scan-scylla`'s, bucketed by repo
+DID prefix. A `listRepos` page is the unit of commit: its repos are fetched
+in parallel but committed in listing order. The commit appends the page's
+rows, records the next cursor, fsyncs and writes `hubble-state.json`. If
+the scan stops, run the same command again: it cuts the files back to the
+state and lists on from the cursor. A crash refetches at most the page in
+flight. `--fresh` starts over. The state names the host, the relations,
+`--dids` and `--limit`, and a run with other ones is refused.
+
+**Catching up, and its limit.** The scan isn't a snapshot of one moment:
+repos read early change before it ends. `cursors.json` gets `time_us`
+`--cursor-margin-secs` (600) before the scan began, above the mirror's own
+lag behind the network, and `marco serve --jetstream URL` replays
+everything since. Replay is idempotent by record URI, so a record created
+during the scan is added and one deleted during it is removed.
+
+That replay has to still be inside the Jetstream instance's retention when
+`marco serve` starts: 36 h on the public instances (`jetstream2.us-east`
+kept 36.6 h). The build refuses a cursor with under 2 h of it left, and the
+server refuses one past `--source-retention-hours`. So a full sweep has to
+finish in about 33.5 h: 36 h less the 2 h to start the server, the 10 min
+margin and the ~15 min a whole-network build takes. The network has about
+41M repos with records, which makes about 340 repos a second, sustained,
+and each `getRepo` downloads the whole repo, posts and likes included (a
+long-lived account's is ~30 MB). At the default 5 a second a sweep takes
+about 95 days: far too slow for a live catch-up. Whether a host serves
+340 a second is its operator's call, not the scan's. Hubble lists repos in
+DID order, so the scan can tell how far through `did:plc` it is: once its
+pace is clear it warns if it will end past the retention, with the rate
+it would need. A sweep that ends past it builds only with `--allow-gap`,
+and that snapshot misses every change between its cursor and the oldest
+event Jetstream still holds, for good.
+
+**Samples.** `--limit N` lists only the first N repos, and `--dids A,B`
+fetches just those. Their snapshots hold a few accounts, not the network:
+they're for trying the path end to end.
+
+### The flags
+
+| Flag | Default | |
+|---|---|---|
+| `--host URL` | `https://hubble.microcosm.blue` | the sync-API host |
+| `--out DIR` | | the output (the build's input); a scan already there resumes |
+| `--snapshot SNAP` | | build here when the scan is whole, then delete `--out` |
+| `--keep-spill` | off | with `--snapshot`, keep `--out` |
+| `--relations FILE` | built-in | the relations to scan; the snapshot holds those |
+| `--fresh` | off | discard the scan in `--out` and start over |
+| `--rate N` | 5 | requests a second to the host, retries included |
+| `--concurrency N` | 4 | repos downloading and parsing at once |
+| `--page-size N` | 1000 | repos per `listRepos` page: the unit of resume |
+| `--contact TEXT` | | a URL or email for the host's operator, in the User-Agent |
+| `--retries N` | 8 | attempts a request before the scan stops |
+| `--timeout-secs S` | 300 | per request, body included |
+| `--max-car-mb N` | 1024 | a bigger repo is skipped as `too_big` |
+| `--dids A,B` | | fetch only these repos |
+| `--limit N` | | list only the first N repos |
+| `--cursor-margin-secs S` | 600 | the snapshot's time is the scan's start less this |
+| `--retention-hours H` | 36 | the source's replay window: warn, and refuse the build with under 2 h to spare |
+| `--allow-gap` | off | build even past the retention |
+| `--zstd-level N` | 1 | |
+| `--progress-secs S` | 10 | |
+
+Progress goes to stderr: repos and repos/s, MB/s, pages, records, repos
+skipped, retries, throttles, and with a listing in DID order the share of
+`did:plc` done and an ETA. With `--ops`, `/metrics` has
+`marco_load_hubble_requests_total{method,status}`,
+`marco_load_hubble_bytes_total{method}`,
+`marco_load_hubble_repos_total{outcome}` and
+`marco_load_hubble_records_total{relation}`. The JSON report at the end has
+the counts above, bytes downloaded, the cursor, and this run's requests,
+retries and throttles.
+
+```sh
+# a few repos end to end
+marco-load scan-hubble --out /data/sample --snapshot /data/sample-snap --limit 100 --contact you@example.com
+
+# every repo; run it again with the same --out if it stops
+marco-load --ops 127.0.0.1:9101 --report scan.json scan-hubble \
+  --out /data/hubble --snapshot /data/snap --contact you@example.com
+```
+
+### Testing it
+
+`tests/hubble.rs` serves `listRepos` and `getRepo` from an in-test HTTP
+server, over CARs it builds: follows, blocks and list items among posts and
+likes, plus inactive repos, `RepoNotFound`, a cut-off CAR, a CAR of another
+repo, a 429 with `Retry-After` and a 500. It aborts a scan after two pages,
+resumes it, builds, and checks that the snapshot holds exactly the records
+it should (`diff` against a direct build of them, and every actor's
+follows), that committed pages weren't fetched again, the skip counts, the
+cursor, the User-Agent and the rate cap. A live check against Hubble reads
+the first `listRepos` page of three and one repo by DID, at 2 requests a
+second:
+
+```sh
+cargo test -p marco-load --test hubble -- --ignored live
+```
+
+`MARCO_SYNC_HOST` and `MARCO_LIVE_DID` point it elsewhere. Never point a
+test at a whole host.
