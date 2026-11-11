@@ -303,3 +303,31 @@ fn a_repo_without_a_revision_fails_rather_than_go_ungated() {
     assert!(err.contains("1 repos still failing"), "{err}");
     assert!(read_rows(&out, "follow", false).is_empty(), "its rows aren't kept either");
 }
+
+#[test]
+fn a_built_sweep_leaves_the_revs_beside_the_snapshot() {
+    let fake = Arc::new(Fake {
+        repos: vec![(B.into(), true, None)],
+        archives: [(
+            B.to_string(),
+            starlite::tests::archive("3kaaaaaaaaa2r", &[("app.bsky.graph.follow/3kaaaaaaaaa21", follow(A))]),
+        )]
+        .into(),
+        ..Default::default()
+    });
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let url = rt.block_on(start(fake));
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("sweep");
+    let snap = tmp.path().join("snap");
+    let mut a = args(out.clone(), url);
+    a.snapshot = Some(snap.clone());
+    run(&a).unwrap();
+    assert!(!out.exists(), "the sweep's output goes once it's built");
+    assert!(snap.join("manifest.json").exists());
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("snap.revs.tsv")).unwrap(),
+        "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb\t3kaaaaaaaaa2r\n",
+        "graph-sync needs it after the build"
+    );
+}

@@ -396,6 +396,10 @@ pub fn run(a: &Args) -> Result<Value> {
         let b = crate::build::build(&o)?;
         let _ = std::fs::remove_dir(&tmp);
         report["build"] = serde_json::to_value(b)?;
+        // graph-sync gates on the revs after the build, when the sweep's output may be gone
+        let revs = PathBuf::from(format!("{}.revs.tsv", snap.display()));
+        std::fs::copy(a.out.join(REVS), &revs).with_context(|| format!("copy the revs to {}", revs.display()))?;
+        report["revs"] = json!(revs);
         if !a.keep_spill {
             let names: Vec<String> = rels.user().iter().map(|&r| rels.get(r).name.clone()).collect();
             clear(&a.out, &names)?;
