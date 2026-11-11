@@ -38,12 +38,12 @@ pub struct Args {
     /// Measured rounds per ratio, after one warm-up round.
     #[arg(long, default_value_t = 3)]
     rounds: usize,
-    /// Read every page first, so latencies are warm.
+    /// Load every page into the cache first (when MARCO_MEMORY holds them), so latencies are warm.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     warm: bool,
 }
 
-/// Open, then the first queries against whatever the page cache holds.
+/// Open, then the first queries against a cold cache.
 pub fn open(path: &Path) -> Result<Value> {
     let t = Instant::now();
     let g = Graph::open(path)?;
@@ -125,14 +125,9 @@ pub fn run(a: &Args) -> Result<Value> {
     out.insert("open_ms".to_string(), json!(open_ms));
     if a.warm {
         let t = Instant::now();
-        let touched: u64 = store
-            .files()
-            .collect::<Vec<_>>()
-            .par_iter()
-            .map(|f| f.1.mapped().unwrap_or_default().iter().step_by(4096).map(|&b| b as u64).sum::<u64>())
-            .sum();
-        std::hint::black_box(touched);
+        let loaded = store.load();
         out.insert("warm_secs".into(), json!(t.elapsed().as_secs_f64()));
+        out.insert("warm_loaded".into(), json!(loaded));
     }
     let n_ids = g.n_ids();
 

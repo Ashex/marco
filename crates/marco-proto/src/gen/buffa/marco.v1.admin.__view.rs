@@ -814,7 +814,7 @@ pub struct GetOverviewResponseView<'a> {
     pub ready_reason: &'a str,
     /// Field 26: `reads_before_ready`
     pub reads_before_ready: u64,
-    /// The storage engine's budget and reads; unset on --storage mmap.
+    /// The storage engine's budget and reads.
     ///
     /// Field 27: `cache`
     pub cache: ::buffa::MessageFieldView<super::super::__buffa::view::CacheView<'a>>,
@@ -1918,7 +1918,7 @@ impl GetOverviewResponseOwnedView {
     pub fn reads_before_ready(&self) -> u64 {
         self.0.reborrow().reads_before_ready
     }
-    /// The storage engine's budget and reads; unset on --storage mmap.
+    /// The storage engine's budget and reads.
     ///
     /// Field 27: `cache`
     #[must_use]
@@ -4185,7 +4185,7 @@ pub struct SnapshotInfoView<'a> {
     pub size_bytes: u64,
     /// Field 6: `written_ms`
     pub written_ms: i64,
-    /// The open at start: mmap and footer checks.
+    /// The open at start: footers, page sums and pinned sections read and checked.
     ///
     /// Field 7: `open_seconds`
     pub open_seconds: f64,
@@ -4596,7 +4596,7 @@ impl SnapshotInfoOwnedView {
     pub fn written_ms(&self) -> i64 {
         self.0.reborrow().written_ms
     }
-    /// The open at start: mmap and footer checks.
+    /// The open at start: footers, page sums and pinned sections read and checked.
     ///
     /// Field 7: `open_seconds`
     #[must_use]
@@ -5517,10 +5517,6 @@ pub struct ProcessInfoView<'a> {
     pub cpu_seconds: f64,
     /// Field 4: `threads`
     pub threads: u32,
-    /// Snapshot bytes in the page cache (mincore), sampled every 10 s.
-    ///
-    /// Field 5: `snapshot_cached_bytes`
-    pub snapshot_cached_bytes: u64,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for ProcessInfoView<'a> {
@@ -5581,13 +5577,6 @@ impl<'a> ::buffa::MessageView<'a> for ProcessInfoView<'a> {
                 )?;
                 view.threads = ::buffa::types::decode_uint32(&mut cur)?;
             }
-            5u32 => {
-                ::buffa::encoding::check_wire_type(
-                    tag,
-                    ::buffa::encoding::WireType::Varint,
-                )?;
-                view.snapshot_cached_bytes = ::buffa::types::decode_uint64(&mut cur)?;
-            }
             _ => {
                 ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
                 let span_len = before_tag.len() - cur.len();
@@ -5614,7 +5603,6 @@ impl<'a> ::buffa::MessageView<'a> for ProcessInfoView<'a> {
             mem_total_bytes: self.mem_total_bytes,
             cpu_seconds: self.cpu_seconds,
             threads: self.threads,
-            snapshot_cached_bytes: self.snapshot_cached_bytes,
             __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
@@ -5640,12 +5628,6 @@ impl<'a> ::buffa::ViewEncode<'a> for ProcessInfoView<'a> {
         if self.threads != 0u32 {
             size += 1u64 + ::buffa::types::uint32_encoded_len(self.threads) as u64;
         }
-        if self.snapshot_cached_bytes != 0u64 {
-            size
-                += 1u64
-                    + ::buffa::types::uint64_encoded_len(self.snapshot_cached_bytes)
-                        as u64;
-        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -5668,9 +5650,6 @@ impl<'a> ::buffa::ViewEncode<'a> for ProcessInfoView<'a> {
         }
         if self.threads != 0u32 {
             ::buffa::types::put_uint32_field(4u32, self.threads, buf);
-        }
-        if self.snapshot_cached_bytes != 0u64 {
-            ::buffa::types::put_uint64_field(5u32, self.snapshot_cached_bytes, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -5719,13 +5698,6 @@ impl<'__a> ::serde::Serialize for ProcessInfoView<'__a> {
                 .serialize_entry(
                     "threads",
                     &::buffa::json_helpers::ProtoJson(&self.threads),
-                )?;
-        }
-        if !::buffa::json_helpers::skip_if::is_zero_u64(&self.snapshot_cached_bytes) {
-            __map
-                .serialize_entry(
-                    "snapshotCachedBytes",
-                    &::buffa::json_helpers::ProtoJson(&self.snapshot_cached_bytes),
                 )?;
         }
         __map.end()
@@ -5838,13 +5810,6 @@ impl ProcessInfoOwnedView {
     #[must_use]
     pub fn threads(&self) -> u32 {
         self.0.reborrow().threads
-    }
-    /// Snapshot bytes in the page cache (mincore), sampled every 10 s.
-    ///
-    /// Field 5: `snapshot_cached_bytes`
-    #[must_use]
-    pub fn snapshot_cached_bytes(&self) -> u64 {
-        self.0.reborrow().snapshot_cached_bytes
     }
 }
 impl ::core::convert::From<::buffa::OwnedView<ProcessInfoView<'static>>>

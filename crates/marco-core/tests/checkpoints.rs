@@ -424,10 +424,10 @@ fn clamped_empty_shards_get_bases() {
 }
 
 /// Once a compacted shard is swapped in and nothing holds the old base, its
-/// old files are unmapped: their disk space doesn't wait for a checkpoint.
+/// old files are closed: their disk space doesn't wait for a checkpoint.
 #[cfg(target_os = "linux")]
 #[test]
-fn a_compaction_unmaps_the_old_files() {
+fn a_compaction_closes_the_old_files() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("g");
     let mut g = Graph::new(Relations::bsky_default());
@@ -440,7 +440,7 @@ fn a_compaction_unmaps_the_old_files() {
     let mut g = reopen(&path);
     g.delete(&format!("at://{}/{}/{}", did(1), COLLS[0], tid(3))).unwrap();
     g.write_checkpoint(&path, 1, 0, Default::default()).unwrap();
-    // a shadowed graph would live on and keep the base mapped
+    // a shadowed graph would live on and keep the base open
     drop(g);
     let mut g = reopen(&path);
     let snap = g.shared_snapshot().unwrap();
@@ -450,22 +450,21 @@ fn a_compaction_unmaps_the_old_files() {
     g.swap_base(&swap);
     remove_unlisted(&path, &c.manifest, false).unwrap();
     drop((snap, swap, c));
-    let mapped = || {
-        let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
-        old.iter().filter(|f| maps.contains(f.as_str())).count()
+    let open_files = || -> Vec<String> {
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(|e| std::fs::read_link(e.ok()?.path()).ok())
+            .map(|l| l.display().to_string())
+            .filter(|l| old.iter().any(|f| l.starts_with(f.as_str())))
+            .collect()
     };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while mapped() > 0 {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "{} old files still mapped: {:?}",
-            mapped(),
-            std::fs::read_to_string("/proc/self/maps")
-                .unwrap()
-                .lines()
-                .filter(|l| l.contains("/g/"))
-                .collect::<Vec<_>>()
-        );
+    loop {
+        let open = open_files();
+        if open.is_empty() {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "old files still open: {open:?}");
         crossbeam_epoch::pin().flush();
         std::thread::sleep(std::time::Duration::from_millis(10));
     }

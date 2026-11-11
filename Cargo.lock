@@ -1704,7 +1704,6 @@ dependencies = [
  "criterion",
  "crossbeam-epoch",
  "libc",
- "memmap2",
  "prometheus",
  "rustc-hash",
  "serde",

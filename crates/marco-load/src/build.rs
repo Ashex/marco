@@ -32,14 +32,12 @@ use serde::Serialize;
 
 use marco_core::did::{classify, DidRef, Radix};
 use marco_core::format6::{Heat, InLayout, InSections, Layout, OutSections, SetWriter6};
-use marco_core::inset;
-use marco_core::outlog::{self, OutBytes};
+use marco_core::outlog::OutBytes;
 use marco_core::rkey::key_of;
 use marco_core::snapshot::{
-    encode_index, encode_side, rel_section, write_directory, DirParts, Meta, RelStats, ShardMeta, Writer, FORMAT,
+    encode_side, rel_section, write_directory, DirParts, Meta, PagedFooter, PagedWriter, RelStats, ShardMeta,
+    PAGED_FORMAT,
 };
-use marco_core::snapshot::{PagedFooter, PagedWriter, PAGED_FORMAT};
-use marco_core::store::v5::SetWriter;
 use marco_core::Relations;
 
 use crate::metrics;
@@ -59,9 +57,7 @@ pub struct Opts {
     /// The input's `cursors.json`: stamped into the manifest, so a server
     /// resumes its sources from the input's cut.
     pub cursors: BTreeMap<String, String>,
-    /// The snapshot format: 5 (what the server reads) or 6 (paged).
-    pub format: u32,
-    /// FORMAT 6: lay small lists out hottest first by these weights,
+    /// Lay small lists out hottest first by these weights,
     /// `did<TAB>weight` files of viewers and subjects ([`Heat`]).
     pub heat: Option<(PathBuf, PathBuf)>,
 }
@@ -190,7 +186,6 @@ impl RelReport {
         self.recreated_keys += c.recreated_keys;
         self.out_records += c.records;
         self.out_lists += c.lists.len() as u64;
-        self.out_bytes.add(&c.out_bytes);
         self.out_max = self.out_max.max(c.out_max);
         self.out_records_indexed += c.indexed;
         self.non_tid += c.side.len() as u64;
@@ -204,7 +199,6 @@ impl RelReport {
         self.in_pairs += b.pairs;
         self.in_lists += b.lists.len() as u64;
         self.in_max = self.in_max.max(b.max);
-        self.in_bytes += b.buf.len() as u64;
         for (k, v) in &b.len_log2 {
             *self.in_len_log2.entry(*k).or_default() += v;
         }
@@ -273,14 +267,14 @@ pub struct Report {
     /// the directory had.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub heat: Option<(u64, u64)>,
-    /// FORMAT 6: per relation, how its lists were laid out.
+    /// Per relation, how its lists were laid out.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub layout: Vec<RelLayout>,
-    /// FORMAT 6: each section's largest size in one shard, against the
+    /// Each section's largest size in one shard, against the
     /// spaces' caps.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub sections_shard_max: BTreeMap<String, u64>,
-    /// FORMAT 6: whether the files were written with O_DIRECT.
+    /// Whether the files were written with O_DIRECT.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub direct_io: Option<bool>,
 }
@@ -592,10 +586,9 @@ impl Spill {
 }
 
 struct ChunkOut {
-    buf: Vec<u8>,
-    /// (shard-local id, bytes), ascending; FORMAT 6: (shard-local id, records).
+    /// (shard-local id, records), ascending.
     lists: Vec<(u32, u32)>,
-    /// FORMAT 6: the lists' records, in list order, for the shard to encode.
+    /// The lists' records, in list order, for the shard to encode.
     edges: Vec<(u64, u32)>,
     side: Vec<(u32, u64, String)>,
     rows: u64,
@@ -607,7 +600,6 @@ struct ChunkOut {
     superseded: u64,
     deleted_keys: u64,
     recreated_keys: u64,
-    out_bytes: OutBytes,
     out_max: u64,
     indexed: u64,
     len_log2: BTreeMap<u32, u64>,
@@ -641,7 +633,6 @@ fn out_chunk(
     subj_index: usize,
     spill: &Spill,
     deletes: Option<(&DeletesOut, &str, usize)>,
-    paged: bool,
     c: &Counters,
 ) -> Result<ChunkOut> {
     let t = Instant::now();
@@ -770,10 +761,8 @@ fn out_chunk(
         .filter(|e| !marco_core::rkey::is_tid(e.1))
         .map(|e| (e.0, e.1, rkey_text(e.1, e.3, &side)))
         .collect();
-    let mut buf = Vec::with_capacity(if paged { 0 } else { edges.len() * 9 });
-    let mut flat = Vec::with_capacity(if paged { edges.len() } else { 0 });
+    let mut flat = Vec::with_capacity(edges.len());
     let mut lists = Vec::new();
-    let mut out_bytes = OutBytes::default();
     let (mut out_max, mut indexed) = (0u64, 0u64);
     let mut len_log2 = BTreeMap::new();
     let mut list: Vec<(u64, u32)> = Vec::new();
@@ -785,14 +774,8 @@ fn out_chunk(
             list.push((edges[i].1, edges[i].2));
             i += 1;
         }
-        if paged {
-            flat.extend_from_slice(&list);
-            lists.push((a - lo, list.len() as u32));
-        } else {
-            let at = buf.len();
-            outlog::encode(&list, subj_index, &mut buf, &mut out_bytes);
-            lists.push((a - lo, (buf.len() - at) as u32));
-        }
+        flat.extend_from_slice(&list);
+        lists.push((a - lo, list.len() as u32));
         out_max = out_max.max(list.len() as u64);
         if list.len() >= subj_index {
             indexed += list.len() as u64;
@@ -823,7 +806,6 @@ fn out_chunk(
     let once = |x: u64| if !by_list || count_bad { x } else { 0 };
     c.rows.fetch_add(once(n), Relaxed);
     Ok(ChunkOut {
-        buf,
         lists,
         edges: flat,
         side,
@@ -836,7 +818,6 @@ fn out_chunk(
         superseded: once(superseded),
         deleted_keys: if by_list { 0 } else { deleted_keys },
         recreated_keys: once(recreated_keys),
-        out_bytes,
         out_max,
         indexed,
         len_log2,
@@ -850,16 +831,15 @@ fn rkey_text(key: u64, row: u32, side: &[(u32, String)]) -> String {
 }
 
 struct BucketOut {
-    buf: Vec<u8>,
     lists: Vec<(u32, u32)>,
     pairs: u64,
     max: u64,
     len_log2: BTreeMap<u32, u64>,
 }
 
-/// One spill file's sets: encoded into the bucket's buffer, or (FORMAT 6)
-/// pushed into `paged`, with `lists` holding member counts.
-fn in_bucket(p: &Path, lo: u32, c: &Counters, mut paged: Option<&mut InSections>) -> Result<BucketOut> {
+/// One spill file's sets, pushed into `sec`, with `lists` holding member
+/// counts.
+fn in_bucket(p: &Path, lo: u32, c: &Counters, sec: &mut InSections) -> Result<BucketOut> {
     let t = Instant::now();
     let mut raw = Vec::new();
     File::open(p)?.read_to_end(&mut raw)?;
@@ -872,7 +852,6 @@ fn in_bucket(p: &Path, lo: u32, c: &Counters, mut paged: Option<&mut InSections>
     v.dedup();
     c.add(2, t);
     let t = Instant::now();
-    let mut buf = Vec::with_capacity(v.len() * 3);
     let mut lists = Vec::new();
     let mut ids: Vec<u32> = Vec::new();
     let mut max = 0u64;
@@ -885,152 +864,17 @@ fn in_bucket(p: &Path, lo: u32, c: &Counters, mut paged: Option<&mut InSections>
             ids.push(v[i] as u32);
             i += 1;
         }
-        if let Some(sec) = paged.as_deref_mut() {
-            sec.push(s - lo, &ids)?;
-            lists.push((s - lo, ids.len() as u32));
-        } else {
-            let at = buf.len();
-            inset::encode(&ids, &mut buf);
-            lists.push((s - lo, (buf.len() - at) as u32));
-        }
+        sec.push(s - lo, &ids)?;
+        lists.push((s - lo, ids.len() as u32));
         max = max.max(ids.len() as u64);
         *len_log2.entry(63 - (ids.len() as u64).leading_zeros()).or_default() += 1;
     }
     c.add(3, t);
     c.rows.fetch_add(v.len() as u64, Relaxed);
-    Ok(BucketOut { buf, lists, pairs: v.len() as u64, max, len_log2 })
+    Ok(BucketOut { lists, pairs: v.len() as u64, max, len_log2 })
 }
 
-/// Where the open section's lists go: offsets for local ids 0..=n.
-struct Placer {
-    offsets: Vec<u64>,
-    next: u32,
-    at: u64,
-}
-
-impl Placer {
-    fn new(n: u32) -> Placer {
-        Placer { offsets: Vec::with_capacity(n as usize + 1), next: 0, at: 0 }
-    }
-
-    fn place(&mut self, lists: &[(u32, u32)]) -> Result<()> {
-        for &(id, len) in lists {
-            if id < self.next {
-                bail!("lists out of id order at local id {id} (files must sort in DID order)");
-            }
-            while self.next <= id {
-                self.offsets.push(self.at);
-                self.next += 1;
-            }
-            self.at += len as u64;
-        }
-        Ok(())
-    }
-
-    fn index(mut self, n: u32) -> Result<Vec<u8>> {
-        while self.next <= n {
-            self.offsets.push(self.at);
-            self.next += 1;
-        }
-        encode_index(&self.offsets)
-    }
-}
-
-/// Writes one shard's out logs for every relation (r{i}.out.dat, out.idx, side).
-#[allow(clippy::too_many_arguments)]
-fn out_shard(
-    w: &mut Writer,
-    files: &[RelFiles],
-    dir: &Dir,
-    lo: u32,
-    hi: u32,
-    o: &Opts,
-    spills: &[Spill],
-    c: &Counters,
-) -> Result<Vec<RelReport>> {
-    let mut reps = Vec::new();
-    for (ri, (mode, rel_files)) in files.iter().enumerate() {
-        let mut rr = RelReport::default();
-        let mut p = Placer::new(hi - lo);
-        let mut side: Vec<(u32, u64, String)> = Vec::new();
-        w.begin(&rel_section(ri, "out.dat"));
-        // list ids follow their URIs' order, which isn't the files' order
-        // (did:key and other repos sort among the did:plc ones), so a list
-        // relation's chunks are merged by id before they're written
-        let mut held: Vec<ChunkOut> = Vec::new();
-        for (f, flo, fhi) in rel_files {
-            if *fhi < lo || *flo >= hi {
-                continue;
-            }
-            let k = (lo / spills[ri].width.max(1)) as usize;
-            let del = o.deletes.as_ref().map(|d| (d, o.rels.list[ri].name.as_str(), k));
-            let mut co =
-                out_chunk(f, *mode, dir, lo, hi, (lo..hi).contains(flo), o.subj_index, &spills[ri], del, false, c)?;
-            if !(lo..hi).contains(flo) || !(lo..hi).contains(fhi) {
-                rr.files_shared += 1;
-            }
-            rr.files += 1;
-            rr.add_out(&co);
-            side.append(&mut co.side);
-            if *mode == Mode::ByList {
-                held.push(co);
-            } else {
-                let t = Instant::now();
-                p.place(&co.lists)?;
-                w.write(&co.buf)?;
-                c.add(5, t);
-            }
-        }
-        if !held.is_empty() {
-            let t = Instant::now();
-            let mut at: Vec<(u32, usize, usize, usize)> = Vec::new();
-            for (ci, co) in held.iter().enumerate() {
-                let mut off = 0usize;
-                for &(id, len) in &co.lists {
-                    at.push((id, ci, off, len as usize));
-                    off += len as usize;
-                }
-            }
-            at.sort_unstable();
-            for (id, ci, off, len) in at {
-                p.place(&[(id, len as u32)])?;
-                w.write(&held[ci].buf[off..off + len])?;
-            }
-            c.add(5, t);
-        }
-        w.end()?;
-        w.section(&rel_section(ri, "out.idx"), &p.index(hi - lo)?)?;
-        side.sort_unstable();
-        let side_ref: Vec<(u32, u64, &str)> = side.iter().map(|(a, k, s)| (*a, *k, s.as_str())).collect();
-        w.section(&rel_section(ri, "side"), &encode_side(&side_ref))?;
-        reps.push(rr);
-    }
-    Ok(reps)
-}
-
-/// Writes one shard's in sets for every relation (r{i}.in.dat, in.idx).
-fn in_shard(w: &mut Writer, k: usize, lo: u32, hi: u32, spills: &[Spill], c: &Counters) -> Result<Vec<RelReport>> {
-    let mut reps = Vec::new();
-    for (ri, sp) in spills.iter().enumerate() {
-        let mut rr = RelReport::default();
-        let mut p = Placer::new(hi - lo);
-        w.begin(&rel_section(ri, "in.dat"));
-        for b in 0..sp.subs {
-            let bo = in_bucket(&sp.paths[k * sp.subs + b], lo, c, None)?;
-            let t = Instant::now();
-            p.place(&bo.lists)?;
-            w.write(&bo.buf)?;
-            c.add(5, t);
-            rr.add_in(&bo);
-        }
-        w.end()?;
-        w.section(&rel_section(ri, "in.idx"), &p.index(hi - lo)?)?;
-        reps.push(rr);
-    }
-    Ok(reps)
-}
-
-/// FORMAT 6: one shard's out lists for every relation (r{i}.out.*, side),
+/// One shard's out lists for every relation (r{i}.out.*, side),
 /// the rkey column streamed into the file as it fills.
 #[allow(clippy::too_many_arguments)]
 fn out_shard6(
@@ -1060,8 +904,7 @@ fn out_shard6(
             }
             let k = (lo / spills[ri].width.max(1)) as usize;
             let del = o.deletes.as_ref().map(|d| (d, o.rels.list[ri].name.as_str(), k));
-            let mut co =
-                out_chunk(f, *mode, dir, lo, hi, (lo..hi).contains(flo), o.subj_index, &spills[ri], del, true, c)?;
+            let mut co = out_chunk(f, *mode, dir, lo, hi, (lo..hi).contains(flo), o.subj_index, &spills[ri], del, c)?;
             if !(lo..hi).contains(flo) || !(lo..hi).contains(fhi) {
                 rr.files_shared += 1;
             }
@@ -1111,7 +954,7 @@ fn out_shard6(
     Ok(reps)
 }
 
-/// FORMAT 6: one shard's in sets for every relation (r{i}.in.*).
+/// One shard's in sets for every relation (r{i}.in.*).
 fn in_shard6(
     w: &mut PagedWriter,
     k: usize,
@@ -1129,7 +972,7 @@ fn in_shard6(
             sec = sec.with_heat(h.clone(), lo);
         }
         for b in 0..sp.subs {
-            let bo = in_bucket(&sp.paths[k * sp.subs + b], lo, c, Some(&mut sec))?;
+            let bo = in_bucket(&sp.paths[k * sp.subs + b], lo, c, &mut sec)?;
             rr.add_in(&bo);
         }
         let t = Instant::now();
@@ -1139,22 +982,6 @@ fn in_shard6(
         reps.push((rr, layout));
     }
     Ok(reps)
-}
-
-/// A shard's file while the build writes it.
-#[allow(clippy::large_enum_variant)]
-enum ShardWriter {
-    F5(Writer),
-    F6(PagedWriter),
-}
-
-impl ShardWriter {
-    fn pinned(&mut self, name: &str, b: &[u8]) -> Result<()> {
-        match self {
-            ShardWriter::F5(w) => w.section(name, b),
-            ShardWriter::F6(w) => w.pinned(name, b),
-        }
-    }
 }
 
 pub fn build(o: &Opts) -> Result<Report> {
@@ -1194,30 +1021,16 @@ pub fn build(o: &Opts) -> Result<Report> {
     rep.dids_other = dir.other.len() as u64;
     rep.bad_dids = c.bad.load(Relaxed);
     let n = dir.len() as u32;
-    let paged = match o.format {
-        FORMAT => false,
-        PAGED_FORMAT => true,
-        f => bail!("format {f}: the build writes {FORMAT} or {PAGED_FORMAT}"),
-    };
-    rep.format = o.format;
+    rep.format = PAGED_FORMAT;
     let other: Vec<&str> = dir.other.iter().map(String::as_str).collect();
     let parts = DirParts { plc: &dir.plc, other: &other, ids: None };
-    let (mut set5, mut set6, width, build_id) = if paged {
-        let mut s = SetWriter6::create(&o.out, n, o.shards)?;
-        rep.direct_io = Some(s.dir.as_ref().unwrap().is_direct());
-        write_directory(s.dir.as_mut().unwrap(), &parts)?;
-        let (w, b) = (s.width, s.build);
-        (None, Some(s), w, b)
-    } else {
-        let mut s = SetWriter::create(&o.out, n, o.shards)?;
-        write_directory(s.dir.as_mut().unwrap(), &parts)?;
-        let (w, b) = (s.width, s.build);
-        (Some(s), None, w, b)
-    };
+    let mut set = SetWriter6::create(&o.out, n, o.shards)?;
+    rep.direct_io = Some(set.dir.as_ref().unwrap().is_direct());
+    write_directory(set.dir.as_mut().unwrap(), &parts)?;
+    let width = set.width;
     rep.phases.push(c.phase("directory", t));
     metrics::set("dids", n as f64);
     let heat = match &o.heat {
-        Some(_) if !paged => bail!("a heat-ordered layout is FORMAT 6's"),
         Some((v, s)) => {
             let (viewer, nv) = read_heat(&dir, v)?;
             let (subject, ns) = read_heat(&dir, s)?;
@@ -1254,18 +1067,8 @@ pub fn build(o: &Opts) -> Result<Report> {
         .iter()
         .map(|r| Spill::new(&o.tmp, &r.name, o.shards, o.sub_buckets, width))
         .collect::<Result<_>>()?;
-    let ranges: Vec<(u32, u32)> = (0..o.shards)
-        .map(|k| match (&set5, &set6) {
-            (Some(s), _) => s.shard_range(k),
-            (_, Some(s)) => s.shard_range(k),
-            _ => unreachable!(),
-        })
-        .collect();
-    let mut writers: Vec<ShardWriter> = match (&mut set5, &mut set6) {
-        (Some(s), _) => s.shards.iter_mut().map(|w| ShardWriter::F5(w.take().unwrap())).collect(),
-        (_, Some(s)) => s.shards.iter_mut().map(|w| ShardWriter::F6(w.take().unwrap())).collect(),
-        _ => unreachable!(),
-    };
+    let ranges: Vec<(u32, u32)> = (0..o.shards).map(|k| set.shard_range(k)).collect();
+    let mut writers: Vec<PagedWriter> = set.shards.iter_mut().map(|w| w.take().unwrap()).collect();
     let mut out_layout = vec![Layout::default(); o.rels.len()];
     let mut in_layout = vec![InLayout::default(); o.rels.len()];
 
@@ -1275,13 +1078,7 @@ pub fn build(o: &Opts) -> Result<Report> {
     let outs: Vec<Vec<(RelReport, Layout)>> = writers
         .par_iter_mut()
         .enumerate()
-        .map(|(k, w)| match w {
-            ShardWriter::F5(w) => Ok(out_shard(w, &files, &dir, ranges[k].0, ranges[k].1, o, &spills, &c)?
-                .into_iter()
-                .map(|r| (r, Layout::default()))
-                .collect()),
-            ShardWriter::F6(w) => out_shard6(w, &files, &dir, ranges[k].0, ranges[k].1, o, &spills, heat.as_ref(), &c),
-        })
+        .map(|(k, w)| out_shard6(w, &files, &dir, ranges[k].0, ranges[k].1, o, &spills, heat.as_ref(), &c))
         .collect::<Result<_>>()?;
     let outs: Vec<Vec<RelReport>> = outs
         .into_iter()
@@ -1309,13 +1106,7 @@ pub fn build(o: &Opts) -> Result<Report> {
     let ins: Vec<Vec<(RelReport, InLayout)>> = writers
         .par_iter_mut()
         .enumerate()
-        .map(|(k, w)| match w {
-            ShardWriter::F5(w) => Ok(in_shard(w, k, ranges[k].0, ranges[k].1, &spills, &c)?
-                .into_iter()
-                .map(|r| (r, InLayout::default()))
-                .collect()),
-            ShardWriter::F6(w) => in_shard6(w, k, ranges[k].0, ranges[k].1, &spills, heat.as_ref(), &c),
-        })
+        .map(|(k, w)| in_shard6(w, k, ranges[k].0, ranges[k].1, &spills, heat.as_ref(), &c))
         .collect::<Result<_>>()?;
     let ins: Vec<Vec<RelReport>> = ins
         .into_iter()
@@ -1333,36 +1124,24 @@ pub fn build(o: &Opts) -> Result<Report> {
 
     let t = Instant::now();
     let c = Counters::default();
-    let build = build_id;
-    let shard_metas: Vec<ShardMeta> = (0..o.shards)
-        .map(|k| match (&set5, &set6) {
-            (Some(s), _) => s.shard_meta(k, Vec::new()),
-            (_, Some(s)) => s.shard_meta(k, Vec::new()),
-            _ => unreachable!(),
-        })
-        .collect();
+    let shard_metas: Vec<ShardMeta> = (0..o.shards).map(|k| set.shard_meta(k, Vec::new())).collect();
     let mut shard_bytes = Vec::new();
-    let footers: Vec<Option<PagedFooter>> = writers
+    let footers: Vec<PagedFooter> = writers
         .into_par_iter()
         .enumerate()
-        .map(|(k, w)| -> Result<Option<PagedFooter>> {
+        .map(|(k, mut w)| -> Result<PagedFooter> {
             let mut stats = Vec::new();
             for ri in 0..o.rels.len() {
                 let mut r = outs[k][ri].clone();
                 r.merge(&ins[k][ri]);
                 stats.push(r.stats());
             }
-            let mut w = w;
             w.pinned("status", &[])?;
             w.pinned("live", &[])?;
             for ri in 0..o.rels.len() {
                 w.pinned(&rel_section(ri, "tomb"), &[])?;
             }
-            let meta = shard_metas[k].clone().with_stats(stats);
-            match w {
-                ShardWriter::F5(w) => SetWriter::finish_shard(w, &meta).map(|_| None),
-                ShardWriter::F6(w) => w.finish("shard", &meta).map(Some),
-            }
+            w.finish("shard", &shard_metas[k].clone().with_stats(stats))
         })
         .collect::<Result<_>>()?;
     for (ri, rel) in o.rels.list.iter().enumerate() {
@@ -1378,52 +1157,37 @@ pub fn build(o: &Opts) -> Result<Report> {
         rep.rels.push(rr);
     }
     let meta = Meta {
-        format: o.format,
-        build,
+        format: PAGED_FORMAT,
+        build: set.build,
         shard_width: width,
         n_ids: n,
         n_plc: rep.dids_plc as u32,
         n_other: rep.dids_other as u32,
         subj_index: o.subj_index as u32,
         relations: o.rels.list.clone(),
-        layout: if o.format == 6 { marco_core::format6::LAYOUT } else { 0 },
+        layout: marco_core::format6::LAYOUT,
     };
-    if let Some(s) = set5 {
-        s.finish_with(&meta, o.cursors.clone())?;
-    }
-    let dir_footer = match set6 {
-        Some(s) => Some(s.finish(&meta, o.cursors.clone())?),
-        None => None,
-    };
+    let df = set.finish(&meta, o.cursors.clone())?;
     c.add(5, t);
     rep.phases.push(c.phase("finish (fsync, rename)", t));
     let _ = std::fs::remove_dir(&o.tmp);
 
-    if let Some(df) = dir_footer {
-        for (ri, rel) in o.rels.list.iter().enumerate() {
-            rep.layout.push(RelLayout { name: rel.name.clone(), out: out_layout[ri], inn: in_layout[ri] });
+    for (ri, rel) in o.rels.list.iter().enumerate() {
+        rep.layout.push(RelLayout { name: rel.name.clone(), out: out_layout[ri], inn: in_layout[ri] });
+    }
+    for f in std::iter::once(&df).chain(&footers) {
+        for s in &f.sections {
+            *rep.sections.entry(s.name.clone()).or_default() += s.len();
+            let m = rep.sections_shard_max.entry(s.name.clone()).or_default();
+            *m = (*m).max(s.len());
         }
-        for f in std::iter::once(&df).chain(footers.iter().flatten()) {
-            for s in &f.sections {
-                *rep.sections.entry(s.name.clone()).or_default() += s.len();
-                let m = rep.sections_shard_max.entry(s.name.clone()).or_default();
-                *m = (*m).max(s.len());
-            }
-        }
-        let size = |p: &Path| std::fs::metadata(p).map(|m| m.len());
-        rep.snapshot_bytes = size(&o.out.join(marco_core::store::DIR_FILE))?;
-        for k in 0..o.shards {
-            let b = size(&o.out.join(marco_core::store::shard_file(k, 0)))?;
-            rep.snapshot_bytes += b;
-            shard_bytes.push(b);
-        }
-    } else {
-        let store = marco_core::store::v5::Store::open(&o.out)?;
-        rep.sections = store.section_bytes();
-        rep.snapshot_bytes = store.bytes();
-        for s in store.shards.iter().flatten() {
-            shard_bytes.push(s.snap.len() as u64);
-        }
+    }
+    let size = |p: &Path| std::fs::metadata(p).map(|m| m.len());
+    rep.snapshot_bytes = size(&o.out.join(marco_core::store::DIR_FILE))?;
+    for k in 0..o.shards {
+        let b = size(&o.out.join(marco_core::store::shard_file(k, 0)))?;
+        rep.snapshot_bytes += b;
+        shard_bytes.push(b);
     }
     rep.shard_bytes_max = shard_bytes.iter().copied().max().unwrap_or(0);
     rep.shard_bytes_min = shard_bytes.iter().copied().min().unwrap_or(0);
@@ -1438,7 +1202,7 @@ pub fn build(o: &Opts) -> Result<Report> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use marco_core::Graph;
+    use marco_core::{Graph, RelId};
     use std::collections::BTreeMap;
 
     fn did(i: u64) -> String {
@@ -1598,7 +1362,6 @@ mod tests {
             sub_buckets: 3,
             deletes: Some(DeletesOut { dir: tmp.path().join("deletes"), since_us: 0 }),
             cursors: [("time_us".to_string(), "1730000000000000".to_string())].into(),
-            format: PAGED_FORMAT,
             heat: None,
         };
         let rep = build(&o).unwrap();
@@ -1689,14 +1452,96 @@ mod tests {
         assert!(rep.rels[3].bad_subject > 0, "lists in other repos are refused");
     }
 
-    /// FORMAT 6 from the same export as FORMAT 5: every list the same, with
-    /// lists long enough to split and to carry by-subject blocks.
+    /// `x`'s lists in `y`, matched by DID, since graphs built apart number
+    /// their DIDs apart: each out list's (rkey, subject) records and distinct
+    /// subjects, and each in set's members; and `y` holds nothing more.
+    fn same_lists(x: &Graph, y: &Graph) {
+        let did = |g: &Graph, id: u32| g.did_of(id).unwrap_or_else(|| panic!("id {id} has no DID"));
+        let out = |g: &Graph, rel: RelId, id: u32| -> Vec<(String, String)> {
+            let mut v: Vec<(String, String)> = g
+                .read(|cx| g.out_all(cx, rel, id))
+                .unwrap()
+                .into_iter()
+                .map(|(k, s)| (g.rkey_string(rel, id, k).unwrap(), did(g, s)))
+                .collect();
+            v.sort();
+            v
+        };
+        let inn = |g: &Graph, rel: RelId, id: u32| -> Vec<String> {
+            let mut v: Vec<String> =
+                g.read(|cx| g.in_set(cx, rel, id)).unwrap().into_iter().map(|a| did(g, a)).collect();
+            v.sort();
+            v
+        };
+        let totals = |g: &Graph, rel: RelId| -> (u64, u64) {
+            (0..g.n_ids()).fold((0, 0), |(o, i), id| {
+                (o + g.read(|cx| g.out_count(cx, rel, id)).unwrap(), i + g.read(|cx| g.in_count(cx, rel, id)).unwrap())
+            })
+        };
+        for rel in 0..x.relations().len() as RelId {
+            for id in 0..x.n_ids() {
+                let d = did(x, id);
+                let Some(yid) = y.id_of(&d) else {
+                    assert!(out(x, rel, id).is_empty() && inn(x, rel, id).is_empty(), "rel {rel}: {d} isn't in y");
+                    continue;
+                };
+                assert_eq!(out(x, rel, id), out(y, rel, yid), "rel {rel} out list of {d}");
+                assert_eq!(
+                    x.read(|cx| x.out_distinct(cx, rel, id)).unwrap(),
+                    y.read(|cx| y.out_distinct(cx, rel, yid)).unwrap(),
+                    "rel {rel} distinct subjects of {d}"
+                );
+                assert_eq!(inn(x, rel, id), inn(y, rel, yid), "rel {rel} in set of {d}");
+            }
+            assert_eq!(totals(x, rel), totals(y, rel), "rel {rel}: records and members");
+        }
+    }
+
+    /// Two snapshots of the same records under the same ids, list by list:
+    /// out lists in key order, distinct subjects, in sets, rkey strings and
+    /// tombstones.
+    fn same_by_id(x: &Graph, y: &Graph) {
+        assert_eq!(x.n_ids(), y.n_ids());
+        for rel in 0..x.relations().len() as RelId {
+            for id in 0..x.n_ids() {
+                assert_eq!(x.did_of(id), y.did_of(id), "id {id}");
+                let a = x.read(|cx| x.out_all(cx, rel, id)).unwrap();
+                assert_eq!(a, y.read(|cx| y.out_all(cx, rel, id)).unwrap(), "rel {rel} out list of id {id}");
+                for &(k, _) in &a {
+                    assert_eq!(x.rkey_string(rel, id, k), y.rkey_string(rel, id, k));
+                }
+                assert_eq!(
+                    x.read(|cx| x.out_distinct(cx, rel, id)).unwrap(),
+                    y.read(|cx| y.out_distinct(cx, rel, id)).unwrap()
+                );
+                assert_eq!(
+                    x.read(|cx| x.in_set(cx, rel, id)).unwrap(),
+                    y.read(|cx| y.in_set(cx, rel, id)).unwrap(),
+                    "rel {rel} in set of id {id}"
+                );
+            }
+            let tombs = |g: &Graph| {
+                let mut v = g.tombstone_keys(rel);
+                v.sort_unstable();
+                v
+            };
+            assert_eq!(tombs(x), tombs(y), "rel {rel} tombstones");
+        }
+    }
+
+    /// A build, the graph's own rewrite of it (what checkpoints write) and a
+    /// heat-ordered build of the same input hold every list the mutable path
+    /// does for the same ops, with lists long enough to split and to carry
+    /// by-subject blocks.
     #[test]
-    fn format_6_builds_the_same_lists() {
+    fn builds_hold_the_mutable_paths_lists() {
         let tmp = tempfile::tempdir().unwrap();
         let input = tmp.path().join("in");
         let mut rng = crate::stats::Rng::new(11);
-        for (rel, n, actors) in [("follow", 60_000, 400), ("block", 8_000, 300)] {
+        let mut live_g = Graph::new(Relations::bsky_default());
+        for (rel, coll, n, actors) in
+            [("follow", "app.bsky.graph.follow", 60_000, 400), ("block", "app.bsky.graph.block", 8_000, 300)]
+        {
             let mut ops: Vec<Op> = Vec::new();
             for t in 0..n as i64 {
                 // actors skewed toward low ids: a few long lists, many short ones
@@ -1714,6 +1559,11 @@ mod tests {
                 let op = if rng.below(12) == 0 { OP_DELETE } else { 1 };
                 ops.push((a, rkey, s, 1000 + t, op));
             }
+            live(
+                &mut live_g,
+                coll,
+                ops.iter().map(|r| (r.0.as_str(), r.1.as_str(), r.2.as_str(), None, r.3, r.4)).collect(),
+            );
             write_export(&input, rel, &ops);
         }
         let mut lops: Vec<ListOp> = Vec::new();
@@ -1722,10 +1572,16 @@ mod tests {
             let rkey = vlatproto::tid::Tid::from_parts(1_700_000_000_000_000 + rng.below(1 << 24) * 997, 0).to_string();
             lops.push((a.clone(), rkey, did(rng.below(3000)), list_uri(&a, rng.below(3)), 1000 + t, 1));
         }
+        live_lists(&mut live_g, &lops);
         write_list_export(&input, &lops);
+        let (v, s) = (tmp.path().join("viewers.tsv"), tmp.path().join("subjects.tsv"));
+        let tsv =
+            |n: u64, w: u64| (0..n).map(|i| format!("{}\t{}\n", did(i * 3), 1 + (i * w) % 30)).collect::<String>();
+        std::fs::write(&v, tsv(200, 7) + "did:plc:notinthesnapshotxxxxxx\t9\n").unwrap();
+        std::fs::write(&s, tsv(400, 13)).unwrap();
         for subj_index in [300, 4096] {
-            let snap = |format: u32| {
-                let out = tmp.path().join(format!("snap{format}-{subj_index}"));
+            let snap = |name: &str, heat: Option<(PathBuf, PathBuf)>| {
+                let out = tmp.path().join(format!("{name}-{subj_index}"));
                 let o = Opts {
                     input: input.clone(),
                     out: out.clone(),
@@ -1736,31 +1592,25 @@ mod tests {
                     sub_buckets: 2,
                     deletes: None,
                     cursors: BTreeMap::new(),
-                    format,
-                    heat: None,
+                    heat,
                 };
                 (build(&o).unwrap(), out)
             };
-            let (r5, a) = snap(FORMAT);
-            let (r6, b) = snap(PAGED_FORMAT);
-            assert_eq!((r5.format, r6.format), (5, 6));
-            let lay = &r6.layout[0];
+            let (r, b) = snap("snap", None);
+            assert_eq!(r.format, PAGED_FORMAT);
+            let lay = &r.layout[0];
             assert!(lay.out.big_lists > 0 && lay.out.small_lists > 0 && lay.inn.big_sets > 0, "{:?}", lay.out);
             assert_eq!(lay.out.bysubj_lists > 0, subj_index == 300);
-            assert_eq!(lay.out.small_lists + lay.out.big_lists, r5.rels[0].out_lists);
-            for (x, y) in r5.rels.iter().zip(&r6.rels) {
-                assert_eq!(
-                    (x.out_records, x.out_lists, x.in_pairs, x.in_lists),
-                    (y.out_records, y.out_lists, y.in_pairs, y.in_lists)
-                );
+            assert_eq!(lay.out.small_lists + lay.out.big_lists, r.rels[0].out_lists);
+            for (ri, x) in r.rels.iter().enumerate() {
+                assert_eq!((x.out_records, x.in_pairs), live_g.records(ri as RelId), "{}", x.name);
             }
-            assert!(r6.sections.contains_key("r0.out.rkey.sums") && r6.sections.contains_key("dir.plc"));
-            assert_eq!(r6.snapshot_bytes % 4096, 0);
-            let c = crate::compare6::compare(&a, &b).unwrap();
-            assert_eq!(c.out_lists, r5.rels.iter().map(|r| r.out_lists).sum::<u64>());
-            assert_eq!(c.in_members, r5.rels.iter().map(|r| r.in_pairs).sum::<u64>());
+            assert!(r.sections.contains_key("r0.out.rkey.sums") && r.sections.contains_key("dir.plc"));
+            assert_eq!(r.snapshot_bytes % 4096, 0);
             let g = Graph::open(&b).unwrap();
-            for (ri, r) in r5.rels.iter().enumerate() {
+            g.snapshot().unwrap().verify_checksums().unwrap();
+            same_lists(&live_g, &g);
+            for (ri, r) in r.rels.iter().enumerate() {
                 let rel = ri as u8;
                 let n: u64 = (0..g.n_ids()).map(|id| g.read(|cx| g.out_count(cx, rel, id)).unwrap()).sum();
                 let m: u64 = (0..g.n_ids()).map(|id| g.read(|cx| g.in_count(cx, rel, id)).unwrap()).sum();
@@ -1769,34 +1619,13 @@ mod tests {
             // the graph's own writer, which checkpoints use, against the builder
             let w = tmp.path().join(format!("rewritten-{subj_index}"));
             g.write_snapshot(&w).unwrap();
-            let c = crate::compare6::compare(&a, &w).unwrap();
-            assert_eq!(c.out_records, r5.rels.iter().map(|r| r.out_records).sum::<u64>());
+            same_by_id(&g, &Graph::open(&w).unwrap());
 
             // heat-ordered: the same lists, laid out differently
-            let (v, s) = (tmp.path().join("viewers.tsv"), tmp.path().join("subjects.tsv"));
-            let tsv =
-                |n: u64, w: u64| (0..n).map(|i| format!("{}\t{}\n", did(i * 3), 1 + (i * w) % 30)).collect::<String>();
-            std::fs::write(&v, tsv(200, 7) + "did:plc:notinthesnapshotxxxxxx\t9\n").unwrap();
-            std::fs::write(&s, tsv(400, 13)).unwrap();
-            let hot = tmp.path().join(format!("hot-{subj_index}"));
-            let o = Opts {
-                input: input.clone(),
-                out: hot.clone(),
-                tmp: tmp.path().join("spill"),
-                rels: Relations::bsky_default(),
-                subj_index,
-                shards: 4,
-                sub_buckets: 2,
-                deletes: None,
-                cursors: BTreeMap::new(),
-                format: PAGED_FORMAT,
-                heat: Some((v, s)),
-            };
-            let rh = build(&o).unwrap();
+            let (rh, hot) = snap("hot", Some((v.clone(), s.clone())));
             let (nv, ns) = rh.heat.unwrap();
             assert!(nv > 100 && nv <= 200 && ns > 100 && ns <= 400, "DIDs not in the snapshot are skipped: {nv} {ns}");
-            let c = crate::compare6::compare(&a, &hot).unwrap();
-            assert_eq!(c.out_records, r5.rels.iter().map(|r| r.out_records).sum::<u64>());
+            same_by_id(&g, &Graph::open(&hot).unwrap());
             let shard0 = |d: &Path| std::fs::read(d.join(marco_core::store::shard_file(0, 0))).unwrap();
             assert_ne!(shard0(&b), shard0(&hot), "a different layout");
         }
@@ -1818,7 +1647,6 @@ mod tests {
             sub_buckets: 1,
             deletes: None,
             cursors: BTreeMap::new(),
-            format: PAGED_FORMAT,
             heat: None,
         };
         let rep = build(&o).unwrap();

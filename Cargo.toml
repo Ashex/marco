@@ -25,7 +25,6 @@ http = "1"
 libc = "0.2"
 vlatproto = { git = "https://github.com/jazware/vlatproto", rev = "8fd41163c003a39ae73c568d648434ef42f32049" }
 anyhow = "1"
-memmap2 = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"

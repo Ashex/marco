@@ -33,7 +33,6 @@ facts:
   - { value: "5", unit: s, label: between segments, note: "`--segment-interval` · what a kill -9 loses", tone: amber }
   - { value: "3M", unit: ops, label: or a day per checkpoint, note: "`--checkpoint-ops` · `--checkpoint-age`", tone: accent }
   - { value: "0", label: diffs after 94 kill -9s, note: "489,121 keys compared", tone: ok }
-  - { value: "~0.5", unit: s, label: kill -9 to ready, note: "p50 by run · 381–595 ms", tone: blue }
 ```
 
 marco keeps no write-ahead log. Every source it reads can replay from a cursor, and replaying an
@@ -100,29 +99,27 @@ Old versions of changed lists stay in the shard's files as garbage. Once a shard
 lists, paced by `--background-io` (200 MB/s), one shard at a time after each checkpoint. Its
 manifest rename is its commit, and the served copies swap the shard in place. A checkpoint that
 comes due gives it up, the shard it was on included, and a crash leaves either the old files or the
-new base, never a mix. With `--storage engine` and a `--memory` that holds the whole snapshot, old
-versions stay cached too, in pages that still hold live lists as well as in dead ones. So compaction
-also takes the shards a rewrite would shrink the most, until the next checkpoint's patches fit in
-what's free and what's left to win back is under 1 GiB: close to every shard a day.
+new base, never a mix. With a `--memory` that holds the whole snapshot, old versions stay cached
+too, in pages that still hold live lists as well as in dead ones. So compaction also takes the
+shards a rewrite would shrink the most, until the next checkpoint's patches fit in what's free and
+what's left to win back is under 1 GiB: close to every shard a day.
 
 On the whole network, a day of the archive's follows, blocks and list items (2.75M ops) made a
-checkpoint of 20 s on a warm page cache: 11 s replaying the day, 9 s writing 65 patches. They held
-1.17 GB of changed lists and blocks and 1.23 GB of indexes and heads, against the 44 GB snapshot. At
-today's write rate that's about once a day. Compacting a shard (about 0.75 GB) took 2.8 s unpaced.
+checkpoint of 25.5 s under a read load, with a `--memory` that holds the snapshot, and 37.3 s with
+one that holds about a third of it. At today's write rate that's about once a day. Compacting a shard (about 0.75 GB) took 2.8 s unpaced.
 
 ## Restart
 
 | Step | Whole network, measured |
 |---|---|
-| Open: mmap the shards, parse the footers | 11 ms cold |
-| Replay the segments after the manifest's cut | 4.46M ops in 10.3 s (432k ops/s) warm, 13.3 s with the page cache dropped |
+| Open: read and check the footers, page sums and pinned sections, then load every page when `--memory` holds them | 7.8 s from a cold disk |
+| Replay the segments after the manifest's cut | 4.46M ops in 10.3 s (432k ops/s) |
 | Each source resumes from the newest segment's cursor | caught up in under a second |
 | Ready | every expected source under 1 s behind |
 
-A restart with more than a day of segments (4.46M ops, where a day of follows and blocks is
-~2.4-2.7M) was ready in 10.9 to 11.7 s on a warm page cache. With checkpoints keeping the segments short, as in the kill
-tests, it's under a second. Opening maps the snapshot without reading it, then maps its pages in
-the background so the first reads don't fault (`--no-prefault` skips that).
+Replay is most of a restart with more than a day of segments (4.46M ops, where a day of follows
+and blocks is ~2.4-2.7M). Checkpoints keep the segments short. Every page open reads is checked
+against its sum, and so is every page read after it.
 
 ## The ready gate
 
@@ -157,15 +154,14 @@ The durability tests killed marco 94 times mid-ingest against the whole-network 
 after a segment, 30 ms before one, and in the middle of checkpoints, then compared every key the
 capture touched against the expected state:
 
-| Run | Kills | Keys compared | Differ | Restart to `/readyz` 200, p50 |
-|---|---|---|---|---|
-| Jetstream, forced checkpoints | 40 | 224,437 | 0 | 595 ms |
-| Jetstream, automatic checkpoints | 30 | 224,437 | 0 | 381 ms |
-| Firehose, automatic checkpoints | 24 | 40,247 | 0 | not timed |
+| Run | Kills | Keys compared | Differ |
+|---|---|---|---|
+| Jetstream, forced checkpoints | 40 | 224,437 | 0 |
+| Jetstream, automatic checkpoints | 30 | 224,437 | 0 |
+| Firehose, automatic checkpoints | 24 | 40,247 | 0 |
 
 Checkpoints cut short by a kill left the old snapshot whole, and the next start replayed from
-it. The firehose run can't time readiness because its fake relay replays frames with their
-recorded times. Details, timelines and the method: [Durability and restarts, measured](p1-results.html).
+it. Details, timelines and the method: [Durability and restarts, measured](p1-results.html).
 
 If the writer or segment thread panics, the process aborts. A writer that keeps answering writes
 no segment will hold would be worse than a restart.

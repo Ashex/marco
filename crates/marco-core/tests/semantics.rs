@@ -48,7 +48,7 @@ fn reopen(g: &Graph) -> Graph {
     let mut g2 = Graph::open(&p).unwrap();
     g2.snapshot().unwrap().verify_checksums().unwrap();
     g2.shards = g.shards;
-    // the mmaps outlive the directory entries
+    // the open files outlive the directory entries
     drop(dir);
     g2
 }
@@ -644,7 +644,7 @@ fn checksums_catch_a_flipped_byte() {
 }
 
 /// Why opening the snapshot at `p` and checking it fails: the engine checks
-/// pinned sections at open, a mapped store only when asked.
+/// pinned sections at open, pages when asked.
 fn open_and_verify(p: &std::path::Path) -> String {
     let e = marco_core::store::Store::open(p).and_then(|s| s.verify_checksums()).unwrap_err();
     format!("{e:#}")

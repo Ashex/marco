@@ -26,8 +26,8 @@ struct Srv {
 
 async fn serve(snap: PathBuf, e: Arc<Engine>) -> Srv {
     let auth = AuthConfig { token: Some(TOKEN.into()), ..Default::default() };
-    let storage = Storage::Engine { memory: 1 << 30, max_frames: Some(FRAMES) };
-    let cfg = Config { auth, storage, prefault: false, ..Config::new(snap) };
+    let storage = Storage { memory: 1 << 30, max_frames: Some(FRAMES) };
+    let cfg = Config { auth, storage, load: false, ..Config::new(snap) };
     let app = App::open_on(cfg, e).unwrap();
     let ui = Arc::new(marco_server::ui::Ui::load(None).unwrap());
     let (_, admin) = marco_server::serve(app.clone(), ui).await.unwrap();

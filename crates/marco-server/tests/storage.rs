@@ -1,6 +1,6 @@
-//! The engine against mmap: every read RPC, randomized, through a server on
-//! each over the same snapshot and the same writes, with the engine's cache
-//! starved; requests over the page limit; faults end to end through the
+//! A starved cache against one that holds the whole snapshot: every read
+//! RPC, randomized, through a server on each over the same snapshot and the
+//! same writes; requests over the page limit; faults end to end through the
 //! Connect API; and the debug assertion that no tokio worker waits on disk.
 
 use std::net::SocketAddr;
@@ -50,7 +50,7 @@ fn copy_of(to: &Path) -> PathBuf {
 }
 
 fn engine(frames: u32) -> Storage {
-    Storage::Engine { memory: 1 << 30, max_frames: Some(frames) }
+    Storage { memory: 1 << 30, max_frames: Some(frames) }
 }
 
 struct Srv {
@@ -60,7 +60,7 @@ struct Srv {
 
 async fn serve(snap: PathBuf, storage: Storage, engine: Option<Arc<Engine>>) -> Srv {
     let auth = AuthConfig { token: Some(TOKEN.into()), ..Default::default() };
-    let cfg = Config { auth, storage, prefault: false, ..Config::new(snap) };
+    let cfg = Config { auth, storage, load: false, ..Config::new(snap) };
     let app = match engine {
         Some(e) => App::open_on(cfg, e),
         None => App::open(cfg),
@@ -333,19 +333,19 @@ fn next_page(q: &Query, answer: &str) -> Option<Query> {
     }
 }
 
-/// Every read RPC, randomized, through mmap and through the engine with a
-/// 4,096-page cache that can't hold the snapshot, with the same writes
-/// applied to both between them: the answers must be identical. Runs on
-/// the server's own runtime, whose workers panic on a blocking read.
+/// Every read RPC, randomized, through an engine whose cache holds the
+/// whole snapshot and one with a 4,096-page cache that can't, with the same
+/// writes applied to both between them: the answers must be identical. Runs
+/// on the server's own runtime, whose workers panic on a blocking read.
 #[test]
-fn the_engine_answers_as_mmap_does_on_a_starved_cache() {
+fn a_starved_cache_answers_as_a_whole_one_does() {
     differential(FRAMES, 4000, 0x5eed_1234_abcd_0001, false);
 }
 
 /// The same at 1,024 pages, a sixth of the snapshot, where the page limit
 /// (51 pages) refuses the rare request that needs more at once.
 #[test]
-fn the_engine_answers_as_mmap_does_on_a_cache_a_sixth_its_size() {
+fn a_cache_a_sixth_its_size_answers_as_a_whole_one_does() {
     differential(1024, 4000, 0x5eed_1234_abcd_0002, true);
 }
 
@@ -353,10 +353,9 @@ fn differential(frames: u32, steps: u32, seed: u64, refused_ok: bool) {
     let rt = marco_server::runtime(Some(4)).unwrap();
     rt.block_on(async {
         let d = tempfile::tempdir().unwrap();
-        let mm = serve(copy_of(&d.path().join("mmap")), Storage::Mmap, None).await;
-        let en = serve(copy_of(&d.path().join("engine")), engine(frames), None).await;
-        assert!(en.app.engine.paged() && !mm.app.engine.paged());
-        let (gm, am, ge, ae) = (graph(&mm), admin(&mm), graph(&en), admin(&en));
+        let wh = serve(copy_of(&d.path().join("whole")), engine(u32::MAX), None).await;
+        let en = serve(copy_of(&d.path().join("starved")), engine(frames), None).await;
+        let (gw, aw, ge, ae) = (graph(&wh), admin(&wh), graph(&en), admin(&en));
         let mut r = Rng(seed);
         let mut seen: Vec<String> = Vec::new();
         let mut t = 0u64;
@@ -369,12 +368,12 @@ fn differential(frames: u32, steps: u32, seed: u64, refused_ok: bool) {
                     let g = g.clone();
                     async move { answer(g.write_batch(req).await.map(|v| v.into_owned())) }
                 };
-                assert_eq!(w(&gm).await, w(&ge).await, "write batch at step {step}");
+                assert_eq!(w(&gw).await, w(&ge).await, "write batch at step {step}");
                 continue;
             }
             let mut q = Some(query(&mut r, &seen));
             while let Some(cur) = q.take() {
-                let (x, y) = (read(&gm, &am, &cur).await, read(&ge, &ae, &cur).await);
+                let (x, y) = (read(&gw, &aw, &cur).await, read(&ge, &ae, &cur).await);
                 asked += 1;
                 if refused_ok && y.starts_with("error ResourceExhausted: this request needs") {
                     refused += 1;
@@ -395,6 +394,8 @@ fn differential(frames: u32, steps: u32, seed: u64, refused_ok: bool) {
         assert!(st.fetched > frames as u64, "the cache filled: {st:?}");
         assert!(st.evict_small + st.evict_main > 0, "and evicted: {st:?}");
         assert_eq!(st.bad_pages, 0);
+        let whole = wh.app.engine.stats();
+        assert_eq!(whole.evict_small + whole.evict_main, 0, "the whole cache never evicted: {whole:?}");
         let pool = marco_server::metrics::RPC_SECONDS.with_label_values(&["Graph/Relationships", "pool"]);
         assert!(pool.get_sample_count() > 0, "requests that missed moved to the pool");
     });
@@ -434,7 +435,7 @@ fn a_request_over_the_page_limit_is_refused() {
 fn faults_reach_the_client_named() {
     // did 0, and two actors with follows in two other shards
     let (k0, x, ky, y) = {
-        let gr = marco_core::Graph::open_on(base(), &Arc::new(Engine::new())).unwrap();
+        let gr = marco_core::Graph::open(base()).unwrap();
         let shard = |i: u32| (gr.id_of(&did(i)).unwrap() / gr.shard_width()) as usize;
         let follows = |i: u32| gr.read(|cx| gr.counts(cx, 0, &did(i))).unwrap().0 > 0;
         let x = (3..N).find(|&i| shard(i) != shard(0) && follows(i)).unwrap();

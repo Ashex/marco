@@ -83,7 +83,7 @@ pub async fn run(a: Args) -> Result<serde_json::Value> {
     let t = Instant::now();
     let app = App::open(Config {
         auth: AuthConfig { token: Some(TOKEN.into()), ..Default::default() },
-        prefault: false,
+        load: false,
         checkpoint_ops: u64::MAX,
         checkpoint_age: Duration::from_secs(365 * 86_400),
         compaction: CompactPolicy { ratio: 0.0, min_garbage: u64::MAX },

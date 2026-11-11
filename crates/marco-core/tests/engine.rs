@@ -412,7 +412,7 @@ fn a_resident_engine_has_no_cache() {
     let path = write_tagged(d.path(), "f.marco", 13, 4);
     let e = Engine::new();
     assert!(e.register(&path).unwrap_err().to_string().contains("no page cache"));
-    let (id, _) = e.open(&path).unwrap();
+    let id = e.add("f.marco", std::fs::read(&path).unwrap());
     let v = e.read_blocking(&mut Hold::new(), |cx| Ok(cx.page(PageId::new(id, 2))?[0])).unwrap();
     assert_eq!(v, word(13, 2, 0) as u8);
     assert!(Engine::with_config(support::config(GROUP as u64 / 2, None, Arc::new(Plain))).is_err());

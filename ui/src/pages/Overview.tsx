@@ -370,7 +370,6 @@ export function Overview() {
                   rows={[
                     ['RSS', <span className="mono">{bytes(o.process?.rssBytes)}</span>, <Meter v={n(o.process?.rssBytes)} max={mt} k="acc" />],
                     ['Merged lists', <span className="mono">{bytes(o.mergedBytes)}</span>, <Meter v={n(o.mergedBytes)} max={mt} />],
-                    ['Page cache', <span className="mono">{bytes(o.process?.snapshotCachedBytes)} / {bytes(o.snapshot?.sizeBytes)}</span>, <Meter v={n(o.process?.snapshotCachedBytes)} max={n(o.snapshot?.sizeBytes)} k="out" />],
                   ]}
                 />
               </PanelBody>

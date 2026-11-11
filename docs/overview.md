@@ -13,7 +13,7 @@ diagram:
     - { id: pipe, label: your pipeline, sub: WriteBatch · Write, at: [0, 5], size: [9, 3], tone: muted }
     - { id: w, label: writer, sub: one thread · in order, at: [14, 2.5], size: [8, 3], tone: accent }
     - { id: g, label: graph, sub: two copies, at: [26, 2.5], size: [8, 3], tone: accent }
-    - { id: snap, label: snapshot, sub: "mmap · 64 shards", at: [26, 8], size: [8, 2.6], shape: store, tone: amber }
+    - { id: snap, label: snapshot, sub: "O_DIRECT · 64 shards", at: [26, 8], size: [8, 2.6], shape: store, tone: amber }
     - { id: app, label: appview, sub: Has · Filter · …, at: [38, 2.5], size: [9, 3] }
   groups:
     - { label: marco serve, around: [w, g, snap], tone: accent }
@@ -100,9 +100,10 @@ edges:
   128. Membership is a binary search and one block decode, and an intersection skips whole blocks.
   Follows' in sets come to 2.09 B a pair.
 
-Opening a snapshot maps it without reading it, so it takes milliseconds, and then marco reads its
-pages in the background so the first queries don't fault (`--no-prefault` skips that). Writes
-land in small per-list deltas in memory. The writer applies each batch to one of two copies of the graph,
+marco reads the snapshot with `O_DIRECT` into its own cache of `--memory` bytes, checking every
+page against its sum. Opening reads each file's footer and pinned sections (the directory, each
+shard's index and heads), and every page too when the budget holds them all. Writes land in small
+per-list deltas in memory. The writer applies each batch to one of two copies of the graph,
 publishes it, then applies the same batch to the other copy once its readers have left, so reads
 never wait on a lock. Every 5 s the writes since the last cut go to a change segment with every
 source's cursor, and a checkpoint folds the segments into new shard files now and then

@@ -75,11 +75,10 @@ pub struct Config {
     pub tombstone_ttl: Duration,
     /// Sources readiness waits for (expect_source adds more).
     pub expected_sources: Vec<String>,
-    /// Map the snapshot's pages in after open and after each checkpoint, in
-    /// the background, so reads and writes don't take page faults. On the
-    /// engine: load every page at open when the budget holds them all.
-    pub prefault: bool,
-    /// How the snapshot is read (`--storage`, `--memory`).
+    /// Load every page into the cache at open, before a checkpoint's switch
+    /// and after a compaction, when the budget holds them all.
+    pub load: bool,
+    /// The store's budget (`--memory`).
     pub storage: Storage,
     /// Threads a request that misses moves to (`--miss-threads`).
     pub miss_threads: usize,
@@ -119,7 +118,7 @@ impl Config {
             serve_before_ready: false,
             tombstone_ttl: Duration::from_secs(7 * 86_400),
             expected_sources: Vec::new(),
-            prefault: true,
+            load: true,
             storage: Storage::from_env().unwrap_or_else(|e| panic!("{e:#}")),
             miss_threads: 64,
             memory_limit: None,
@@ -341,7 +340,6 @@ pub struct App {
     pub started_ms: i64,
     pub started: Instant,
     pub open_seconds: f64,
-    pub cached_bytes: AtomicU64,
     /// Open loaded every page: the budget holds the whole snapshot.
     pub resident: AtomicBool,
     /// Paged bytes in the shards' files no index names, as of the last
@@ -464,7 +462,7 @@ impl App {
     }
 
     /// Opens on an engine the caller made (tests give it a faulty device);
-    /// it must match `cfg.storage`.
+    /// it must have `cfg.storage`'s budget.
     pub fn open_on(cfg: Config, engine: Arc<Engine>) -> Result<Arc<App>> {
         let t = Instant::now();
         if !cfg.read_only {
@@ -476,7 +474,8 @@ impl App {
         let Replayed { graph: g, cursors, segments: segs, ops, last, .. } = open_replayed(&cfg, &engine, None)?;
         let mut resident = false;
         let beside = Arc::new(crate::memory::Beside::default());
-        if let (Storage::Engine { memory, max_frames }, Some(s)) = (&cfg.storage, g.snapshot()) {
+        if let Some(s) = g.snapshot() {
+            let Storage { memory, max_frames } = &cfg.storage;
             // a checkpoint that patches every shard reads each one's index and heads
             // again beside the old until its switch; the directory it never rewrites
             let pinned = engine.bytes().borrowed;
@@ -497,7 +496,7 @@ impl App {
                 warn_limit(*memory, limit);
                 crate::memory::spawn(engine.clone(), *memory, limit, beside.clone());
             }
-            if cfg.prefault {
+            if cfg.load {
                 let t = Instant::now();
                 resident = s.load();
                 if resident {
@@ -566,7 +565,6 @@ impl App {
             started_ms: now_ms(),
             started: Instant::now(),
             open_seconds,
-            cached_bytes: AtomicU64::new(0),
             resident: AtomicBool::new(resident),
             garbage_bytes: AtomicU64::new(0),
             compacted_at: Mutex::new(VecDeque::new()),
@@ -576,7 +574,6 @@ impl App {
             *app.tx.lock().unwrap() = Some(tx);
         }
         crate::metrics::READY.set(ready as i64);
-        app.prefault();
         Ok(app)
     }
 
@@ -929,17 +926,6 @@ impl App {
                 bail!("{}", j.error);
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    }
-
-    /// Maps the served snapshot's pages in, on a thread of its own. (On the
-    /// engine, open loaded them already when they fit.)
-    pub(crate) fn prefault(&self) {
-        if !self.cfg.prefault || self.engine.paged() {
-            return;
-        }
-        if let Some(s) = self.graph().shared_snapshot() {
-            std::thread::Builder::new().name("marco-prefault".into()).spawn(move || s.populate()).ok();
         }
     }
 

@@ -60,14 +60,9 @@ pub fn run(a: &Args) -> Result<Value> {
     let mut out = BTreeMap::new();
     out.insert("open_ms".to_string(), json!(open_ms));
     let t = Instant::now();
-    let touched: u64 = store
-        .files()
-        .collect::<Vec<_>>()
-        .par_iter()
-        .map(|f| f.1.mapped().unwrap_or_default().iter().step_by(4096).map(|&b| b as u64).sum::<u64>())
-        .sum();
-    std::hint::black_box(touched);
+    let loaded = store.load();
     out.insert("warm_secs".into(), json!(t.elapsed().as_secs_f64()));
+    out.insert("warm_loaded".into(), json!(loaded));
 
     // sizes: the list relation's and its companion's sections, the list URIs in the directory
     let n_ids = g.n_ids();

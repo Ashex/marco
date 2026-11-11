@@ -3,7 +3,6 @@
 //! and it lets a page show the last hour without a Prometheus.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -282,34 +281,25 @@ impl Ring {
     }
 }
 
-/// Samples forever, and every 30 s measures the snapshot's page-cache share.
+/// Samples forever.
 pub fn spawn(app: Arc<App>) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(STEP);
-        let mut n = 0u64;
         loop {
             tick.tick().await;
             let a = app.clone();
-            let every_30s = n.is_multiple_of(6);
-            n += 1;
-            let _ = tokio::task::spawn_blocking(move || sample(&a, every_30s)).await;
+            let _ = tokio::task::spawn_blocking(move || sample(&a)).await;
         }
     });
 }
 
-fn sample(app: &App, cache: bool) {
+fn sample(app: &App) {
     app.sample_rates();
-    let (delta, tombs, snap) = {
+    let (delta, tombs) = {
         let g = app.graph();
         g.refresh_gauges();
-        let (d, t) = crate::admin_svc::delta_totals(&g);
-        (d, t, g.shared_snapshot())
+        crate::admin_svc::delta_totals(&g)
     };
-    if let (true, Some(s)) = (cache, snap) {
-        let b: u64 = s.files().map(|f| f.1.mapped().map_or(0, crate::sys::resident)).sum();
-        app.cached_bytes.store(b, Ordering::Relaxed);
-        crate::metrics::CACHED.set(b as i64);
-    }
     let p = crate::sys::proc_self();
     let (depth, _) = app.engine.io_depth();
     let extra = [

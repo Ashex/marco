@@ -116,7 +116,7 @@ message GetOverviewResponse {
   // Why not ready, empty when ready.
   string ready_reason = 25;
   uint64 reads_before_ready = 26;
-  // The storage engine's budget and reads; unset on --storage mmap.
+  // The storage engine's budget and reads.
   Cache cache = 27;
 }
 
@@ -219,7 +219,7 @@ message SnapshotInfo {
   uint32 shards = 4;
   uint64 size_bytes = 5;
   int64 written_ms = 6;
-  // The open at start: mmap and footer checks.
+  // The open at start: footers, page sums and pinned sections read and checked.
   double open_seconds = 7;
   // Out lists this long get a by-subject index.
   uint32 subj_index = 8;
@@ -255,8 +255,8 @@ message ProcessInfo {
   uint64 mem_total_bytes = 2;
   double cpu_seconds = 3;
   uint32 threads = 4;
-  // Snapshot bytes in the page cache (mincore), sampled every 10 s.
-  uint64 snapshot_cached_bytes = 5;
+  reserved 5;
+  reserved "snapshot_cached_bytes";
 }
 
 message Job {

@@ -183,8 +183,8 @@ impl Rng {
     }
 }
 
-/// Anonymous resident bytes (the heap, both graph copies' deltas), apart
-/// from the mapped snapshot.
+/// Anonymous resident bytes: the heap, the store's cache, both graph
+/// copies' deltas.
 fn rss_anon() -> u64 {
     std::fs::read_to_string("/proc/self/status")
         .ok()
@@ -495,7 +495,7 @@ async fn run(a: Args) -> Result<Value> {
 
     if a.deletes > 0 {
         out.insert("delete_by_uri".into(), deletes(&a.snapshot, a.deletes, false, 0x5851_f42d_4c95_7f2d, 0)?);
-        out.insert("delete_by_uri_populated".into(), deletes(&a.snapshot, a.deletes, true, 0x2545_f491_4f6c_dd1d, 0)?);
+        out.insert("delete_by_uri_loaded".into(), deletes(&a.snapshot, a.deletes, true, 0x2545_f491_4f6c_dd1d, 0)?);
         // the most deltas a checkpoint lets build up
         out.insert(
             "delete_by_uri_after_3m_ops".into(),
@@ -506,15 +506,15 @@ async fn run(a: Args) -> Result<Value> {
 }
 
 /// Deletes random base records by URI on the engine, one at a time, timed.
-/// With `populate`, the snapshot's pages are mapped in first; `prefill`
-/// firehose-shaped writes go in before.
-fn deletes(path: &std::path::Path, n: usize, populate: bool, seed: u64, prefill: usize) -> Result<Value> {
+/// With `load`, the snapshot's pages are loaded into the cache first (when
+/// MARCO_MEMORY holds them); `prefill` firehose-shaped writes go in before.
+fn deletes(path: &std::path::Path, n: usize, load: bool, seed: u64, prefill: usize) -> Result<Value> {
     let mut g = Graph::open(path)?;
     let t = Instant::now();
-    if populate {
-        g.snapshot().unwrap().populate();
+    if load {
+        g.snapshot().unwrap().load();
     }
-    let populate_secs = t.elapsed().as_secs_f64();
+    let load_secs = t.elapsed().as_secs_f64();
     let mut rng = Rng(seed);
     if prefill > 0 {
         let s = sample(&g, &mut rng);
@@ -558,7 +558,7 @@ fn deletes(path: &std::path::Path, n: usize, populate: bool, seed: u64, prefill:
         lat.push(t.elapsed().as_nanos() as u64);
         removed += matches!(r, marco_core::Removed::Subject(_)) as usize;
     }
-    Ok(json!({"deleted": removed, "populate_secs": populate_secs, "latency": pct(lat)}))
+    Ok(json!({"deleted": removed, "load_secs": load_secs, "latency": pct(lat)}))
 }
 
 fn main() -> Result<()> {

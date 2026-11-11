@@ -22,18 +22,13 @@ const N: u32 = 40_000;
 const FRAMES: u32 = 2048;
 
 fn storage() -> marco_core::store::Storage {
-    marco_core::store::Storage::Engine { memory: 1 << 30, max_frames: Some(FRAMES) }
+    marco_core::store::Storage { memory: 1 << 30, max_frames: Some(FRAMES) }
 }
 
 /// A read-only server on `snap` with a cold cache.
 async fn cold(snap: &Path) -> (Arc<App>, GraphClient<HttpClient>) {
-    let cfg = Config {
-        read_only: true,
-        prefault: false,
-        storage: storage(),
-        miss_threads: 4,
-        ..Config::new(snap.to_path_buf())
-    };
+    let cfg =
+        Config { read_only: true, load: false, storage: storage(), miss_threads: 4, ..Config::new(snap.to_path_buf()) };
     let app = App::open(cfg).unwrap();
     let ui = Arc::new(marco_server::ui::Ui::load(None).unwrap());
     let (api, _): (SocketAddr, SocketAddr) = marco_server::serve(app.clone(), ui).await.unwrap();
@@ -74,7 +69,7 @@ fn pages_of(snap: &Path, rel: &str, dir: CoreDir, actor: &str) -> u64 {
 
 /// Actors with out lists of about `lo..hi` follows.
 fn with_out(snap: &Path, lo: u64, hi: u64, n: usize) -> Vec<String> {
-    let g = Graph::open_on(snap, &Arc::new(Engine::new())).unwrap();
+    let g = Graph::open(snap).unwrap();
     (3..N).map(did).filter(|d| (lo..hi).contains(&g.read(|cx| g.counts(cx, 0, d)).unwrap().0)).take(n).collect()
 }
 

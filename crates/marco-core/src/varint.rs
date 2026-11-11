@@ -1,5 +1,5 @@
 //! LEB128 varints and little-endian loads from byte slices that may be
-//! unaligned (everything read from a snapshot comes out of an mmap).
+//! unaligned (pinned sections and cached pages hold them at any offset).
 
 #[inline]
 pub fn put(out: &mut Vec<u8>, mut v: u64) {

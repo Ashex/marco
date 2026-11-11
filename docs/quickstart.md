@@ -18,7 +18,7 @@ diagram:
   edges:
     - "in -> b"
     - "b -> s"
-    - "s -> m: mmap"
+    - "s -> m: O_DIRECT"
     - "js.t -> m.b: since time_us"
     - "m -> q"
 facts:
@@ -134,7 +134,7 @@ the time a server could start (`--retention-hours`, 36).
 
 ```bash
 openssl rand -hex 16 > token
-target/release/marco serve --snapshot snap --admin-token-file token \
+target/release/marco serve --snapshot snap --memory 3GiB --admin-token-file token \
   --jetstream wss://jetstream2.us-east.bsky.network
 ```
 

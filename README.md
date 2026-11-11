@@ -27,9 +27,10 @@ firehose, or your own pipeline through the write API).
   Scylla with a parallel full scan and builds the snapshot from them: the whole network's follows
   and blocks went from an empty directory to ready in 6.8 minutes, and matched the archive build
   record for record. → [Quickstart](docs/quickstart.md), [Rebuilding from Scylla](docs/scylla.md)
-- **Restarts are cheap.** A snapshot opens by mmap in milliseconds. Writes go to a change segment
-  every 5 s with every source's cursor, and a checkpoint folds them into new shard files. A
-  `kill -9` is back to `/readyz` 200 in about half a second. → [Durability and restarts](docs/durability.md)
+- **Its own cache.** marco reads the snapshot with `O_DIRECT` into a cache of `--memory` bytes,
+  checking every page against its sum, and a budget that holds the whole network's snapshot loads
+  it in 7.8 s from a cold disk. Writes go to a change segment every 5 s with every source's cursor,
+  and a checkpoint folds them into new shard files. → [Durability and restarts](docs/durability.md)
 - **An operator console and these docs are built in.** `/admin` on the admin listener shows the
   graph, its relations, ingest, requests, storage and settings, and `/docs` on both listeners serves the pages in `docs/`.
   `/` on the API listener is an explorer that runs the read calls and shows each answer, its latency and its `curl`.
@@ -51,7 +52,7 @@ Build a snapshot from build input, then serve it and catch up from Jetstream:
 ```bash
 target/release/marco-load build --input input --out snap
 openssl rand -hex 16 > token
-target/release/marco serve --snapshot snap --admin-token-file token \
+target/release/marco serve --snapshot snap --memory 3GiB --admin-token-file token \
   --jetstream wss://jetstream2.us-east.bsky.network
 curl -s localhost:7300/readyz          # 503 while it catches up, then "ready"
 curl -s localhost:7300/marco.v1.Graph/Has -H 'content-type: application/json' \

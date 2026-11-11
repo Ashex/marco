@@ -30,8 +30,8 @@ facts:
 network, and put the API listener wherever your appview can reach it. The process needs its
 snapshot directory on local disk with room for half again its size (checkpoints add patches, and
 compaction lets a shard's files reach `--compaction-ratio` of what it holds, plus the one shard it
-rewrites), and RAM for the hot part of the snapshot in page cache
-([Sizing](sizing.md)).
+rewrites), and `--memory` for marco's own cache of the snapshot's pages, which it reads with
+`O_DIRECT` and checks against their sums ([Sizing](sizing.md)).
 
 > [!WARNING]
 > Run one `marco serve` per snapshot directory. Nothing locks it, so two writable processes on one
@@ -113,12 +113,9 @@ console's Settings page shows each one's value and where it came from.
 | `--background-io` | `MARCO_BACKGROUND_IO` | `200,5000` | The pace of background I/O, MB a second then operations a second (0: unpaced): compactions, checkpoint writes, verify and list stats. Requests go first. |
 | `--merge-ratio` | `MARCO_MERGE_RATIO` | 0.125 | With `--compact-min`, a list's delta merges past this share of its base. |
 | `--compact-min` | `MARCO_COMPACT_MIN` | 0 | Merge a list's delta inside the write past this many entries. 0 leaves it to checkpoints. |
-| `--no-prefault` | `MARCO_NO_PREFAULT` | off | Don't map the snapshot's pages in after open. With `--storage engine`, don't load every page at open when `--memory` holds them all. |
-| `--mmap-advice` | `MARCO_MMAP_ADVICE` | `default` | With `--storage mmap`, `random` maps the snapshot with MADV_RANDOM: a fault reads its own page, with no readahead around it. |
-| `--storage` | `MARCO_STORAGE` | `mmap` | How the snapshot is read: `mmap` (the kernel's page cache) or `engine` (`O_DIRECT` into marco's own cache of `--memory` bytes, every page checked against its sum). |
-| `--memory` | `MARCO_MEMORY` | | With `--storage engine`, required: the store's budget (`13GiB`, `6G`), its pinned sections, page cache and tables. It must hold the pinned sections, the shards' index and heads a second time (a checkpoint reads them again beside the old until its switch), and 2 GiB more, or marco won't start. The graph's deltas and the process live outside it, up to what `--memory-limit` leaves. |
-| `--memory-limit` | `MARCO_MEMORY_LIMIT` | the cgroup's `memory.max` | With `--storage engine`, the whole process's limit (`8GiB`, or `none`). What the process holds beside `--memory` (the graph's deltas in both served copies, a checkpoint's replay, requests) past the limit less `--memory` less 512 MiB comes out of the cache, so a day of writes and its checkpoint stay under it. `marco_process_beside_bytes` is what it holds, `marco_store_bytes{part="reserved"}` what the cache gave up for it. |
-| `--miss-threads` | `MARCO_MISS_THREADS` | 64 | With `--storage engine`, the threads a request that misses the cache moves to. A request that waits over a second for one gets `resource_exhausted`. |
+| `--memory` | `MARCO_MEMORY` | | Required: the store's budget (`13GiB`, `6G`), its pinned sections, page cache and tables. Pages are read with `O_DIRECT` into the cache, every one checked against its sum; when the budget holds them all, open loads every page. It must hold the pinned sections, the shards' index and heads a second time (a checkpoint reads them again beside the old until its switch), and 2 GiB more, or marco won't start. The graph's deltas and the process live outside it, up to what `--memory-limit` leaves. |
+| `--memory-limit` | `MARCO_MEMORY_LIMIT` | the cgroup's `memory.max` | The whole process's limit (`8GiB`, or `none`). What the process holds beside `--memory` (the graph's deltas in both served copies, a checkpoint's replay, requests) past the limit less `--memory` less 512 MiB comes out of the cache, so a day of writes and its checkpoint stay under it. `marco_process_beside_bytes` is what it holds, `marco_store_bytes{part="reserved"}` what the cache gave up for it. |
+| `--miss-threads` | `MARCO_MISS_THREADS` | 64 | The threads a request that misses the cache moves to. A request that waits over a second for one gets `resource_exhausted`. |
 | `--trace-ratio` | `MARCO_TRACE_RATIO` | 0 | The share of ops that get a span, 0 to 1. |
 | `--otlp URL` | `MARCO_OTLP` | | An OTLP/HTTP collector's base URL for spans. |
 | `--ui-dir` | `MARCO_UI_DIR` | the embedded build | A built console and docs (`ui/dist`) to serve instead of the ones built into the binary. |
@@ -132,10 +129,10 @@ trying the console and the API without data.
 
 - `/healthz`: `ok` while the process is up.
 - `/readyz`: 200 `ready` once every configured source has caught up since start, else 503 with
-  why ([the ready gate](durability.md#the-ready-gate)). With `--storage engine` it also answers 503
-  `storage failing` while 64 or more distinct pages have failed their reads on the device (EIO
-  after retries, or short) in the last 60 s: the disk is going. A few bad pages leave it ready; their
-  requests fail with `data_loss` or `unavailable` naming the page.
+  why ([the ready gate](durability.md#the-ready-gate)). It also answers 503 `storage failing`
+  while 64 or more distinct pages have failed their reads on the device (EIO after retries, or
+  short) in the last 60 s: the disk is going. A few bad pages leave it ready; their requests fail
+  with `data_loss` or `unavailable` naming the page.
 
 ## Metrics
 
@@ -173,8 +170,8 @@ A scraper that can't send the token reads the same text from `--ops-listen`, whi
 | `marco_store_compaction_shards_total`, `marco_store_compaction_bytes_total`, `marco_store_compaction_garbage_bytes_total` | | Shards compacted, the bytes they wrote, the garbage they cleared |
 | `marco_store_compaction_seconds` | | One shard's compaction |
 | `marco_store_compaction_pending` | | Shards the running compaction has left, 0 when none runs |
-| `marco_store_bytes` | `part` | With `--storage engine`, where the budget is: `budget`, `pinned_dir`, `pinned_index`, `pinned_heads`, `pinned_tables`, `cache_main`, `cache_small`, `retired`, `pinned_frames`, `free`, `borrowed`, `garbage`, `reserved` (given up for what the process holds beside it, `--memory-limit`) |
-| `marco_process_beside_bytes`, `marco_store_reserve_short_bytes` | | With `--storage engine` and a memory limit: what the process holds beside the store (RSS less the store's books), and how much of what it should have given back the store couldn't |
+| `marco_store_bytes` | `part` | Where the budget is: `budget`, `pinned_dir`, `pinned_index`, `pinned_heads`, `pinned_tables`, `cache_main`, `cache_small`, `retired`, `pinned_frames`, `free`, `borrowed`, `garbage`, `reserved` (given up for what the process holds beside it, `--memory-limit`) |
+| `marco_process_beside_bytes`, `marco_store_reserve_short_bytes` | | With a memory limit: what the process holds beside the store (RSS less the store's books), and how much of what it should have given back the store couldn't |
 | `marco_store_lookups_total` | `structure`, `result`, `queue` | Page lookups by structure (`out_small`, `out_subj`, `out_rkey`, `out_bysubj`, `in_small`, `in_blocks`), `hit` or `miss`, and the queue a hit was in (`none` for a write's reads, which don't count as uses) |
 | `marco_store_request_pages`, `marco_store_request_rounds` | `rpc` | Pages a request read from disk, and the rounds it waited |
 | `marco_store_miss_pool_busy`, `marco_store_miss_pool_wait_seconds`, `marco_store_busy_total` | | The miss pool's threads in use, the wait for one, and requests refused after a second |
@@ -192,7 +189,6 @@ A scraper that can't send the token reads the same text from `--ops-listen`, whi
 | `marco_directory_dids` | `part` | DIDs: `base` (snapshot) or `live` |
 | `marco_snapshot_edges` | `rel`, `dir` | Records (out) and pairs (in) in the snapshot |
 | `marco_snapshot_bytes` | `section` | Snapshot bytes by section |
-| `marco_snapshot_cached_bytes` | | Snapshot bytes in the page cache (mincore, every 10 s) |
 | `marco_snapshot_seconds` | `what` | Snapshot open and write times |
 | `marco_build_info` | `version`, `commit` | 1 |
 

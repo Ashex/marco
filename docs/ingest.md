@@ -118,8 +118,8 @@ pipeline per marco, or keep your own cursors per pipeline.
 ## The built-in consumer
 
 ```bash
-marco serve --snapshot snap --jetstream wss://jetstream2.us-east.bsky.network
-marco serve --snapshot snap --firehose wss://bsky.network
+marco serve --snapshot snap --memory 13GiB --jetstream wss://jetstream2.us-east.bsky.network
+marco serve --snapshot snap --memory 13GiB --firehose wss://bsky.network
 ```
 
 `--jetstream` follows a Jetstream instance (`wss://host` or `wss://host/subscribe`) and asks for

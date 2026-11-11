@@ -429,7 +429,7 @@ function overview() {
       tombstones: BigInt(r.name === 'follow' ? 1118 : 86),
       mergedBytes: BigInt(r.name === 'follow' ? 172e6 : 14e6),
     })),
-    process: { rssBytes: 16_600_000_000n, memTotalBytes: 64_000_000_000n, cpuSeconds: 68_211, threads: 41, snapshotCachedBytes: 0n },
+    process: { rssBytes: 16_600_000_000n, memTotalBytes: 64_000_000_000n, cpuSeconds: 68_211, threads: 41 },
     cache: {
       budgetBytes: 14_000_000_000n,
       pinnedDirBytes: 890_000_000n,

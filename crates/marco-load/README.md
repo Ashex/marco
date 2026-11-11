@@ -303,7 +303,7 @@ marco-load --ops 127.0.0.1:9101 --report scan.json scan-scylla \
   --config scylla.toml --out /data/scan --snapshot /data/snap
 
 # 2. serve it and catch up from the snapshot's time; /readyz turns 200 once caught up
-marco serve --snapshot /data/snap --jetstream wss://jetstream.example.com
+marco serve --snapshot /data/snap --memory 13GiB --jetstream wss://jetstream.example.com
 ```
 
 For production:

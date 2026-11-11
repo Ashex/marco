@@ -1,5 +1,5 @@
-//! FORMAT 6's codecs against FORMAT 5's, on random lists: every read a
-//! FORMAT 5 list answers, the FORMAT 6 one answers the same, in one round,
+//! The paged codecs against the whole-list ones, on random lists: every read
+//! a whole list answers, the paged one answers the same, in one round,
 //! within the page bounds of storage.html §8.
 //!
 //! Lists are packed several to a column, as in a shard, and every column
@@ -14,7 +14,7 @@ use marco_core::inset::{self, InList, PagedIn};
 use marco_core::outlog::{self, OutBytes, OutList, OutSpaces, PagedOut, SplitCols, BLOCK};
 use marco_core::read::{Engine, Hold, ReadCx, R};
 use marco_core::rkey::NON_TID;
-use marco_core::snapshot::{AlignedPage, Bytes};
+use marco_core::snapshot::AlignedPage;
 use marco_core::store::engine::USED_SAMPLE;
 use marco_core::store::page::{FileId, PageId, PAGE};
 
@@ -103,7 +103,7 @@ impl Pages {
             for p in c {
                 let id = PageId::new(FileId(file), 0);
                 let bytes = if keep(id) { p.0.to_vec() } else { Vec::new() };
-                assert_eq!(e.add(format!("page-{file}"), Bytes::Owned(bytes)), FileId(file));
+                assert_eq!(e.add(format!("page-{file}"), bytes), FileId(file));
                 file += 1;
             }
         }
@@ -180,26 +180,26 @@ fn check_out(o: &Out, i: usize, r: &mut Rng) {
     let list = &o.lists[i];
     let n = list.len();
     let f5b = f5_out(list, o.subj_index);
-    let f5 = OutList::parse(&f5b, o.subj_index);
+    let whole = OutList::parse(&f5b, o.subj_index);
     let big = n > WHOLE;
     let bysubj = big && n >= o.subj_index;
     let nb = n.div_ceil(BLOCK);
 
     let (got, pages) = one_round(&o.pages, |cx| o.open(cx, i)?.to_vec(cx));
-    assert_eq!(got, f5.to_vec(), "to_vec, n {n}");
+    assert_eq!(got, whole.to_vec(), "to_vec, n {n}");
     assert!(pages <= if big { 2 * nb + 2 } else { 1 });
     let (got, _) = one_round(&o.pages, |cx| {
         let l = o.open(cx, i)?;
         Ok((l.len(), l.distinct(), l.blocks()))
     });
-    assert_eq!(got, (f5.len(), f5.distinct(), nb));
+    assert_eq!(got, (whole.len(), whole.distinct(), nb));
     let (got, _) = one_round(&o.pages, |cx| {
         let mut v = Vec::new();
         o.open(cx, i)?.subjects_sorted(cx, &mut v)?;
         Ok(v)
     });
     let mut want = Vec::new();
-    f5.subjects_sorted(&mut want);
+    whole.subjects_sorted(&mut want);
     assert_eq!(got, want, "subjects_sorted");
 
     let mut probes: Vec<usize> = (0..12).map(|_| r.below(n as u64) as usize).collect();
@@ -207,18 +207,18 @@ fn check_out(o: &Out, i: usize, r: &mut Rng) {
     for &p in &probes {
         let (k, s) = list[p];
         let (got, pages) = one_round(&o.pages, |cx| o.open(cx, i)?.find_key(cx, k));
-        assert_eq!(got, f5.find_key(k));
+        assert_eq!(got, whole.find_key(k));
         assert_eq!(got, Some(p));
         assert!(pages <= 1, "find_key read {pages} pages");
         for miss in [k.wrapping_add(1), k.wrapping_sub(1), k ^ NON_TID] {
-            assert_eq!(one_round(&o.pages, |cx| o.open(cx, i)?.find_key(cx, miss)).0, f5.find_key(miss));
+            assert_eq!(one_round(&o.pages, |cx| o.open(cx, i)?.find_key(cx, miss)).0, whole.find_key(miss));
         }
         let (got, pages) = one_round(&o.pages, |cx| {
             let l = o.open(cx, i)?;
             let (s, k) = (l.subject(cx, p), l.key_at(cx, p));
             Ok((s?, k?))
         });
-        assert_eq!(got, (f5.subject(p), f5.key_at(p)));
+        assert_eq!(got, (whole.subject(p), whole.key_at(p)));
         assert!(pages <= 2);
         for subject in [s, s.wrapping_add(1), u32::MAX, 0] {
             let stop = 1 + r.below(4) as usize;
@@ -243,9 +243,9 @@ fn check_out(o: &Out, i: usize, r: &mut Rng) {
                     true
                 };
                 if asc {
-                    f5.for_subject_asc(subject, push);
+                    whole.for_subject_asc(subject, push);
                 } else {
-                    f5.for_subject(subject, push);
+                    whole.for_subject(subject, push);
                 }
                 let (got, pages) = one_round(&o.pages, |cx| collect(cx, usize::MAX));
                 assert_eq!(got, want, "for_subject asc {asc} n {n}");
@@ -268,8 +268,8 @@ fn check_out(o: &Out, i: usize, r: &mut Rng) {
             Ok((keys[..k?].to_vec(), s?.to_vec()))
         });
         let mut keys = [0u64; BLOCK];
-        let k = f5.block_keys(b, &mut keys);
-        assert_eq!(got, (keys[..k].to_vec(), f5.block_subjects(b).to_vec()), "block {b}");
+        let k = whole.block_keys(b, &mut keys);
+        assert_eq!(got, (keys[..k].to_vec(), whole.block_subjects(b).to_vec()), "block {b}");
         assert!(pages <= 2);
     }
     for _ in 0..6 {
@@ -285,7 +285,7 @@ fn check_out(o: &Out, i: usize, r: &mut Rng) {
             _ => n + 5,
         };
         let mut want = Vec::new();
-        f5.for_each_desc(before, |k, s| {
+        whole.for_each_desc(before, |k, s| {
             want.push((k, s));
             want.len() < limit
         });
@@ -305,7 +305,7 @@ fn check_out(o: &Out, i: usize, r: &mut Rng) {
 }
 
 #[test]
-fn out_lists_answer_as_format_5_does() {
+fn paged_out_lists_answer_as_whole_ones_do() {
     let mut r = Rng(0x9e37_79b9_7f4a_7c15);
     for subj_index in [4096, 129, 2] {
         for round in 0..3 {
@@ -383,26 +383,26 @@ fn check_in(s: &In, i: usize, r: &mut Rng) {
     let n = ids.len();
     let mut f5b = Vec::new();
     inset::encode(ids, &mut f5b);
-    let f5 = InList::parse(&f5b);
+    let whole = InList::parse(&f5b);
     let nb = n.div_ceil(BLOCK);
     let (got, pages) = one_round(&s.pages, |cx| {
         let l = s.open(cx, i)?;
         Ok((l.len(), l.to_vec(cx)?))
     });
-    assert_eq!(got, (f5.len(), f5.to_vec()));
+    assert_eq!(got, (whole.len(), whole.to_vec()));
     assert!(pages <= nb.max(1));
     let mut xs: Vec<u32> = (0..16).map(|_| ids[r.below(n as u64) as usize]).collect();
     xs.extend(xs.clone().iter().map(|x| x.wrapping_add(1)));
     xs.extend([0, u32::MAX, ids[0], ids[n - 1]]);
     for x in xs {
         let (got, pages) = one_round(&s.pages, |cx| s.open(cx, i)?.contains(cx, x));
-        assert_eq!(got, f5.contains(x), "contains {x}");
+        assert_eq!(got, whole.contains(x), "contains {x}");
         assert!(pages <= 1, "contains read {pages} pages");
         let cap = if r.below(2) == 0 { 10 } else { 400 };
         let limit = 1 + r.below(cap) as usize;
         for after in [Some(x), None] {
             let mut want = Vec::new();
-            f5.for_each_after(after, |v| {
+            whole.for_each_after(after, |v| {
                 want.push(v);
                 want.len() < limit
             });
@@ -426,7 +426,7 @@ fn check_in(s: &In, i: usize, r: &mut Rng) {
         probes.dedup();
         let limit = if r.below(3) == 0 { 1 + r.below(5) as usize } else { usize::MAX };
         let mut want = Vec::new();
-        f5.intersect_sorted(&probes, limit, &mut want);
+        whole.intersect_sorted(&probes, limit, &mut want);
         let (got, pages) = one_round(&s.pages, |cx| {
             let mut v = Vec::new();
             s.open(cx, i)?.intersect_sorted(cx, &probes, limit, &mut v)?;
@@ -438,7 +438,7 @@ fn check_in(s: &In, i: usize, r: &mut Rng) {
 }
 
 #[test]
-fn in_sets_answer_as_format_5_does() {
+fn paged_in_sets_answer_as_whole_ones_do() {
     let mut r = Rng(0x2545_f491_4f6c_dd1d);
     for round in 0..4 {
         let mut sets: Vec<Vec<u32>> = SIZES.iter().map(|&n| random_set(&mut r, n)).collect();

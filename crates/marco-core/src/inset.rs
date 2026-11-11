@@ -455,7 +455,7 @@ impl<'a> InList<'a> {
 ///
 /// ```text
 /// head:   u32 n, u32 nb, nb x (u32 first id, u32 block at), nb x u8 (block count - 1)
-/// blocks: FORMAT 5's: per block, Elias-Fano of the ids after its first
+/// blocks: per block, Elias-Fano of the ids after its first
 /// ```
 ///
 /// A fresh write fills every block but the last to [`BLOCK`]; a patch's
@@ -738,7 +738,7 @@ impl<'g> SplitIn<'g> {
 }
 
 /// An in set in a FORMAT 6 shard: whole (at most
-/// [`crate::format6::WHOLE`] members, FORMAT 5's bytes, its page already
+/// [`crate::format6::WHOLE`] members, in [`InList`]'s bytes, its page already
 /// read) or split. An override built from deltas is a `Whole` of any size.
 #[derive(Clone, Copy)]
 pub enum PagedIn<'g> {

@@ -72,14 +72,16 @@ items weren't part of that run. Their scan output is ~27 B a row on synthetic da
 | Bulk build peak RSS | 10.6 GB |
 | scan-scylla client peak RSS | 9.0 GB at 2 ranges in flight per shard, 11.5 GB at 8 |
 
-marco maps the snapshot and lets the page cache hold it, so memory is mostly page cache. A box
-with RAM for the whole snapshot serves every read from memory. One with less can keep the in sets
-and indexes hot and pay an NVMe read when an out log misses the cache (~100 µs, estimated). Run that box with `--no-prefault`: by default marco reads the whole snapshot through the
-page cache after open and after every checkpoint, which on a smaller box evicts the hot set it
-should keep. During a checkpoint
-the old and new shard files are both mapped, and the RSS reads ~71 GiB on a 61 GiB box because a
-page mapped twice counts twice. The page cache held both without the box running short, but size
-for twice the snapshot in page cache if checkpoints have to leave reads untouched.
+marco reads the snapshot with `O_DIRECT` into its own cache, so the kernel's page cache holds none
+of it. `--memory` is the whole store: the pinned sections (the directory, each shard's index and
+heads, every page's sum) and the cache's frames. It must hold the pinned sections, the shards'
+index and heads a second time (a checkpoint reads them again beside the old until its switch), and
+2 GiB more. A budget that holds every page loads them all at open, and checkpoints and compactions
+put the pages they write into the cache, so that server never reads from disk after open. One with
+less keeps the pages reads come back to and reads a missing page from the drive, one 4 KiB read
+checked against its sum. The graph's deltas, a checkpoint's replay and requests live beside the
+budget, and `--memory-limit` keeps the whole process under a cgroup's limit by taking what they
+need past it out of the cache ([Operations](operations.md)).
 
 ## Reads
 
@@ -128,10 +130,9 @@ API at that rate should size for it.
 | Bulk build from the export | 115 s, 25.9M edges/s |
 | Scylla scan of follows and blocks, one 16-shard node | 4.4 min at 11.2M rows/s |
 | Scylla to `/readyz` 200, end to end, follows and blocks | 6.8 min |
-| Open a snapshot, caches dropped | 11 ms |
-| kill -9 to `/readyz` 200, p50 by run | 381-595 ms |
-| Restart with a day of segments | 10.9-11.7 s warm, 13.3 s of replay alone with the page cache dropped |
-| Checkpoint of a day (2.75M ops) | 20 s, 2.41 GB written (1.17 GB of changed lists and blocks, 1.23 GB of indexes and heads) |
+| Open a snapshot from a cold disk, every page loaded | 7.8 s |
+| Replay 4.46M ops of segments at open | 10.3 s |
+| Checkpoint of a day (2.75M ops) under a read load | 25.5 s with the snapshot cached, 37.3 s with a third of it |
 | Compaction of one shard | 2.7-2.8 s for 0.73-0.75 GB, unpaced |
 
 ## Growth

@@ -317,7 +317,6 @@ impl svc::Admin for AdminApi {
                 mem_total_bytes: crate::sys::mem_total(),
                 cpu_seconds: p.cpu_seconds,
                 threads: p.threads,
-                snapshot_cached_bytes: app.cached_bytes.load(Ordering::Relaxed),
                 ..Default::default()
             }
             .into(),
@@ -338,7 +337,7 @@ impl svc::Admin for AdminApi {
             ready,
             ready_reason,
             reads_before_ready: app.reads_before_ready.load(Ordering::Relaxed),
-            cache: if app.engine.paged() { cache_pb(app).into() } else { Default::default() },
+            cache: cache_pb(app).into(),
             ..Default::default()
         };
         Response::ok(resp)

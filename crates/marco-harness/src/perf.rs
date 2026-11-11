@@ -1485,16 +1485,11 @@ fn shapes_of(a: &Args, inp: &Inputs) -> Result<(Vec<Mix>, Vec<String>)> {
     Ok((a.shapes.iter().map(|s| Ok(Mix::one(Shape::parse(s)?))).collect::<Result<_>>()?, Vec::new()))
 }
 
-/// A read-only App with the snapshot mapped in before it returns, as the
-/// server's prefault leaves it, so no step takes the page faults.
+/// A read-only App, its snapshot loaded into the cache at open when the
+/// budget (MARCO_MEMORY) holds it, as the server's open leaves it, so no
+/// step waits on disk.
 fn read_only_app(snapshot: &Path) -> Result<Arc<App>> {
-    let app = App::open(Config { read_only: true, ..Config::new(snapshot.to_path_buf()) })?;
-    let t = Instant::now();
-    if let Some(s) = app.graph().shared_snapshot() {
-        s.populate();
-    }
-    eprintln!("snapshot mapped in {:.1} s", t.elapsed().as_secs_f64());
-    Ok(app)
+    App::open(Config { read_only: true, ..Config::new(snapshot.to_path_buf()) })
 }
 
 fn save(out: &Path, meta: &Value, steps: &[Value]) -> Result<()> {

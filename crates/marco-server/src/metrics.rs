@@ -1,5 +1,5 @@
 //! The server's own metrics, beside marco-core's op histograms: wire time
-//! and errors per RPC, build info, the page-cache share of the snapshot.
+//! and errors per RPC, build info, the store's budget and reads.
 
 use std::sync::LazyLock;
 use std::time::Instant;
@@ -86,11 +86,6 @@ pub static RPC_ERRORS: LazyLock<IntCounterVec> = LazyLock::new(|| {
 
 pub static BUILD: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     register_int_gauge_vec!("marco_build_info", "1, labelled with the version and commit", &["version", "commit"])
-        .unwrap()
-});
-
-pub static CACHED: LazyLock<IntGauge> = LazyLock::new(|| {
-    register_int_gauge!("marco_snapshot_cached_bytes", "Snapshot bytes in the page cache (mincore, every 10 s)")
         .unwrap()
 });
 
@@ -197,7 +192,6 @@ pub fn init(version: &str, commit: &str) {
     LazyLock::force(&POOL_WAIT);
     LazyLock::force(&BUSY);
     LazyLock::force(&RPC_ERRORS);
-    LazyLock::force(&CACHED);
     LazyLock::force(&READY);
     LazyLock::force(&crate::peer::REFUSED);
     LazyLock::force(&READS_BEFORE_READY);
@@ -303,13 +297,10 @@ pub fn store_bytes(app: &crate::app::App) -> StoreBytes {
         garbage: app.garbage_bytes.load(std::sync::atomic::Ordering::Relaxed),
         ..Default::default()
     };
-    if !app.engine.paged() {
-        return s;
-    }
     let mut files = 0u64;
     if let Some(snap) = app.graph().snapshot() {
         for (i, (_, f)) in snap.files().enumerate() {
-            let StoreFile::Paged { file, pinned } = f else { continue };
+            let StoreFile { file, pinned } = f;
             files += file.borrowed();
             s.pinned_tables += file.borrowed();
             let Some(p) = pinned else { continue };

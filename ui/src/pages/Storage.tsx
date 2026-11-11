@@ -134,9 +134,7 @@ export function Storage() {
                 { label: 'Merged since snapshot', value: mb, unit: mbU, sec: `${fmtCount(o.mergedLists)} lists`, title: 'marco_override_bytes', spark: <Spark data={sum(s, { metric: 'merges' })} /> },
                 { label: 'Tombstones', value: fmtCount(o.tombstones), spark: <Spark data={sum(s, { metric: 'tombstones' })} /> },
                 { label: 'Segments', value: fmtCount(o.durability?.segments), sec: `${bytes(o.durability?.segmentBytes)} · ${si(o.durability?.segmentOps)} ops`, right: o.durability?.segmentMs ? ago(o.durability.segmentMs) : undefined, title: 'change segments since the checkpoint' },
-                o.cache
-                  ? { label: 'Open', value: dur(o.snapshot!.openSeconds * 1000), sec: verifyJob ? `verify ${verifyJob}` : undefined, title: 'pinned sections read and checked, pages loaded, segments replayed' }
-                  : { label: 'Cold open', value: (o.snapshot!.openSeconds * 1000).toFixed(0), unit: 'ms', sec: verifyJob ? `verify ${verifyJob}` : undefined, title: 'mmap + footer checks, no full xxh3' },
+                { label: 'Open', value: dur(o.snapshot!.openSeconds * 1000), sec: verifyJob ? `verify ${verifyJob}` : undefined, title: 'pinned sections read and checked, pages loaded, segments replayed' },
               ]}
             />
           )

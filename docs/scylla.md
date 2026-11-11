@@ -19,7 +19,7 @@ diagram:
     - "sc -> scan: token ranges"
     - "scan -> spill"
     - "spill -> snap: build"
-    - "snap -> srv: mmap"
+    - "snap -> srv: O_DIRECT"
     - "js -> srv: since time_us"
 facts:
   - { value: "4.4", unit: min, label: to scan 2.97B rows, note: "follows + blocks · 11.2M rows/s · one node", tone: accent }
@@ -44,7 +44,7 @@ marco-load --ops 127.0.0.1:9101 --report scan.json scan-scylla \
   --config scylla.toml --out /data/scan --snapshot /data/snap
 
 # 2. serve it and catch up from the snapshot's time; /readyz turns 200 once caught up
-marco serve --snapshot /data/snap --jetstream wss://jetstream2.us-east.bsky.network
+marco serve --snapshot /data/snap --memory 13GiB --jetstream wss://jetstream2.us-east.bsky.network
 ```
 
 ```toml
@@ -109,7 +109,7 @@ target/release/marco-load build --input input --out snap
 target/release/marco-load diff --a snap --b snap-scylla
 
 # 3. serve the rebuilt snapshot as in the quickstart
-target/release/marco serve --snapshot snap-scylla --jetstream wss://jetstream2.us-east.bsky.network
+target/release/marco serve --snapshot snap-scylla --memory 3GiB --jetstream wss://jetstream2.us-east.bsky.network
 ```
 
 `diff` compares the two snapshots DID by DID and reports any record that differs.

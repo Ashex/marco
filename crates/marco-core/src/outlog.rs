@@ -1043,7 +1043,7 @@ fn partition(n: usize, pred: impl Fn(usize) -> bool) -> usize {
 }
 
 /// An out list in a FORMAT 6 shard: whole (a list of at most
-/// [`crate::format6::WHOLE`] records, in FORMAT 5's bytes, the one page that
+/// [`crate::format6::WHOLE`] records, in [`OutList`]'s bytes, the one page that
 /// holds it already read) or split into a pinned head and paged blocks. An
 /// override built from deltas is a `Whole` of any length.
 #[derive(Clone, Copy)]

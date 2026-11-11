@@ -317,7 +317,7 @@ pub mod gauges {
 pub static SNAPSHOT_SECONDS: std::sync::LazyLock<prometheus::HistogramVec> = std::sync::LazyLock::new(|| {
     prometheus::register_histogram_vec!(
         "marco_snapshot_seconds",
-        "Snapshot open (mmap + footer) and write times",
+        "Snapshot open (footers and pinned sections) and write times",
         &["what"],
         prometheus::exponential_buckets(1e-5, 4.0, 14).unwrap()
     )

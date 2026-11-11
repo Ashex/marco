@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use marco_core::read::Engine;
 use marco_core::store::engine::Config as EngineConfig;
 use marco_core::store::io::{default_device, Fault, Times};
-use marco_core::store::{shard_file, Storage, StoreFile};
+use marco_core::store::{shard_file, Storage};
 use marco_core::{CompactPolicy, Graph};
 use marco_server::app::{App, Config, Op};
 use marco_server::synth::{did, tid, uri, FOLLOW};
@@ -39,7 +39,7 @@ fn snapshot_of(n: u32) -> (tempfile::TempDir, PathBuf) {
 
 /// The engine with `memory` bytes and the minimum-budget check off.
 fn engine(memory: u64) -> Storage {
-    Storage::Engine { memory, max_frames: Some(u32::MAX) }
+    Storage { memory, max_frames: Some(u32::MAX) }
 }
 
 fn cfg(snap: &Path, storage: Storage, compact: bool) -> Config {
@@ -128,12 +128,7 @@ async fn compacted(app: &App) {
 fn files_borrowed(app: &App) -> u64 {
     let g = app.graph();
     let s = g.snapshot().unwrap();
-    s.files()
-        .map(|(_, f)| match f {
-            StoreFile::Paged { file, .. } => file.borrowed() + f.pinned_bytes(),
-            StoreFile::Mapped { .. } => 0,
-        })
-        .sum()
+    s.files().map(|(_, f)| f.file.borrowed() + f.pinned_bytes()).sum()
 }
 
 #[test]
@@ -147,14 +142,15 @@ fn a_fits_all_server_stays_at_zero_misses_across_ten_checkpoints() {
         let b = app.engine.bytes();
         assert_eq!(b.main_frames, pages, "open loaded every page");
         let base = app.engine.stats();
-        let (mmap_d, mmap_snap) = snapshot();
-        let mmap = App::open(cfg(&mmap_snap, Storage::Mmap, false)).unwrap();
+        // the same writes on a server that neither checkpoints nor compacts
+        let (ref_d, ref_snap) = snapshot();
+        let reference = App::open(cfg(&ref_snap, engine(256 * MIB), false)).unwrap();
         for r in 0..10 {
             feed(&app, r).await;
-            feed(&mmap, r).await;
+            feed(&reference, r).await;
             app.checkpoint().await.unwrap();
             compacted(&app).await;
-            assert_eq!(dump(&app.graph()), dump(&mmap.graph()), "round {r}");
+            assert_eq!(dump(&app.graph()), dump(&reference.graph()), "round {r}");
             let s = app.engine.stats();
             assert_eq!(
                 (s.misses, s.fetched, s.past_pages, s.write_through_skipped),
@@ -168,8 +164,8 @@ fn a_fits_all_server_stays_at_zero_misses_across_ten_checkpoints() {
         assert!(s.written_through > 0);
         println!("10 checkpoints, {} compactions, {} pages written through", d.compactions, s.written_through);
         app.shutdown().await.unwrap();
-        mmap.shutdown().await.unwrap();
-        drop(mmap_d);
+        reference.shutdown().await.unwrap();
+        drop(ref_d);
     });
 }
 
@@ -202,9 +198,8 @@ fn older_patches_give_their_index_and_heads_back() {
         assert!(patches >= 6 * 6, "most shards have six patches: {patches}");
         for f in s.shards.iter().flatten() {
             for (i, p) in f.parts.iter().enumerate() {
-                let StoreFile::Paged { file, .. } = &p.file else { unreachable!() };
                 assert_eq!(
-                    file.has_pinned(),
+                    p.file.file.has_pinned(),
                     i + 1 == f.parts.len(),
                     "{}: only the newest keeps its pinned sections",
                     p.name
@@ -293,8 +288,8 @@ fn a_bad_page_under_a_checkpoint_fails_it_cleanly() {
         let mut ec = EngineConfig::new(64 * MIB).device(fault.clone());
         ec.max_frames = Some(64);
         let e = Arc::new(Engine::with_config(ec).unwrap());
-        let mut c = cfg(&snap, Storage::Engine { memory: 64 * MIB, max_frames: Some(64) }, false);
-        c.prefault = false;
+        let mut c = cfg(&snap, Storage { memory: 64 * MIB, max_frames: Some(64) }, false);
+        c.load = false;
         let app = App::open_on(c, e).unwrap();
         feed(&app, 0).await;
         // every shard's base fails its reads: the patch's merge needs old versions
@@ -328,7 +323,7 @@ fn a_bad_page_under_a_checkpoint_fails_it_cleanly() {
         // the failed one's id isn't used again
         assert_eq!(app.durability.lock().unwrap().checkpoint, 2);
         app.shutdown().await.unwrap();
-        let reopened = App::open(cfg(&snap, Storage::Mmap, false)).unwrap();
+        let reopened = App::open(cfg(&snap, engine(256 * MIB), false)).unwrap();
         assert_eq!(reopened.graph().snapshot().unwrap().manifest.checkpoint, 2);
         reopened.shutdown().await.unwrap();
     });

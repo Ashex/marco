@@ -8,7 +8,6 @@
 //! marco-load verify --snapshot FILE            checksums, every list decoded, a sampled export checked
 //! marco-load replay --snapshot FILE --deletes DIR   delete-by-URI replay through the mutable path
 //! marco-load diff   --a SNAP --b SNAP              two snapshots compared record by record
-//! marco-load compare6 --a SNAP5 --b SNAP6          a FORMAT 6 build against FORMAT 5's, list by list
 //! marco-load scan-scylla --config TOML --out DIR [--snapshot SNAP]   Scylla tables -> build input (-> snapshot)
 //! marco-load fill-scylla --config TOML --input DIR   build input -> Scylla tables (tests, benchmarks)
 //! ```
@@ -22,7 +21,6 @@ use clap::{Parser, Subcommand};
 
 mod bench;
 mod build;
-mod compare6;
 #[cfg(feature = "scylla")]
 mod cql;
 mod diff;
@@ -81,9 +79,6 @@ enum Cmd {
         /// Build even if a cursor is past the retention.
         #[arg(long)]
         allow_gap: bool,
-        /// Snapshot format: 6, which the server reads (paged, written with O_DIRECT), or 5, for compare6.
-        #[arg(long, default_value_t = marco_core::snapshot::PAGED_FORMAT)]
-        format: u32,
         /// Lay each shard's small lists out hottest first by these weights (`did<TAB>weight`): out lists by
         /// viewers, then subjects; in sets by subjects, then viewers. Off by default.
         #[arg(long, num_args = 2, value_names = ["VIEWERS", "SUBJECTS"])]
@@ -98,8 +93,6 @@ enum Cmd {
     Verify(verify::VerifyArgs),
     Replay(verify::ReplayArgs),
     Diff(diff::Args),
-    /// A FORMAT 6 snapshot against the FORMAT 5 one built from the same input.
-    Compare6(compare6::Args),
     /// Scan Scylla tables into build input (see the README), then optionally build.
     #[cfg(feature = "scylla")]
     ScanScylla(Box<cql::scan::Args>),
@@ -130,7 +123,6 @@ fn main() -> Result<()> {
             deletes_since_us,
             retention_hours,
             allow_gap,
-            format,
             heat,
         } => {
             let rels = match relations {
@@ -151,7 +143,6 @@ fn main() -> Result<()> {
                 sub_buckets,
                 deletes,
                 cursors,
-                format,
                 heat: heat.map(|h| (h[0].clone(), h[1].clone())),
             };
             let r = build::build(&o)?;
@@ -164,7 +155,6 @@ fn main() -> Result<()> {
         Cmd::Verify(a) => verify::verify(&a)?,
         Cmd::Replay(a) => verify::replay(&a)?,
         Cmd::Diff(a) => diff::run(&a)?,
-        Cmd::Compare6(a) => compare6::run(&a)?,
         #[cfg(feature = "scylla")]
         Cmd::ScanScylla(a) => cql::scan::run(&a)?,
         #[cfg(feature = "scylla")]

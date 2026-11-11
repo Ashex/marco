@@ -573,7 +573,7 @@ pub struct GetOverviewResponse {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
     )]
     pub reads_before_ready: u64,
-    /// The storage engine's budget and reads; unset on --storage mmap.
+    /// The storage engine's budget and reads.
     ///
     /// Field 27: `cache`
     #[serde(
@@ -2797,7 +2797,7 @@ pub struct SnapshotInfo {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_i64"
     )]
     pub written_ms: i64,
-    /// The open at start: mmap and footer checks.
+    /// The open at start: footers, page sums and pinned sections read and checked.
     ///
     /// Field 7: `open_seconds`
     #[serde(
@@ -3649,16 +3649,6 @@ pub struct ProcessInfo {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u32"
     )]
     pub threads: u32,
-    /// Snapshot bytes in the page cache (mincore), sampled every 10 s.
-    ///
-    /// Field 5: `snapshot_cached_bytes`
-    #[serde(
-        rename = "snapshotCachedBytes",
-        alias = "snapshot_cached_bytes",
-        with = "::buffa::json_helpers::uint64",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
-    )]
-    pub snapshot_cached_bytes: u64,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -3670,7 +3660,6 @@ impl ::core::fmt::Debug for ProcessInfo {
             .field("mem_total_bytes", &self.mem_total_bytes)
             .field("cpu_seconds", &self.cpu_seconds)
             .field("threads", &self.threads)
-            .field("snapshot_cached_bytes", &self.snapshot_cached_bytes)
             .finish()
     }
 }
@@ -3715,12 +3704,6 @@ impl ::buffa::Message for ProcessInfo {
         if self.threads != 0u32 {
             size += 1u64 + ::buffa::types::uint32_encoded_len(self.threads) as u64;
         }
-        if self.snapshot_cached_bytes != 0u64 {
-            size
-                += 1u64
-                    + ::buffa::types::uint64_encoded_len(self.snapshot_cached_bytes)
-                        as u64;
-        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -3742,9 +3725,6 @@ impl ::buffa::Message for ProcessInfo {
         }
         if self.threads != 0u32 {
             ::buffa::types::put_uint32_field(4u32, self.threads, buf);
-        }
-        if self.snapshot_cached_bytes != 0u64 {
-            ::buffa::types::put_uint64_field(5u32, self.snapshot_cached_bytes, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -3787,13 +3767,6 @@ impl ::buffa::Message for ProcessInfo {
                 )?;
                 self.threads = ::buffa::types::decode_uint32(buf)?;
             }
-            5u32 => {
-                ::buffa::encoding::check_wire_type(
-                    tag,
-                    ::buffa::encoding::WireType::Varint,
-                )?;
-                self.snapshot_cached_bytes = ::buffa::types::decode_uint64(buf)?;
-            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -3806,7 +3779,6 @@ impl ::buffa::Message for ProcessInfo {
         self.mem_total_bytes = 0u64;
         self.cpu_seconds = 0f64;
         self.threads = 0u32;
-        self.snapshot_cached_bytes = 0u64;
         self.__buffa_unknown_fields.clear();
     }
 }

@@ -705,17 +705,13 @@ impl Writer {
         if !self.verifying() {
             *self.app.verify.lock().unwrap() = vec![Default::default(); self.app.snapshot_files()];
         }
-        if self.app.cfg.prefault {
-            // before its first reads would fault (or miss) every page
+        if self.app.cfg.load {
+            // before its first reads would miss every page
             let (f, engine) = (swapped, self.app.engine.clone());
             std::thread::Builder::new()
-                .name("marco-prefault".into())
+                .name("marco-load".into())
                 .spawn(move || {
-                    let file = &f.base().file;
-                    file.populate();
-                    if let marco_core::store::StoreFile::Paged { file: p, .. } = file {
-                        engine.load(&[&**p]);
-                    }
+                    engine.load(&[&*f.base().file.file]);
                 })
                 .ok();
         }
@@ -766,10 +762,9 @@ fn rewrite(app: &App, id: u64, upto: u64, cursors: BTreeMap<String, String>) -> 
         if let Some(e) = &r.skipped {
             bail!("replaying the segments after the cut: {e}");
         }
-        if cfg.prefault {
-            // before the switch: the new files' first reads would fault (or miss) every page
+        if cfg.load {
+            // before the switch: the new files' first reads would miss every page
             if let Some(s) = r.graph.snapshot() {
-                s.populate();
                 s.load();
             }
         }

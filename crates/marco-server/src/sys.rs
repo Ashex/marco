@@ -1,4 +1,4 @@
-//! Process and page-cache figures from /proc and mincore(2).
+//! Process figures from /proc.
 
 pub struct Proc {
     pub rss_bytes: u64,
@@ -36,20 +36,4 @@ pub fn mem_total() -> u64 {
 
 fn page_size() -> u64 {
     (unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).max(4096) as u64
-}
-
-/// Bytes of a mapping that are in the page cache.
-pub fn resident(bytes: &[u8]) -> u64 {
-    if bytes.is_empty() {
-        return 0;
-    }
-    let page = page_size() as usize;
-    let start = bytes.as_ptr() as usize & !(page - 1);
-    let len = bytes.as_ptr() as usize + bytes.len() - start;
-    let mut vec = vec![0u8; len.div_ceil(page)];
-    let r = unsafe { libc::mincore(start as *mut libc::c_void, len, vec.as_mut_ptr()) };
-    if r != 0 {
-        return 0;
-    }
-    vec.iter().filter(|&&b| b & 1 == 1).count() as u64 * page as u64
 }

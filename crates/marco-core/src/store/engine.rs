@@ -2,9 +2,9 @@
 //! the I/O behind it, and the read loop over them ([`Engine::pass`],
 //! [`Engine::read_blocking`]).
 //!
-//! An engine made with [`Engine::new`] keeps whole files in memory, owned or
-//! mapped ([`Engine::add`], [`Engine::open`]), and never misses a page they
-//! have. One made with [`Engine::with_config`] also registers FORMAT 6 files
+//! An engine made with [`Engine::new`] keeps whole files in memory
+//! ([`Engine::add`]: an in-memory graph's, and tests'), and never misses a
+//! page they have. One made with [`Engine::with_config`] registers snapshot files
 //! ([`Engine::register`]): their pinned sections are read at open, checked
 //! and kept, and their paged sections are read a page at a time into a cache
 //! that never holds more than `--memory`. A pass reads only what's in memory;
@@ -23,7 +23,7 @@ use rustc_hash::FxHashMap;
 use crate::read::{
     BadPage, Found, Guard, Hold, LookupCounts, Misses, PageSet, ReadCx, ReadStats, StorageError, UsedBytes, R,
 };
-use crate::snapshot::{sums_section, Bytes, PagedFooter, SectionKind, TRAILER};
+use crate::snapshot::{sums_section, PagedFooter, SectionKind, TRAILER};
 use crate::store::cache::{Cache, CacheBytes, Entry, FileTable, GROUP, NO_FRAME};
 use crate::store::io::{
     default_device, AlignedBuf, DevFile, Device, IoPool, Lane, PageRead, Rate, Run, TokenBucket, MAX_RUN,
@@ -73,7 +73,7 @@ impl Config {
 /// What an engine's entry for a file holds.
 pub(crate) enum EntryData {
     /// The whole file in memory.
-    Resident { bytes: Bytes, footer: Option<PagedFooter> },
+    Resident { bytes: Vec<u8> },
     /// A FORMAT 6 file read through the cache.
     Paged(Arc<FileState>),
 }
@@ -275,51 +275,6 @@ impl Drop for PagedFile {
             inner.bad.lock().unwrap().retain(|p, _| p.file != self.id);
             cache.unborrow(self.borrowed);
         }
-    }
-}
-
-/// A file kept whole in an engine ([`Engine::add_mapped`]): unregistered
-/// when dropped, so a shared engine lets go of a checkpoint's old files with
-/// the store that held them. Its id is never used again.
-pub struct Resident {
-    inner: Arc<Inner>,
-    id: FileId,
-    map: Option<Arc<memmap2::Mmap>>,
-}
-
-impl Resident {
-    pub fn id(&self) -> FileId {
-        self.id
-    }
-}
-
-impl Drop for Resident {
-    fn drop(&mut self) {
-        {
-            let guard = crossbeam_epoch::pin();
-            self.inner.table.remove(self.id, &guard);
-        }
-        self.inner.bad.lock().unwrap().retain(|p, _| p.file != self.id);
-        // The table's entry holds the mapping too, and is destroyed by whichever
-        // thread next collects the epoch, often a worker's pass. Wait for that
-        // here (a store usually drops on a thread of its own, never wait on a
-        // worker) so the munmap, which takes a while for a big file, happens on
-        // this one.
-        let Some(map) = self.map.take() else { return };
-        if crate::read::on_async_thread() {
-            return;
-        }
-        let until = std::time::Instant::now() + Duration::from_secs(5);
-        while Arc::strong_count(&map) > 1 && std::time::Instant::now() < until {
-            crossbeam_epoch::pin().flush();
-            std::thread::sleep(Duration::from_micros(200));
-        }
-    }
-}
-
-impl std::fmt::Debug for Resident {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Resident").field("id", &self.id).finish()
     }
 }
 
@@ -629,12 +584,7 @@ enum Class {
 impl Engine {
     /// An engine that keeps whole files in memory and has no page cache.
     pub fn new() -> Engine {
-        Engine::paced(Rate::default())
-    }
-
-    /// [`Engine::new`] with background writes paced at `background`.
-    pub fn paced(background: Rate) -> Engine {
-        Engine::build(None, None, None, Duration::ZERO, Arc::new(TokenBucket::new(background)))
+        Engine::build(None, None, None, Duration::ZERO, Arc::new(TokenBucket::new(Rate::default())))
     }
 
     /// An engine with a page cache of `cfg.memory` bytes. Fails if that
@@ -685,34 +635,11 @@ impl Engine {
 
     /// Registers a file's bytes under `name`. Its pages are `bytes` in 4 KiB
     /// steps; a partial last page is past the end.
-    pub fn add(&self, name: impl Into<String>, bytes: Bytes) -> FileId {
-        self.add_resident(name.into(), bytes, None)
-    }
-
-    fn add_resident(&self, name: String, bytes: Bytes, footer: Option<PagedFooter>) -> FileId {
+    pub fn add(&self, name: impl Into<String>, bytes: Vec<u8>) -> FileId {
         let id = self.next_id();
-        let e = Entry { dropped: Default::default(), slots: Box::new([]), data: EntryData::Resident { bytes, footer } };
-        self.inner.table.insert(id, &name, e);
+        let e = Entry { dropped: Default::default(), slots: Box::new([]), data: EntryData::Resident { bytes } };
+        self.inner.table.insert(id, &name.into(), e);
         id
-    }
-
-    /// Maps the FORMAT 6 file at `path` whole, checks its footer and
-    /// registers it under its file name. It is never evicted or freed.
-    pub fn open(&self, path: &Path) -> Result<(FileId, PagedFooter)> {
-        let f = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-        // SAFETY: snapshot files are written once and renamed into place; nothing
-        // writes to one after that.
-        let map = unsafe { memmap2::Mmap::map(&f)? };
-        let footer = PagedFooter::read(&map).with_context(|| path.display().to_string())?;
-        let id = self.add_resident(file_name(path), Bytes::Map(map), Some(footer.clone()));
-        Ok((id, footer))
-    }
-
-    /// Registers the FORMAT 6 file its caller mapped whole and reads its
-    /// pinned sections from, until the handle drops.
-    pub fn add_mapped(&self, name: impl Into<String>, map: Arc<memmap2::Mmap>, footer: PagedFooter) -> Resident {
-        let id = self.add_resident(name.into(), Bytes::Shared(map.clone()), Some(footer));
-        Resident { inner: self.inner.clone(), id, map: Some(map) }
     }
 
     pub(crate) fn cache(&self) -> Option<&Arc<Cache>> {
@@ -974,7 +901,7 @@ impl Engine {
                 // isn't reused before the guard is gone.
                 Some((unsafe { c.page(f) }, if queue { c.found(f) } else { Found::Other }))
             }
-            EntryData::Resident { bytes, .. } => {
+            EntryData::Resident { bytes } => {
                 let off = p.offset() as usize;
                 Some((bytes.get(off..off + PAGE)?.try_into().ok()?, Found::Other))
             }
@@ -1055,7 +982,7 @@ impl Engine {
     fn try_pin(&self, p: PageId, guard: &Guard) -> Option<u32> {
         let e = self.inner.table.get(p.file, guard)?;
         match &e.data {
-            EntryData::Resident { bytes, .. } => (p.offset() as usize + PAGE <= bytes.len()).then_some(NO_FRAME),
+            EntryData::Resident { bytes } => (p.offset() as usize + PAGE <= bytes.len()).then_some(NO_FRAME),
             EntryData::Paged(_) => {
                 let f = e.slots.get(p.page as usize)?.load(Acquire);
                 (f != NO_FRAME && self.inner.cache.as_ref()?.pin(f)).then_some(f)
@@ -1075,16 +1002,15 @@ impl Engine {
             return Class::Bad(StorageError::Short(BadPage { file, section: None, page: p.page }));
         };
         match &e.data {
-            EntryData::Resident { bytes, footer } => {
+            EntryData::Resident { bytes } => {
                 if p.offset() as usize + PAGE <= bytes.len() {
                     if hold.keep && !hold.pins.contains(p) {
                         add.push((p, NO_FRAME));
                     }
                     return Class::Here;
                 }
-                let section = footer.as_ref().and_then(|f| f.page_at(p.page)).map(|s| s.name.clone());
                 let file = self.name(p.file).unwrap_or_default().to_string();
-                Class::Bad(StorageError::Short(BadPage { file, section, page: p.page }))
+                Class::Bad(StorageError::Short(BadPage { file, section: None, page: p.page }))
             }
             EntryData::Paged(st) => {
                 if st.range(p.page).is_none() {

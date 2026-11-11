@@ -552,7 +552,6 @@ pub fn run(a: &Args) -> Result<Value> {
             sub_buckets: 4,
             deletes: None,
             cursors,
-            format: marco_core::snapshot::PAGED_FORMAT,
             heat: None,
         };
         let b = crate::build::build(&o)?;

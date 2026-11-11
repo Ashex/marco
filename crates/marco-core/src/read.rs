@@ -260,10 +260,9 @@ impl Drop for Private {
 ///
 /// ```
 /// # use marco_core::read::{BlockAt, Blocks, Engine, PageBlocks, ReadCx};
-/// # use marco_core::snapshot::Bytes;
 /// # use marco_core::store::page::{PageId, PAGE};
 /// # let engine = Engine::new();
-/// # let file = engine.add("f", Bytes::Owned(vec![7u8; PAGE]));
+/// # let file = engine.add("f", vec![7u8; PAGE]);
 /// # let at = [BlockAt::new(PageId::new(file, 0), 0, 16)];
 /// # let blocks = PageBlocks::new(&at);
 /// let guard = engine.pin();
@@ -276,10 +275,9 @@ impl Drop for Private {
 ///
 /// ```compile_fail,E0597
 /// # use marco_core::read::{BlockAt, Blocks, Engine, PageBlocks, ReadCx};
-/// # use marco_core::snapshot::Bytes;
 /// # use marco_core::store::page::{PageId, PAGE};
 /// # let engine = Engine::new();
-/// # let file = engine.add("f", Bytes::Owned(vec![7u8; PAGE]));
+/// # let file = engine.add("f", vec![7u8; PAGE]);
 /// # let at = [BlockAt::new(PageId::new(file, 0), 0, 16)];
 /// # let blocks = PageBlocks::new(&at);
 /// let b = {
@@ -294,10 +292,9 @@ impl Drop for Private {
 ///
 /// ```
 /// # use marco_core::read::{BlockAt, Blocks, Engine, Hold, PageBlocks};
-/// # use marco_core::snapshot::Bytes;
 /// # use marco_core::store::page::{PageId, PAGE};
 /// # let engine = Engine::new();
-/// # let file = engine.add("f", Bytes::Owned(vec![7u8; PAGE]));
+/// # let file = engine.add("f", vec![7u8; PAGE]);
 /// # let at = [BlockAt::new(PageId::new(file, 0), 0, 16)];
 /// # let blocks = PageBlocks::new(&at);
 /// let n = engine.pass(&mut Hold::none(), |cx| blocks.block(cx, 0).map(|b| b.len())).unwrap();
@@ -306,10 +303,9 @@ impl Drop for Private {
 ///
 /// ```compile_fail
 /// # use marco_core::read::{BlockAt, Blocks, Engine, Hold, PageBlocks};
-/// # use marco_core::snapshot::Bytes;
 /// # use marco_core::store::page::{PageId, PAGE};
 /// # let engine = Engine::new();
-/// # let file = engine.add("f", Bytes::Owned(vec![7u8; PAGE]));
+/// # let file = engine.add("f", vec![7u8; PAGE]);
 /// # let at = [BlockAt::new(PageId::new(file, 0), 0, 16)];
 /// # let blocks = PageBlocks::new(&at);
 /// let b = engine.pass(&mut Hold::none(), |cx| blocks.block(cx, 0)).unwrap();
@@ -860,14 +856,14 @@ impl std::error::Error for StorageError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::snapshot::{Bytes, FileKind, PagedWriter};
+    use crate::snapshot::{FileKind, PagedFooter, PagedWriter};
     use crate::store::page::FileId;
 
     /// Three pages, every byte of page i equal to i + 1.
     fn engine() -> (Engine, FileId) {
         let e = Engine::new();
         let bytes = (0..3u8).flat_map(|i| [i + 1; PAGE]).collect();
-        let f = e.add("shard-000-00000000.marco", Bytes::Owned(bytes));
+        let f = e.add("shard-000-00000000.marco", bytes);
         (e, f)
     }
 
@@ -937,7 +933,9 @@ mod tests {
         w.paged("r0.out.small", 0, &[5u8; PAGE + 1]).unwrap();
         w.finish("shard", &()).unwrap();
         let e = Engine::new();
-        let (f, footer) = e.open(&p).unwrap();
+        let bytes = std::fs::read(&p).unwrap();
+        let footer = PagedFooter::read(&bytes).unwrap();
+        let f = e.add("shard-001-00000000.marco", bytes);
         assert_eq!(e.name(f), Some("shard-001-00000000.marco"));
         let small = footer.section("r0.out.small").unwrap().clone();
         let page = |i: u32| PageId::new(f, small.first_page() + i);

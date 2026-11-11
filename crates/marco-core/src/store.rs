@@ -25,14 +25,13 @@ use crate::read::{Engine, StorageError};
 use crate::snapshot::{
     rel_section, BaseDir, DirRanges, FileKind, Meta, PagedFooter, PagedSection, ShardMeta, PAGED_FORMAT,
 };
-use crate::store::engine::{PagedFile, PinnedSections, Resident};
+use crate::store::engine::{PagedFile, PinnedSections};
 use crate::store::page::{FileId, PAGE};
 
 pub mod cache;
 pub mod engine;
 pub mod io;
 pub mod page;
-pub mod v5;
 
 pub const DIR_FILE: &str = "directory.marco";
 pub const MANIFEST: &str = "manifest.json";
@@ -70,11 +69,10 @@ pub struct Manifest {
 /// they were written, which is the order their pages follow the base's in
 /// each of the shard's spaces. A reader opens all of them: the newest file's
 /// pinned sections (index, heads) describe the whole shard, and their offsets
-/// point into any of the files' pages. FORMAT 5 shards are a base alone.
+/// point into any of the files' pages.
 ///
-/// In `manifest.json` a shard with no patches is its base's name, so FORMAT 5
-/// manifests read and write unchanged; one with patches is
-/// `{"base": name, "patches": [names]}`.
+/// In `manifest.json` a shard with no patches is its base's name; one with
+/// patches is `{"base": name, "patches": [names]}`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ShardFiles {
     pub base: String,
@@ -155,112 +153,32 @@ impl Manifest {
     }
 }
 
-/// A FORMAT 6 file mapped whole: the engine serves its pages from the
-/// mapping, and its pinned sections are read in place from the same one.
-/// Opening reads nothing but the footer, as FORMAT 5's mmap did; sums are
-/// checked by [`MappedFile::verify_checksums`].
-pub struct MappedFile {
-    pub name: String,
-    pub footer: PagedFooter,
-    map: Arc<memmap2::Mmap>,
-}
-
-impl MappedFile {
-    /// Maps the file and parses its footer.
-    pub fn open(path: &Path) -> Result<MappedFile> {
-        let f = File::open(path).with_context(|| format!("open {}", path.display()))?;
-        // SAFETY: snapshot files are written once and renamed into place; nothing
-        // writes to one after that.
-        let map = unsafe { memmap2::Mmap::map(&f)? };
-        #[cfg(unix)]
-        if crate::snapshot::mmap_random() {
-            map.advise(memmap2::Advice::Random).context("madvise(MADV_RANDOM)")?;
-        }
-        let footer = PagedFooter::read(&map).with_context(|| path.display().to_string())?;
-        let name = path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
-        Ok(MappedFile { name, footer, map: Arc::new(map) })
-    }
-
-    pub fn bytes(&self) -> &[u8] {
-        &self.map
-    }
-
-    pub fn len(&self) -> usize {
-        self.map.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
-    }
-
-    pub fn sections(&self) -> &[PagedSection] {
-        &self.footer.sections
-    }
-
-    /// Where pinned section `name` is in the file; None if the file has none
-    /// by that name.
-    pub fn pinned_range(&self, name: &str) -> Option<Range<usize>> {
-        let s = self.footer.section(name).filter(|s| !s.is_paged())?;
-        Some(s.off as usize..(s.off + s.len()) as usize)
-    }
-
-    /// Checks every pinned section and every page against the footer:
-    /// catches a truncated copy or a bad disk. Reads the whole file.
-    pub fn verify_checksums(&self) -> Result<()> {
-        self.footer.verify(&self.map)
-    }
-
-    /// Maps every page of the file into this process now (MADV_POPULATE_READ),
-    /// reading what isn't cached: later reads take no page faults.
-    pub fn populate(&self) {
-        #[cfg(target_os = "linux")]
-        let _ = self.map.advise(memmap2::Advice::PopulateRead);
-    }
-
-    /// Asks the kernel to read the whole file ahead (MADV_WILLNEED).
-    pub fn advise_willneed(&self) {
-        let _ = self.map.advise(memmap2::Advice::WillNeed);
-    }
-}
-
-/// How a process reads its snapshots: mapped whole (the page cache's), or
-/// through an engine that reads pages with `O_DIRECT` into a cache of
-/// `memory` bytes (`--storage`, `--memory`).
+/// How a process reads its snapshots: through an engine that reads pages
+/// with `O_DIRECT` into a cache of `memory` bytes (`--memory`).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Storage {
-    Mmap,
-    Engine {
-        memory: u64,
-        /// Caps the frames below what the budget allows (tests).
-        max_frames: Option<u32>,
-    },
+pub struct Storage {
+    pub memory: u64,
+    /// Caps the frames below what the budget allows (tests).
+    pub max_frames: Option<u32>,
 }
 
 /// The budget [`Storage::from_env`] gives an engine when `MARCO_MEMORY`
-/// doesn't say.
-pub const DEFAULT_TEST_MEMORY: u64 = 1 << 30;
+/// doesn't say: past the 2 GiB of cache a server wants beside the pinned
+/// tier, for a small snapshot.
+pub const DEFAULT_TEST_MEMORY: u64 = 3 << 30;
 
 impl Storage {
-    /// What `MARCO_STORAGE` (`mmap` or `engine`), `MARCO_MEMORY` and
-    /// `MARCO_MAX_FRAMES` say, mmap when unset: how [`Store::open`] and
-    /// [`crate::Graph::open`] read, so tools and the whole test suite can
-    /// run on the engine.
+    /// What `MARCO_MEMORY` and `MARCO_MAX_FRAMES` say: how [`Store::open`]
+    /// and [`crate::Graph::open`] read, for tools and tests.
     pub fn from_env() -> Result<Storage> {
         let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
-        match var("MARCO_STORAGE").as_deref().map(str::trim) {
-            None | Some("mmap") => Ok(Storage::Mmap),
-            Some("engine") => Ok(Storage::Engine {
-                memory: var("MARCO_MEMORY").map(|m| parse_bytes(&m)).transpose()?.unwrap_or(DEFAULT_TEST_MEMORY),
-                max_frames: var("MARCO_MAX_FRAMES")
-                    .map(|m| m.trim().parse().context("MARCO_MAX_FRAMES"))
-                    .transpose()?,
-            }),
-            Some(o) => bail!("MARCO_STORAGE {o:?}: mmap or engine"),
-        }
+        Ok(Storage {
+            memory: var("MARCO_MEMORY").map(|m| parse_bytes(&m)).transpose()?.unwrap_or(DEFAULT_TEST_MEMORY),
+            max_frames: var("MARCO_MAX_FRAMES").map(|m| m.trim().parse().context("MARCO_MAX_FRAMES")).transpose()?,
+        })
     }
 
-    /// An engine for this storage: one that keeps whole files for mmap,
-    /// one with a page cache of the budget for the engine.
+    /// An engine with a page cache of the budget.
     pub fn engine(&self) -> Result<Arc<Engine>> {
         self.engine_paced(io::Rate::default())
     }
@@ -268,32 +186,24 @@ impl Storage {
     /// [`Storage::engine`] with background I/O paced at `background`
     /// (`--background-io`).
     pub fn engine_paced(&self, background: io::Rate) -> Result<Arc<Engine>> {
-        match self {
-            Storage::Mmap => Ok(Arc::new(Engine::paced(background))),
-            Storage::Engine { memory, max_frames } => {
-                let mut cfg = crate::store::engine::Config::new(*memory);
-                cfg.max_frames = *max_frames;
-                cfg.background = background;
-                // knobs for the storage measurements, not flags: the I/O pool's
-                // size (E7), and EIO on pages of a file (E6: `FILE:P,P,...`)
-                if let Some(n) = std::env::var("MARCO_IO_THREADS").ok().filter(|v| !v.trim().is_empty()) {
-                    cfg.io_threads = n.trim().parse().context("MARCO_IO_THREADS")?;
-                }
-                if let Some(f) = std::env::var("MARCO_FAULT_EIO").ok().filter(|v| !v.trim().is_empty()) {
-                    let (file, pages) = f.trim().split_once(':').context("MARCO_FAULT_EIO is FILE:P,P,...")?;
-                    let pages: Vec<u32> = pages
-                        .split(',')
-                        .map(|p| p.trim().parse())
-                        .collect::<Result<_, _>>()
-                        .context("MARCO_FAULT_EIO")?;
-                    let fault = io::Fault::new(io::default_device());
-                    fault.eio(file, pages, io::Times::Always);
-                    tracing::warn!(file, "MARCO_FAULT_EIO: reads of some of its pages fail");
-                    cfg.device = fault;
-                }
-                Ok(Arc::new(Engine::with_config(cfg)?))
-            }
+        let mut cfg = crate::store::engine::Config::new(self.memory);
+        cfg.max_frames = self.max_frames;
+        cfg.background = background;
+        // knobs for the storage measurements, not flags: the I/O pool's
+        // size, and EIO on pages of a file (`FILE:P,P,...`)
+        if let Some(n) = std::env::var("MARCO_IO_THREADS").ok().filter(|v| !v.trim().is_empty()) {
+            cfg.io_threads = n.trim().parse().context("MARCO_IO_THREADS")?;
         }
+        if let Some(f) = std::env::var("MARCO_FAULT_EIO").ok().filter(|v| !v.trim().is_empty()) {
+            let (file, pages) = f.trim().split_once(':').context("MARCO_FAULT_EIO is FILE:P,P,...")?;
+            let pages: Vec<u32> =
+                pages.split(',').map(|p| p.trim().parse()).collect::<Result<_, _>>().context("MARCO_FAULT_EIO")?;
+            let fault = io::Fault::new(io::default_device());
+            fault.eio(file, pages, io::Times::Always);
+            tracing::warn!(file, "MARCO_FAULT_EIO: reads of some of its pages fail");
+            cfg.device = fault;
+        }
+        Ok(Arc::new(Engine::with_config(cfg)?))
     }
 }
 
@@ -333,65 +243,46 @@ impl Pin {
     }
 }
 
-/// A snapshot file as a store holds it: mapped whole and kept whole in the
-/// engine, or registered with an engine that reads it a page at a time. A
-/// registered file's pinned sections are there only when the store reads
-/// them: the directory and each shard's newest file.
-pub enum StoreFile {
-    Mapped { file: MappedFile, reg: Option<Resident> },
-    Paged { file: Arc<PagedFile>, pinned: Option<Arc<PinnedSections>> },
+/// A snapshot file as a store holds it: registered with an engine that reads
+/// it a page at a time. Its pinned sections are there only when the store
+/// reads them: the directory and each shard's newest file.
+pub struct StoreFile {
+    pub file: Arc<PagedFile>,
+    pub pinned: Option<Arc<PinnedSections>>,
 }
 
 impl StoreFile {
-    /// Opens `path` the way `engine` reads: registered with it, its pinned
-    /// sections read too with `pinned`, or mapped (and kept whole in it,
-    /// with `register`).
-    fn open(path: &Path, engine: &Engine, register: bool, pinned: bool) -> Result<StoreFile> {
-        if engine.paged() {
-            let file = engine.register(path)?;
-            let pinned = match pinned {
-                true => Some(engine.pinned(&file).with_context(|| path.display().to_string())?),
-                false => None,
-            };
-            return Ok(StoreFile::Paged { file, pinned });
-        }
-        let file = MappedFile::open(path)?;
-        let reg = register.then(|| engine.add_mapped(file.name.clone(), file.map.clone(), file.footer.clone()));
-        Ok(StoreFile::Mapped { file, reg })
+    /// Registers `path` with `engine`, reading its pinned sections too with
+    /// `pinned`.
+    fn open(path: &Path, engine: &Engine, pinned: bool) -> Result<StoreFile> {
+        let file = engine.register(path)?;
+        let pinned = match pinned {
+            true => Some(engine.pinned(&file).with_context(|| path.display().to_string())?),
+            false => None,
+        };
+        Ok(StoreFile { file, pinned })
     }
 
     pub fn name(&self) -> &str {
-        match self {
-            StoreFile::Mapped { file, .. } => &file.name,
-            StoreFile::Paged { file, .. } => file.name(),
-        }
+        self.file.name()
     }
 
     pub fn footer(&self) -> &PagedFooter {
-        match self {
-            StoreFile::Mapped { file, .. } => &file.footer,
-            StoreFile::Paged { file, .. } => file.footer(),
-        }
+        self.file.footer()
     }
 
     pub fn sections(&self) -> &[PagedSection] {
         &self.footer().sections
     }
 
-    /// Its id in the engine, if it's registered there.
-    pub fn id(&self) -> Option<FileId> {
-        match self {
-            StoreFile::Mapped { reg, .. } => reg.as_ref().map(Resident::id),
-            StoreFile::Paged { file, .. } => Some(file.id()),
-        }
+    /// Its id in the engine.
+    pub fn id(&self) -> FileId {
+        self.file.id()
     }
 
     /// Bytes on disk.
     pub fn len(&self) -> u64 {
-        match self {
-            StoreFile::Mapped { file, .. } => file.len() as u64,
-            StoreFile::Paged { file, .. } => file.pages() as u64 * PAGE as u64,
-        }
+        self.file.pages() as u64 * PAGE as u64
     }
 
     pub fn is_empty(&self) -> bool {
@@ -401,10 +292,7 @@ impl StoreFile {
     /// Where pinned section `name` is.
     pub fn pin(&self, name: &str) -> Option<Pin> {
         let off = self.footer().section(name).filter(|s| !s.is_paged())?.off;
-        match self {
-            StoreFile::Mapped { file, .. } => Some(Pin { buf: 0, range: file.pinned_range(name)?, off }),
-            StoreFile::Paged { pinned, .. } => pinned.as_ref()?.at(name).map(|(buf, range)| Pin { buf, range, off }),
-        }
+        self.pinned.as_ref()?.at(name).map(|(buf, range)| Pin { buf, range, off })
     }
 
     /// A pinned section's bytes.
@@ -413,73 +301,36 @@ impl StoreFile {
         if p.range.is_empty() {
             return &[];
         }
-        match self {
-            StoreFile::Mapped { file, .. } => &file.bytes()[p.range.clone()],
-            StoreFile::Paged { pinned, .. } => {
-                &pinned.as_ref().expect("pinned sections read").buf(p.buf)[p.range.clone()]
-            }
-        }
+        &self.buf(p.buf)[p.range.clone()]
     }
 
-    /// The file's bytes, when it's mapped.
-    pub fn mapped(&self) -> Option<&[u8]> {
-        match self {
-            StoreFile::Mapped { file, .. } => Some(file.bytes()),
-            StoreFile::Paged { .. } => None,
-        }
-    }
-
-    /// Buffer `buf`'s bytes: the whole file when it's mapped.
+    /// Buffer `buf`'s bytes.
     pub fn buf(&self, buf: usize) -> &[u8] {
-        match self {
-            StoreFile::Mapped { file, .. } => file.bytes(),
-            StoreFile::Paged { pinned, .. } => pinned.as_ref().expect("pinned sections read").buf(buf),
-        }
+        self.pinned.as_ref().expect("pinned sections read").buf(buf)
     }
 
     /// Bytes its pinned sections other than the page sums hold against the
-    /// engine's budget (0 when mapped, or not read).
+    /// engine's budget (0 when not read).
     pub fn pinned_bytes(&self) -> u64 {
-        match self {
-            StoreFile::Paged { pinned: Some(p), .. } => p.borrowed(),
-            _ => 0,
-        }
+        self.pinned.as_ref().map_or(0, |p| p.borrowed())
     }
 
     /// Checks every pinned section and every page against the footer,
     /// reading the file from disk: a page that fails is marked bad (and one
     /// that reads clean loses its mark).
     pub fn verify_checksums(&self, engine: &Engine) -> Result<()> {
-        match self {
-            StoreFile::Mapped { file, .. } => file.verify_checksums(),
-            StoreFile::Paged { file: f, .. } => {
-                // every page is read, and marked, even when a pinned section fails
-                let pinned = engine.verify_pinned(f);
-                let pages = engine.verify(f);
-                pinned?;
-                match pages.into_iter().next() {
-                    Some((_, e)) => match &e {
-                        StorageError::Checksum(b) => {
-                            bail!("section {} page {}: checksum", b.section.as_deref().unwrap_or("?"), b.page)
-                        }
-                        _ => bail!("{e}"),
-                    },
-                    None => Ok(()),
+        // every page is read, and marked, even when a pinned section fails
+        let pinned = engine.verify_pinned(&self.file);
+        let pages = engine.verify(&self.file);
+        pinned?;
+        match pages.into_iter().next() {
+            Some((_, e)) => match &e {
+                StorageError::Checksum(b) => {
+                    bail!("section {} page {}: checksum", b.section.as_deref().unwrap_or("?"), b.page)
                 }
-            }
-        }
-    }
-
-    /// Maps every page in now, when it's mapped ([`MappedFile::populate`]).
-    pub fn populate(&self) {
-        if let StoreFile::Mapped { file, .. } = self {
-            file.populate();
-        }
-    }
-
-    pub fn advise_willneed(&self) {
-        if let StoreFile::Mapped { file, .. } = self {
-            file.advise_willneed();
+                _ => bail!("{e}"),
+            },
+            None => Ok(()),
         }
     }
 }
@@ -493,7 +344,7 @@ pub struct DirFile {
 
 impl DirFile {
     pub fn open(path: &Path, engine: &Engine) -> Result<DirFile> {
-        let file = StoreFile::open(path, engine, false, true)?;
+        let file = StoreFile::open(path, engine, true)?;
         if file.footer().kind != "dir" {
             bail!("{} isn't a directory file", path.display());
         }
@@ -571,7 +422,7 @@ impl ShardFile {
         for (i, name) in files.files().enumerate() {
             let p = dir.join(name);
             // only the newest file's pinned sections are the shard's
-            let file = StoreFile::open(&p, engine, true, i == last)?;
+            let file = StoreFile::open(&p, engine, i == last)?;
             let footer = file.footer();
             let meta: ShardMeta =
                 serde_json::from_value(footer.meta.clone()).with_context(|| format!("{} meta", p.display()))?;
@@ -599,7 +450,7 @@ impl ShardFile {
                     ["a patch", "the base"][parts.is_empty() as usize]
                 );
             }
-            let id = file.id().expect("a shard file is registered");
+            let id = file.id();
             parts.push(ShardPart { name: name.to_string(), file, id });
             metas.push(meta);
         }
@@ -719,14 +570,14 @@ pub struct Store {
 }
 
 impl Store {
-    /// Opens the snapshot the way [`Storage::from_env`] says, on an engine
-    /// of its own.
+    /// Opens the snapshot on an engine of its own, of the budget
+    /// [`Storage::from_env`] says.
     pub fn open(path: &Path) -> Result<Store> {
         Store::open_on(path, &Storage::from_env()?.engine()?)
     }
 
-    /// Opens the snapshot through `engine`: registered with it a page at a
-    /// time if it has a cache, else mapped whole.
+    /// Opens the snapshot through `engine`, registered with it a page at a
+    /// time.
     pub fn open_on(path: &Path, engine: &Arc<Engine>) -> Result<Store> {
         let manifest = Manifest::read(path)?;
         let dir = DirFile::open(&path.join(DIR_FILE), engine)?;
@@ -798,27 +649,9 @@ impl Store {
         m
     }
 
-    pub fn advise_willneed(&self) {
-        for (_, f) in self.files() {
-            f.advise_willneed();
-        }
-    }
-
-    /// Maps every mapped file's pages in ([`MappedFile::populate`]).
-    pub fn populate(&self) {
-        for (_, f) in self.files() {
-            f.populate();
-        }
-    }
-
-    /// The files read a page at a time.
+    /// The files, as the engine registered them.
     pub fn paged_files(&self) -> Vec<&PagedFile> {
-        self.files()
-            .filter_map(|(_, f)| match f {
-                StoreFile::Paged { file, .. } => Some(&**file),
-                StoreFile::Mapped { .. } => None,
-            })
-            .collect()
+        self.files().map(|(_, f)| &*f.file).collect()
     }
 
     /// Paged pages in the snapshot: what full residency takes.
@@ -867,8 +700,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shard_files_keep_format_5_manifests_unchanged() {
-        let json = r#"{"format":5,"build":7,"checkpoint":2,"written_ms":1,"segment":9,"shards":{"0":"shard-000-00000002.marco","1":"shard-001-00000000.marco"},"cursors":{"jetstream":"42"}}"#;
+    fn shard_files_without_patches_are_a_name() {
+        let json = r#"{"format":6,"build":7,"checkpoint":2,"written_ms":1,"segment":9,"shards":{"0":"shard-000-00000002.marco","1":"shard-001-00000000.marco"},"cursors":{"jetstream":"42"}}"#;
         let m: Manifest = serde_json::from_str(json).unwrap();
         assert_eq!(m.shards[&0], ShardFiles::base("shard-000-00000002.marco"));
         assert_eq!(serde_json::to_string(&m).unwrap(), json);

@@ -1,35 +1,34 @@
-//! Snapshot files: named sections, each 64-byte aligned and xxh3-summed,
-//! then a JSON footer (kind, meta, section table), its length as u64 and a
-//! magic. Opening is an mmap and a footer parse; nothing is read until a
-//! query touches it. A snapshot is a set of them (store.rs): one directory
-//! file and a shard file per id range.
+//! Snapshot files ([`PagedFooter`], [`PagedWriter`]): named sections, each
+//! either pinned (read whole at open, xxh3-summed) or paged (4 KiB pages,
+//! each with a seeded sum), then a JSON footer (kind, meta, section table),
+//! its length as u64 and a magic. A snapshot is a set of them (store.rs): one
+//! directory file and, per id range, a shard's base file and its patches.
 //!
-//! FORMAT 6 files ([`PagedFooter`], [`PagedWriter`]) end the same way, but
-//! each section is either pinned (read whole at open) or paged (4 KiB pages,
-//! each with a seeded sum), and a shard is a base file plus patch files.
-//!
-//! Sections (the dir.* in the directory file, the r{i}.* in each shard, for
-//! the shard's ids):
+//! The directory file's sections, all pinned:
 //!
 //! ```text
 //! dir.plc        P x 15 B   packed did:plc, sorted
+//! dir.plc.radix  radix starts over dir.plc
 //! dir.plc.ids    P x u32    id of each (absent: id = position)
 //! dir.oth.off    (M+1) x u64, dir.oth.str: other DIDs, sorted
 //! dir.oth.ids    M x u32    (absent: id = P + position)
 //! dir.byid       N x u32    id -> plc position, or 1<<31 | other position (absent: the identity)
-//! r{i}.out.dat   out logs, by actor id (outlog.rs)
-//! r{i}.out.idx   offsets into it (Index)
-//! r{i}.in.dat    in sets, by subject id (inset.rs)
-//! r{i}.in.idx
+//! ```
+//!
+//! A shard's, for its ids (the r{i}.out.* and r{i}.in.* list sections are
+//! format6.rs's):
+//!
+//! ```text
 //! r{i}.side      non-TID rkeys: sorted (actor u32, key u64, off u32), then the strings
 //! r{i}.tomb      deletes: sorted (actor u32, key u64, time_us i64)
+//! r{i}.stamp     records replaced or re-created after a delete
 //! status         actor statuses from sources: sorted (id u32, status u8)
 //! live           DIDs of the shard's ids past the directory, from live_lo up
 //! ```
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::Write;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -44,8 +43,6 @@ use crate::store::page::{page_align, page_seed, page_sum, section_tag, Page, PAG
 use crate::varint::{self, u32_at, u64_at};
 
 pub const MAGIC: &[u8; 8] = b"MARCOSN1";
-pub const FORMAT: u32 = 5;
-const ALIGN: u64 = 64;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RelStats {
@@ -87,13 +84,8 @@ pub struct Meta {
     /// Out logs this long or longer carry a by-subject index.
     pub subj_index: u32,
     pub relations: Vec<Relation>,
-    /// FORMAT 6's block layout ([`crate::format6::LAYOUT`]); FORMAT 5 has none.
-    #[serde(default, skip_serializing_if = "is_zero")]
+    /// The block layout ([`crate::format6::LAYOUT`]).
     pub layout: u32,
-}
-
-fn is_zero(v: &u32) -> bool {
-    *v == 0
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -121,99 +113,7 @@ impl ShardMeta {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SectionInfo {
-    pub name: String,
-    pub off: u64,
-    pub len: u64,
-    /// xxh3-64 of the section's bytes, checked by [`Snapshot::verify_checksums`].
-    pub xxh3: u64,
-}
-
-#[derive(Serialize, Deserialize)]
-struct Footer {
-    format: u32,
-    kind: String,
-    meta: serde_json::Value,
-    sections: Vec<SectionInfo>,
-}
-
-pub struct Writer {
-    f: BufWriter<File>,
-    pos: u64,
-    sections: Vec<SectionInfo>,
-    open: Option<(String, u64)>,
-    hasher: xxhash_rust::xxh3::Xxh3,
-    tmp: PathBuf,
-    path: PathBuf,
-}
-
-impl Writer {
-    /// Writes to a temp file beside `path`; `finish` renames it into place.
-    pub fn create(path: &Path) -> Result<Writer> {
-        let tmp = temp_path(path)?;
-        let f = File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
-        Ok(Writer {
-            f: BufWriter::with_capacity(8 << 20, f),
-            pos: 0,
-            sections: Vec::new(),
-            open: None,
-            hasher: xxhash_rust::xxh3::Xxh3::new(),
-            tmp,
-            path: path.to_path_buf(),
-        })
-    }
-
-    pub fn begin(&mut self, name: &str) {
-        assert!(self.open.is_none(), "section {name} begun inside another");
-        self.open = Some((name.to_string(), self.pos));
-        self.hasher.reset();
-    }
-
-    pub fn write(&mut self, b: &[u8]) -> Result<()> {
-        self.f.write_all(b)?;
-        self.pos += b.len() as u64;
-        if self.open.is_some() {
-            self.hasher.update(b);
-        }
-        Ok(())
-    }
-
-    /// Bytes written to the open section so far.
-    pub fn section_len(&self) -> u64 {
-        self.open.as_ref().map(|(_, s)| self.pos - s).unwrap_or(0)
-    }
-
-    pub fn end(&mut self) -> Result<u64> {
-        let (name, start) = self.open.take().expect("no open section");
-        let len = self.pos - start;
-        self.sections.push(SectionInfo { name, off: start, len, xxh3: self.hasher.digest() });
-        let pad = (ALIGN - self.pos % ALIGN) % ALIGN;
-        self.write(&vec![0u8; pad as usize])?;
-        Ok(len)
-    }
-
-    pub fn section(&mut self, name: &str, b: &[u8]) -> Result<()> {
-        self.begin(name);
-        self.write(b)?;
-        self.end()?;
-        Ok(())
-    }
-
-    pub fn finish(mut self, kind: &str, meta: &impl Serialize) -> Result<Vec<SectionInfo>> {
-        let footer = serde_json::to_vec(&Footer {
-            format: FORMAT,
-            kind: kind.into(),
-            meta: serde_json::to_value(meta)?,
-            sections: self.sections.clone(),
-        })?;
-        self.f.write_all(&footer)?;
-        self.f.write_all(&(footer.len() as u64).to_le_bytes())?;
-        self.f.write_all(MAGIC)?;
-        commit(self.f, &self.tmp, &self.path)?;
-        Ok(self.sections)
-    }
-}
+// ---------------------------------------------------------------- directory
 
 /// A temp file name beside `path`, unique to this process and moment.
 fn temp_path(path: &Path) -> Result<PathBuf> {
@@ -222,380 +122,6 @@ fn temp_path(path: &Path) -> Result<PathBuf> {
     name.push(format!(".tmp.{}.{nanos}", std::process::id()));
     Ok(path.with_file_name(name))
 }
-
-/// Flushes and fsyncs `f`, renames `tmp` to `path` and fsyncs the directory.
-fn commit(f: BufWriter<File>, tmp: &Path, path: &Path) -> Result<()> {
-    let f = f.into_inner().map_err(|e| e.into_error())?;
-    f.sync_all()?;
-    std::fs::rename(tmp, path)?;
-    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
-    File::open(parent)?.sync_all()?;
-    Ok(())
-}
-
-pub enum Bytes {
-    Map(memmap2::Mmap),
-    /// A mapping other owners read too: a FORMAT 6 file's pinned sections
-    /// are read from the same mapping the engine serves its pages from.
-    Shared(Arc<memmap2::Mmap>),
-    Owned(Vec<u8>),
-}
-
-impl std::ops::Deref for Bytes {
-    type Target = [u8];
-    fn deref(&self) -> &[u8] {
-        match self {
-            Bytes::Map(m) => m,
-            Bytes::Shared(m) => m,
-            Bytes::Owned(v) => v,
-        }
-    }
-}
-
-static MMAP_RANDOM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Snapshots opened after this call map their files with MADV_RANDOM, so a
-/// fault reads its own page and no readahead around it. Off by default.
-pub fn set_mmap_random(on: bool) {
-    MMAP_RANDOM.store(on, std::sync::atomic::Ordering::Relaxed);
-}
-
-pub(crate) fn mmap_random() -> bool {
-    MMAP_RANDOM.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-pub struct Snapshot {
-    bytes: Bytes,
-    pub kind: String,
-    pub meta: serde_json::Value,
-    pub sections: Vec<SectionInfo>,
-    by_name: HashMap<String, Range<usize>>,
-}
-
-impl Snapshot {
-    pub fn open(path: &Path) -> Result<Snapshot> {
-        let f = File::open(path).with_context(|| format!("open {}", path.display()))?;
-        // SAFETY: snapshot files are written once and renamed into place; nothing
-        // writes to one after that.
-        let map = unsafe { memmap2::Mmap::map(&f)? };
-        #[cfg(unix)]
-        if mmap_random() {
-            map.advise(memmap2::Advice::Random).context("madvise(MADV_RANDOM)")?;
-        }
-        Snapshot::from_bytes(Bytes::Map(map))
-    }
-
-    pub fn from_bytes(bytes: Bytes) -> Result<Snapshot> {
-        let n = bytes.len();
-        if n < 16 || &bytes[n - 8..] != MAGIC {
-            bail!("not a marco snapshot");
-        }
-        let flen = u64_at(&bytes, n - 16) as usize;
-        if flen + 16 > n {
-            bail!("snapshot footer out of range");
-        }
-        let footer: serde_json::Value =
-            serde_json::from_slice(&bytes[n - 16 - flen..n - 16]).context("snapshot footer")?;
-        let format = footer.get("format").and_then(|f| f.as_u64()).unwrap_or(0);
-        if format != FORMAT as u64 {
-            bail!("snapshot format {format}, this build reads {FORMAT}: rebuild the snapshot");
-        }
-        let footer: Footer = serde_json::from_value(footer).context("snapshot footer")?;
-        let mut by_name = HashMap::new();
-        for s in &footer.sections {
-            let r = s.off as usize..(s.off + s.len) as usize;
-            if r.end > n - 16 - flen {
-                bail!("section {} out of range", s.name);
-            }
-            by_name.insert(s.name.clone(), r);
-        }
-        Ok(Snapshot { bytes, kind: footer.kind, meta: footer.meta, sections: footer.sections, by_name })
-    }
-
-    pub fn len(&self) -> usize {
-        self.bytes.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.bytes.is_empty()
-    }
-
-    pub fn range(&self, name: &str) -> Option<Range<usize>> {
-        self.by_name.get(name).cloned()
-    }
-
-    pub fn bytes(&self) -> &[u8] {
-        &self.bytes
-    }
-
-    /// Hashes every section and compares it with the footer: catches a
-    /// truncated copy or a bad disk. Reads the whole file.
-    pub fn verify_checksums(&self) -> Result<()> {
-        for s in &self.sections {
-            let r = &self.by_name[&s.name];
-            let h = xxhash_rust::xxh3::xxh3_64(&self.bytes[r.clone()]);
-            if h != s.xxh3 {
-                bail!("section {} checksum {h:016x}, footer says {:016x}", s.name, s.xxh3);
-            }
-        }
-        Ok(())
-    }
-
-    /// Maps every page of the file into this process now (MADV_POPULATE_READ),
-    /// reading what isn't cached: later reads take no page faults.
-    pub fn populate(&self) {
-        #[cfg(target_os = "linux")]
-        if let Bytes::Map(m) = &self.bytes {
-            let _ = m.advise(memmap2::Advice::PopulateRead);
-        }
-    }
-
-    /// Asks the kernel to read the whole file ahead (MADV_WILLNEED).
-    pub fn advise_willneed(&self) {
-        if let Bytes::Map(m) = &self.bytes {
-            let _ = m.advise(memmap2::Advice::WillNeed);
-        }
-    }
-}
-
-// ---------------------------------------------------------------- offsets
-
-/// Offsets for ids 0..=n, in one of two forms whose lengths tell them apart.
-/// Dense: the offsets [`Packed`]. Sparse, when it's at most half of dense (a
-/// relation most ids have no list in, like blocks or lists): a bitmap of the
-/// ids with a list (u64 words), a u32 rank per 512 ids (the set bits before
-/// them), the c + 1 starts of those lists [`Packed`], then u32 c. Either way
-/// a lookup is a few loads, no search.
-pub fn encode_index(offsets: &[u64]) -> Result<Vec<u8>> {
-    let Some(n) = offsets.len().checked_sub(1) else {
-        return Ok(Vec::new());
-    };
-    let present: Vec<usize> = (0..n).filter(|&i| offsets[i + 1] > offsets[i]).collect();
-    let c = present.len();
-    // the bitmap costs a load per lookup, worth it only where it saves most of dense's bytes
-    if 2 * sparse_len(n, c) <= packed_len(n + 1) {
-        // packed starts span 128 lists, not 128 ids: when they can't, dense may still fit
-        if let Some(out) = encode_sparse(offsets, &present) {
-            return Ok(out);
-        }
-    }
-    let mut out = Vec::with_capacity(packed_len(n + 1));
-    if let Err(i) = encode_packed(offsets, &mut out) {
-        bail!("the lists of ids {}..={i} are over 4 GiB", i / 128 * 128);
-    }
-    Ok(out)
-}
-
-fn encode_sparse(offsets: &[u64], present: &[usize]) -> Option<Vec<u8>> {
-    let (n, c) = (offsets.len() - 1, present.len());
-    let mut bits = vec![0u64; n.div_ceil(64)];
-    for &i in present {
-        bits[i / 64] |= 1 << (i % 64);
-    }
-    let mut out = Vec::with_capacity(sparse_len(n, c));
-    for w in &bits {
-        out.extend_from_slice(&w.to_le_bytes());
-    }
-    let mut rank = 0u32;
-    for block in bits.chunks(8) {
-        out.extend_from_slice(&rank.to_le_bytes());
-        rank += block.iter().map(|w| w.count_ones()).sum::<u32>();
-    }
-    let starts: Vec<u64> = present.iter().map(|&i| offsets[i]).chain([offsets[n]]).collect();
-    encode_packed(&starts, &mut out).ok()?;
-    out.extend_from_slice(&(c as u32).to_le_bytes());
-    Some(out)
-}
-
-fn packed_len(m: usize) -> usize {
-    8 * m.div_ceil(128) + 4 * m
-}
-
-fn sparse_len(n: usize, c: usize) -> usize {
-    8 * n.div_ceil(64) + 4 * n.div_ceil(512) + packed_len(c + 1) + 4
-}
-
-/// Ascending offsets as a u64 base per 128, then a u32 each from its base:
-/// half the bytes of plain u64s. Err(i): offset i is over 4 GiB past its base.
-fn encode_packed(offsets: &[u64], out: &mut Vec<u8>) -> std::result::Result<(), usize> {
-    for g in 0..offsets.len().div_ceil(128) {
-        out.extend_from_slice(&offsets[g * 128].to_le_bytes());
-    }
-    for (i, &o) in offsets.iter().enumerate() {
-        let rel = o - offsets[i / 128 * 128];
-        if rel > u32::MAX as u64 {
-            return Err(i);
-        }
-        out.extend_from_slice(&(rel as u32).to_le_bytes());
-    }
-    Ok(())
-}
-
-#[derive(Clone, Copy)]
-pub struct Packed<'a> {
-    bases: &'a [u8],
-    rels: &'a [u8],
-}
-
-impl<'a> Packed<'a> {
-    fn parse(b: &'a [u8], m: usize) -> Option<Packed<'a>> {
-        let (bases, rels) = b.split_at_checked(8 * m.div_ceil(128))?;
-        (rels.len() == 4 * m).then_some(Packed { bases, rels })
-    }
-
-    #[inline]
-    fn at(&self, i: usize) -> usize {
-        u64_at(self.bases, 8 * (i / 128)).wrapping_add(u32_at(self.rels, 4 * i) as u64) as usize
-    }
-}
-
-#[derive(Clone, Copy)]
-pub enum Index<'a> {
-    Dense { offsets: Packed<'a>, n: usize },
-    Sparse { bits: &'a [u8], ranks: &'a [u8], starts: Packed<'a>, n: usize, c: usize },
-}
-
-impl<'a> Index<'a> {
-    /// An index over ids 0..n, None if its length is neither form's.
-    pub fn parse(bytes: &'a [u8], n: usize) -> Option<Index<'a>> {
-        if let Some(offsets) = Packed::parse(bytes, n + 1) {
-            return Some(Index::Dense { offsets, n });
-        }
-        let (rest, c) = bytes.split_last_chunk::<4>()?;
-        let c = u32::from_le_bytes(*c) as usize;
-        if c > n || bytes.len() != sparse_len(n, c) {
-            return None;
-        }
-        let (bits, rest) = rest.split_at(8 * n.div_ceil(64));
-        let (ranks, rest) = rest.split_at(4 * n.div_ceil(512));
-        Some(Index::Sparse { bits, ranks, starts: Packed::parse(rest, c + 1)?, n, c })
-    }
-
-    /// The byte range of `id`'s list, None if it has none.
-    #[inline]
-    pub fn range(&self, id: u32) -> Option<Range<usize>> {
-        let i = id as usize;
-        match *self {
-            Index::Dense { offsets, n } => {
-                if i >= n {
-                    return None;
-                }
-                let (a, b) = (offsets.at(i), offsets.at(i + 1));
-                (b > a).then_some(a..b)
-            }
-            Index::Sparse { bits, ranks, starts, n, c } => {
-                if i >= n {
-                    return None;
-                }
-                let w = u64_at(bits, 8 * (i / 64));
-                if w >> (i % 64) & 1 == 0 {
-                    return None;
-                }
-                // sections are 64-byte aligned, so a rank's 8 words are one cache line
-                let mut r = u32_at(ranks, 4 * (i / 512)) as usize + (w & ((1 << (i % 64)) - 1)).count_ones() as usize;
-                for k in i / 512 * 8..i / 64 {
-                    r += u64_at(bits, 8 * k).count_ones() as usize;
-                }
-                // a bitmap with more bits than c, or starts out of order, is malformed:
-                // no list, not a panic
-                if r >= c {
-                    return None;
-                }
-                let (a, b) = (starts.at(r), starts.at(r + 1));
-                (b > a).then_some(a..b)
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-mod index_tests {
-    use super::*;
-
-    fn offsets(n: usize, has: impl Fn(u64) -> bool) -> Vec<u64> {
-        offsets_with(n, |i| if has(i) { 1 + i % 7 } else { 0 })
-    }
-
-    fn offsets_with(n: usize, len: impl Fn(u64) -> u64) -> Vec<u64> {
-        let mut o = vec![0u64];
-        for i in 0..n as u64 {
-            o.push(o.last().unwrap() + len(i));
-        }
-        o
-    }
-
-    fn check(o: &[u64], ix: &Index) {
-        let n = o.len() - 1;
-        for i in 0..n + 2 {
-            let want = (i < n && o[i + 1] > o[i]).then(|| o[i] as usize..o[i + 1] as usize);
-            assert_eq!(ix.range(i as u32), want, "id {i}");
-        }
-    }
-
-    #[test]
-    fn dense_and_sparse_find_the_same_lists() {
-        for every in [1u64, 2, 3, 40, 1000] {
-            for n in [0usize, 1, 63, 64, 65, 511, 512, 513, 5000] {
-                let o = offsets(n, |i| i % every == 0);
-                let b = encode_index(&o).unwrap();
-                let ix = Index::parse(&b, n).unwrap();
-                if n >= 512 {
-                    assert_eq!(matches!(ix, Index::Sparse { .. }), every >= 3, "every {every} n {n}");
-                }
-                check(&o, &ix);
-                assert!(Index::parse(&b[..b.len() - 1], n).is_none(), "a short index is refused");
-            }
-        }
-        // runs that fill whole words and blocks, and ids on their edges
-        let o = offsets(5000, |i| (600..1700).contains(&i) || i % 512 == 511 || i % 64 == 0);
-        let b = encode_index(&o).unwrap();
-        let ix = Index::parse(&b, 5000).unwrap();
-        assert!(matches!(ix, Index::Sparse { .. }));
-        check(&o, &ix);
-        assert!(Index::parse(&[1, 0], 10).is_none());
-        assert!(Index::parse(&[], 10).is_none());
-    }
-
-    #[test]
-    fn sparse_falls_back_to_dense_when_its_starts_cannot_pack() {
-        // a 40 MB list every 128 ids: dense's 128 ids hold one list, sparse's 128 starts 5 GB
-        let n = 25_600;
-        let o = offsets_with(n, |i| if i % 128 == 0 { 40 << 20 } else { 0 });
-        assert!(2 * sparse_len(n, n / 128) <= packed_len(n + 1));
-        let b = encode_index(&o).unwrap();
-        let ix = Index::parse(&b, n).unwrap();
-        assert!(matches!(ix, Index::Dense { .. }));
-        check(&o, &ix);
-        let o = offsets_with(300, |i| if i == 5 { 5 << 30 } else { 1 });
-        let e = encode_index(&o).unwrap_err().to_string();
-        assert!(e.contains("ids 0..=6"), "{e}");
-    }
-
-    #[test]
-    fn a_bad_sparse_index_finds_nothing_rather_than_panic() {
-        let n = 5000;
-        let o = offsets(n, |i| i % 40 == 0);
-        let mut b = encode_index(&o).unwrap();
-        let c = u32::from_le_bytes(b[b.len() - 4..].try_into().unwrap());
-        assert_eq!(c, 125);
-        let mut reversed = b.clone();
-        let rels = 8 * n.div_ceil(64) + 4 * n.div_ceil(512) + 8 * (c as usize + 1).div_ceil(128);
-        reversed[rels..rels + 8].copy_from_slice(&[0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0]);
-        let ix = Index::parse(&reversed, n).unwrap();
-        assert_eq!(ix.range(0), None, "starts out of order");
-        assert_eq!(ix.range(80), Some(o[80] as usize..o[81] as usize));
-        let mut longer = b.clone();
-        longer.splice(longer.len() - 4.., (c + 1).to_le_bytes());
-        assert!(Index::parse(&longer, n).is_none(), "a c the length doesn't fit");
-        b[..8 * n.div_ceil(64)].fill(0xff);
-        b[8 * n.div_ceil(64)..8 * n.div_ceil(64) + 4 * n.div_ceil(512)].fill(0);
-        let ix = Index::parse(&b, n).unwrap();
-        let found = (0..n as u32 + 2).filter(|&i| ix.range(i).is_some()).count();
-        assert!(found > 0 && found < n, "{found}");
-    }
-}
-
-// ---------------------------------------------------------------- directory
 
 pub struct DirParts<'a> {
     /// Sorted, unique.
@@ -606,62 +132,18 @@ pub struct DirParts<'a> {
     pub ids: Option<(&'a [u32], &'a [u32])>,
 }
 
-/// Where [`write_directory`] puts its sections: a FORMAT 5 [`Writer`], or a
-/// FORMAT 6 [`PagedWriter`], where every directory section is pinned.
-pub trait SectionSink {
-    fn begin(&mut self, name: &str) -> Result<()>;
-    fn write(&mut self, b: &[u8]) -> Result<()>;
-    fn end(&mut self) -> Result<u64>;
-
-    fn section(&mut self, name: &str, b: &[u8]) -> Result<()> {
-        self.begin(name)?;
-        self.write(b)?;
-        self.end()?;
-        Ok(())
-    }
-}
-
-impl SectionSink for Writer {
-    fn begin(&mut self, name: &str) -> Result<()> {
-        Writer::begin(self, name);
-        Ok(())
-    }
-
-    fn write(&mut self, b: &[u8]) -> Result<()> {
-        Writer::write(self, b)
-    }
-
-    fn end(&mut self) -> Result<u64> {
-        Writer::end(self)
-    }
-}
-
-impl SectionSink for PagedWriter {
-    fn begin(&mut self, name: &str) -> Result<()> {
-        self.begin_pinned(name)
-    }
-
-    fn write(&mut self, b: &[u8]) -> Result<()> {
-        self.write_pinned(b)
-    }
-
-    fn end(&mut self) -> Result<u64> {
-        self.end_pinned()
-    }
-}
-
-pub fn write_directory(w: &mut impl SectionSink, d: &DirParts) -> Result<()> {
-    w.begin("dir.plc")?;
+pub fn write_directory(w: &mut PagedWriter, d: &DirParts) -> Result<()> {
+    w.begin_pinned("dir.plc")?;
     let mut buf = Vec::with_capacity(1 << 20);
     for chunk in d.plc.chunks(1 << 16) {
         buf.clear();
         for &v in chunk {
             buf.extend_from_slice(&plc_to_bytes(v));
         }
-        w.write(&buf)?;
+        w.write_pinned(&buf)?;
     }
-    w.end()?;
-    w.section("dir.plc.radix", &encode_radix(d.plc))?;
+    w.end_pinned()?;
+    w.pinned("dir.plc.radix", &encode_radix(d.plc))?;
     let mut off = Vec::with_capacity(8 * (d.other.len() + 1));
     let mut strs = Vec::new();
     for s in d.other {
@@ -669,8 +151,8 @@ pub fn write_directory(w: &mut impl SectionSink, d: &DirParts) -> Result<()> {
         strs.extend_from_slice(s.as_bytes());
     }
     off.extend_from_slice(&(strs.len() as u64).to_le_bytes());
-    w.section("dir.oth.off", &off)?;
-    w.section("dir.oth.str", &strs)?;
+    w.pinned("dir.oth.off", &off)?;
+    w.pinned("dir.oth.str", &strs)?;
     if let Some((plc_ids, oth_ids)) = d.ids {
         let n = d.plc.len() + d.other.len();
         let mut byid = vec![u32::MAX; n];
@@ -684,9 +166,9 @@ pub fn write_directory(w: &mut impl SectionSink, d: &DirParts) -> Result<()> {
             bail!("directory ids aren't dense");
         }
         let le = |v: &[u32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
-        w.section("dir.plc.ids", &le(plc_ids))?;
-        w.section("dir.oth.ids", &le(oth_ids))?;
-        w.section("dir.byid", &le(&byid))?;
+        w.pinned("dir.plc.ids", &le(plc_ids))?;
+        w.pinned("dir.oth.ids", &le(oth_ids))?;
+        w.pinned("dir.byid", &le(&byid))?;
     }
     Ok(())
 }
@@ -715,10 +197,6 @@ pub struct DirRanges {
 }
 
 impl DirRanges {
-    pub fn new(s: &Snapshot) -> DirRanges {
-        DirRanges::by(|name| s.range(name))
-    }
-
     /// The sections where `range` says they are in the file.
     pub fn by(range: impl Fn(&str) -> Option<Range<usize>>) -> DirRanges {
         DirRanges {
@@ -752,14 +230,6 @@ pub enum DidAt<'a> {
 }
 
 impl<'a> BaseDir<'a> {
-    pub fn new(s: &'a Snapshot) -> BaseDir<'a> {
-        BaseDir::with(s, &DirRanges::new(s))
-    }
-
-    pub fn with(s: &'a Snapshot, r: &DirRanges) -> BaseDir<'a> {
-        BaseDir::over(s.bytes(), r)
-    }
-
     /// The directory in the file `b`, its sections at `r`.
     pub fn over(b: &'a [u8], r: &DirRanges) -> BaseDir<'a> {
         let opt = |r: &Option<Range<usize>>| r.clone().map(|r| &b[r]);
@@ -1019,12 +489,10 @@ pub fn decode_live(b: &[u8]) -> Result<Vec<crate::did::DidKey>> {
 
 // ---------------------------------------------------------------- FORMAT 6 files
 
-/// The format of paged files ([`PagedFooter`]): what marco serves and writes.
-/// [`FORMAT`] is the one before it, which only `marco-load build --format 5`
-/// writes and `compare6` reads.
+/// The format of snapshot files ([`PagedFooter`]): what marco serves and writes.
 pub const PAGED_FORMAT: u32 = 6;
 
-/// Pinned sections start on a multiple of this, as FORMAT 5's sections do.
+/// Pinned sections start on a multiple of this.
 pub const PINNED_ALIGN: u64 = 64;
 
 /// The trailer every snapshot file ends with: the footer's length as u64,
@@ -1117,13 +585,12 @@ pub fn sums_section(name: &str) -> String {
 /// sits before the JSON so the trailer ends the last page. An `O_DIRECT`
 /// reader reads the last page, gets the footer's range from
 /// [`PagedFooter::footer_range`], reads the pages that hold it and calls
-/// [`PagedFooter::parse`]. FORMAT 5's reader takes the same trailer, so it
-/// fails on a FORMAT 6 file with "snapshot format 6".
+/// [`PagedFooter::parse`].
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PagedFooter {
     /// Always [`PAGED_FORMAT`].
     pub format: u32,
-    /// "dir" or "shard", as in FORMAT 5.
+    /// "dir" or "shard".
     pub kind: String,
     pub file: FileKind,
     /// Random per file: seeds its page sums, and names the base a patch is
@@ -1728,9 +1195,6 @@ mod paged_tests {
             page_sum(bytes[(first as usize + 1) * PAGE..][..PAGE].try_into().unwrap(), footer.seed(small, first + 1))
         );
 
-        // FORMAT 5's reader refuses it by format
-        let e = Snapshot::from_bytes(Bytes::Owned(bytes.clone())).err().unwrap().to_string();
-        assert!(e.contains("snapshot format 6"), "{e}");
         let mut flipped = bytes.clone();
         flipped[(first as usize + 2) * PAGE + 100] ^= 1;
         let e = footer.verify(&flipped).unwrap_err().to_string();

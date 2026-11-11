@@ -1,25 +1,25 @@
-//! FORMAT 6 shard layout: where a relation's lists go in a shard file, and
+//! The shard layout: where a relation's lists go in a shard file, and
 //! the pieces every reader and writer of it shares.
 //!
 //! Per relation `r{i}`, both directions:
 //!
 //! ```text
-//! out.small   paged   lists of at most WHOLE records, whole (FORMAT 5 bytes), none crossing a page
+//! out.small   paged   lists of at most WHOLE records, whole (outlog.rs's list bytes), none crossing a page
 //! out.subj    paged   big lists' subject blocks: k x u32
 //! out.rkey    paged   big lists' rkey blocks: k - 1 varint deltas from the block's first rkey (in the head)
 //! out.bysubj  paged   by-subject blocks of lists of at least subj_index records:
 //!                     k x u32 positions, then Elias-Fano of their subjects (inset's block codec)
 //! out.head    pinned  big lists' heads (outlog::SplitOut)
 //! out.idx     pinned  an entry per id (Entries)
-//! in.small    paged   sets of at most WHOLE members, whole (FORMAT 5 bytes)
-//! in.blocks   paged   big sets' Elias-Fano blocks (FORMAT 5's)
+//! in.small    paged   sets of at most WHOLE members, whole (inset.rs's set bytes)
+//! in.blocks   paged   big sets' Elias-Fano blocks (inset's block codec)
 //! in.head     pinned  big sets' heads (inset::SplitIn)
 //! in.idx      pinned
-//! side, tomb, stamp   pinned, FORMAT 5 bytes
+//! side, tomb, stamp   pinned (snapshot.rs)
 //! ```
 //!
-//! and per shard `status` and `live`, pinned, FORMAT 5 bytes. The directory
-//! file keeps FORMAT 5's sections, all pinned.
+//! and per shard `status` and `live`, pinned (snapshot.rs). The directory
+//! file's sections are all pinned.
 //!
 //! A block never crosses a page. Offsets into a paged section count bytes in
 //! the shard's space for that section name: the base's pages, then each
@@ -1354,9 +1354,9 @@ mod tests {
     }
 
     /// A shard written through OutSections and InSections with the paged
-    /// writer reads back as FORMAT 5's codecs say, list by list.
+    /// writer reads back as the list codecs say, list by list.
     #[test]
-    fn a_shard_reads_back_as_format_5() {
+    fn a_shard_reads_back_as_written() {
         shard_round_trip(None);
     }
 
@@ -1456,8 +1456,8 @@ mod tests {
         assert!(bytes.total() <= layout.paged_used + layout.head_bytes);
 
         let e = Engine::new();
-        let (fid, footer) = e.open(&p).unwrap();
-        assert_eq!(read_footer(&p).unwrap(), footer);
+        let footer = read_footer(&p).unwrap();
+        let fid = e.add("shard-000-00000000.marco", file.clone());
         let pinned = Pinned::read(&p, &footer).unwrap();
         assert_eq!(pinned.get("r0.out.idx"), Pinned::from_bytes(&footer, &file).unwrap().get("r0.out.idx"));
         assert!(pinned.has("r0.out.rkey.sums") && !pinned.has("r0.out.rkey"));

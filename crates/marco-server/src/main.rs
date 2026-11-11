@@ -39,12 +39,6 @@ enum Cmd {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
-enum MmapAdvice {
-    Default,
-    Random,
-}
-
 #[derive(Args)]
 struct Serve {
     /// The snapshot directory (marco-load build's --out).
@@ -140,18 +134,11 @@ struct Serve {
     /// checkpoint writes, verify and list stats. Requests always go first.
     #[arg(long, env = "MARCO_BACKGROUND_IO", default_value = "200,5000", value_parser = parse_rate)]
     background_io: marco_core::store::io::Rate,
-    /// Don't map the snapshot's pages in after open (they then fault in as reads touch them). On
-    /// --storage engine: don't load every page at open when --memory holds them all.
-    #[arg(long, env = "MARCO_NO_PREFAULT")]
-    no_prefault: bool,
-    /// How the snapshot is read: mmap (the kernel's page cache) or engine (O_DIRECT into a cache
-    /// of --memory bytes, every page checked against its sum).
-    #[arg(long, env = "MARCO_STORAGE", default_value = "mmap", value_parser = ["mmap", "engine"])]
-    storage: String,
-    /// The engine's budget: its pinned sections, page cache and tables (44GiB, 13GiB, 6G). It
-    /// must hold the pinned tier plus 2 GiB; the graph's deltas and the process live outside it.
-    #[arg(long, env = "MARCO_MEMORY", required_if_eq("storage", "engine"))]
-    memory: Option<String>,
+    /// The store's budget: its pinned sections, page cache and tables (44GiB, 13GiB, 6G). Pages are
+    /// read with O_DIRECT into the cache, every one checked against its sum. It must hold the pinned
+    /// tier plus 2 GiB; the graph's deltas and the process live outside it.
+    #[arg(long, env = "MARCO_MEMORY")]
+    memory: String,
     /// The process's memory limit (8GiB; "none" for none). The store gives back cache to keep the process
     /// under it: what the graph's deltas, a checkpoint and requests take beside --memory, past what the limit
     /// leaves less 512 MiB, comes out of the cache. Default: the cgroup's memory.max.
@@ -164,9 +151,6 @@ struct Serve {
     /// for tests that want a starved cache.
     #[arg(long, env = "MARCO_MAX_FRAMES", hide = true)]
     max_frames: Option<u32>,
-    /// madvise for the snapshot's mappings (--storage mmap): `random` turns off the kernel's readahead around a fault.
-    #[arg(long, env = "MARCO_MMAP_ADVICE", value_enum, default_value = "default")]
-    mmap_advice: MmapAdvice,
     /// Follow a Jetstream instance (wss://host or wss://host/subscribe) for the relations' collections.
     #[arg(long, env = "MARCO_JETSTREAM", conflicts_with = "firehose")]
     jetstream: Option<String>,
@@ -215,12 +199,9 @@ fn flags(m: &ArgMatches, s: &Serve) -> Vec<FlagInfo> {
         ("compaction_ratio", s.compaction_ratio.to_string()),
         ("compaction_min_garbage_mb", s.compaction_min_garbage_mb.to_string()),
         ("background_io", format!("{},{}", s.background_io.bytes_per_s / 1_000_000, s.background_io.ops_per_s)),
-        ("no_prefault", s.no_prefault.to_string()),
-        ("storage", s.storage.clone()),
-        ("memory", s.memory.clone().unwrap_or_else(|| "—".into())),
+        ("memory", s.memory.clone()),
         ("memory_limit", s.memory_limit.clone().unwrap_or_else(|| "cgroup".into())),
         ("miss_threads", s.miss_threads.to_string()),
-        ("mmap_advice", format!("{:?}", s.mmap_advice).to_lowercase()),
         ("jetstream", s.jetstream.clone().unwrap_or_else(|| "—".into())),
         ("firehose", s.firehose.clone().unwrap_or_else(|| "—".into())),
         ("source_retention_hours", s.source_retention_hours.to_string()),
@@ -331,13 +312,9 @@ fn main() -> Result<()> {
             if source.is_some() && s.read_only {
                 bail!("--read-only can't follow a source");
             }
-            let storage = match (s.storage.as_str(), &s.memory) {
-                ("engine", Some(m)) => marco_core::store::Storage::Engine {
-                    memory: marco_core::store::parse_bytes(m).context("--memory")?,
-                    max_frames: s.max_frames,
-                },
-                ("engine", None) => bail!("--storage engine needs --memory"),
-                _ => marco_core::store::Storage::Mmap,
+            let storage = marco_core::store::Storage {
+                memory: marco_core::store::parse_bytes(&s.memory).context("--memory")?,
+                max_frames: s.max_frames,
             };
             let memory_limit = match s.memory_limit.as_deref() {
                 Some("none") => None,
@@ -361,7 +338,6 @@ fn main() -> Result<()> {
                 checkpoint_ops: s.checkpoint_ops,
                 checkpoint_age: std::time::Duration::from_secs_f64(s.checkpoint_age),
                 serve_before_ready: s.serve_before_ready,
-                prefault: !s.no_prefault,
                 compaction: marco_core::CompactPolicy {
                     ratio: s.compaction_ratio.max(0.0),
                     min_garbage: s.compaction_min_garbage_mb << 20,
@@ -379,10 +355,8 @@ fn main() -> Result<()> {
                 handle_resolver: origin("--handle-resolver", s.handle_resolver.as_deref())?,
             };
             let ui = Arc::new(marco_server::ui::Ui::load_with(s.ui_dir.as_deref(), site)?);
-            let random = s.mmap_advice == MmapAdvice::Random;
             let rt = marco_server::runtime(None)?;
             rt.block_on(async move {
-                marco_core::snapshot::set_mmap_random(random);
                 let app = App::open(cfg)?;
                 let (api, admin) = marco_server::serve(app.clone(), ui).await?;
                 if let Some(ops) = marco_server::serve_ops(&app).await? {

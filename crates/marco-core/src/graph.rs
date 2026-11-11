@@ -283,8 +283,8 @@ impl Graph {
         }
     }
 
-    /// Opens the snapshot at `path` the way [`crate::store::Storage::from_env`]
-    /// says, on an engine of its own.
+    /// Opens the snapshot at `path` on an engine of its own, of the budget
+    /// [`crate::store::Storage::from_env`] says.
     pub fn open(path: &Path) -> Result<Graph> {
         Graph::open_on(path, &crate::store::Storage::from_env()?.engine()?)
     }
