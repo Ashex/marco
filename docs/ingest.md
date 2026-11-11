@@ -159,8 +159,8 @@ server says are handled:
 - **`CursorTooOld`.** The instance refuses a seq below its retention floor before the upgrade,
   because the events between are gone. marco ends that source rather than jump to the tip: the
   state is `cursor_too_old`, `marco_ingest_cursor_too_old_total` counts it, the error is logged
-  with the server's reply, and marco stays not ready. Rebuild the snapshot. marco doesn't
-  backfill from the instance's archive.
+  with the server's reply, and marco stays not ready. Rebuild the snapshot: `marco-load
+  scan-jetstream` builds one from the instance's archive, stamped with a seq this source resumes from.
 - **`#info`.** `OutdatedCursor` (a time cursor was clamped up to the instance's oldest event, so
   events may be missing) and `FutureCursor` (a seq beyond the tip, as after the instance was
   reset: events at or below the saved seq are dropped until the tip passes it, so a source stuck

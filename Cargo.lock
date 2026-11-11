@@ -1789,6 +1789,7 @@ dependencies = [
  "toml",
  "uuid",
  "vlatproto",
+ "xxhash-rust",
  "zstd",
 ]
 

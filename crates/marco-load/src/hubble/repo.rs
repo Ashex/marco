@@ -49,7 +49,7 @@ pub struct RepoRows {
 /// Why a whole repo was skipped.
 pub type Bad = &'static str;
 
-fn path_of<'a>(record: &ValueRef<'a>, path: &str) -> Option<&'a str> {
+pub(crate) fn path_of<'a>(record: &ValueRef<'a>, path: &str) -> Option<&'a str> {
     path.split('.').try_fold(record, |v, k| v.get(k))?.as_str()
 }
 

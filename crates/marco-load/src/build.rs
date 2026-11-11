@@ -159,6 +159,63 @@ pub fn build_scanned(
 /// The input directory's cursors file.
 pub const CURSORS: &str = "cursors.json";
 
+/// The input directory's optional account events: rows of (did String,
+/// time_us Int64, event UInt8), the event 0 active, 1 deleted, 2 takendown,
+/// 3 reset (a resync: the repo's records before it are gone).
+pub const ACCOUNTS: &str = "accounts.rb.zst";
+
+/// What an input's account events come to.
+#[derive(Default)]
+struct Accounts {
+    /// Each DID's latest status that isn't active, by (time_us, event).
+    statuses: Vec<(String, u8)>,
+    /// Per DID: a record whose latest op is at or before `deleted` or before
+    /// `reset` is gone (i64::MIN: none).
+    cuts: Vec<(String, i64, i64)>,
+    rows: u64,
+}
+
+fn read_accounts(input: &Path) -> Result<Accounts> {
+    let p = input.join(ACCOUNTS);
+    if !p.exists() {
+        return Ok(Accounts::default());
+    }
+    // latest (time, event) of 0..=2, deleted cut, reset cut
+    type Fold = (Option<(i64, u8)>, i64, i64);
+    let mut by: std::collections::HashMap<Vec<u8>, Fold> = Default::default();
+    let mut rows = Rows::open(&p)?;
+    let mut cols = [Vec::new()];
+    let mut n = 0u64;
+    while rows.next(&mut cols)? {
+        let (t, e) = (rows.i64()?, rows.u8()?);
+        n += 1;
+        let a = by.entry(std::mem::take(&mut cols[0])).or_insert((None, i64::MIN, i64::MIN));
+        match e {
+            0..=2 => {
+                if a.0.is_none_or(|s| (t, e) > s) {
+                    a.0 = Some((t, e));
+                }
+                if e == 1 {
+                    a.1 = a.1.max(t);
+                }
+            }
+            3 => a.2 = a.2.max(t),
+            _ => bail!("{}: account event {e}", p.display()),
+        }
+    }
+    let mut out = Accounts { rows: n, ..Default::default() };
+    for (did, (st, del, reset)) in by {
+        let Ok(did) = String::from_utf8(did) else { continue };
+        if let Some((_, e @ 1..=2)) = st {
+            out.statuses.push((did.clone(), e));
+        }
+        if del != i64::MIN || reset != i64::MIN {
+            out.cuts.push((did, del, reset));
+        }
+    }
+    Ok(out)
+}
+
 #[derive(Serialize, Default, Clone)]
 pub struct Phase {
     pub name: String,
@@ -187,6 +244,8 @@ pub struct RelReport {
     pub deleted_keys: u64,
     /// Live keys that were deleted and created again under the same rkey.
     pub recreated_keys: u64,
+    /// Live keys an account's deletion or a resync dropped (the input's accounts).
+    pub account_dropped: u64,
     pub non_tid: u64,
     pub out_records: u64,
     pub out_lists: u64,
@@ -214,6 +273,7 @@ impl RelReport {
         self.superseded += c.superseded;
         self.deleted_keys += c.deleted_keys;
         self.recreated_keys += c.recreated_keys;
+        self.account_dropped += c.account_dropped;
         self.out_records += c.records;
         self.out_lists += c.lists.len() as u64;
         self.out_max = self.out_max.max(c.out_max);
@@ -243,6 +303,7 @@ impl RelReport {
         self.superseded += o.superseded;
         self.deleted_keys += o.deleted_keys;
         self.recreated_keys += o.recreated_keys;
+        self.account_dropped += o.account_dropped;
         self.non_tid += o.non_tid;
         self.out_records += o.out_records;
         self.out_lists += o.out_lists;
@@ -282,6 +343,9 @@ pub struct Report {
     pub dids_plc: u64,
     pub dids_other: u64,
     pub bad_dids: u64,
+    /// From the input's accounts file: its rows, the statuses kept, and the DIDs with a cut.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accounts: Option<BTreeMap<String, u64>>,
     pub phases: Vec<Phase>,
     pub rels: Vec<RelReport>,
     pub sections: BTreeMap<String, u64>,
@@ -472,7 +536,8 @@ pub(crate) fn own_list<'a>(repo: &[u8], list: &'a [u8]) -> Option<&'a str> {
 /// The op column: 1 create, 2 update, 3 delete (repo_records' enum; crawl rows are creates).
 const OP_DELETE: u8 = 3;
 
-fn build_dir(files: &[(PathBuf, bool)], c: &Counters) -> Result<(Dir, Vec<(RepoSpan, RepoSpan)>)> {
+/// `extra`: DIDs to have ids whether or not a row names them (those with a status).
+fn build_dir(files: &[(PathBuf, bool)], extra: &[String], c: &Counters) -> Result<(Dir, Vec<(RepoSpan, RepoSpan)>)> {
     let shards: Vec<Mutex<(Vec<u128>, usize)>> = (0..DIR_SHARDS).map(|_| Mutex::new((Vec::new(), 0))).collect();
     let others: Mutex<HashSet<String>> = Mutex::new(HashSet::new());
     let flush = |shard: usize, buf: &mut Vec<u128>| {
@@ -558,6 +623,15 @@ fn build_dir(files: &[(PathBuf, bool)], c: &Counters) -> Result<(Dir, Vec<(RepoS
             Ok((span, list_span))
         })
         .collect::<Result<Vec<_>>>()?;
+    for d in extra {
+        match classify(d) {
+            Some(DidRef::Plc(v)) => shards[(v >> 112) as usize].lock().unwrap().0.push(v),
+            Some(DidRef::Other(s)) => {
+                others.lock().unwrap().insert(s.to_string());
+            }
+            None => {}
+        }
+    }
     let t = Instant::now();
     let parts: Vec<Vec<u128>> = shards
         .into_par_iter()
@@ -630,6 +704,7 @@ struct ChunkOut {
     superseded: u64,
     deleted_keys: u64,
     recreated_keys: u64,
+    account_dropped: u64,
     out_max: u64,
     indexed: u64,
     len_log2: BTreeMap<u32, u64>,
@@ -663,6 +738,7 @@ fn out_chunk(
     subj_index: usize,
     spill: &Spill,
     deletes: Option<(&DeletesOut, &str, usize)>,
+    cuts: &[(u32, i64, i64)],
     c: &Counters,
 ) -> Result<ChunkOut> {
     let t = Instant::now();
@@ -742,6 +818,7 @@ fn out_chunk(
     let slot = |row: u32, i: u32| ids[(w * row + i) as usize];
     let mut edges: Vec<(u32, u64, u32, u32)> = Vec::with_capacity(recs.len());
     let (mut superseded, mut deleted_keys, mut recreated_keys, mut bad_subject) = (0u64, 0u64, 0u64, 0u64);
+    let mut account_dropped = 0u64;
     let mut del_rows: Vec<u8> = Vec::new();
     let mut i = 0;
     while i < recs.len() {
@@ -767,6 +844,8 @@ fn out_chunk(
                     del_rows.extend_from_slice(&last.2.to_le_bytes());
                 }
             }
+        } else if cuts.binary_search_by_key(&a, |c| c.0).is_ok_and(|x| last.2 <= cuts[x].1 || last.2 < cuts[x].2) {
+            account_dropped += 1;
         } else {
             if group.iter().any(|r| r.3 == OP_DELETE) {
                 recreated_keys += 1;
@@ -848,6 +927,7 @@ fn out_chunk(
         superseded: once(superseded),
         deleted_keys: if by_list { 0 } else { deleted_keys },
         recreated_keys: once(recreated_keys),
+        account_dropped: if by_list { 0 } else { account_dropped },
         out_max,
         indexed,
         len_log2,
@@ -916,6 +996,7 @@ fn out_shard6(
     o: &Opts,
     spills: &[Spill],
     heat: Option<&Arc<Heat>>,
+    cuts: &[(u32, i64, i64)],
     c: &Counters,
 ) -> Result<Vec<(RelReport, Layout)>> {
     let mut reps = Vec::new();
@@ -934,7 +1015,8 @@ fn out_shard6(
             }
             let k = (lo / spills[ri].width.max(1)) as usize;
             let del = o.deletes.as_ref().map(|d| (d, o.rels.list[ri].name.as_str(), k));
-            let mut co = out_chunk(f, *mode, dir, lo, hi, (lo..hi).contains(flo), o.subj_index, &spills[ri], del, c)?;
+            let mut co =
+                out_chunk(f, *mode, dir, lo, hi, (lo..hi).contains(flo), o.subj_index, &spills[ri], del, cuts, c)?;
             if !(lo..hi).contains(flo) || !(lo..hi).contains(fhi) {
                 rr.files_shared += 1;
             }
@@ -1046,7 +1128,27 @@ pub fn build(o: &Opts) -> Result<Report> {
     sys::reset_peak_rss();
     let t = Instant::now();
     let c = Counters::default();
-    let (dir, spans) = build_dir(&all, &c)?;
+    let accounts = read_accounts(&o.input)?;
+    let extra: Vec<String> = accounts.statuses.iter().map(|s| s.0.clone()).collect();
+    let (dir, spans) = build_dir(&all, &extra, &c)?;
+    let mut statuses: Vec<(u32, u8)> =
+        accounts.statuses.iter().filter_map(|(d, e)| Some((dir.lookup(d.as_bytes())?, *e))).collect();
+    statuses.sort_unstable();
+    let mut cuts: Vec<(u32, i64, i64)> =
+        accounts.cuts.iter().filter_map(|(d, del, reset)| Some((dir.lookup(d.as_bytes())?, *del, *reset))).collect();
+    cuts.sort_unstable();
+    if accounts.rows > 0 {
+        rep.accounts = Some(
+            [
+                ("rows".to_string(), accounts.rows),
+                ("deleted".to_string(), statuses.iter().filter(|s| s.1 == 1).count() as u64),
+                ("takendown".to_string(), statuses.iter().filter(|s| s.1 == 2).count() as u64),
+                ("cut_dids".to_string(), cuts.len() as u64),
+            ]
+            .into(),
+        );
+    }
+    drop(accounts);
     rep.dids_plc = dir.plc.len() as u64;
     rep.dids_other = dir.other.len() as u64;
     rep.bad_dids = c.bad.load(Relaxed);
@@ -1108,7 +1210,7 @@ pub fn build(o: &Opts) -> Result<Report> {
     let outs: Vec<Vec<(RelReport, Layout)>> = writers
         .par_iter_mut()
         .enumerate()
-        .map(|(k, w)| out_shard6(w, &files, &dir, ranges[k].0, ranges[k].1, o, &spills, heat.as_ref(), &c))
+        .map(|(k, w)| out_shard6(w, &files, &dir, ranges[k].0, ranges[k].1, o, &spills, heat.as_ref(), &cuts, &c))
         .collect::<Result<_>>()?;
     let outs: Vec<Vec<RelReport>> = outs
         .into_iter()
@@ -1154,7 +1256,15 @@ pub fn build(o: &Opts) -> Result<Report> {
 
     let t = Instant::now();
     let c = Counters::default();
-    let shard_metas: Vec<ShardMeta> = (0..o.shards).map(|k| set.shard_meta(k, Vec::new())).collect();
+    let shard_status: Vec<Vec<(u32, u8)>> =
+        ranges.iter().map(|&(lo, hi)| statuses.iter().filter(|s| (lo..hi).contains(&s.0)).copied().collect()).collect();
+    let shard_metas: Vec<ShardMeta> = (0..o.shards)
+        .map(|k| {
+            let mut m = set.shard_meta(k, Vec::new());
+            m.statuses = shard_status[k].len() as u64;
+            m
+        })
+        .collect();
     let mut shard_bytes = Vec::new();
     let footers: Vec<PagedFooter> = writers
         .into_par_iter()
@@ -1166,7 +1276,7 @@ pub fn build(o: &Opts) -> Result<Report> {
                 r.merge(&ins[k][ri]);
                 stats.push(r.stats());
             }
-            w.pinned("status", &[])?;
+            w.pinned("status", &marco_core::snapshot::encode_statuses(&shard_status[k]))?;
             w.pinned("live", &[])?;
             for ri in 0..o.rels.len() {
                 w.pinned(&rel_section(ri, "tomb"), &[])?;
@@ -1758,6 +1868,92 @@ mod tests {
             .collect();
         let (rep, _) = build_lists(tmp.path(), &lops, 5);
         assert_eq!((rep.rels[2].rows, rep.rels[3].rows), (200, 200));
+    }
+
+    #[test]
+    fn account_events_drop_and_hide() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("in");
+        let [a, b, c, d, e, f] = [1, 2, 3, 4, 5, 6].map(did);
+        let s = did(20);
+        let k = |n: u64| vlatproto::tid::Tid::from_parts(1_700_000_000_000_000 + n, 0).to_string();
+        let follows: Vec<Op> = vec![
+            // a: deleted at 200: what came before goes, a later record stays
+            (a.clone(), k(1), s.clone(), 100, 1),
+            (a.clone(), k(2), s.clone(), 300, 1),
+            (a.clone(), k(3), s.clone(), 200, 1),
+            // b: taken down, its records kept; c: taken down and back
+            (b.clone(), k(4), s.clone(), 100, 1),
+            (c.clone(), k(5), s.clone(), 100, 1),
+            // d: reset at 200, its replacement row at the same time
+            (d.clone(), k(6), s.clone(), 100, 1),
+            (d.clone(), k(7), s.clone(), 300, 1),
+            (d.clone(), k(8), s.clone(), 200, 1),
+            // f: deleted, then active again: the deletion still took its records
+            (f.clone(), k(9), s.clone(), 100, 1),
+            (f.clone(), k(10), s.clone(), 350, 1),
+        ];
+        write_export(&input, "follow", &follows);
+        write_export(&input, "block", &[]);
+        let lops: Vec<ListOp> = vec![(a.clone(), k(11), s.clone(), list_uri(&a, 1), 150, 1)];
+        write_list_export(&input, &lops);
+        let events: [(&str, i64, u8); 9] = [
+            (&a, 200, 1),
+            (&b, 150, 2),
+            (&c, 150, 2),
+            (&c, 250, 0),
+            (&d, 200, 3),
+            (&e, 50, 2),
+            (&f, 200, 1),
+            (&f, 300, 0),
+            // a takedown older than the deletion doesn't win
+            (&a, 120, 2),
+        ];
+        let mut raw = Vec::new();
+        for (who, t, ev) in events {
+            put(&mut raw, who);
+            raw.extend_from_slice(&t.to_le_bytes());
+            raw.push(ev);
+        }
+        std::fs::write(input.join(ACCOUNTS), zstd::encode_all(&raw[..], 3).unwrap()).unwrap();
+        let out = tmp.path().join("snap");
+        let o = Opts {
+            input,
+            out: out.clone(),
+            tmp: tmp.path().join("spill"),
+            rels: Relations::bsky_default(),
+            subj_index: 8,
+            shards: 3,
+            sub_buckets: 1,
+            deletes: None,
+            cursors: BTreeMap::new(),
+            heat: None,
+        };
+        let rep = build(&o).unwrap();
+        assert_eq!(rep.rels[0].account_dropped, 4, "a's two, d's one, f's one");
+        assert_eq!(rep.rels[2].account_dropped + rep.rels[3].account_dropped, 1, "counted once, by its companion");
+        let acc = rep.accounts.unwrap();
+        assert_eq!((acc["rows"], acc["deleted"], acc["takendown"], acc["cut_dids"]), (9, 1, 2, 3));
+        let g = Graph::open(&out).unwrap();
+        let mut st: Vec<(String, &str)> =
+            g.statuses().into_iter().map(|(d, s)| (d, marco_core::Status::name(Some(s)))).collect();
+        st.sort();
+        let mut want = vec![(a.clone(), "deleted"), (b.clone(), "takendown"), (e.clone(), "takendown")];
+        want.sort();
+        assert_eq!(st, want);
+        let rkeys = |who: &str| -> Vec<String> {
+            let (l, _) = g.read(|cx| g.out_list(cx, 0, who, 100, None)).unwrap();
+            let mut v: Vec<String> = l.into_iter().map(|(u, _)| u.rsplit('/').next().unwrap().to_string()).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(rkeys(&a), [k(2)]);
+        assert_eq!(rkeys(&b), [k(4)]);
+        assert_eq!(rkeys(&c), [k(5)]);
+        assert_eq!(rkeys(&d), [k(7), k(8)]);
+        assert_eq!(rkeys(&f), [k(10)]);
+        let items = g.read(|cx| g.counts(cx, 2, &list_uri(&a, 1))).unwrap().0;
+        assert_eq!(items, 0);
     }
 
     #[test]

@@ -27,9 +27,9 @@ static BYTES: LazyLock<IntCounterVec> = LazyLock::new(|| {
 });
 
 /// The longest a Retry-After is honored for before the request counts as failed.
-const MAX_PAUSE: Duration = Duration::from_secs(15 * 60);
+pub(crate) const MAX_PAUSE: Duration = Duration::from_secs(15 * 60);
 /// How long a 429 or 503 without Retry-After pauses every request.
-const THROTTLE_PAUSE: Duration = Duration::from_secs(10);
+pub(crate) const THROTTLE_PAUSE: Duration = Duration::from_secs(10);
 
 pub struct Limiter {
     interval: Duration,
@@ -51,7 +51,7 @@ impl Limiter {
         tokio::time::sleep_until(at).await;
     }
 
-    fn pause_until(&self, t: Instant) {
+    pub(crate) fn pause_until(&self, t: Instant) {
         let mut n = self.next.lock().unwrap();
         *n = (*n).max(t);
     }
@@ -111,7 +111,7 @@ enum Outcome {
 
 /// How long the host asks to be left alone: Retry-After in seconds, else
 /// atproto's RateLimit-Reset (a Unix time).
-fn retry_after(h: &reqwest::header::HeaderMap) -> Option<Duration> {
+pub(crate) fn retry_after(h: &reqwest::header::HeaderMap) -> Option<Duration> {
     let num = |name: &str| h.get(name)?.to_str().ok()?.trim().parse::<u64>().ok();
     if let Some(s) = num("retry-after") {
         return Some(Duration::from_secs(s));

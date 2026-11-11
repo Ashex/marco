@@ -11,6 +11,7 @@
 //! marco-load scan-scylla --config TOML --out DIR [--snapshot SNAP]   Scylla tables -> build input (-> snapshot)
 //! marco-load fill-scylla --config TOML --input DIR   build input -> Scylla tables (tests, benchmarks)
 //! marco-load scan-hubble --out DIR [--host URL] [--snapshot SNAP]   a sync-API host's repos -> build input (-> snapshot)
+//! marco-load scan-jetstream --out DIR [--host URL] [--snapshot SNAP]   a Jetstream v2 archive -> build input (-> snapshot)
 //! ```
 //!
 //! The build's input format is in this crate's README.
@@ -27,6 +28,8 @@ mod cql;
 mod diff;
 #[cfg(feature = "hubble")]
 mod hubble;
+#[cfg(feature = "jetstream")]
+mod jetstream;
 mod lists_bench;
 mod metrics;
 mod rows;
@@ -107,6 +110,9 @@ enum Cmd {
     /// Fetch every repo a sync-API host lists (Hubble by default) into build input, then optionally build.
     #[cfg(feature = "hubble")]
     ScanHubble(Box<hubble::Args>),
+    /// Replay a Jetstream v2 instance's sealed archive of the relations into build input, then optionally build.
+    #[cfg(feature = "jetstream")]
+    ScanJetstream(Box<jetstream::Args>),
 }
 
 fn main() -> Result<()> {
@@ -169,6 +175,8 @@ fn main() -> Result<()> {
         Cmd::FillScylla(a) => cql::fill::run(&a)?,
         #[cfg(feature = "hubble")]
         Cmd::ScanHubble(a) => hubble::run(&a)?,
+        #[cfg(feature = "jetstream")]
+        Cmd::ScanJetstream(a) => jetstream::run(&a)?,
     };
     let s = serde_json::to_string_pretty(&report)?;
     if let Some(p) = cli.report {

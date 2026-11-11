@@ -21,12 +21,16 @@ firehose, or your own pipeline through the write API).
 - **One API.** `marco.v1.Graph` is a ConnectRPC service: gRPC, gRPC-Web and JSON over POST from one
   proto (`proto/marco/v1`). `Has`, `Relationships`, `BlockPairs`, `ListOut`, `ListIn`, `Counts`,
   `Intersect` and `Filter` read, and `Write` and `WriteBatch` write. → [Query API](docs/query-api.md)
-- **Three ways to build a snapshot.** `marco-load build` reads build input: zstd RowBinary rows
+- **Several ways to build a snapshot.** `marco-load build` reads build input: zstd RowBinary rows
   per relation, which any exporter can write (a ClickHouse archive export, or a script). If you
   run an appview, `marco-load scan-scylla` reads its follows, blocks and list items tables in
   Scylla with a parallel full scan and builds the snapshot from them: the whole network's follows
   and blocks went from an empty directory to ready in 6.8 minutes, and matched the archive build
-  record for record. → [Quickstart](docs/quickstart.md), [Rebuilding from Scylla](docs/scylla.md)
+  record for record. `marco-load scan-jetstream` replays a Jetstream v2 instance's sealed archive
+  of the graph collections, account events included, and stamps the instance's last sealed seq,
+  so `marco serve --jetstream-v2` on the same host resumes from it exactly; `scan-hubble` reads
+  every repo from a sync-API mirror. → [Quickstart](docs/quickstart.md),
+  [Rebuilding from Scylla](docs/scylla.md), [marco-load](crates/marco-load/README.md)
 - **Its own cache.** marco reads the snapshot with `O_DIRECT` into a cache of `--memory` bytes,
   checking every page against its sum, and a budget that holds the whole network's snapshot loads
   it in 7.8 s from a cold disk. Writes go to a change segment every 5 s with every source's cursor,
