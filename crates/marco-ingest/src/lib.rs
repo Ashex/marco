@@ -99,10 +99,6 @@ pub(crate) fn edge_uri(rels: &marco_core::Relations, did: &str, coll: &str, rkey
     marco_core::relation::parse_uri(&uri).is_some().then_some(uri)
 }
 
-pub(crate) fn valid_subject(s: &str) -> bool {
-    marco_core::did::classify(s).is_some()
-}
-
 /// A list relation's record: its list, which must be in the record's own
 /// repo (the appview refuses the rest too). Ok(None) for other relations.
 pub(crate) fn list_of(

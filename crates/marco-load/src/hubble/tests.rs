@@ -181,6 +181,7 @@ fn sweeps_a_mirror_into_build_input_and_resumes_its_failures() {
             ("app.bsky.graph.block/3kaaaaaaaaa21", rec(&[("subject", C)])),
             ("app.bsky.graph.follow/3kaaaaaaaaa21", follow(B)),
             ("app.bsky.graph.follow/3kaaaaaaaaa22", follow("rei.example")),
+            ("app.bsky.graph.listblock/3kaaaaaaaaa21", rec(&[("subject", &other)])),
             ("app.bsky.graph.listitem/3kaaaaaaaaa21", rec(&[("subject", B), ("list", &list)])),
             ("app.bsky.graph.listitem/3kaaaaaaaaa22", rec(&[("subject", C), ("list", &other)])),
             ("app.bsky.graph.verification/3kaaaaaaaaa21", rec(&[("subject", B)])),
@@ -237,6 +238,7 @@ fn sweeps_a_mirror_into_build_input_and_resumes_its_failures() {
     assert_eq!(read_rows(&out, "block", false), vec![f(A, "3kaaaaaaaaa21", C)]);
     let items = read_rows(&out, "listitem", true);
     assert_eq!(items, vec![(A.into(), "3kaaaaaaaaa21".into(), B.into(), list.clone())]);
+    assert_eq!(read_rows(&out, "listblock", false), vec![f(A, "3kaaaaaaaaa21", &other)], "a list in another repo");
     let cursors: BTreeMap<String, String> = serde_json::from_slice(&std::fs::read(out.join(CURSORS)).unwrap()).unwrap();
     assert!(cursors.contains_key(SNAPSHOT_TIME));
     // each repo read, at the rev it was read at, once though the sweep ran twice
@@ -277,7 +279,7 @@ fn wanted_stops_past_the_last_collection() {
     let w = Wanted::new(&rels, &rels.user());
     assert_eq!(w.keep("app.bsky.feed.post/3k"), Keep::Skip);
     assert_eq!(w.keep("app.bsky.graph.block/3k"), Keep::Record);
-    assert_eq!(w.keep("app.bsky.graph.listblock/3k"), Keep::Skip);
+    assert_eq!(w.keep("app.bsky.graph.listblock/3k"), Keep::Record);
     assert_eq!(w.keep("app.bsky.graph.listitem/3k"), Keep::Record);
     assert_eq!(w.keep("app.bsky.graph.listitemx/3k"), Keep::Stop, "sorts past listitem/");
     assert_eq!(w.keep("app.bsky.graph.verification/3k"), Keep::Stop);

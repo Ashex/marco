@@ -13,6 +13,11 @@
 //! list = "list"
 //! ```
 //!
+//! A relation with `subject_kind = "list"` names a list instead of an
+//! account: its subject is the list's AT URI, in any repo, and the edge goes
+//! from the actor to the list's node (`listblock`: blocking everyone on a
+//! moderation list).
+//!
 //! A relation with `list` keeps edges from that record (a list, in the
 //! actor's own repo) to the subject: the list is a node in the directory,
 //! keyed by its AT URI. A delete names only the actor and rkey, so each such
@@ -23,6 +28,23 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 pub type RelId = u8;
+
+/// What a relation's subject names.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SubjectKind {
+    /// An account, by DID.
+    #[default]
+    Did,
+    /// A list, by its record's AT URI: a node in the directory.
+    List,
+}
+
+impl SubjectKind {
+    fn is_did(&self) -> bool {
+        *self == SubjectKind::Did
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Relation {
@@ -37,6 +59,8 @@ pub struct Relation {
     /// Set on a companion: the list relation whose records it holds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_of: Option<String>,
+    #[serde(default, skip_serializing_if = "SubjectKind::is_did")]
+    pub subject_kind: SubjectKind,
 }
 
 impl Relation {
@@ -46,6 +70,14 @@ impl Relation {
 
     pub fn list_of<'a>(&self, record: &'a serde_json::Value) -> Option<&'a str> {
         path_of(self.list.as_deref()?, record)
+    }
+
+    /// Whether `s` is the kind of subject this relation names.
+    pub fn valid_subject(&self, s: &str) -> bool {
+        match self.subject_kind {
+            SubjectKind::Did => crate::did::classify(s).is_some(),
+            SubjectKind::List => s.starts_with("at://") && parse_uri(s).is_some(),
+        }
     }
 }
 
@@ -74,6 +106,7 @@ impl Relations {
                 subject: path.clone(),
                 list: None,
                 owner_of: Some(x.name.clone()),
+                subject_kind: SubjectKind::List,
             });
             all.push(x);
             all.extend(owner);
@@ -93,19 +126,22 @@ impl Relations {
         Relations::new(r.list)
     }
 
-    /// follow, block and listitem, the relations an appview needs first.
+    /// follow, block, listitem and listblock, the relations an appview needs
+    /// first. listblock comes last, so the others keep their ids.
     pub fn bsky_default() -> Relations {
-        let rel = |name: &str, collection: &str, list: Option<&str>| Relation {
+        let rel = |name: &str, collection: &str, list: Option<&str>, subject_kind| Relation {
             name: name.into(),
             collection: collection.into(),
             subject: "subject".into(),
             list: list.map(Into::into),
             owner_of: None,
+            subject_kind,
         };
         Relations::new(vec![
-            rel("follow", "app.bsky.graph.follow", None),
-            rel("block", "app.bsky.graph.block", None),
-            rel("listitem", "app.bsky.graph.listitem", Some("list")),
+            rel("follow", "app.bsky.graph.follow", None, SubjectKind::Did),
+            rel("block", "app.bsky.graph.block", None, SubjectKind::Did),
+            rel("listitem", "app.bsky.graph.listitem", Some("list"), SubjectKind::Did),
+            rel("listblock", "app.bsky.graph.listblock", None, SubjectKind::List),
         ])
         .expect("default relations")
     }
@@ -117,6 +153,9 @@ impl Relations {
             }
             if r.subject.is_empty() || r.name.is_empty() || r.list.as_ref().is_some_and(|l| l.is_empty()) {
                 bail!("relation {i}: name and subject are required, and list can't be empty");
+            }
+            if r.list.is_some() && r.subject_kind == SubjectKind::List {
+                bail!("relation {}: a list relation's subject is an account", r.name);
             }
             if r.name.contains('.') {
                 bail!("relation {}: names can't hold a '.'", r.name);
@@ -133,9 +172,14 @@ impl Relations {
         (0..self.list.len() as RelId).filter(|&r| self.list[r as usize].owner_of.is_none()).collect()
     }
 
-    /// The relations between actors: neither list relations nor companions.
+    /// The relations between actors: neither list relations, nor companions,
+    /// nor relations naming a list.
     pub fn actor_rels(&self) -> Vec<RelId> {
-        (0..self.list.len() as RelId).filter(|&r| !self.is_list(r) && !self.is_owner(r)).collect()
+        (0..self.list.len() as RelId)
+            .filter(|&r| {
+                !self.is_list(r) && !self.is_owner(r) && self.list[r as usize].subject_kind == SubjectKind::Did
+            })
+            .collect()
     }
 
     pub fn is_list(&self, rel: RelId) -> bool {
@@ -227,12 +271,16 @@ subject = "target.did"
     fn list_companions() {
         let r = Relations::bsky_default();
         let names: Vec<&str> = r.list.iter().map(|x| x.name.as_str()).collect();
-        assert_eq!(names, ["follow", "block", "listitem", "listitem.owner"]);
+        assert_eq!(names, ["follow", "block", "listitem", "listitem.owner", "listblock"]);
         assert_eq!(r.by_collection("app.bsky.graph.listitem"), Some(2));
         assert_eq!(r.owner_rel(2), Some(3));
         assert_eq!(r.list_rel(3), Some(2));
         assert_eq!(r.owner_rel(0), None);
-        assert_eq!(r.user(), vec![0, 1, 2]);
+        assert_eq!(r.user(), vec![0, 1, 2, 4]);
+        assert_eq!(r.actor_rels(), vec![0, 1], "a listblock goes from an actor to a list, not to an actor");
+        assert_eq!(r.get(4).subject_kind, SubjectKind::List, "listblock names a list");
+        assert!(r.get(4).valid_subject("at://did:plc:x/app.bsky.graph.list/l") && !r.get(4).valid_subject("did:plc:x"));
+        assert!(r.get(0).valid_subject("did:plc:x") && !r.get(0).valid_subject("at://did:plc:x/app.bsky.graph.list/l"));
         let again = Relations::new(r.list.clone()).unwrap();
         assert_eq!(again.list, r.list);
         let rec = serde_json::json!({"list": "at://did:plc:x/app.bsky.graph.list/l", "subject": "did:plc:y"});

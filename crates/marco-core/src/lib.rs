@@ -23,5 +23,5 @@ pub use graph::{
     Added, BaseSwap, CheckpointReport, CompactPolicy, Compacted, Dir, Garbage, Graph, Headroom, ListRef, Relationship,
     Removed, SetOp, SharedSnapshot, Stored, COMPACTION_STOPPED, COUNT_EXACT,
 };
-pub use relation::{RelId, Relation, Relations};
+pub use relation::{RelId, Relation, Relations, SubjectKind};
 pub use segment::{Op, Rec, Status};

@@ -791,7 +791,7 @@ async fn admin_rpcs() {
     assert_eq!(o.snapshot.shards, 4);
     assert_eq!(o.snapshot.files, 5);
     assert_eq!(o.directory.base, marco_server::synth::graph(N, 4).unwrap().n_ids() as u64, "DIDs and list nodes");
-    assert_eq!(o.relations.len(), 4, "follow, block, listitem, listitem.owner");
+    assert_eq!(o.relations.len(), 5, "follow, block, listitem, listitem.owner, listblock");
     assert_eq!(o.relations[0].name, "follow");
     assert!(o.relations[0].snapshot_records > 2 * N as u64);
     assert_eq!(o.delta_entries, 0);

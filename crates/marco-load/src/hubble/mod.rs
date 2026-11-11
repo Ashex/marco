@@ -218,7 +218,7 @@ fn rows_of(
             continue;
         };
         let r = rels.get(rel);
-        let Some(subject) = path_of(&v, &r.subject).filter(|s| marco_core::did::classify(s).is_some()) else {
+        let Some(subject) = path_of(&v, &r.subject).filter(|s| r.valid_subject(s)) else {
             c.bad_subject += 1;
             continue;
         };

@@ -9,7 +9,7 @@
 use marco_core::Relations;
 use serde::Deserialize;
 
-use crate::{account_change, edge_uri, list_of, valid_subject, Change, Event, Kind, Op};
+use crate::{account_change, edge_uri, list_of, Change, Event, Kind, Op};
 
 /// Jetstream's `time_us` is per instance and may repeat across events, so a
 /// resume starts this far back and replays the overlap.
@@ -86,7 +86,7 @@ pub fn decode(line: &[u8], rels: &Relations) -> Result<Event, &'static str> {
                     let subject = c.record.as_ref().and_then(|r| rels.get(rel).subject_of(r));
                     let list = c.record.as_ref().and_then(|r| rels.get(rel).list_of(r));
                     match (subject, list_of(rels, rel, &uri, list)) {
-                        (Some(s), Ok(list)) if valid_subject(s) => {
+                        (Some(s), Ok(list)) if rels.get(rel).valid_subject(s) => {
                             ev.change =
                                 Change::Ops(vec![Op::Add { uri, subject: s.to_string(), list, time_us: ev.time_us }]);
                         }
@@ -162,11 +162,11 @@ mod tests {
         let r = Relations::bsky_default();
         assert_eq!(
             subscribe_url("wss://js.example", &r, Some(5)),
-            "wss://js.example/subscribe?wantedCollections=app.bsky.graph.follow&wantedCollections=app.bsky.graph.block&wantedCollections=app.bsky.graph.listitem&cursor=5"
+            "wss://js.example/subscribe?wantedCollections=app.bsky.graph.follow&wantedCollections=app.bsky.graph.block&wantedCollections=app.bsky.graph.listitem&wantedCollections=app.bsky.graph.listblock&cursor=5"
         );
         assert_eq!(
             subscribe_url("ws://127.0.0.1:9/subscribe?x=1", &r, None),
-            "ws://127.0.0.1:9/subscribe?x=1&wantedCollections=app.bsky.graph.follow&wantedCollections=app.bsky.graph.block&wantedCollections=app.bsky.graph.listitem"
+            "ws://127.0.0.1:9/subscribe?x=1&wantedCollections=app.bsky.graph.follow&wantedCollections=app.bsky.graph.block&wantedCollections=app.bsky.graph.listitem&wantedCollections=app.bsky.graph.listblock"
         );
     }
 

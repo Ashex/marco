@@ -41,7 +41,7 @@ use crate::inset::{self, InList, PagedIn};
 use crate::obs::{self, Applied, Op};
 use crate::outlog::{self, OutBytes, OutList, PagedOut};
 use crate::read::{Engine, Hold, ReadCx, StorageError, R};
-use crate::relation::{parse_uri, RelId, Relations};
+use crate::relation::{parse_uri, RelId, Relations, SubjectKind};
 use crate::rkey::{self, is_tid, key_of};
 use crate::segment::{Rec, Status};
 use crate::snapshot::{
@@ -1701,7 +1701,10 @@ impl Graph {
             },
         };
         let a = self.intern(did)?;
-        let s = self.intern(subject)?;
+        let s = match self.rels.get(rel).subject_kind {
+            SubjectKind::Did => self.intern(subject)?,
+            SubjectKind::List => self.intern_node(subject)?,
+        };
         let l = list.map(|l| self.intern_node(l)).transpose()?;
         let (key, side) = key_of(rkey_s);
         let rec = owner.unwrap_or(rel);

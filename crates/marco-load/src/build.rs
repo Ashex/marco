@@ -39,6 +39,7 @@ use marco_core::snapshot::{
     PAGED_FORMAT,
 };
 use marco_core::Relations;
+use marco_core::SubjectKind;
 
 use crate::metrics;
 use crate::rows::Rows;
@@ -442,7 +443,13 @@ pub(crate) fn own_list<'a>(repo: &[u8], list: &'a [u8]) -> Option<&'a str> {
 /// The op column: 1 create, 2 update, 3 delete (repo_records' enum; crawl rows are creates).
 const OP_DELETE: u8 = 3;
 
-fn build_dir(files: &[(PathBuf, bool)], c: &Counters) -> Result<(Dir, Vec<(RepoSpan, RepoSpan)>)> {
+/// A list's record URI: what a relation naming lists has as its subject.
+fn list_subject(b: &[u8]) -> Option<&str> {
+    std::str::from_utf8(b).ok().filter(|s| s.starts_with("at://") && marco_core::relation::parse_uri(s).is_some())
+}
+
+/// `files`: (path, has a list column, subjects are lists).
+fn build_dir(files: &[(PathBuf, bool, bool)], c: &Counters) -> Result<(Dir, Vec<(RepoSpan, RepoSpan)>)> {
     let shards: Vec<Mutex<(Vec<u128>, usize)>> = (0..DIR_SHARDS).map(|_| Mutex::new((Vec::new(), 0))).collect();
     let others: Mutex<HashSet<String>> = Mutex::new(HashSet::new());
     let flush = |shard: usize, buf: &mut Vec<u128>| {
@@ -457,13 +464,14 @@ fn build_dir(files: &[(PathBuf, bool)], c: &Counters) -> Result<(Dir, Vec<(RepoS
     };
     let spans = files
         .par_iter()
-        .map(|(f, has_list)| -> Result<(RepoSpan, RepoSpan)> {
+        .map(|(f, has_list, subject_list)| -> Result<(RepoSpan, RepoSpan)> {
             let t = Instant::now();
             let mut rows = Rows::open(f)?;
             let mut cols = vec![Vec::new(); if *has_list { 4 } else { 3 }];
             let mut list_span: RepoSpan = None;
             let mut local_lists: HashSet<String> = HashSet::new();
             let mut bad_list = 0u64;
+            let mut bad_node = 0u64;
             let mut bufs: Vec<Vec<u128>> = (0..DIR_SHARDS).map(|_| Vec::with_capacity(4096)).collect();
             let mut local_other: HashSet<String> = HashSet::new();
             let mut last_repo: Vec<u8> = Vec::new();
@@ -503,7 +511,18 @@ fn build_dir(files: &[(PathBuf, bool)], c: &Counters) -> Result<(Dir, Vec<(RepoS
                     }
                     last_repo.clone_from(&cols[0]);
                 }
-                add(&cols[2], &mut bufs);
+                if *subject_list {
+                    match list_subject(&cols[2]) {
+                        Some(l) => {
+                            if !local_lists.contains(l) {
+                                local_lists.insert(l.to_string());
+                            }
+                        }
+                        None => bad_node += 1,
+                    }
+                } else {
+                    add(&cols[2], &mut bufs);
+                }
                 if *has_list {
                     match own_list(&cols[0], &cols[3]) {
                         Some(l) => {
@@ -523,7 +542,7 @@ fn build_dir(files: &[(PathBuf, bool)], c: &Counters) -> Result<(Dir, Vec<(RepoS
             }
             others.lock().unwrap().extend(local_other.into_iter().chain(local_lists));
             c.rows.fetch_add(n, Relaxed);
-            c.bad.fetch_add(bad + bad_list, Relaxed);
+            c.bad.fetch_add(bad + bad_list + bad_node, Relaxed);
             c.add(0, t);
             Ok((span, list_span))
         })
@@ -626,6 +645,7 @@ fn put_str(out: &mut Vec<u8>, s: &[u8]) {
 fn out_chunk(
     f: &Path,
     mode: Mode,
+    subject_list: bool,
     dir: &Dir,
     lo: u32,
     hi: u32,
@@ -675,10 +695,16 @@ fn out_chunk(
             ids.push(u32::MAX);
         }
         if op != OP_DELETE {
-            match std::str::from_utf8(&cols[2]).ok().and_then(classify) {
-                Some(DidRef::Plc(v)) => plc_keys.push((v, w * row + 1)),
-                Some(DidRef::Other(o)) => ids[(w * row + 1) as usize] = dir.other_id(o),
-                None => {}
+            if subject_list {
+                if let Some(l) = list_subject(&cols[2]) {
+                    ids[(w * row + 1) as usize] = dir.other_id(l);
+                }
+            } else {
+                match std::str::from_utf8(&cols[2]).ok().and_then(classify) {
+                    Some(DidRef::Plc(v)) => plc_keys.push((v, w * row + 1)),
+                    Some(DidRef::Other(o)) => ids[(w * row + 1) as usize] = dir.other_id(o),
+                    None => {}
+                }
             }
             if listed {
                 if let Some(l) = own_list(&cols[0], &cols[3]) {
@@ -904,7 +930,21 @@ fn out_shard6(
             }
             let k = (lo / spills[ri].width.max(1)) as usize;
             let del = o.deletes.as_ref().map(|d| (d, o.rels.list[ri].name.as_str(), k));
-            let mut co = out_chunk(f, *mode, dir, lo, hi, (lo..hi).contains(flo), o.subj_index, &spills[ri], del, c)?;
+            // a companion reads its list relation's files, whose subjects are accounts
+            let subject_list = o.rels.list[ri].subject_kind == SubjectKind::List && o.rels.list[ri].owner_of.is_none();
+            let mut co = out_chunk(
+                f,
+                *mode,
+                subject_list,
+                dir,
+                lo,
+                hi,
+                (lo..hi).contains(flo),
+                o.subj_index,
+                &spills[ri],
+                del,
+                c,
+            )?;
             if !(lo..hi).contains(flo) || !(lo..hi).contains(fhi) {
                 rr.files_shared += 1;
             }
@@ -998,13 +1038,14 @@ pub fn build(o: &Opts) -> Result<Report> {
             _ => (Mode::Plain, r.name.as_str()),
         })
         .collect();
-    let mut all: Vec<(PathBuf, bool)> = Vec::new();
+    let mut all: Vec<(PathBuf, bool, bool)> = Vec::new();
     let mut per_rel: Vec<Vec<usize>> = Vec::new();
-    for &(mode, dir) in &modes {
+    for (&(mode, dir), r) in modes.iter().zip(&o.rels.list) {
+        let subject_list = r.subject_kind == SubjectKind::List && r.owner_of.is_none();
         let mut v = Vec::new();
         for f in files_of(&o.input, dir)? {
             let i = all.iter().position(|x| x.0 == f).unwrap_or_else(|| {
-                all.push((f, mode != Mode::Plain));
+                all.push((f, mode != Mode::Plain, subject_list));
                 all.len() - 1
             });
             v.push(i);
@@ -1255,8 +1296,10 @@ mod tests {
         ops.sort_by_key(|r| (r.4, r.5));
         for (a, k, s, l, us, op) in ops {
             let uri = format!("at://{a}/{coll}/{k}");
+            let rels = g.relations();
+            let rel = rels.get(rels.by_collection(coll).unwrap());
             let edge = op != OP_DELETE
-                && classify(s).is_some()
+                && rel.valid_subject(s)
                 && l.is_none_or(|l| own_list(a.as_bytes(), l.as_bytes()).is_some());
             if edge {
                 g.add_rec(&uri, s, l, us).unwrap();
@@ -1351,6 +1394,24 @@ mod tests {
         }
         live_lists(&mut g, &lops);
         write_list_export(&input, &lops);
+        // listblocks: lists in any repo, deletes, and accounts that aren't lists
+        let mut bops: Vec<Op> = Vec::new();
+        for t in 0..3_000i64 {
+            let a = did(rng.below(300));
+            let rkey = vlatproto::tid::Tid::from_parts(1_700_000_000_000_000 + rng.below(1500) * 997, 0).to_string();
+            let (s, op) = match rng.below(10) {
+                0..=2 => (String::new(), OP_DELETE),
+                3 if rng.below(10) == 0 => (did(rng.below(60)), 1),
+                _ => (list_uri(&did(rng.below(120)), rng.below(4)), 1 + rng.below(2) as u8),
+            };
+            bops.push((a, rkey, s, 1000 + t, op));
+        }
+        live(
+            &mut g,
+            "app.bsky.graph.listblock",
+            bops.iter().map(|r| (r.0.as_str(), r.1.as_str(), r.2.as_str(), None, r.3, r.4)).collect(),
+        );
+        write_export(&input, "listblock", &bops);
         let out = tmp.path().join("snap");
         let o = Opts {
             input: input.clone(),
@@ -1404,6 +1465,30 @@ mod tests {
                 assert_eq!(x, y, "in {rel} {d}");
                 let e = did(rng.below(400));
                 assert_eq!(b.read(|cx| b.has(cx, rel, &d, &e)).unwrap(), g.read(|cx| g.has(cx, rel, &d, &e)).unwrap());
+            }
+        }
+        // listblocks: actor -> list node, the same either way
+        let lb = 4u8;
+        let st = &b.snapshot().unwrap().stats()[lb as usize];
+        assert_eq!((st.out_records, st.in_pairs), g.records(lb), "listblock");
+        assert!(st.out_records > 1000, "listblocks were built: {}", st.out_records);
+        assert!(rep.rels[lb as usize].bad_subject > 0, "an account isn't a list");
+        for i in 0..300 {
+            let d = did(i);
+            assert_eq!(
+                b.read(|cx| b.out_list(cx, lb, &d, 100_000, None)).unwrap().0,
+                g.read(|cx| g.out_list(cx, lb, &d, 100_000, None)).unwrap().0,
+                "listblock {d}"
+            );
+        }
+        for i in 0..120 {
+            for l in 0..4 {
+                let list = list_uri(&did(i), l);
+                let mut x = b.read(|cx| b.in_list(cx, lb, &list, 100_000, None)).unwrap().0;
+                let mut y = g.read(|cx| g.in_list(cx, lb, &list, 100_000, None)).unwrap().0;
+                x.sort();
+                y.sort();
+                assert_eq!(x, y, "blockers of {list}");
             }
         }
         let (li, lo) = (2u8, 3u8);
@@ -1566,6 +1651,7 @@ mod tests {
             );
             write_export(&input, rel, &ops);
         }
+        write_export(&input, "listblock", &[]);
         let mut lops: Vec<ListOp> = Vec::new();
         for t in 0..20_000i64 {
             let a = did(rng.below(40));
@@ -1635,6 +1721,7 @@ mod tests {
         let input = tmp.join("in");
         write_export(&input, "follow", &[]);
         write_export(&input, "block", &[]);
+        write_export(&input, "listblock", &[]);
         write_list_export(&input, lops);
         let out = tmp.join("snap");
         let o = Opts {

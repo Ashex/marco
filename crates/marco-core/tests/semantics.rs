@@ -1266,3 +1266,47 @@ fn combine_counted_on_long_lists() {
     }
     assert!(exact_over_1000, "some pair has an exact total past 1,000");
 }
+
+const LISTBLOCK: u8 = 4;
+
+fn listblock(a: &str, rkey: &str) -> String {
+    format!("at://{a}/app.bsky.graph.listblock/{rkey}")
+}
+
+#[test]
+fn listblocks_point_at_lists_in_any_repo() {
+    // o keeps a list of x and y; v blocks through it from its own repo
+    let (o, v, x, y, w) = (did(1), did(5), did(2), did(3), did(6));
+    let l1 = list_uri(&o, 1);
+    for snapshot_between in [false, true] {
+        let mut g = graph();
+        assert_eq!(g.relations().get(LISTBLOCK).name, "listblock");
+        g.add_rec(&listitem(&o, &tid(1)), &x, Some(&l1), 0).unwrap();
+        g.add_rec(&listitem(&o, &tid(2)), &y, Some(&l1), 0).unwrap();
+        assert_eq!(g.add_rec(&listblock(&v, &tid(3)), &l1, None, 0).unwrap(), Added::Added, "the list is o's, not v's");
+        assert!(g.add_rec(&listblock(&v, &tid(4)), &x, None, 0).is_err(), "a listblock names a list, not an account");
+        assert!(g.add_rec(&block(&v, &tid(5)), &l1, None, 0).is_err(), "a block names an account, not a list");
+        if snapshot_between {
+            g = reopen(&g);
+        }
+        let id = |g: &Graph, s: &str| g.id_of(s).unwrap();
+        let (out, _) = g.read(|cx| g.out_list(cx, LISTBLOCK, &v, 10, None)).unwrap();
+        assert_eq!(out, vec![(listblock(&v, &tid(3)), l1.clone())], "the record, naming the list");
+        let (blockers, _) = g.read(|cx| g.in_list(cx, LISTBLOCK, &l1, 10, None)).unwrap();
+        assert_eq!(blockers, vec![v.clone()]);
+        assert_eq!(g.read(|cx| g.has(cx, LISTBLOCK, &v, &l1)).unwrap(), Some(listblock(&v, &tid(3))));
+
+        // does v block x through a list: v's blocked lists and the lists x is on
+        let blocks = |g: &Graph, who: &str| {
+            let a = ListRef { rel: LISTBLOCK, dir: Dir::Out, actor: id(g, &v) };
+            let b = ListRef { rel: LIST, dir: Dir::In, actor: id(g, who) };
+            !g.read(|cx| g.combine(cx, a, b, SetOp::And, 10, None)).unwrap().is_empty()
+        };
+        assert!(blocks(&g, &x) && blocks(&g, &y));
+        g.add_rec(&follow(&w, &tid(6)), &v, None, 0).unwrap();
+        assert!(!blocks(&g, &w), "w is on no list v blocks");
+
+        assert_eq!(g.delete(&listblock(&v, &tid(3))).unwrap(), removed(&l1), "delete by URI finds the list");
+        assert!(!blocks(&g, &x));
+    }
+}

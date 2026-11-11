@@ -17,7 +17,7 @@ use marco_core::Relations;
 use vlatproto::cbor::ValueRef;
 use vlatproto::cid::Cid;
 
-use crate::{account_change, edge_uri, list_of, valid_subject, Change, Event, Kind, Op};
+use crate::{account_change, edge_uri, list_of, Change, Event, Kind, Op};
 
 /// The subscribe URL: `base` (`wss://host`, or the full XRPC path) with a
 /// cursor when given.
@@ -131,7 +131,7 @@ pub fn decode(frame: &[u8], rels: &Relations) -> Result<Frame, &'static str> {
                         let r = rels.get(rel);
                         let list = r.list.as_deref().and_then(|p| subject_of(&rec, p));
                         match (subject_of(&rec, &r.subject), list_of(rels, rel, &uri, list)) {
-                            (Some(s), Ok(list)) if valid_subject(s) => {
+                            (Some(s), Ok(list)) if rels.get(rel).valid_subject(s) => {
                                 out.push(Op::Add { uri, subject: s.to_string(), list, time_us: ev.time_us })
                             }
                             (_, list) => {

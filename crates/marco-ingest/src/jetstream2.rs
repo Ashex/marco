@@ -25,7 +25,7 @@
 use marco_core::Relations;
 use serde::Deserialize;
 
-use crate::{account_change, edge_uri, list_of, valid_subject, Change, Event, Kind, Op};
+use crate::{account_change, edge_uri, list_of, Change, Event, Kind, Op};
 
 /// The XRPC path of the stream.
 pub const PATH: &str = "/xrpc/network.bsky.jetstream.subscribeEvents";
@@ -169,7 +169,7 @@ pub fn decode(frame: &[u8], rels: &Relations, floor: &mut TimeFloor) -> Result<D
                     let subject = p.record.as_ref().and_then(|r| rels.get(rel).subject_of(r));
                     let list = p.record.as_ref().and_then(|r| rels.get(rel).list_of(r));
                     match (subject, list_of(rels, rel, &uri, list)) {
-                        (Some(s), Ok(list)) if valid_subject(s) => {
+                        (Some(s), Ok(list)) if rels.get(rel).valid_subject(s) => {
                             ev.change = Change::Ops(vec![Op::Add { uri, subject: s.to_string(), list, time_us }]);
                         }
                         (_, list) => {
@@ -266,7 +266,7 @@ mod tests {
     fn url() {
         let r = Relations::bsky_default();
         let colls =
-            "collections=app.bsky.graph.follow&collections=app.bsky.graph.block&collections=app.bsky.graph.listitem";
+            "collections=app.bsky.graph.follow&collections=app.bsky.graph.block&collections=app.bsky.graph.listitem&collections=app.bsky.graph.listblock";
         assert_eq!(subscribe_url("wss://js.example", &r, Some(5)), format!("wss://js.example{PATH}?{colls}&cursor=5"));
         assert_eq!(
             subscribe_url(&format!("ws://127.0.0.1:9{PATH}"), &r, None),
@@ -371,6 +371,32 @@ mod tests {
         let like = br#"{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribeEvents#commit","seq":9,"did":"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa","time":"2026-11-11T10:00:00Z","rev":"3k","operation":"create","collection":"app.bsky.feed.like","rkey":"3k","record":{}}}"#;
         match decode(like, &rels, &mut floor) {
             Ok(Decoded::Event(ev)) => assert_eq!((ev.cursor, ev.change), (9, Change::None)),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_listblock_names_a_list_in_another_repo() {
+        let rels = Relations::bsky_default();
+        let frame = |subject: &str| {
+            format!(
+                r#"{{"$type":"message","payload":{{"$type":"network.bsky.jetstream.subscribeEvents#commit","seq":9,"did":"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa","time":"2026-11-11T10:00:00Z","rev":"3k","operation":"create","collection":"app.bsky.graph.listblock","rkey":"3kaaaaaaaaa22","record":{{"subject":"{subject}"}}}}}}"#
+            )
+        };
+        let list = "at://did:plc:bbbbbbbbbbbbbbbbbbbbbbbb/app.bsky.graph.list/3kaaaaaaaaa2a";
+        let uri = "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.graph.listblock/3kaaaaaaaaa22";
+        match decode(frame(list).as_bytes(), &rels, &mut TimeFloor::default()) {
+            Ok(Decoded::Event(ev)) => assert_eq!(
+                ev.change,
+                Change::Ops(vec![Op::Add { uri: uri.into(), subject: list.into(), list: None, time_us: ev.time_us }])
+            ),
+            other => panic!("{other:?}"),
+        }
+        match decode(frame("did:plc:bbbbbbbbbbbbbbbbbbbbbbbb").as_bytes(), &rels, &mut TimeFloor::default()) {
+            Ok(Decoded::Event(ev)) => {
+                assert_eq!(ev.skipped, vec!["bad_subject"], "an account isn't a list");
+                assert!(matches!(&ev.change, Change::Ops(ops) if matches!(ops[0], Op::Delete { .. })));
+            }
             other => panic!("{other:?}"),
         }
     }
