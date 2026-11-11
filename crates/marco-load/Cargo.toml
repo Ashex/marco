@@ -7,9 +7,11 @@ license = "MIT"
 publish = false
 
 [features]
-default = ["jemalloc", "metrics", "scylla"]
+default = ["jemalloc", "metrics", "scylla", "hubble"]
 # scan-scylla and fill-scylla (the scylla driver and tokio)
 scylla = ["dep:scylla", "dep:tokio", "dep:uuid", "dep:futures"]
+# sweep-hubble (reqwest, tokio and vlatproto's CBOR)
+hubble = ["dep:reqwest", "dep:tokio", "dep:futures", "dep:vlatproto", "dep:chrono"]
 jemalloc = ["marco-ops/jemalloc"]
 # off: marco-core without its op metrics, for the overhead bench
 metrics = ["marco-core/metrics"]
@@ -30,6 +32,9 @@ scylla = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true, features = ["rt-multi-thread"] }
 uuid = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
+vlatproto = { workspace = true, optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "http2", "query"], optional = true }
+chrono = { version = "0.4", default-features = false, features = ["std"], optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

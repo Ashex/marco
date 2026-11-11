@@ -9,6 +9,7 @@
 //! marco-load replay --snapshot FILE --deletes DIR   delete-by-URI replay through the mutable path
 //! marco-load diff   --a SNAP --b SNAP              two snapshots compared record by record
 //! marco-load scan-scylla --config TOML --out DIR [--snapshot SNAP]   Scylla tables -> build input (-> snapshot)
+//! marco-load sweep-hubble --out DIR [--snapshot SNAP]                 a Hubble mirror's repos -> build input (-> snapshot)
 //! marco-load fill-scylla --config TOML --input DIR   build input -> Scylla tables (tests, benchmarks)
 //! ```
 //!
@@ -24,6 +25,8 @@ mod build;
 #[cfg(feature = "scylla")]
 mod cql;
 mod diff;
+#[cfg(feature = "hubble")]
+mod hubble;
 mod lists_bench;
 mod metrics;
 mod rows;
@@ -96,6 +99,9 @@ enum Cmd {
     /// Scan Scylla tables into build input (see the README), then optionally build.
     #[cfg(feature = "scylla")]
     ScanScylla(Box<cql::scan::Args>),
+    /// Download every repo on a Hubble mirror into build input (and with --snapshot, build it).
+    #[cfg(feature = "hubble")]
+    SweepHubble(Box<hubble::Args>),
     /// Load build input into Scylla tables as current state (tests, benchmarks).
     #[cfg(feature = "scylla")]
     FillScylla(cql::fill::Args),
@@ -157,6 +163,8 @@ fn main() -> Result<()> {
         Cmd::Diff(a) => diff::run(&a)?,
         #[cfg(feature = "scylla")]
         Cmd::ScanScylla(a) => cql::scan::run(&a)?,
+        #[cfg(feature = "hubble")]
+        Cmd::SweepHubble(a) => hubble::run(&a)?,
         #[cfg(feature = "scylla")]
         Cmd::FillScylla(a) => cql::fill::run(&a)?,
     };

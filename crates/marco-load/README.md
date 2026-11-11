@@ -9,6 +9,7 @@ from the P0 and P1 runs.
 marco-load build        --input DIR --out SNAP           build input -> snapshot
 marco-load scan-scylla  --config TOML --out DIR [--snapshot SNAP]
                                                          Scylla tables -> build input (-> snapshot)
+marco-load sweep-hubble --out DIR [--snapshot SNAP]   a Hubble mirror's repos -> build input (-> snapshot)
 marco-load fill-scylla  --config TOML --input DIR        build input -> Scylla tables (tests, benchmarks)
 marco-load diff         --a SNAP --b SNAP                two snapshots, record by record
 marco-load verify       --snapshot SNAP                  checksums, every list decoded, both directions agree
@@ -108,6 +109,49 @@ the instance has dropped it. `--allow-gap`
 overrides either. Retention differs by instance: measure yours with
 `marco-harness retention --jetstream URL`. The public `jetstream2.us-east`
 kept 36.6 h when measured.
+
+## Building from Hubble
+
+`sweep-hubble` downloads every repo on a [Hubble](https://hubble.microcosm.blue) mirror and writes
+the input format: no appview, no archive key. It lists the mirror with
+`com.atproto.sync.listRepos` and fetches each repo with `com.atproto.sync.getRepo` as STAR-lite,
+zstd on the wire. Keys come in byte order, so it skips the records of other collections without
+buffering them and drops the connection once a repo's keys pass the last relation's collection: a
+repo's posts and likes cost only their wire bytes. Each record becomes a create at `time_us` 0
+(current state). A record whose subject isn't a DID, or a list item on a list in another repo, is
+skipped and counted.
+
+```bash
+marco-load sweep-hubble --out /data/sweep --snapshot /data/snap \
+  --user-agent "marco-load (you@example.com)"
+marco-load sweep-hubble --out /tmp/s --dids dids.txt --snapshot /tmp/snap   # a few repos
+```
+
+**What it reads.** Repos listed inactive (deleted, deactivated, taken down, suspended) are skipped,
+since Hubble serves none of them, and counted by status in the report (`inactive`). A repo Hubble
+refuses (`RepoNotFound`, `RepoTakendown` and the like) is counted under `gone`. Active repos are
+counted by Hubble's sync status (`sync_status`), so a sweep says how many it read from repos the
+mirror flags `desynchronized` or `throttled`. Nothing is verified: no CIDs, MST or signatures.
+
+**Politeness.** Hubble is a community mirror that pays for the egress, and it publishes no rate
+limit. `--concurrency` (12) bounds the downloads in flight; tell the operator before a full sweep
+and put a contact in `--user-agent`. A 429 or 5xx waits as long as the server asks
+(`RateLimit-Reset`, then `Retry-After`, up to `--max-wait-secs`, 300), else 1 s doubling to a
+minute, at most 20 times a request.
+
+**Resume.** Repos come in pages of `--page-size` (500), in DID order, and a page commits whole: a
+zstd frame per bucket, the files synced, then `sweep-state.json` with each file's length and the
+page's last DID. After a crash, run the same command: it cuts the files back and goes on after
+that DID. A repo that fails goes to a ledger and is tried again after the listing, `--retry-passes`
+(2) times; any still failing stop the sweep with an error, and the next run retries just those.
+`--fresh` starts over.
+
+**Catching up.** As with a Scylla scan, `cursors.json` gets the sweep's start less
+`--cursor-margin-secs` (300), and `marco serve --jetstream` replays everything since. So the whole
+sweep has to finish inside the source's retention: the progress line warns when its pace heads
+past `--retention-hours` (36), and the build refuses a cursor too old to replay. A full network
+sweep runs to days at a polite concurrency, past a public Jetstream's 36 h: follow a source that
+holds longer (a self-hosted Jetstream v2 with a longer `--cursor-lookback`).
 
 ## Building from ScyllaDB
 
