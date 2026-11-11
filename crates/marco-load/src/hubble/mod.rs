@@ -45,6 +45,9 @@ use spill::{bucket_of, Spill, BUCKETS};
 use starlite::Keep;
 
 pub const STATE: &str = "sweep-state.json";
+/// Each repo read and the revision it was read at, `did<TAB>rev` lines: what
+/// a tail recorded since gates on (graph-sync).
+pub const REVS: &str = "revs.tsv";
 pub const RELATIONS: &str = "relations.toml";
 
 #[derive(clap::Args)]
@@ -137,6 +140,9 @@ pub struct State {
     pub lens: Vec<Vec<u64>>,
     /// Repos that failed, and how many times.
     pub failed: BTreeMap<String, u32>,
+    /// Committed bytes of `revs.tsv`.
+    #[serde(default)]
+    pub revs_len: u64,
     pub counts: Counts,
 }
 
@@ -240,11 +246,12 @@ struct Sweep<'a> {
     wanted: Wanted,
     client: Client,
     spill: Spill,
+    revs: std::fs::File,
     st: State,
 }
 
 enum Outcome {
-    Ok(RepoRows, u64),
+    Ok(RepoRows, u64, String),
     Gone(String),
     Failed(String),
 }
@@ -254,9 +261,11 @@ impl Sweep<'_> {
         let mut c = Counts::default();
         let keep = |k: &str| self.wanted.keep(k);
         let o = match self.client.get_repo(&did, &keep).await {
+            // without its revision, nothing could tell which later events the snapshot already has
+            Ok(f) if f.rev.is_none() => Outcome::Failed("no revision in the response or the archive".into()),
             Ok(f) => {
                 let rows = rows_of(&did, &f.records, &self.rels, &self.idx, &self.wanted, &mut c);
-                Outcome::Ok(rows, f.wire_bytes)
+                Outcome::Ok(rows, f.wire_bytes, f.rev.unwrap_or_default())
             }
             Err(FetchError::Gone(why)) => Outcome::Gone(why),
             Err(FetchError::Failed(e)) => Outcome::Failed(format!("{e:#}")),
@@ -276,13 +285,15 @@ impl Sweep<'_> {
         // per relation, per bucket: the page's rows
         let mut raw: Vec<BTreeMap<usize, Vec<u8>>> = vec![BTreeMap::new(); self.user.len()];
         let mut st = self.st.clone();
+        let mut revs = String::new();
         for (did, o, c) in results {
             st.counts.bad_subject += c.bad_subject;
             st.counts.cross_repo_rows += c.cross_repo_rows;
             st.counts.bad_record += c.bad_record;
             match o {
-                Outcome::Ok(rows, wire) => {
+                Outcome::Ok(rows, wire, rev) => {
                     st.failed.remove(&did);
+                    revs.push_str(&format!("{did}\t{rev}\n"));
                     st.counts.repos += 1;
                     st.counts.wire_bytes += wire;
                     let b = bucket_of(&did);
@@ -316,6 +327,9 @@ impl Sweep<'_> {
         if cursor.is_some() {
             st.cursor = cursor;
         }
+        std::io::Write::write_all(&mut self.revs, revs.as_bytes())?;
+        st.revs_len += revs.len() as u64;
+        self.revs.sync_data()?;
         self.spill.sync()?;
         st.write(self.dir)?;
         self.st = st;
@@ -334,7 +348,7 @@ fn did_list(path: &Path, cursor: Option<&str>) -> Result<Vec<Repo>> {
 }
 
 fn clear(dir: &Path, rels: &[String]) -> Result<()> {
-    for f in [STATE, CURSORS, RELATIONS] {
+    for f in [STATE, CURSORS, RELATIONS, REVS] {
         let _ = std::fs::remove_file(dir.join(f));
     }
     for r in rels {
@@ -424,12 +438,20 @@ async fn sweep(a: &Args, rels: Relations) -> Result<Value> {
         },
     };
     let spill = Spill::open(dir, &names, &st.lens)?;
+    let revs_path = dir.join(REVS);
+    let revs = std::fs::OpenOptions::new().create(true).append(true).open(&revs_path)?;
+    let have = revs.metadata()?.len();
+    if have < st.revs_len {
+        bail!("{} has {have} bytes, the sweep state says {}: changed under it", revs_path.display(), st.revs_len);
+    }
+    // a crash after the append and before the state: cut back to the state
+    revs.set_len(st.revs_len)?;
     let user_agent: &'static str = Box::leak(a.user_agent.clone().into_boxed_str());
     let mut client = Client::new(&a.hubble, a.concurrency, user_agent)?;
     client.max_wait = Duration::from_secs(a.max_wait_secs);
     let idx: BTreeMap<RelId, usize> = user.iter().enumerate().map(|(i, &r)| (r, i)).collect();
     let wanted = Wanted::new(&rels, &user);
-    let mut s = Sweep { a, dir, rels, user, idx, wanted, client, spill, st };
+    let mut s = Sweep { a, dir, rels, user, idx, wanted, client, spill, revs, st };
     s.st.runs += 1;
     let run = Instant::now();
     let prior_secs = s.st.secs;

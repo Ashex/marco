@@ -87,8 +87,15 @@ fn serve(f: &Fake, path: &str) -> Vec<u8> {
             return response("400 Bad Request", &[("content-encoding", "zstd".into())], &body);
         };
         let body = zstd::bulk::compress(a, 1).unwrap();
-        let name = format!("attachment; filename=\"{}@3kaaaaaaaaa22.star-lite\"", did.replace(':', "-"));
-        return response("200 OK", &[("content-encoding", "zstd".into()), ("content-disposition", name)], &body);
+        // only A's response names its rev: the rest fall back to the archive's commit
+        let mut headers = vec![("content-encoding", "zstd".to_string())];
+        if did == A {
+            headers.push((
+                "content-disposition",
+                format!("attachment; filename=\"{}@3kaaaaaaaaa2a.star-lite\"", did.replace(':', "-")),
+            ));
+        }
+        return response("200 OK", &headers, &body);
     }
     response("404 Not Found", &[], b"")
 }
@@ -145,7 +152,12 @@ fn read_rows(dir: &Path, rel: &str, list: bool) -> Vec<(String, String, String, 
     let mut out = Vec::new();
     let Ok(rd) = std::fs::read_dir(dir.join(rel)) else { return out };
     for e in rd {
-        let mut rows = Rows::open(&e.unwrap().path()).unwrap();
+        let p = e.unwrap().path();
+        // a sweep that hasn't finished still has its empty bucket files
+        if std::fs::metadata(&p).unwrap().len() == 0 {
+            continue;
+        }
+        let mut rows = Rows::open(&p).unwrap();
         let mut cols = vec![Vec::new(); if list { 4 } else { 3 }];
         while rows.next(&mut cols).unwrap() {
             assert_eq!((rows.i64().unwrap(), rows.u8().unwrap()), (0, 1), "current state: creates at time 0");
@@ -227,6 +239,18 @@ fn sweeps_a_mirror_into_build_input_and_resumes_its_failures() {
     assert_eq!(items, vec![(A.into(), "3kaaaaaaaaa21".into(), B.into(), list.clone())]);
     let cursors: BTreeMap<String, String> = serde_json::from_slice(&std::fs::read(out.join(CURSORS)).unwrap()).unwrap();
     assert!(cursors.contains_key(SNAPSHOT_TIME));
+    // each repo read, at the rev it was read at, once though the sweep ran twice
+    let mut revs: Vec<String> = std::fs::read_to_string(out.join(REVS)).unwrap().lines().map(str::to_string).collect();
+    revs.sort();
+    assert_eq!(
+        revs,
+        [
+            "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa\t3kaaaaaaaaa2a",
+            "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb\t3k",
+            "did:plc:eeeeeeeeeeeeeeeeeeeeeeee\t3k",
+            "did:plc:gggggggggggggggggggggggg\t3k",
+        ]
+    );
 
     // the build takes it
     let snap = tmp.path().join("snap");
@@ -257,4 +281,25 @@ fn wanted_stops_past_the_last_collection() {
     assert_eq!(w.keep("app.bsky.graph.listitem/3k"), Keep::Record);
     assert_eq!(w.keep("app.bsky.graph.listitemx/3k"), Keep::Stop, "sorts past listitem/");
     assert_eq!(w.keep("app.bsky.graph.verification/3k"), Keep::Stop);
+}
+
+#[test]
+fn a_repo_without_a_revision_fails_rather_than_go_ungated() {
+    const H: &str = "did:plc:hhhhhhhhhhhhhhhhhhhhhhhh";
+    let fake = Arc::new(Fake {
+        repos: vec![(H.into(), true, None)],
+        archives: [(
+            H.to_string(),
+            starlite::tests::archive("", &[("app.bsky.graph.follow/3kaaaaaaaaa21", follow(A))]),
+        )]
+        .into(),
+        ..Default::default()
+    });
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let url = rt.block_on(start(fake));
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("sweep");
+    let err = run(&args(out.clone(), url)).unwrap_err().to_string();
+    assert!(err.contains("1 repos still failing"), "{err}");
+    assert!(read_rows(&out, "follow", false).is_empty(), "its rows aren't kept either");
 }

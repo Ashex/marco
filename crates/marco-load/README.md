@@ -127,6 +127,11 @@ marco-load sweep-hubble --out /data/sweep --snapshot /data/snap \
 marco-load sweep-hubble --out /tmp/s --dids dids.txt --snapshot /tmp/snap   # a few repos
 ```
 
+**Revisions.** Beside the build input, `revs.tsv` lists each repo read and the revision it was
+read at (`did<TAB>rev`, from the response's `Content-Disposition`, else the archive's commit). A
+tail recorded since the sweep began can then skip the events a repo's snapshot already holds:
+graph-sync does. A repo whose revision can't be read fails, like any other failure.
+
 **What it reads.** Repos listed inactive (deleted, deactivated, taken down, suspended) are skipped,
 since Hubble serves none of them, and counted by status in the report (`inactive`). A repo Hubble
 refuses (`RepoNotFound`, `RepoTakendown` and the like) is counted under `gone`. Active repos are

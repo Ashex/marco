@@ -171,14 +171,16 @@ pub(crate) mod tests {
     }
 
     /// An archive of `records` (key, record bytes), keys in order, with a
-    /// commit of rev `rev`.
+    /// commit of rev `rev`, or no commit when `rev` is empty.
     pub(crate) fn archive(rev: &str, records: &[(&str, Vec<u8>)]) -> Vec<u8> {
         let mut b = MAGIC.to_vec();
         b.extend_from_slice(&[0x01, 0x71, 0x12, 0x20]);
         b.extend_from_slice(&[7u8; 32]);
         let commit = vlatproto::cbor::Value::Map(vec![("rev".into(), vlatproto::cbor::Value::Text(rev.into()))]);
         let mut c = Vec::new();
-        commit.encode(&mut c);
+        if !rev.is_empty() {
+            commit.encode(&mut c);
+        }
         put_varint(&mut b, c.len() as u64);
         b.extend_from_slice(&c);
         for (k, r) in records {
