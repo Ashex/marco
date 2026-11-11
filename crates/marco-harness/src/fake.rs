@@ -99,6 +99,7 @@ impl Fake {
                 };
                 Message::Text(s.into())
             }
+            Proto::JetstreamV2 => unreachable!("the harness has no Jetstream v2 mode"),
             Proto::Firehose => Message::Binary(m.bytes.clone().into()),
         }
     }
@@ -153,6 +154,7 @@ async fn serve(sock: tokio::net::TcpStream, f: Arc<Fake>) -> Result<()> {
         (None, _) if f.rate == 0 => 0,
         (None, _) => f.head(),
         (Some(c), Proto::Jetstream) => f.through(c.saturating_sub(1)),
+        (Some(_), Proto::JetstreamV2) => unreachable!("the harness has no Jetstream v2 mode"),
         (Some(c), Proto::Firehose) => f.through(c),
     };
     let (mut tx, mut rx) = ws.split();

@@ -53,7 +53,7 @@ const GAP_SLACK: Duration = Duration::from_secs(600);
 
 /// Where a source with no cursor of its own starts, when the snapshot was
 /// bulk-built and carries the time its records are current to: that time,
-/// for Jetstream. None otherwise (the live tail). Refuses a time Jetstream
+/// for Jetstream (a v2 instance seeks to it, and its events carry seqs from there). None otherwise (the live tail). Refuses a time Jetstream
 /// can't replay from: older than `retention`, or (asking the instance) its
 /// first event from there comes well after. Refuses a firehose too, which
 /// resumes only by seq: catch up from Jetstream instead. `allow_gap` turns
@@ -69,20 +69,25 @@ pub async fn start_point(app: &App, src: &Source, retention: Duration, allow_gap
     let gap = match src.proto {
         Proto::Firehose => Some(format!(
             "the snapshot is current to {:.1} h ago and {} would start at its live tail, missing what changed in between: \
-             bulk-built snapshots catch up from Jetstream (--jetstream)",
+             bulk-built snapshots catch up from Jetstream (--jetstream or --jetstream-v2)",
             hours(age_us),
             src.name
         )),
-        Proto::Jetstream if Duration::from_micros(age_us as u64) > retention => Some(format!(
+        Proto::Jetstream | Proto::JetstreamV2 if Duration::from_micros(age_us as u64) > retention => Some(format!(
             "the snapshot is current to {:.1} h ago, past {}'s {:.1} h retention (--source-retention-hours): \
              following it would miss what changed in between; rebuild",
             hours(age_us),
             src.name,
             retention.as_secs_f64() / 3600.0
         )),
-        Proto::Jetstream => {
+        Proto::Jetstream | Proto::JetstreamV2 => {
             let rels = app.graph().relations().clone();
-            match marco_ingest::jetstream::first_event_us(&src.url, &rels, t as u64).await {
+            let first = if src.proto == Proto::Jetstream {
+                marco_ingest::jetstream::first_event_us(&src.url, &rels, t as u64).await
+            } else {
+                marco_ingest::jetstream2::first_event_us(&src.url, &rels, t as u64).await
+            };
+            match first {
                 Ok(first) if first - t > GAP_SLACK.as_micros() as i64 => Some(format!(
                     "{} no longer holds the snapshot's time ({:.1} h ago): its first event from there is {:.1} h later, \
                      and what changed in between would be missing; rebuild",
@@ -105,7 +110,7 @@ pub async fn start_point(app: &App, src: &Source, retention: Duration, allow_gap
         eprintln!("warning: {msg}");
     }
     Ok(match src.proto {
-        Proto::Jetstream => Some(t as u64),
+        Proto::Jetstream | Proto::JetstreamV2 => Some(t as u64),
         Proto::Firehose => None,
     })
 }
@@ -131,7 +136,7 @@ pub fn start(
         loop {
             tick.tick().await;
             a.report_source(&name, report(&st));
-            if st.state() == "stopped" {
+            if matches!(st.state(), "stopped" | "cursor_too_old") {
                 return;
             }
         }

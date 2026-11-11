@@ -41,6 +41,7 @@ impl Capture {
                     msgs.push(Msg { cursor, collection, bytes: line.to_vec() });
                 }
             }
+            Proto::JetstreamV2 => unreachable!("the harness has no Jetstream v2 mode"),
             Proto::Firehose => {
                 let mut r = b.as_slice();
                 while r.len() >= 4 {
@@ -70,6 +71,7 @@ pub struct Args {
 fn bucket(proto: Proto, rels: &Relations, b: &[u8]) -> Option<(usize, usize)> {
     let ev = match proto {
         Proto::Jetstream => jetstream::decode(b, rels).ok()?,
+        Proto::JetstreamV2 => unreachable!("the harness has no Jetstream v2 mode"),
         Proto::Firehose => match firehose::decode(b, rels).ok()? {
             Frame::Event(ev) => ev,
             _ => return None,
@@ -91,6 +93,7 @@ pub async fn run(a: Args) -> Result<()> {
     let rels = Relations::bsky_default();
     let url = match a.proto {
         Proto::Jetstream => jetstream::subscribe_url(&a.url, &rels, None),
+        Proto::JetstreamV2 => unreachable!("the harness has no Jetstream v2 mode"),
         Proto::Firehose => firehose::subscribe_url(&a.url, None),
     };
     let connector = if url.starts_with("wss://") {
@@ -133,6 +136,7 @@ pub async fn run(a: Args) -> Result<()> {
                 out.write_all(&bytes)?;
                 out.write_all(b"\n")?;
             }
+            Proto::JetstreamV2 => unreachable!("the harness has no Jetstream v2 mode"),
             Proto::Firehose => {
                 out.write_all(&(bytes.len() as u32).to_be_bytes())?;
                 out.write_all(&bytes)?;

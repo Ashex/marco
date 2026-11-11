@@ -59,6 +59,44 @@ pub fn subscribe_url(base: &str, rels: &Relations, cursor: Option<u64>) -> Strin
     u
 }
 
+/// A commit's change in `ev`, shared with Jetstream v2, whose records are the
+/// same JSON.
+pub(crate) fn commit_change(
+    rels: &Relations,
+    did: &str,
+    operation: &str,
+    collection: &str,
+    rkey: &str,
+    record: Option<&serde_json::Value>,
+    ev: &mut Event,
+) {
+    let Some(rel) = rels.by_collection(collection) else { return };
+    let Some(uri) = edge_uri(rels, did, collection, rkey) else {
+        ev.skipped.push("bad_uri");
+        return;
+    };
+    match operation {
+        // An update is an add, which replaces what the key held. A record
+        // that isn't an edge (a bad subject or list) leaves the key empty,
+        // as a delete, so the live graph ends where a rebuild does.
+        "create" | "update" => {
+            let subject = record.and_then(|r| rels.get(rel).subject_of(r));
+            let list = record.and_then(|r| rels.get(rel).list_of(r));
+            match (subject, list_of(rels, rel, &uri, list)) {
+                (Some(s), Ok(list)) if valid_subject(s) => {
+                    ev.change = Change::Ops(vec![Op::Add { uri, subject: s.to_string(), list, time_us: ev.time_us }]);
+                }
+                (_, list) => {
+                    ev.skipped.push(if list.is_err() { "bad_list" } else { "bad_subject" });
+                    ev.change = Change::Ops(vec![Op::Delete { uri, time_us: ev.time_us }]);
+                }
+            }
+        }
+        "delete" => ev.change = Change::Ops(vec![Op::Delete { uri, time_us: ev.time_us }]),
+        _ => ev.skipped.push("bad_operation"),
+    }
+}
+
 /// One event; Err is the decode-error label.
 pub fn decode(line: &[u8], rels: &Relations) -> Result<Event, &'static str> {
     let raw: Raw = serde_json::from_slice(line).map_err(|_| "json")?;
@@ -73,32 +111,7 @@ pub fn decode(line: &[u8], rels: &Relations) -> Result<Event, &'static str> {
         "commit" => {
             ev.kind = Kind::Commit;
             let c = raw.commit.ok_or("no_commit")?;
-            let Some(rel) = rels.by_collection(&c.collection) else { return Ok(ev) };
-            let Some(uri) = edge_uri(rels, &raw.did, &c.collection, &c.rkey) else {
-                ev.skipped.push("bad_uri");
-                return Ok(ev);
-            };
-            match c.operation.as_str() {
-                // An update is an add, which replaces what the key held. A record
-                // that isn't an edge (a bad subject or list) leaves the key empty,
-                // as a delete, so the live graph ends where a rebuild does.
-                "create" | "update" => {
-                    let subject = c.record.as_ref().and_then(|r| rels.get(rel).subject_of(r));
-                    let list = c.record.as_ref().and_then(|r| rels.get(rel).list_of(r));
-                    match (subject, list_of(rels, rel, &uri, list)) {
-                        (Some(s), Ok(list)) if valid_subject(s) => {
-                            ev.change =
-                                Change::Ops(vec![Op::Add { uri, subject: s.to_string(), list, time_us: ev.time_us }]);
-                        }
-                        (_, list) => {
-                            ev.skipped.push(if list.is_err() { "bad_list" } else { "bad_subject" });
-                            ev.change = Change::Ops(vec![Op::Delete { uri, time_us: ev.time_us }]);
-                        }
-                    }
-                }
-                "delete" => ev.change = Change::Ops(vec![Op::Delete { uri, time_us: ev.time_us }]),
-                _ => ev.skipped.push("bad_operation"),
-            }
+            commit_change(rels, &raw.did, &c.operation, &c.collection, &c.rkey, c.record.as_ref(), &mut ev);
         }
         "account" => {
             ev.kind = Kind::Account;

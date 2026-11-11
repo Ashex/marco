@@ -416,6 +416,7 @@ async fn bench(snapshot: &Path, capture: &Path, work: &Path) -> Result<()> {
     let f = fake::start(cap.clone(), "127.0.0.1:0", 0).await?;
     let url = match cap.proto {
         Proto::Jetstream => format!("ws://{}/subscribe", f.addr),
+        Proto::JetstreamV2 => unreachable!("the harness has no Jetstream v2 mode"),
         Proto::Firehose => format!("ws://{}/xrpc/com.atproto.sync.subscribeRepos", f.addr),
     };
     let app = work_app(snapshot, work)?;
@@ -533,6 +534,7 @@ async fn retention(proto: Proto, url: &str) -> Result<()> {
     let rels = marco_core::Relations::bsky_default();
     let u = match proto {
         Proto::Jetstream => marco_ingest::jetstream::subscribe_url(url, &rels, Some(1)),
+        Proto::JetstreamV2 => unreachable!("the harness has no Jetstream v2 mode"),
         Proto::Firehose => marco_ingest::firehose::subscribe_url(url, Some(1)),
     };
     let connector = if u.starts_with("wss://") {
@@ -554,6 +556,7 @@ async fn retention(proto: Proto, url: &str) -> Result<()> {
         };
         let ev = match proto {
             Proto::Jetstream => marco_ingest::jetstream::decode(&b, &rels).ok(),
+            Proto::JetstreamV2 => unreachable!("the harness has no Jetstream v2 mode"),
             Proto::Firehose => match marco_ingest::firehose::decode(&b, &rels) {
                 Ok(marco_ingest::firehose::Frame::Event(ev)) => Some(ev),
                 Ok(other) => {

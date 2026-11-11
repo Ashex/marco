@@ -14,6 +14,8 @@ pub const SNAPSHOT_TIME: &str = "time_us";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Proto {
     Jetstream,
+    /// Jetstream v2's `subscribeEvents`, resumed by seq.
+    JetstreamV2,
     Firehose,
 }
 
@@ -21,6 +23,7 @@ impl Proto {
     pub fn as_str(self) -> &'static str {
         match self {
             Proto::Jetstream => "jetstream",
+            Proto::JetstreamV2 => "jetstreamv2",
             Proto::Firehose => "firehose",
         }
     }
@@ -28,7 +31,7 @@ impl Proto {
     pub fn cursor_kind(self) -> &'static str {
         match self {
             Proto::Jetstream => "time_us",
-            Proto::Firehose => "seq",
+            Proto::JetstreamV2 | Proto::Firehose => "seq",
         }
     }
 }
@@ -38,7 +41,7 @@ pub struct Source {
     pub proto: Proto,
     /// `ws://` or `wss://`.
     pub url: String,
-    /// `jetstream:<host>` or `firehose:<host>`: the key its cursor is kept by.
+    /// `jetstream:<host>`, `jetstreamv2:<host>` or `firehose:<host>`: the key its cursor is kept by.
     pub name: String,
 }
 
@@ -170,6 +173,8 @@ mod tests {
         let s = Source::new(Proto::Firehose, "https://relay.example").unwrap();
         assert_eq!((s.name.as_str(), s.url.as_str()), ("firehose:relay.example", "wss://relay.example"));
         assert_eq!(Source::new(Proto::Jetstream, "ws://127.0.0.1:7/x").unwrap().name, "jetstream:127.0.0.1:7");
+        let s = Source::new(Proto::JetstreamV2, "https://js2.example").unwrap();
+        assert_eq!((s.name.as_str(), s.proto.cursor_kind()), ("jetstreamv2:js2.example", "seq"));
         assert!(Source::new(Proto::Jetstream, "ftp://x").is_err());
         assert!(Source::new(Proto::Jetstream, "wss:///x").is_err());
     }

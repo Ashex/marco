@@ -2,76 +2,18 @@
 //! cursors, a restart resumes from the sink's cursor less the overlap, and
 //! account events set and clear statuses only when there's something to do.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use marco_core::Relations;
-use marco_ingest::{Op, Proto, Sink, Source, Status};
+use marco_ingest::{Proto, Sink, Source, Status};
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::tungstenite::Message;
 
-#[derive(Default)]
-struct Mem {
-    edges: Mutex<BTreeMap<String, String>>,
-    statuses: Mutex<HashMap<String, Status>>,
-    cursors: Mutex<HashMap<String, String>>,
-    /// (cursor, what) per sink call, in order.
-    calls: Mutex<Vec<(u64, String)>>,
-}
-
-impl Sink for Mem {
-    async fn apply_from(&self, source: &str, cursor: &str, ops: &[Op]) -> anyhow::Result<()> {
-        let mut e = self.edges.lock().unwrap();
-        for op in ops {
-            match op {
-                Op::Add { uri, subject, .. } => {
-                    e.entry(uri.clone()).or_insert_with(|| subject.clone());
-                }
-                Op::Delete { uri, .. } => {
-                    e.remove(uri);
-                }
-            }
-        }
-        self.cursors.lock().unwrap().insert(source.into(), cursor.into());
-        self.calls.lock().unwrap().push((cursor.parse().unwrap(), format!("{} ops", ops.len())));
-        Ok(())
-    }
-
-    async fn status_from(
-        &self,
-        source: &str,
-        cursor: &str,
-        did: &str,
-        s: Option<Status>,
-        _: i64,
-    ) -> anyhow::Result<u64> {
-        match s {
-            Some(s) => self.statuses.lock().unwrap().insert(did.into(), s),
-            None => self.statuses.lock().unwrap().remove(did),
-        };
-        self.cursors.lock().unwrap().insert(source.into(), cursor.into());
-        self.calls.lock().unwrap().push((cursor.parse().unwrap(), format!("status {did} {s:?}")));
-        Ok(0)
-    }
-
-    fn source_cursor(&self, source: &str) -> Option<String> {
-        self.cursors.lock().unwrap().get(source).cloned()
-    }
-
-    fn has_status(&self, did: &str) -> bool {
-        self.statuses.lock().unwrap().contains_key(did)
-    }
-}
-
-fn now_us() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros() as u64
-}
-
-const A: &str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
-const B: &str = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
-const C: &str = "did:plc:cccccccccccccccccccccccc";
+mod common;
+use common::*;
 
 fn follow(t: u64, did: &str, op: &str, rkey: &str, subject: Option<&str>) -> String {
     let rec =
@@ -133,12 +75,6 @@ async fn until(sink: &Mem, cursor: u64) {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("cursor never reached {cursor}: {:?}", sink.calls.lock().unwrap());
-}
-
-impl Mem {
-    fn source_cursor_num(&self) -> u64 {
-        self.cursors.lock().unwrap().values().next().map_or(0, |c| c.parse().unwrap())
-    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

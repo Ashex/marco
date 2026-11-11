@@ -49,6 +49,7 @@ fn touched(cap: &Capture) -> (BTreeSet<String>, BTreeSet<String>) {
     for m in &cap.msgs {
         let ev = match cap.proto {
             Proto::Jetstream => jetstream::decode(&m.bytes, &rels).ok(),
+            Proto::JetstreamV2 => unreachable!("the harness has no Jetstream v2 mode"),
             Proto::Firehose => match firehose::decode(&m.bytes, &rels) {
                 Ok(Frame::Event(ev)) => Some(ev),
                 _ => None,
@@ -240,6 +241,7 @@ pub async fn run(a: Args) -> Result<bool> {
     let fk = fake::start(cap.clone(), "127.0.0.1:0", a.rate).await?;
     let url = match cap.proto {
         Proto::Jetstream => format!("ws://{}/subscribe", fk.addr),
+        Proto::JetstreamV2 => unreachable!("the harness has no Jetstream v2 mode"),
         Proto::Firehose => format!("ws://{}/xrpc/com.atproto.sync.subscribeRepos", fk.addr),
     };
     let src = Source::new(cap.proto, &url)?;
@@ -410,6 +412,7 @@ async fn finish(
     }
     let url = match cap.proto {
         Proto::Jetstream => "/subscribe",
+        Proto::JetstreamV2 => unreachable!("the harness has no Jetstream v2 mode"),
         Proto::Firehose => "/xrpc/com.atproto.sync.subscribeRepos",
     };
     // its own fake, at full speed: the expected state is the whole capture, once
