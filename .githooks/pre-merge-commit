@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# git merge runs this hook, not pre-commit: give merges the same checks
+exec "$(git rev-parse --show-toplevel)/.githooks/pre-commit"
