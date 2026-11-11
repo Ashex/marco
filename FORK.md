@@ -12,7 +12,10 @@ requests, not pull requests, so the fork carries its own changes and merges upst
 | `main` | upstream's `main` merged in, plus the patches below. Never rebased: services build from it |
 | topic branches | optional, merged into `main` with `--no-ff` |
 
-Sync with `git fetch upstream && git merge upstream/main`. The `sync-marco-fork` skill in
+Sync with `git fetch upstream && git merge upstream/main`.
+
+`.githooks/pre-commit` runs fmt, clippy and the workspace tests before each commit, merges
+included. Enable it once per clone with `git config core.hooksPath .githooks`. The `sync-marco-fork` skill in
 `northsky/appview/data-service/.claude/skills/` has the whole procedure.
 
 ## The patches
