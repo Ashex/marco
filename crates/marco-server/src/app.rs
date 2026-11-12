@@ -617,8 +617,12 @@ impl App {
                 return Err(format!("op {i}: no relation for {coll}"));
             };
             if let Op::Add { subject, list, .. } = op {
-                if classify(subject).is_none() {
-                    return Err(format!("op {i}: subject {subject:?} isn't a DID"));
+                if !g.relations().get(rel).valid_subject(subject) {
+                    let kind = match g.relations().get(rel).subject_kind {
+                        marco_core::SubjectKind::Did => "a DID",
+                        marco_core::SubjectKind::List => "a list's AT URI",
+                    };
+                    return Err(format!("op {i}: subject {subject:?} isn't {kind}"));
                 }
                 if g.relations().is_list(rel) {
                     let owner = parse_uri(uri).map(|x| x.0);

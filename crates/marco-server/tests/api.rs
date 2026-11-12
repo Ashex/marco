@@ -1227,3 +1227,30 @@ async fn followers_newest_first() {
         .into_owned();
     assert_eq!(ids.actors.len(), 4, "id order is still there");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn listblocks_through_the_write_api() {
+    let s = start(false, false).await;
+    let g = graph(s.api, None);
+    let w = graph(s.api, Some(TOKEN));
+    let (v, o) = (did(N + 8_000), did(N + 8_001));
+    let list = list_uri(&o, 0);
+    let lb = uri(&v, "app.bsky.graph.listblock", &tid(9_600_000, 1));
+    w.write_batch(WriteBatchRequest { ops: vec![add(&lb, &list)], ..Default::default() }).await.unwrap();
+    let out = g
+        .list_out(ListOutRequest { rel: "listblock".into(), actor: v.clone(), limit: 10, ..Default::default() })
+        .await
+        .unwrap()
+        .into_owned();
+    let got: Vec<(&str, &str)> = out.edges.iter().map(|e| (e.uri.as_str(), e.subject.as_str())).collect();
+    assert_eq!(got, vec![(lb.as_str(), list.as_str())]);
+
+    let refused = |op: WriteOp| {
+        let w = &w;
+        async move { w.write_batch(WriteBatchRequest { ops: vec![op], ..Default::default() }).await.unwrap_err().code }
+    };
+    let lb2 = uri(&v, "app.bsky.graph.listblock", &tid(9_600_001, 1));
+    assert_eq!(refused(add(&lb2, &o)).await, ErrorCode::InvalidArgument, "a listblock names a list");
+    let fo = uri(&v, FOLLOW, &tid(9_600_002, 1));
+    assert_eq!(refused(add(&fo, &list)).await, ErrorCode::InvalidArgument, "a follow names an account");
+}
