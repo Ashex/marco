@@ -235,7 +235,7 @@ fn twenty_checkpoints_match_a_full_rebuild() {
 fn a_patch_writes_only_what_changed() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("g");
-    let mut g = Graph::new(Relations::bsky_default());
+    let mut g = Graph::new(without_time_order());
     g.shards = 1;
     g.set_subj_index(1000);
     let f = COLLS[0];
@@ -478,7 +478,7 @@ fn a_compaction_closes_the_old_files() {
 fn an_insert_rewrites_its_own_block() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("g");
-    let mut g = Graph::new(Relations::bsky_default());
+    let mut g = Graph::new(without_time_order());
     g.shards = 1;
     let popular = did(0);
     // followers 1..6000, every other one: ids spread over the set
@@ -561,4 +561,13 @@ fn compaction_clears_cached_garbage_for_the_next_checkpoint() {
     let total: u64 = all.iter().map(|(_, x)| x.reclaim()).sum();
     assert_eq!(snap.compaction_due(&never, room(0, total)).len(), cached, "as many as it takes");
     assert_eq!(snap.compaction_due(&never, room(0, total + 1)).len(), cached, "all it can when that's short");
+}
+
+/// The default relations without the follows' `.by` companion: the tests that
+/// count the blocks one write touches measure the engine, not that companion,
+/// which writes its own blocks for every follow.
+fn without_time_order() -> Relations {
+    let list =
+        Relations::bsky_default().list.into_iter().map(|r| marco_core::Relation { newest_in: false, ..r }).collect();
+    Relations::new(list).unwrap()
 }

@@ -115,9 +115,6 @@ source's cursor, and a checkpoint folds the segments into new shard files now an
   the follow graph (12.2B likes).
 - A record store. marco keeps ids, rkeys and subjects. It doesn't store record bodies, profiles,
   list records or list kinds, and it doesn't search.
-- Followers in time order. In lists come back in id order with a DID cursor. Out lists are newest
-  first.
-- List subjects. Every subject is a DID, so `listblock` isn't a relation yet.
 - Distributed. One box holds the whole network today, and sharding across nodes is a later option.
 - A write-ahead log. After a crash marco replays its sources from their cursors, so an API writer
   keeps its own cursor and replays from it ([Writing and ingest](ingest.md)).

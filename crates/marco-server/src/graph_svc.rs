@@ -285,6 +285,23 @@ pub fn list_in_(g: &Graph, cx: &ReadCx<'_>, rel: RelId, req: &ListInRequest) -> 
     if g.hidden(&req.subject) {
         return Ok(ListInResponse::default());
     }
+    if req.newest_first {
+        let lim = limit(req.limit, 50, 1000);
+        // a cursor that isn't a key this call gave: no page, rather than the first again
+        let before = match req.cursor.as_str() {
+            "" => None,
+            c => match c.parse::<u64>() {
+                Ok(k) => Some(k),
+                Err(_) => return Ok(ListInResponse::default()),
+            },
+        };
+        let (actors, next) = g.in_newest(cx, rel, &req.subject, lim, before)?;
+        return Ok(ListInResponse {
+            actors,
+            cursor: next.map(|k| k.to_string()).unwrap_or_default(),
+            ..Default::default()
+        });
+    }
     let cursor = (!req.cursor.is_empty()).then_some(req.cursor.as_str());
     let lim = limit(req.limit, 50, 1000);
     let (actors, next) = g.in_list(cx, rel, &req.subject, lim, cursor)?;
@@ -577,6 +594,9 @@ impl svc::Graph for GraphApi {
         self.readable()?;
         let req = req.to_owned_message();
         let rel = rel_id(&self.0.graph(), &req.rel)?;
+        if req.newest_first && self.0.graph().relations().reverse_rel(rel).is_none() {
+            return Err(bad(format!("{} isn't kept in time order: newest_first needs newest_in", req.rel)));
+        }
         Response::ok(run(&self.0, &ctx, "Graph/ListIn", move |g, cx| list_in_(g, cx, rel, &req)).await?)
     }
 

@@ -1310,3 +1310,71 @@ fn listblocks_point_at_lists_in_any_repo() {
         assert!(!blocks(&g, &x));
     }
 }
+
+/// A subject's followers newest first, every page: the followers' DIDs.
+fn newest(g: &Graph, s: &str, limit: usize) -> Vec<Vec<String>> {
+    let mut pages = Vec::new();
+    let mut before = None;
+    loop {
+        let (page, next) = g.read(|cx| g.in_newest(cx, FOLLOW, s, limit, before)).unwrap();
+        pages.push(page);
+        match next {
+            Some(n) => before = Some(n),
+            None => return pages,
+        }
+    }
+}
+
+#[test]
+fn followers_come_newest_first() {
+    let s = did(100);
+    let other = did(101);
+    let x: Vec<String> = (1..=6).map(did).collect();
+    for snapshot_between in [false, true] {
+        let mut g = graph();
+        for (i, a) in x[..5].iter().enumerate() {
+            g.add_rec(&follow(a, &tid(i as u64 + 1)), &s, None, 0).unwrap();
+        }
+        // x2 follows twice; x6's record key isn't a TID, so it has no time and goes last
+        g.add_rec(&follow(&x[1], &tid(7)), &s, None, 0).unwrap();
+        g.add_rec(&follow(&x[5], "m1"), &s, None, 0).unwrap();
+        g.add_rec(&follow(&x[0], &tid(8)), &other, None, 0).unwrap();
+        if snapshot_between {
+            g = reopen(&g);
+        }
+        let want = |v: &[usize]| v.iter().map(|&i| x[i].clone()).collect::<Vec<_>>();
+        assert_eq!(
+            newest(&g, &s, 3),
+            vec![want(&[1, 4, 3]), want(&[2, 1, 0]), want(&[5])],
+            "x2's later record, x5, x4 / x3, x2's first, x1 / x6"
+        );
+        assert_eq!(newest(&g, &other, 10), vec![want(&[0])]);
+
+        assert_eq!(g.delete(&follow(&x[3], &tid(4))).unwrap(), removed(&s));
+        // x5 points its record at someone else
+        g.add_rec(&follow(&x[4], &tid(5)), &other, None, 0).unwrap();
+        g.set_status(&x[2], Some(Status::Deleted), 0).unwrap();
+        let g = if snapshot_between { reopen(&g) } else { g };
+        assert_eq!(newest(&g, &s, 10), vec![want(&[1, 1, 0, 5])]);
+        assert_eq!(newest(&g, &other, 10), vec![want(&[0, 4])]);
+    }
+}
+
+#[test]
+fn followers_sharing_a_record_key_are_both_kept() {
+    // two repos can mint the same TID: the same microsecond and clock id
+    let s = did(200);
+    let (y1, y2) = (did(201), did(202));
+    let mut g = graph();
+    g.add_rec(&follow(&y1, &tid(9)), &s, None, 0).unwrap();
+    g.add_rec(&follow(&y2, &tid(9)), &s, None, 0).unwrap();
+    let mut got = newest(&g, &s, 10).concat();
+    got.sort();
+    let mut want = vec![y1.clone(), y2.clone()];
+    want.sort();
+    assert_eq!(got, want);
+    g.delete(&follow(&y1, &tid(9))).unwrap();
+    assert_eq!(newest(&g, &s, 10), vec![vec![y2.clone()]], "the delete takes y1's, not y2's");
+    let g = reopen(&g);
+    assert_eq!(newest(&g, &s, 10), vec![vec![y2]]);
+}

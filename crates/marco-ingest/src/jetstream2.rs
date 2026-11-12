@@ -91,7 +91,8 @@ pub fn subscribe_url(base: &str, rels: &Relations, cursor: Option<u64>) -> Strin
         u.push_str(PATH);
     }
     let mut sep = if u.contains('?') { '&' } else { '?' };
-    for r in rels.list.iter().filter(|r| r.owner_of.is_none()) {
+    // a companion's collection is its relation's: ask for each once
+    for r in rels.list.iter().filter(|r| r.owner_of.is_none() && r.reverse_of.is_none()) {
         u.push(sep);
         u.push_str("collections=");
         u.push_str(&r.collection);

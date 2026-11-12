@@ -576,7 +576,13 @@ impl svc::Admin for AdminApi {
             .collect();
         // the config as written: companions are made, not configured
         let user = marco_core::Relations {
-            list: g.relations().list.iter().filter(|r| r.owner_of.is_none()).cloned().collect(),
+            list: g
+                .relations()
+                .list
+                .iter()
+                .filter(|r| r.owner_of.is_none() && r.reverse_of.is_none())
+                .cloned()
+                .collect(),
         };
         let config = toml::to_string(&user).unwrap_or_default();
         Response::ok(ListRelationsResponse { relations, config, ..Default::default() })

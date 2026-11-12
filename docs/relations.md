@@ -57,6 +57,8 @@ That's the default, the one `marco-load build` uses without `--relations`.
 | `collection` | required | The record's NSID. Unique: one relation per collection. |
 | `subject` | required | Dotted path to the subject DID in the record (`subject`, or `a.b` for a nested field). |
 | `list` | optional | Dotted path to an AT URI of a record in the same repo. Edges go from that record instead of from the actor. |
+| `subject_kind` | optional | `did` (default), or `list`: the subject is a list's AT URI, in any repo, and the edge goes to the list's node (`listblock`). |
+| `newest_in` | optional | Also keep each subject's records newest first, in a companion `<name>.by` (`ListIn` with `newestFirst`). It costs a second copy of the relation's records. Default on for `follow`. |
 
 A relation with `list` gets a companion named `<name>.owner`, added for you and never configured.
 There can be 255 relations in all, companions included.

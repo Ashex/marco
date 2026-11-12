@@ -580,8 +580,9 @@ impl Graph {
         let mut removed = 0;
         if status == Some(Status::Deleted) {
             for rel in 0..self.rels.len() as RelId {
-                // a list relation's logs are by list: its records go through its companion
-                if self.rels.is_list(rel) {
+                // a list relation's logs are by list: its records go through its companion;
+                // a .by companion's are the actor's followers', which aren't the actor's
+                if self.rels.is_list(rel) || self.rels.is_reverse(rel) {
                     continue;
                 }
                 let list_rel = self.rels.list_rel(rel);
@@ -1456,6 +1457,27 @@ impl Graph {
         Ok(r)
     }
 
+    /// One page of the actors naming `subject` newest first, by their records'
+    /// times, and the cursor for the next page. Needs `rel`'s `.by` companion
+    /// (`newest_in`); a relation without one has no time order.
+    pub fn in_newest(
+        &self,
+        cx: &ReadCx<'_>,
+        rel: RelId,
+        subject: &str,
+        limit: usize,
+        before: Option<u64>,
+    ) -> R<(Vec<String>, Option<u64>)> {
+        let (Some(rc), Some(s)) = (self.rels.reverse_rel(rel), self.id_of(subject)) else {
+            return Ok((Vec::new(), None));
+        };
+        let page = self.out_page(cx, rc, s, limit, before)?;
+        let next = (limit > 0 && page.len() == limit).then(|| page[page.len() - 1].0);
+        let actors =
+            page.into_iter().filter(|&(_, a)| !self.hidden_id(a)).filter_map(|(_, a)| self.did_of(a)).collect();
+        Ok((actors, next))
+    }
+
     /// One page of the actors naming `subject`, in id order, and the cursor
     /// for the next page (a DID).
     pub fn in_list(
@@ -1797,7 +1819,36 @@ impl Graph {
         }
         self.records[rel as usize] += 1;
         self.maybe_compact(rel, actor, subject)?;
+        if let Some(rc) = self.rels.reverse_rel(rel) {
+            self.put_rev(rc, subject, actor, key)?;
+        }
         Ok(Added::Added)
+    }
+
+    /// The record into its relation's `.by` companion: under the subject, at
+    /// its time with the actor's low bits, the next free key if another
+    /// record (the same actor's too: records are distinct) already has that one.
+    fn put_rev(&mut self, rc: RelId, subject: u32, actor: u32, key: u64) -> Result<()> {
+        let k0 = rev_key(key, actor);
+        for k in k0..k0 + REV_PROBE {
+            if self.rd(|g, cx| g.out_get(cx, rc, subject, k))?.is_none() {
+                self.put_id(rc, subject, k, actor)?;
+                return Ok(());
+            }
+        }
+        tracing::warn!(subject, actor, key, "no free .by key near the record's: it's left out of the time order");
+        Ok(())
+    }
+
+    fn remove_rev(&mut self, rc: RelId, subject: u32, actor: u32, key: u64) -> Result<()> {
+        let k0 = rev_key(key, actor);
+        for k in k0..k0 + REV_PROBE {
+            if self.rd(|g, cx| g.out_get(cx, rc, subject, k))? == Some(actor) {
+                self.remove_id(rc, subject, k)?;
+                return Ok(());
+            }
+        }
+        Ok(())
     }
 
     fn delete_(&mut self, uri: &str, time_us: i64) -> Result<(RelId, Removed)> {
@@ -1876,6 +1927,9 @@ impl Graph {
             self.pairs[rel as usize] -= 1;
         }
         self.maybe_compact(rel, actor, subject)?;
+        if let Some(rc) = self.rels.reverse_rel(rel) {
+            self.remove_rev(rc, subject, actor, key)?;
+        }
         Ok(Some(subject))
     }
 
@@ -2160,6 +2214,20 @@ impl Graph {
         if self.base.is_none() && self.state.iter().all(|s| s.out_over.is_empty()) {
             self.subj_index = n;
         }
+    }
+}
+
+/// How far past a record's `.by` key to look for a free one.
+const REV_PROBE: u64 = 16;
+
+/// A record's key in its relation's `.by` companion: a TID keeps its time and
+/// trades its clock id for the actor's low bits, so followers of one subject
+/// rarely meet; any other rkey has no time and sorts oldest, by actor.
+pub fn rev_key(key: u64, actor: u32) -> u64 {
+    if crate::rkey::is_tid(key) {
+        (key & !0x3ff) | (actor as u64 & 0x3ff)
+    } else {
+        actor as u64
     }
 }
 

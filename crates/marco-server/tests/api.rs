@@ -791,7 +791,7 @@ async fn admin_rpcs() {
     assert_eq!(o.snapshot.shards, 4);
     assert_eq!(o.snapshot.files, 5);
     assert_eq!(o.directory.base, marco_server::synth::graph(N, 4).unwrap().n_ids() as u64, "DIDs and list nodes");
-    assert_eq!(o.relations.len(), 5, "follow, block, listitem, listitem.owner, listblock");
+    assert_eq!(o.relations.len(), 6, "follow, block, listitem, listitem.owner, listblock, follow.by");
     assert_eq!(o.relations[0].name, "follow");
     assert!(o.relations[0].snapshot_records > 2 * N as u64);
     assert_eq!(o.delta_entries, 0);
@@ -807,7 +807,7 @@ async fn admin_rpcs() {
     let t_del = marco_server::app::now_ms() * 1000 - 3_600_000_000;
     s.app.apply_from("live", "1", &[Op::Delete { uri: tomb.clone(), time_us: t_del }]).await.unwrap();
     let o = a.get_overview(GetOverviewRequest::default()).await.unwrap().into_owned();
-    assert_eq!(o.delta_entries, 2, "out add + in add");
+    assert_eq!(o.delta_entries, 4, "out add + in add, and the same in follow.by");
     assert_eq!(o.tombstones, 1);
     assert!(o.dirty_shards >= 1);
     assert_eq!(o.write_cursor, "cur-9");
@@ -825,7 +825,7 @@ async fn admin_rpcs() {
 
     let sh = a.list_shards(ListShardsRequest::default()).await.unwrap().into_owned();
     assert_eq!(sh.shards.len(), 4);
-    assert_eq!(sh.shards.iter().map(|x| x.delta_entries).sum::<u64>(), 2);
+    assert_eq!(sh.shards.iter().map(|x| x.delta_entries).sum::<u64>(), 4, "follow's and follow.by's");
     assert_eq!(sh.shards.iter().map(|x| x.tombstones).sum::<u32>(), 1);
     assert!(sh.shards.iter().any(|x| x.state != "clean"));
     assert!(sh.shards.iter().all(|x| x.verify == "unverified"));
@@ -833,8 +833,9 @@ async fn admin_rpcs() {
     let st = a.get_storage(GetStorageRequest::default()).await.unwrap().into_owned();
     assert!(st.sections.iter().any(|x| x.name == "r0.out.small" && x.rel == "follow" && x.files == 4));
     assert!(st.sections.iter().any(|x| x.rel == "directory"));
-    assert_eq!(st.delta_lists, 2);
-    assert_eq!(st.deltas.len(), 2);
+    // follow's out list and in set, and follow.by's
+    assert_eq!(st.delta_lists, 4);
+    assert_eq!(st.deltas.len(), 4);
     assert_eq!(
         a.get_storage(GetStorageRequest { by: "x".into(), ..Default::default() }).await.unwrap_err().code,
         ErrorCode::InvalidArgument
@@ -1190,4 +1191,39 @@ async fn lists() {
     assert_eq!(outcome(&r.results[0]), format!("removed {a7}"));
     let m = g.list_out(page(true)).await.unwrap().into_owned();
     assert_eq!(m.edges.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn followers_newest_first() {
+    let s = start(false, false).await;
+    let g = graph(s.api, None);
+    let w = graph(s.api, Some(TOKEN));
+    // fresh accounts past the synthetic graph's: s0 is followed by f1..f4 in that order
+    let s0 = did(N + 9_000);
+    let f: Vec<String> = (1..=4).map(|i| did(N + 9_000 + i)).collect();
+    let ops = f.iter().enumerate().map(|(i, x)| add(&uri(x, FOLLOW, &tid(9_500_000 + i as u64, 1)), &s0)).collect();
+    w.write_batch(WriteBatchRequest { ops, ..Default::default() }).await.unwrap();
+    let page = |cursor: &str| ListInRequest {
+        rel: "follow".into(),
+        subject: s0.clone(),
+        limit: 3,
+        cursor: cursor.into(),
+        newest_first: true,
+        ..Default::default()
+    };
+    let p1 = g.list_in(page("")).await.unwrap().into_owned();
+    assert_eq!(p1.actors, vec![f[3].clone(), f[2].clone(), f[1].clone()], "newest first");
+    assert!(!p1.cursor.is_empty());
+    let p2 = g.list_in(page(&p1.cursor)).await.unwrap().into_owned();
+    assert_eq!((p2.actors, p2.cursor.as_str()), (vec![f[0].clone()], ""));
+    assert!(g.list_in(page("not a key")).await.unwrap().into_owned().actors.is_empty(), "no page, not the first again");
+
+    let blocks = ListInRequest { rel: "block".into(), subject: s0.clone(), newest_first: true, ..Default::default() };
+    assert_eq!(g.list_in(blocks).await.unwrap_err().code, ErrorCode::InvalidArgument, "blocks keep no time order");
+    let ids = g
+        .list_in(ListInRequest { rel: "follow".into(), subject: s0.clone(), limit: 10, ..Default::default() })
+        .await
+        .unwrap()
+        .into_owned();
+    assert_eq!(ids.actors.len(), 4, "id order is still there");
 }

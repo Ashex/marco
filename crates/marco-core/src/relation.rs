@@ -18,6 +18,10 @@
 //! from the actor to the list's node (`listblock`: blocking everyone on a
 //! moderation list).
 //!
+//! A relation with `newest_in = true` also keeps each subject's records
+//! newest first, in a companion `<name>.by`: the subject's followers in the
+//! order they followed. Its records are the relation's, held by subject.
+//!
 //! A relation with `list` keeps edges from that record (a list, in the
 //! actor's own repo) to the subject: the list is a node in the directory,
 //! keyed by its AT URI. A delete names only the actor and rkey, so each such
@@ -61,6 +65,12 @@ pub struct Relation {
     pub owner_of: Option<String>,
     #[serde(default, skip_serializing_if = "SubjectKind::is_did")]
     pub subject_kind: SubjectKind,
+    /// Keep each subject's records newest first too, in a `<name>.by` companion.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub newest_in: bool,
+    /// Set on a `.by` companion: the relation whose records it holds by subject.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reverse_of: Option<String>,
 }
 
 impl Relation {
@@ -95,7 +105,7 @@ impl Relations {
     /// The configured relations, each list relation followed by its
     /// companion. Companions in `list` (a snapshot's) are made again.
     pub fn new(list: Vec<Relation>) -> Result<Relations> {
-        let user: Vec<Relation> = list.into_iter().filter(|r| r.owner_of.is_none()).collect();
+        let user: Vec<Relation> = list.into_iter().filter(|r| r.owner_of.is_none() && r.reverse_of.is_none()).collect();
         let r = Relations { list: user };
         r.validate()?;
         let mut all = Vec::with_capacity(r.list.len() + 1);
@@ -107,10 +117,28 @@ impl Relations {
                 list: None,
                 owner_of: Some(x.name.clone()),
                 subject_kind: SubjectKind::List,
+                newest_in: false,
+                reverse_of: None,
             });
             all.push(x);
             all.extend(owner);
         }
+        // last, so adding one moves no other relation's id
+        let reverse: Vec<Relation> = all
+            .iter()
+            .filter(|x| x.newest_in)
+            .map(|x| Relation {
+                name: format!("{}.by", x.name),
+                collection: x.collection.clone(),
+                subject: x.subject.clone(),
+                list: None,
+                owner_of: None,
+                subject_kind: SubjectKind::Did,
+                newest_in: false,
+                reverse_of: Some(x.name.clone()),
+            })
+            .collect();
+        all.extend(reverse);
         if all.len() > RelId::MAX as usize {
             bail!("at most {} relations, companions included", RelId::MAX);
         }
@@ -136,9 +164,13 @@ impl Relations {
             list: list.map(Into::into),
             owner_of: None,
             subject_kind,
+            newest_in: false,
+            reverse_of: None,
         };
+        // followers newest first, as getFollowers lists them
+        let follow = Relation { newest_in: true, ..rel("follow", "app.bsky.graph.follow", None, SubjectKind::Did) };
         Relations::new(vec![
-            rel("follow", "app.bsky.graph.follow", None, SubjectKind::Did),
+            follow,
             rel("block", "app.bsky.graph.block", None, SubjectKind::Did),
             rel("listitem", "app.bsky.graph.listitem", Some("list"), SubjectKind::Did),
             rel("listblock", "app.bsky.graph.listblock", None, SubjectKind::List),
@@ -153,6 +185,9 @@ impl Relations {
             }
             if r.subject.is_empty() || r.name.is_empty() || r.list.as_ref().is_some_and(|l| l.is_empty()) {
                 bail!("relation {i}: name and subject are required, and list can't be empty");
+            }
+            if r.newest_in && (r.list.is_some() || r.subject_kind == SubjectKind::List) {
+                bail!("relation {}: newest_in is for relations between accounts", r.name);
             }
             if r.list.is_some() && r.subject_kind == SubjectKind::List {
                 bail!("relation {}: a list relation's subject is an account", r.name);
@@ -169,7 +204,20 @@ impl Relations {
 
     /// The relations a caller names: every one but the companions.
     pub fn user(&self) -> Vec<RelId> {
-        (0..self.list.len() as RelId).filter(|&r| self.list[r as usize].owner_of.is_none()).collect()
+        (0..self.list.len() as RelId).filter(|&r| !self.is_owner(r) && !self.is_reverse(r)).collect()
+    }
+
+    pub fn is_reverse(&self, rel: RelId) -> bool {
+        self.list[rel as usize].reverse_of.is_some()
+    }
+
+    /// A relation's `.by` companion, which holds its records by subject, newest first.
+    pub fn reverse_rel(&self, rel: RelId) -> Option<RelId> {
+        if !self.list[rel as usize].newest_in {
+            return None;
+        }
+        let name = &self.list[rel as usize].name;
+        self.list.iter().position(|r| r.reverse_of.as_ref() == Some(name)).map(|i| i as RelId)
     }
 
     /// The relations between actors: neither list relations, nor companions,
@@ -177,7 +225,10 @@ impl Relations {
     pub fn actor_rels(&self) -> Vec<RelId> {
         (0..self.list.len() as RelId)
             .filter(|&r| {
-                !self.is_list(r) && !self.is_owner(r) && self.list[r as usize].subject_kind == SubjectKind::Did
+                !self.is_list(r)
+                    && !self.is_owner(r)
+                    && !self.is_reverse(r)
+                    && self.list[r as usize].subject_kind == SubjectKind::Did
             })
             .collect()
     }
@@ -218,7 +269,10 @@ impl Relations {
     }
 
     pub fn by_collection(&self, collection: &str) -> Option<RelId> {
-        self.list.iter().position(|r| r.collection == collection && r.owner_of.is_none()).map(|i| i as RelId)
+        self.list
+            .iter()
+            .position(|r| r.collection == collection && r.owner_of.is_none() && r.reverse_of.is_none())
+            .map(|i| i as RelId)
     }
 
     pub fn by_name(&self, name: &str) -> Option<RelId> {
@@ -271,7 +325,10 @@ subject = "target.did"
     fn list_companions() {
         let r = Relations::bsky_default();
         let names: Vec<&str> = r.list.iter().map(|x| x.name.as_str()).collect();
-        assert_eq!(names, ["follow", "block", "listitem", "listitem.owner", "listblock"]);
+        assert_eq!(names, ["follow", "block", "listitem", "listitem.owner", "listblock", "follow.by"]);
+        assert_eq!(r.reverse_rel(0), Some(5), "followers newest first");
+        assert_eq!(r.reverse_rel(1), None);
+        assert_eq!(r.by_collection("app.bsky.graph.follow"), Some(0), "the relation, not its companion");
         assert_eq!(r.by_collection("app.bsky.graph.listitem"), Some(2));
         assert_eq!(r.owner_rel(2), Some(3));
         assert_eq!(r.list_rel(3), Some(2));

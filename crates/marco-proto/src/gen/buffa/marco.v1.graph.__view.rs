@@ -3643,6 +3643,12 @@ pub struct ListInRequestView<'a> {
     pub limit: u32,
     /// Field 4: `cursor`
     pub cursor: &'a str,
+    /// Newest first by the records' times instead of id order, one entry per
+    /// record: for a relation kept in time order too (follow, through its
+    /// follow.by companion). The cursor is then the last record's key.
+    ///
+    /// Field 5: `newest_first`
+    pub newest_first: bool,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for ListInRequestView<'a> {
@@ -3703,6 +3709,13 @@ impl<'a> ::buffa::MessageView<'a> for ListInRequestView<'a> {
                 )?;
                 view.cursor = ::buffa::types::borrow_str(&mut cur)?;
             }
+            5u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.newest_first = ::buffa::types::decode_bool(&mut cur)?;
+            }
             _ => {
                 ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
                 let span_len = before_tag.len() - cur.len();
@@ -3729,6 +3742,7 @@ impl<'a> ::buffa::MessageView<'a> for ListInRequestView<'a> {
             subject: self.subject.to_string(),
             limit: self.limit,
             cursor: self.cursor.to_string(),
+            newest_first: self.newest_first,
             __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
@@ -3752,6 +3766,9 @@ impl<'a> ::buffa::ViewEncode<'a> for ListInRequestView<'a> {
         if !self.cursor.is_empty() {
             size += 1u64 + ::buffa::types::string_encoded_len(&self.cursor) as u64;
         }
+        if self.newest_first {
+            size += 1u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -3774,6 +3791,9 @@ impl<'a> ::buffa::ViewEncode<'a> for ListInRequestView<'a> {
         }
         if !self.cursor.is_empty() {
             ::buffa::types::put_string_field(4u32, &self.cursor, buf);
+        }
+        if self.newest_first {
+            ::buffa::types::put_bool_field(5u32, self.newest_first, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -3811,6 +3831,9 @@ impl<'__a> ::serde::Serialize for ListInRequestView<'__a> {
         }
         if !::buffa::json_helpers::skip_if::is_empty_str(self.cursor) {
             __map.serialize_entry("cursor", self.cursor)?;
+        }
+        if self.newest_first {
+            __map.serialize_entry("newestFirst", &self.newest_first)?;
         }
         __map.end()
     }
@@ -3924,6 +3947,15 @@ impl ListInRequestOwnedView {
     #[must_use]
     pub fn cursor(&self) -> &'_ str {
         self.0.reborrow().cursor
+    }
+    /// Newest first by the records' times instead of id order, one entry per
+    /// record: for a relation kept in time order too (follow, through its
+    /// follow.by companion). The cursor is then the last record's key.
+    ///
+    /// Field 5: `newest_first`
+    #[must_use]
+    pub fn newest_first(&self) -> bool {
+        self.0.reborrow().newest_first
     }
 }
 impl ::core::convert::From<::buffa::OwnedView<ListInRequestView<'static>>>

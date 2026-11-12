@@ -421,6 +421,9 @@ enum Mode {
     ByList,
     /// The same files: the records, repo -> list.
     ByOwner,
+    /// A `.by` companion: no files of its own; its relation's records by
+    /// subject, from the triples that relation's out pass spills.
+    Reverse,
 }
 
 fn widen(span: &mut RepoSpan, v: &[u8]) {
@@ -652,6 +655,7 @@ fn out_chunk(
     count_bad: bool,
     subj_index: usize,
     spill: &Spill,
+    rev: Option<&Spill>,
     deletes: Option<(&DeletesOut, &str, usize)>,
     c: &Counters,
 ) -> Result<ChunkOut> {
@@ -774,6 +778,8 @@ fn out_chunk(
                 Mode::ByOwner => edges.push((a, key, list, last.4)),
                 Mode::ByList if (lo..hi).contains(&list) => edges.push((list, key, subject, last.4)),
                 Mode::ByList => {}
+                // built from its relation's spilled triples, never read from files
+                Mode::Reverse => {}
             }
         }
         i = j;
@@ -817,6 +823,21 @@ fn out_chunk(
     for (b, bytes) in by_bucket.iter().enumerate() {
         if !bytes.is_empty() {
             spill.files[b].lock().unwrap().write_all(bytes)?;
+        }
+    }
+    // the records again, by subject, for the relation's .by companion
+    if let Some(rev) = rev {
+        let mut by_bucket: Vec<Vec<u8>> = vec![Vec::new(); rev.files.len()];
+        for &(a, key, s, _) in &edges {
+            let b = &mut by_bucket[rev.bucket(s)];
+            b.extend_from_slice(&s.to_le_bytes());
+            b.extend_from_slice(&key.to_le_bytes());
+            b.extend_from_slice(&a.to_le_bytes());
+        }
+        for (b, bytes) in by_bucket.iter().enumerate() {
+            if !bytes.is_empty() {
+                rev.files[b].lock().unwrap().write_all(bytes)?;
+            }
         }
     }
     if let Some((d, rel, k)) = deletes {
@@ -911,11 +932,17 @@ fn out_shard6(
     hi: u32,
     o: &Opts,
     spills: &[Spill],
+    revs: &[Option<Spill>],
     heat: Option<&Arc<Heat>>,
     c: &Counters,
 ) -> Result<Vec<(RelReport, Layout)>> {
     let mut reps = Vec::new();
     for (ri, (mode, rel_files)) in files.iter().enumerate() {
+        // its out lists come from the triples, once every shard has spilled them
+        if *mode == Mode::Reverse {
+            reps.push((RelReport::default(), Layout::default()));
+            continue;
+        }
         let mut rr = RelReport::default();
         let mut sec = OutSections::new(ri, o.subj_index);
         if let Some(h) = heat {
@@ -942,6 +969,7 @@ fn out_shard6(
                 (lo..hi).contains(flo),
                 o.subj_index,
                 &spills[ri],
+                revs[ri].as_ref(),
                 del,
                 c,
             )?;
@@ -994,6 +1022,98 @@ fn out_shard6(
     Ok(reps)
 }
 
+/// One shard's out lists for a `.by` companion `ri`, from the triples its
+/// relation spilled, and the companion's pairs into its in pass spill. A
+/// subject's records go newest first by their `.by` keys; records that meet
+/// on a key take the next free one, as the live path does.
+#[allow(clippy::too_many_arguments)]
+fn rev_shard6(
+    w: &mut PagedWriter,
+    k: usize,
+    lo: u32,
+    hi: u32,
+    ri: usize,
+    rev: &Spill,
+    spill: &Spill,
+    subj_index: usize,
+    heat: Option<&Arc<Heat>>,
+    c: &Counters,
+) -> Result<(RelReport, Layout)> {
+    let mut rr = RelReport::default();
+    let mut sec = OutSections::new(ri, subj_index);
+    if let Some(h) = heat {
+        sec = sec.with_heat(h.clone(), lo);
+    }
+    sec.begin(w)?;
+    let mut pairs: Vec<Vec<u8>> = vec![Vec::new(); spill.files.len()];
+    for b in 0..rev.subs {
+        let t = Instant::now();
+        let p = &rev.paths[k * rev.subs + b];
+        let mut raw = Vec::new();
+        File::open(p)?.read_to_end(&mut raw)?;
+        let _ = std::fs::remove_file(p);
+        let mut v: Vec<(u32, u64, u32)> = raw
+            .as_chunks::<16>()
+            .0
+            .iter()
+            .map(|t| {
+                let s = u32::from_le_bytes(t[..4].try_into().unwrap());
+                let key = u64::from_le_bytes(t[4..12].try_into().unwrap());
+                let a = u32::from_le_bytes(t[12..].try_into().unwrap());
+                (s, marco_core::graph::rev_key(key, a), a)
+            })
+            .collect();
+        drop(raw);
+        c.add(0, t);
+        let t = Instant::now();
+        v.sort_unstable();
+        c.add(2, t);
+        let t = Instant::now();
+        let mut list: Vec<(u64, u32)> = Vec::new();
+        let mut i = 0;
+        while i < v.len() {
+            let s = v[i].0;
+            if !(lo..hi).contains(&s) {
+                bail!("a .by triple for {s} in shard {k}'s spill ({lo}..{hi})");
+            }
+            list.clear();
+            while i < v.len() && v[i].0 == s {
+                let mut key = v[i].1;
+                if let Some(&(last, _)) = list.last() {
+                    key = key.max(last + 1);
+                }
+                list.push((key, v[i].2));
+                let a = v[i].2;
+                pairs[spill.bucket(a)].extend_from_slice(&(((a as u64) << 32) | s as u64).to_le_bytes());
+                i += 1;
+            }
+            sec.push(s - lo, &list)?;
+            rr.out_records += list.len() as u64;
+            rr.out_lists += 1;
+            rr.out_max = rr.out_max.max(list.len() as u64);
+            if list.len() >= subj_index {
+                rr.out_records_indexed += list.len() as u64;
+            }
+            *rr.out_len_log2.entry(63 - (list.len() as u64).leading_zeros()).or_default() += 1;
+        }
+        rr.spill_bytes += v.len() as u64 * 8;
+        c.rows.fetch_add(v.len() as u64, Relaxed);
+        sec.drain(w)?;
+        c.add(3, t);
+    }
+    for (b, bytes) in pairs.iter().enumerate() {
+        if !bytes.is_empty() {
+            spill.files[b].lock().unwrap().write_all(bytes)?;
+        }
+    }
+    let t = Instant::now();
+    let (bytes, layout) = sec.finish(w, hi - lo)?;
+    rr.out_bytes = bytes;
+    w.pinned(&rel_section(ri, "side"), &encode_side(&[]))?;
+    c.add(5, t);
+    Ok((rr, layout))
+}
+
 /// One shard's in sets for every relation (r{i}.in.*).
 fn in_shard6(
     w: &mut PagedWriter,
@@ -1032,9 +1152,10 @@ pub fn build(o: &Opts) -> Result<Report> {
         .rels
         .list
         .iter()
-        .map(|r| match (&r.list, &r.owner_of) {
-            (Some(_), _) => (Mode::ByList, r.name.as_str()),
-            (_, Some(p)) => (Mode::ByOwner, p.as_str()),
+        .map(|r| match (&r.list, &r.owner_of, &r.reverse_of) {
+            (_, _, Some(p)) => (Mode::Reverse, p.as_str()),
+            (Some(_), _, _) => (Mode::ByList, r.name.as_str()),
+            (_, Some(p), _) => (Mode::ByOwner, p.as_str()),
             _ => (Mode::Plain, r.name.as_str()),
         })
         .collect();
@@ -1042,6 +1163,10 @@ pub fn build(o: &Opts) -> Result<Report> {
     let mut per_rel: Vec<Vec<usize>> = Vec::new();
     for (&(mode, dir), r) in modes.iter().zip(&o.rels.list) {
         let subject_list = r.subject_kind == SubjectKind::List && r.owner_of.is_none();
+        if mode == Mode::Reverse {
+            per_rel.push(Vec::new());
+            continue;
+        }
         let mut v = Vec::new();
         for f in files_of(&o.input, dir)? {
             let i = all.iter().position(|x| x.0 == f).unwrap_or_else(|| {
@@ -1108,6 +1233,17 @@ pub fn build(o: &Opts) -> Result<Report> {
         .iter()
         .map(|r| Spill::new(&o.tmp, &r.name, o.shards, o.sub_buckets, width))
         .collect::<Result<_>>()?;
+    // a relation with a .by companion spills its records by subject for it
+    let revs: Vec<Option<Spill>> = o
+        .rels
+        .list
+        .iter()
+        .enumerate()
+        .map(|(ri, r)| match o.rels.reverse_rel(ri as marco_core::RelId) {
+            Some(_) => Spill::new(&o.tmp, &format!("{}.rev", r.name), o.shards, o.sub_buckets, width).map(Some),
+            None => Ok(None),
+        })
+        .collect::<Result<_>>()?;
     let ranges: Vec<(u32, u32)> = (0..o.shards).map(|k| set.shard_range(k)).collect();
     let mut writers: Vec<PagedWriter> = set.shards.iter_mut().map(|w| w.take().unwrap()).collect();
     let mut out_layout = vec![Layout::default(); o.rels.len()];
@@ -1119,8 +1255,33 @@ pub fn build(o: &Opts) -> Result<Report> {
     let outs: Vec<Vec<(RelReport, Layout)>> = writers
         .par_iter_mut()
         .enumerate()
-        .map(|(k, w)| out_shard6(w, &files, &dir, ranges[k].0, ranges[k].1, o, &spills, heat.as_ref(), &c))
+        .map(|(k, w)| out_shard6(w, &files, &dir, ranges[k].0, ranges[k].1, o, &spills, &revs, heat.as_ref(), &c))
         .collect::<Result<_>>()?;
+    for sp in revs.iter().flatten() {
+        for f in &sp.files {
+            f.lock().unwrap().flush()?;
+        }
+    }
+    rep.phases.push(c.phase("out logs", t));
+
+    // the .by companions, now that every shard's records are spilled
+    let t = Instant::now();
+    let c = Counters::default();
+    let mut outs = outs;
+    for (ri, r) in o.rels.list.iter().enumerate() {
+        let Some(src) = r.reverse_of.as_ref().and_then(|p| o.rels.by_name(p)) else { continue };
+        let rev = revs[src as usize].as_ref().expect("a .by companion's relation spills for it");
+        let got: Vec<(RelReport, Layout)> = writers
+            .par_iter_mut()
+            .enumerate()
+            .map(|(k, w)| {
+                rev_shard6(w, k, ranges[k].0, ranges[k].1, ri, rev, &spills[ri], o.subj_index, heat.as_ref(), &c)
+            })
+            .collect::<Result<_>>()?;
+        for (k, g) in got.into_iter().enumerate() {
+            outs[k][ri] = g;
+        }
+    }
     let outs: Vec<Vec<RelReport>> = outs
         .into_iter()
         .map(|v| {
@@ -1138,7 +1299,7 @@ pub fn build(o: &Opts) -> Result<Report> {
             f.lock().unwrap().flush()?;
         }
     }
-    rep.phases.push(c.phase("out logs", t));
+    rep.phases.push(c.phase("reverse", t));
     drop(dir);
 
     sys::reset_peak_rss();
@@ -1543,12 +1704,16 @@ mod tests {
     fn same_lists(x: &Graph, y: &Graph) {
         let did = |g: &Graph, id: u32| g.did_of(id).unwrap_or_else(|| panic!("id {id} has no DID"));
         let out = |g: &Graph, rel: RelId, id: u32| -> Vec<(String, String)> {
-            let mut v: Vec<(String, String)> = g
-                .read(|cx| g.out_all(cx, rel, id))
-                .unwrap()
-                .into_iter()
-                .map(|(k, s)| (g.rkey_string(rel, id, k).unwrap(), did(g, s)))
-                .collect();
+            // a .by key carries the actor's id bits, and ids differ between the
+            // two graphs: compare its time, or that it has none
+            let rev = g.relations().is_reverse(rel);
+            let key = |k: u64| match (rev, k >> 32) {
+                (true, 0) => "no time".to_string(),
+                (true, _) => (k >> 10).to_string(),
+                (false, _) => g.rkey_string(rel, id, k).unwrap(),
+            };
+            let mut v: Vec<(String, String)> =
+                g.read(|cx| g.out_all(cx, rel, id)).unwrap().into_iter().map(|(k, s)| (key(k), did(g, s))).collect();
             v.sort();
             v
         };

@@ -2426,6 +2426,18 @@ pub struct ListInRequest {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
     )]
     pub cursor: ::buffa::alloc::string::String,
+    /// Newest first by the records' times instead of id order, one entry per
+    /// record: for a relation kept in time order too (follow, through its
+    /// follow.by companion). The cursor is then the last record's key.
+    ///
+    /// Field 5: `newest_first`
+    #[serde(
+        rename = "newestFirst",
+        alias = "newest_first",
+        with = "::buffa::json_helpers::proto_bool",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_false"
+    )]
+    pub newest_first: bool,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -2437,6 +2449,7 @@ impl ::core::fmt::Debug for ListInRequest {
             .field("subject", &self.subject)
             .field("limit", &self.limit)
             .field("cursor", &self.cursor)
+            .field("newest_first", &self.newest_first)
             .finish()
     }
 }
@@ -2479,6 +2492,9 @@ impl ::buffa::Message for ListInRequest {
         if !self.cursor.is_empty() {
             size += 1u64 + ::buffa::types::string_encoded_len(&self.cursor) as u64;
         }
+        if self.newest_first {
+            size += 1u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -2500,6 +2516,9 @@ impl ::buffa::Message for ListInRequest {
         }
         if !self.cursor.is_empty() {
             ::buffa::types::put_string_field(4u32, &self.cursor, buf);
+        }
+        if self.newest_first {
+            ::buffa::types::put_bool_field(5u32, self.newest_first, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -2542,6 +2561,13 @@ impl ::buffa::Message for ListInRequest {
                 )?;
                 ::buffa::types::merge_string(&mut self.cursor, buf)?;
             }
+            5u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.newest_first = ::buffa::types::decode_bool(buf)?;
+            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -2554,6 +2580,7 @@ impl ::buffa::Message for ListInRequest {
         self.subject.clear();
         self.limit = 0u32;
         self.cursor.clear();
+        self.newest_first = false;
         self.__buffa_unknown_fields.clear();
     }
 }

@@ -154,6 +154,10 @@ message ListInRequest {
   // Default 50, at most 1000.
   uint32 limit = 3;
   string cursor = 4;
+  // Newest first by the records' times instead of id order, one entry per
+  // record: for a relation kept in time order too (follow, through its
+  // follow.by companion). The cursor is then the last record's key.
+  bool newest_first = 5;
 }
 
 message ListInResponse {

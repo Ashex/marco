@@ -119,6 +119,17 @@ cursor. A page can hold fewer than `limit` items before the end, since hidden ac
 after the page is cut, so page until the cursor is empty. Records whose rkey isn't a TID sort as newest.
 Neither call rejects a bad cursor (Intersect does), so pass back only cursors marco gave you.
 
+**Newest first.** `ListIn` with `newestFirst` pages a subject's records newest first by their
+rkeys' times, one entry per record, for a relation kept in time order (`newest_in`; `follow` by
+default, so a profile's followers in the order they followed). Its cursor is the last record's
+key: pass it back as given. A cursor that isn't one gets an empty page, and a relation without a
+time order is `invalid_argument`. Records whose rkey isn't a TID have no time and come last.
+
+```json
+// ListIn {"rel":"follow","subject":"did:plc:alice2222…","limit":2,"newestFirst":true}
+{"actors":["did:plc:dave2222…","did:plc:carol2222…"],"cursor":"3626181233467162625"}
+```
+
 ## Counts
 
 Per actor (up to 100) and relation: `outRecords` (the actor's records), `inActors` (the actors
