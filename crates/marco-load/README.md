@@ -632,7 +632,7 @@ come straight from the archive's own fold rules:
 | Archive row | Build input |
 |---|---|
 | create, update, a `#sync`'s replacement create | the record's subject (and list, for a list relation): create or update |
-| a create or update whose record isn't an edge (no subject, a subject that isn't a DID, a list in another repo) | a delete: the key ends empty, as it does live (`skipped` counts the reason) |
+| a create or update whose record isn't an edge (no subject, a subject not of its relation's kind: a DID, or a list's URI for `listblock`; a list in another repo) | a delete: the key ends empty, as it does live (`skipped` counts the reason) |
 | delete | a delete |
 | `#account` deleted, takendown, active | an `accounts.rb.zst` row: 1, 2, 0 |
 | `#account` deactivated, suspended, throttled, desynchronized | nothing: the account comes back as it was |
