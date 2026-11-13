@@ -80,9 +80,10 @@ fn one_way(x: &Graph, y: &Graph, rel: RelId, coll: &str, samples: usize) -> Side
 
 /// A `.by` companion's record, as a build-independent key: its key holds the
 /// actor's low id bits (and a probe past a taken key), so it matches by the
-/// record time and the actor's DID.
+/// record time and the actor's DID. A record without a time is keyed by its
+/// actor's id alone, below 2^32.
 fn by_key(g: &Graph, k: u64, actor: u32) -> (u64, String) {
-    let t = if marco_core::rkey::is_tid(k) { k >> 10 } else { 0 };
+    let t = if k >> 32 != 0 { k >> 10 } else { 0 };
     (t, g.did_of(actor).unwrap_or_default())
 }
 
@@ -101,22 +102,24 @@ fn one_way_by(x: &Graph, y: &Graph, rel: RelId, coll: &str, samples: usize) -> S
         }
         s.records.fetch_add(out.len() as u64, Relaxed);
         let Some(did) = x.did_of(id) else { return };
-        let theirs: std::collections::HashSet<(u64, String)> = y
-            .id_of(&did)
-            .map(|yid| y.read(|cx| y.out_all(cx, rel, yid)).unwrap())
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(k, a)| by_key(y, k, a))
-            .collect();
+        // a multiset: two records at one time and actor match two, not one
+        let mut theirs: std::collections::HashMap<(u64, String), u64> = std::collections::HashMap::new();
+        for (k, a) in y.id_of(&did).map(|yid| y.read(|cx| y.out_all(cx, rel, yid)).unwrap()).unwrap_or_default() {
+            *theirs.entry(by_key(y, k, a)).or_default() += 1;
+        }
         let mut m = 0u64;
         for &(k, actor) in &out {
             let key = by_key(x, k, actor);
-            if theirs.contains(&key) {
-                m += 1;
-            } else {
-                let mut v = s.samples.lock().unwrap();
-                if v.len() < samples {
-                    v.push(format!("{} -> {coll} by {did} at {}", key.1, key.0));
+            match theirs.get_mut(&key) {
+                Some(n) if *n > 0 => {
+                    *n -= 1;
+                    m += 1;
+                }
+                _ => {
+                    let mut v = s.samples.lock().unwrap();
+                    if v.len() < samples {
+                        v.push(format!("{} -> {did} ({coll}, .by time {})", key.1, key.0));
+                    }
                 }
             }
         }

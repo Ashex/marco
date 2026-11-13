@@ -1403,6 +1403,7 @@ pub fn build(o: &Opts) -> Result<Report> {
     rep.phases.push(c.phase("out logs", t));
 
     // the .by companions, now that every shard's records are spilled
+    sys::reset_peak_rss();
     let t = Instant::now();
     let c = Counters::default();
     let mut outs = outs;
@@ -2126,6 +2127,81 @@ mod tests {
             .collect();
         let (rep, _) = build_lists(tmp.path(), &lops, 5);
         assert_eq!((rep.rels[2].rows, rep.rels[3].rows), (200, 200));
+    }
+
+    /// A snapshot of `follows` (and empty block, listitem and listblock
+    /// inputs), with `statuses` taken down: DIDs that get ids and no records.
+    fn snap_of(dir: &Path, follows: &[Op], statuses: &[String]) -> PathBuf {
+        let input = dir.join("in");
+        write_export(&input, "follow", follows);
+        write_export(&input, "block", &[]);
+        write_export(&input, "listblock", &[]);
+        write_list_export(&input, &[]);
+        let mut raw = Vec::new();
+        for d in statuses {
+            put(&mut raw, d);
+            raw.extend_from_slice(&1i64.to_le_bytes());
+            raw.push(2);
+        }
+        std::fs::write(input.join(ACCOUNTS), zstd::encode_all(&raw[..], 3).unwrap()).unwrap();
+        let out = dir.join("snap");
+        let o = Opts {
+            input,
+            out: out.clone(),
+            tmp: dir.join("spill"),
+            rels: Relations::bsky_default(),
+            subj_index: 8,
+            shards: 3,
+            sub_buckets: 1,
+            deletes: None,
+            cursors: BTreeMap::new(),
+            heat: None,
+        };
+        build(&o).unwrap();
+        out
+    }
+
+    /// `diff`'s report on the follow.by companion, and whether it found the two equal.
+    fn by_diff(a: &Path, b: &Path) -> (serde_json::Value, bool) {
+        let d = crate::diff::run(&crate::diff::Args { a: a.into(), b: b.into(), samples: 3 }).unwrap();
+        let by = d["relations"].as_array().unwrap().iter().find(|r| r["relation"] == "follow.by").unwrap().clone();
+        (by, d["equal"] == true)
+    }
+
+    #[test]
+    fn diff_matches_a_non_tid_follow_across_builds_with_other_ids() {
+        let (x, y) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let actor = "did:web:zz.example".to_string();
+        let follows: Vec<Op> = vec![(actor.clone(), "self".into(), did(1), 5, 1)];
+        let a = snap_of(x.path(), &follows, &[]);
+        // statuses only in b: the actor's id moves past them, by more than a key's low 10 bits
+        let b = snap_of(y.path(), &follows, &(1000..3000).map(did).collect::<Vec<_>>());
+        let (ga, gb) = (Graph::open(&a).unwrap(), Graph::open(&b).unwrap());
+        let (ia, ib) = (ga.id_of(&actor).unwrap(), gb.id_of(&actor).unwrap());
+        assert!(ib >> 10 != ia >> 10, "ids {ia} and {ib} share their high bits");
+        let (by, equal) = by_diff(&a, &b);
+        assert_eq!(
+            (by["a_records"].as_u64(), by["only_a"].as_u64(), by["only_b"].as_u64()),
+            (Some(1), Some(0), Some(0)),
+            "{by}"
+        );
+        assert!(equal);
+    }
+
+    #[test]
+    fn diff_counts_two_by_records_at_one_time_against_one() {
+        let (x, y) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let a1 = did(2);
+        // two TIDs a clock id apart: the same .by time for one actor
+        let k = |clock: u64| vlatproto::tid::Tid::from_parts(1_700_000_000_000_000, clock).to_string();
+        // one subject, so the companion holds both side by side
+        let both: Vec<Op> = vec![(a1.clone(), k(1), did(1), 5, 1), (a1.clone(), k(2), did(1), 5, 1)];
+        let a = snap_of(x.path(), &both, &[]);
+        let b = snap_of(y.path(), &both[..1], &[]);
+        let (by, equal) = by_diff(&a, &b);
+        assert_eq!((by["a_records"].as_u64(), by["b_records"].as_u64()), (Some(2), Some(1)), "{by}");
+        assert_eq!(by["only_a"].as_u64(), Some(1), "{by}");
+        assert!(!equal);
     }
 
     #[test]

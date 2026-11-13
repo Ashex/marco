@@ -50,7 +50,7 @@ pub struct Args {
     pub out: PathBuf,
     #[arg(long, default_value = "https://hubble.microcosm.blue")]
     pub hubble: String,
-    /// Relations config (TOML); default follow, block and listitem.
+    /// Relations config (TOML); default follow, block, listitem and listblock.
     #[arg(long)]
     pub relations: Option<PathBuf>,
     /// Sweep only these repos (a file of DIDs, one a line) instead of listing the mirror.
@@ -110,7 +110,8 @@ pub struct Counts {
     pub inactive: BTreeMap<String, u64>,
     /// Active repos by Hubble's sync status ("synchronized" when it gives none).
     pub sync_status: BTreeMap<String, u64>,
-    /// Records skipped: their subject isn't a DID, or a list item's list is in another repo.
+    /// Records skipped: their subject isn't of their relation's kind (a DID, or a list's URI for
+    /// listblock), or a list item's list is in another repo.
     pub bad_subject: u64,
     pub cross_repo_rows: u64,
     pub bad_record: u64,
