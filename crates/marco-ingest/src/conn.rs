@@ -1,12 +1,6 @@
 //! A source's read loop: dial, read and decode, queue for the writer, and
 //! redial with backoff from the last event read. At start it resumes from
-//! the sink's saved cursor (Jetstream's less [`jetstream::OVERLAP_US`]; see
-//! [`jetstream2::resume_cursor`] for v2's).
-//!
-//! A Jetstream v2 source stops for good, in state `cursor_too_old`, when the
-//! instance no longer holds its cursor: a seq it refuses with `CursorTooOld`,
-//! or a time it clamps with `#info OutdatedCursor` (unless the gap is
-//! allowed). What came between is missing and no replay brings it back.
+//! the sink's saved cursor (Jetstream v1's less [`jetstream::OVERLAP_US`]).
 
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, LazyLock};
@@ -21,11 +15,10 @@ use tokio_tungstenite::tungstenite::{self, Message};
 use tokio_tungstenite::Connector;
 
 use crate::firehose::{self, Frame};
-use crate::jetstream2::{self, TimeFloor};
 use crate::metrics::*;
 use crate::source::{register, Proto, Source, SourceState};
 use crate::writer::{self, LagTap};
-use crate::{jetstream, Event, Sink};
+use crate::{jetstream, jetstream2, Event, Kind, Sink};
 
 /// Above the largest legal firehose frame (a 2 MB CAR and 200 ops).
 pub const MAX_FRAME_BYTES: usize = 5 << 20;
@@ -47,9 +40,6 @@ pub struct Options {
     /// Where a source with no cursor of its own starts (time_us or seq),
     /// rather than the live tail: a bulk-built snapshot's time.
     pub start: Option<u64>,
-    /// Follow a Jetstream v2 source past `#info OutdatedCursor` rather than
-    /// stop: what it no longer holds stays missing.
-    pub allow_gap: bool,
 }
 
 impl Default for Options {
@@ -66,7 +56,6 @@ impl Default for Options {
             user_agent: concat!("marco/", env!("CARGO_PKG_VERSION")).into(),
             lag_tap: None,
             start: None,
-            allow_gap: false,
         }
     }
 }
@@ -82,10 +71,10 @@ pub fn run<S: Sink>(
 ) -> (Arc<SourceState>, tokio::task::JoinHandle<()>) {
     let st = register(&src);
     let (tx, rx) = mpsc::channel(opts.queue.max(1));
-    // A relay's seqs can't be guessed, so a new firehose source saves the
-    // first event's cursor before applying it (Jetstream's is saved below,
-    // before dialling).
-    let fresh = src.proto == Proto::Firehose && sink.source_cursor(&src.name).is_none();
+    // A relay's or a v2 instance's seqs can't be guessed, so a new source of
+    // theirs saves the first event's cursor before applying it (Jetstream
+    // v1's is saved below, before dialling).
+    let fresh = src.proto != Proto::Jetstream && sink.source_cursor(&src.name).is_none();
     let w = tokio::spawn(writer::run(rx, sink.clone(), st.clone(), opts.lag_tap.clone(), fresh));
     let r = {
         let st = st.clone();
@@ -127,6 +116,20 @@ fn jitter(d: Duration) -> Duration {
     d.mul_f64(0.5 + (n % 1000) as f64 / 2000.0)
 }
 
+/// The last seq a v2 source has read (0 while its cursor is a time or none):
+/// anything at or below it is the overlap of a resume.
+fn seq_floor(cursor: Option<u64>) -> u64 {
+    cursor.filter(|&c| c < jetstream2::TIME_CURSOR_MIN).unwrap_or(0)
+}
+
+/// The response body when a dial was refused with CursorTooOld.
+fn cursor_too_old(e: &tungstenite::Error) -> Option<String> {
+    let tungstenite::Error::Http(r) = e else { return None };
+    let body = r.body().as_deref().unwrap_or_default();
+    (r.status().as_u16() == 400 && jetstream2::rejection(body).as_deref() == Some("CursorTooOld"))
+        .then(|| String::from_utf8_lossy(&body[..body.len().min(300)]).into_owned())
+}
+
 /// True when shutdown came first.
 async fn sleep_or_shutdown(d: Duration, shutdown: &mut watch::Receiver<bool>) -> bool {
     tokio::select! {
@@ -137,29 +140,27 @@ async fn sleep_or_shutdown(d: Duration, shutdown: &mut watch::Receiver<bool>) ->
 
 enum Decoded {
     Event(Event),
-    Info(String),
-    /// The instance no longer holds the time asked for (Jetstream v2).
-    Outdated(String),
+    /// An `#info` frame's name and message.
+    Info(String, String),
     Error(String),
     Bad(&'static str),
 }
 
-fn decode(proto: Proto, rels: &Relations, msg: &[u8], floor: &mut TimeFloor) -> Decoded {
+fn decode(proto: Proto, rels: &Relations, msg: &[u8]) -> Decoded {
     match proto {
         Proto::Jetstream => match jetstream::decode(msg, rels) {
             Ok(ev) => Decoded::Event(ev),
             Err(e) => Decoded::Bad(e),
         },
-        Proto::JetstreamV2 => match jetstream2::decode(msg, rels, floor) {
-            Ok(jetstream2::Decoded::Event(ev)) => Decoded::Event(ev),
-            Ok(jetstream2::Decoded::OutdatedCursor(m)) => Decoded::Outdated(m),
-            Ok(jetstream2::Decoded::Info(n)) => Decoded::Info(n),
-            Ok(jetstream2::Decoded::Error(e)) => Decoded::Error(e),
+        Proto::JetstreamV2 => match jetstream2::decode(msg, rels) {
+            Ok(jetstream2::Frame::Event(ev)) => Decoded::Event(ev),
+            Ok(jetstream2::Frame::Info { name, message }) => Decoded::Info(name, message),
+            Ok(jetstream2::Frame::Error(e)) => Decoded::Error(e),
             Err(e) => Decoded::Bad(e),
         },
         Proto::Firehose => match firehose::decode(msg, rels) {
             Ok(Frame::Event(ev)) => Decoded::Event(ev),
-            Ok(Frame::Info(n)) => Decoded::Info(n),
+            Ok(Frame::Info(n)) => Decoded::Info(n, String::new()),
             Ok(Frame::Error(e)) => Decoded::Error(e),
             Err(e) => Decoded::Bad(e),
         },
@@ -183,7 +184,7 @@ async fn read<S: Sink>(
             tracing::info!(source = name, cursor = c, "a new source, starting where the snapshot is current to");
         }
     }
-    if cursor.is_none() && src.proto.is_jetstream() {
+    if cursor.is_none() && src.proto == Proto::Jetstream {
         // A new source starts from now, saved before the first event: a
         // kill before the sink's first checkpoint then resumes here rather
         // than at a later live tail, which would skip what came between.
@@ -194,7 +195,9 @@ async fn read<S: Sink>(
         }
         cursor = start.parse().ok();
     }
-    if let Some(c) = cursor {
+    // A v2 time cursor is a place to seek to and not a position: the cursor
+    // reported is the newest seq applied.
+    if let Some(c) = cursor.filter(|&c| src.proto != Proto::JetstreamV2 || c < jetstream2::TIME_CURSOR_MIN) {
         st.cursor.store(c, Ordering::Relaxed);
         CURSOR.with_label_values(&[&name]).set(c as i64);
     }
@@ -205,7 +208,7 @@ async fn read<S: Sink>(
         .max_frame_size(Some(MAX_FRAME_BYTES))
         .write_buffer_size(0);
     let mut backoff = opts.backoff_min;
-    let mut floor = TimeFloor::default();
+    let (mut syncs, mut last_sync_log) = (0u64, None::<Instant>);
     loop {
         if *shutdown.borrow() {
             break;
@@ -214,11 +217,13 @@ async fn read<S: Sink>(
             Proto::Jetstream => {
                 jetstream::subscribe_url(&src.url, &rels, cursor.map(|c| c.saturating_sub(opts.overlap_us)))
             }
-            Proto::JetstreamV2 => jetstream2::subscribe_url(
-                &src.url,
-                &rels,
-                cursor.map(|c| jetstream2::resume_cursor(c, opts.overlap_us)),
-            ),
+            Proto::JetstreamV2 => {
+                // a seq resumes exactly; a time (a snapshot's) gets the overlap of v1's
+                let c =
+                    cursor
+                        .map(|c| if c >= jetstream2::TIME_CURSOR_MIN { c.saturating_sub(opts.overlap_us) } else { c });
+                jetstream2::subscribe_url(&src.url, &rels, c)
+            }
             Proto::Firehose => firehose::subscribe_url(&src.url, cursor),
         };
         let mut req = match url.as_str().into_client_request() {
@@ -232,6 +237,9 @@ async fn read<S: Sink>(
         if let Ok(v) = opts.user_agent.parse() {
             req.headers_mut().insert("user-agent", v);
         }
+        if src.proto == Proto::JetstreamV2 {
+            jetstream2::offer_subprotocol(&mut req);
+        }
         st.set_state("connecting");
         let connector = if url.starts_with("wss://") { Connector::Rustls(tls()) } else { Connector::Plain };
         let dial = tokio::time::timeout(
@@ -242,22 +250,25 @@ async fn read<S: Sink>(
             r = dial => r,
             _ = shutdown.changed() => break,
         };
-        let failed = match dialed {
-            Ok(Ok((ws, _))) => Ok(ws),
-            Ok(Err(tungstenite::Error::Http(r)))
-                if src.proto == Proto::JetstreamV2
-                    && jetstream2::refusal(r.body().as_deref()).as_deref() == Some(jetstream2::CURSOR_TOO_OLD) =>
-            {
-                let body = String::from_utf8_lossy(r.body().as_deref().unwrap_or_default()).into_owned();
+        if let (Proto::JetstreamV2, Ok(Err(e))) = (src.proto, &dialed) {
+            if let Some(body) = cursor_too_old(e) {
+                // Reconnecting asks the same question. The instance has dropped
+                // what lies between this cursor and its floor, and only a
+                // rebuild fills that, so the source ends rather than skipping to
+                // the tip.
+                CURSOR_TOO_OLD.with_label_values(&[&name]).inc();
+                st.set_state("cursor_too_old");
                 tracing::error!(
                     source = name,
                     cursor,
-                    refusal = body,
-                    "the instance no longer holds this source's cursor: what came since is missing; rebuild"
+                    response = body,
+                    "the instance no longer holds this source's cursor, and what it dropped since can't be replayed: not following it; rebuild the snapshot"
                 );
-                st.set_state("cursor_too_old");
                 return;
             }
+        }
+        let failed = match dialed {
+            Ok(Ok((ws, _))) => Ok(ws),
             Ok(Err(e)) => Err((connect_error(&e), e.to_string())),
             Err(_) => Err(("timeout".into(), "connect timed out".into())),
         };
@@ -302,13 +313,25 @@ async fn read<S: Sink>(
                         Some(Err(tungstenite::Error::Capacity(_))) => break "too_big",
                         Some(Err(_)) => break "read_error",
                     };
-                    match decode(src.proto, &rels, &bytes, &mut floor) {
+                    match decode(src.proto, &rels, &bytes) {
+                        Decoded::Event(ev) if src.proto == Proto::JetstreamV2 && ev.cursor <= seq_floor(cursor) => {
+                            DEDUPED.with_label_values(&[&name]).inc();
+                        }
                         Decoded::Event(ev) => {
                             EVENTS.with_label_values(&[&name, ev.kind.as_str()]).inc();
                             for r in &ev.skipped {
                                 SKIPPED.with_label_values(&[name.as_str(), r]).inc();
                             }
                             st.events.fetch_add(1, Ordering::Relaxed);
+                            if ev.kind == Kind::Sync {
+                                // A resync would re-read the repo; until marco does, its edges can be stale.
+                                SYNC_EVENTS.with_label_values(&[&name]).inc();
+                                syncs += 1;
+                                if last_sync_log.is_none_or(|t| t.elapsed() >= Duration::from_secs(30)) {
+                                    last_sync_log = Some(Instant::now());
+                                    tracing::warn!(source = name, cursor = ev.cursor, syncs, "#sync events: not resynced");
+                                }
+                            }
                             st.read_cursor.store(ev.cursor, Ordering::Relaxed);
                             cursor = Some(ev.cursor);
                             if tx.send(ev).await.is_err() {
@@ -316,25 +339,15 @@ async fn read<S: Sink>(
                             }
                             last_rx = Instant::now();
                         }
-                        Decoded::Info(n) => {
+                        Decoded::Info(n, message) => {
                             EVENTS.with_label_values(&[&name, "info"]).inc();
-                            tracing::warn!(source = name, info = n, cursor, "info frame");
-                        }
-                        Decoded::Outdated(m) if opts.allow_gap => {
-                            EVENTS.with_label_values(&[&name, "info"]).inc();
-                            tracing::warn!(source = name, cursor, info = m, "following past a gap the instance no longer holds");
-                        }
-                        Decoded::Outdated(m) => {
-                            tracing::error!(
-                                source = name,
-                                cursor,
-                                info = m,
-                                "the instance no longer holds this source's cursor: what came since is missing; rebuild"
-                            );
-                            let _ = ws.close(None).await;
-                            connected.set(0);
-                            st.set_state("cursor_too_old");
-                            return;
+                            if src.proto == Proto::JetstreamV2 {
+                                // a server-supplied name is a label only when it is a known one
+                                let known = matches!(n.as_str(), "OutdatedCursor" | "FutureCursor");
+                                CURSOR_NOTICES.with_label_values(&[name.as_str(), if known { n.as_str() } else { "other" }]).inc();
+                            }
+                            let message: String = message.chars().take(300).collect();
+                            tracing::warn!(source = name, info = n, message, cursor, "info frame");
                         }
                         Decoded::Error(e) => {
                             EVENTS.with_label_values(&[&name, "error"]).inc();

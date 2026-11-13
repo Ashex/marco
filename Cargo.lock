@@ -1772,6 +1772,7 @@ name = "marco-load"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "chrono",
  "clap",
  "futures",
@@ -1789,6 +1790,7 @@ dependencies = [
  "toml",
  "uuid",
  "vlatproto",
+ "xxhash-rust",
  "zstd",
 ]
 

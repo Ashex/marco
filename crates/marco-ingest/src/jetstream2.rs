@@ -1,44 +1,57 @@
-//! Jetstream v2's `network.bsky.jetstream.subscribeEvents`: proposal-0015
-//! JSON frames, `{"$type":"message","payload":{...}}`. The cursor is `seq`,
-//! the instance's own event sequence. It's exact, so a resume asks for the
-//! event after the saved one and replays nothing. Unlike v1's `/subscribe`,
-//! a seq below what the instance holds is refused with `CursorTooOld` rather
-//! than clamped, so a consumer that was down too long finds out instead of
-//! skipping the gap.
+//! Jetstream v2's live tail, `network.bsky.jetstream.subscribeEvents`. The
+//! cursor is the instance's `seq`: monotonic and exact on the instance that
+//! assigned it, but with gaps, and meaningless on any other instance. A
+//! resume asks for the last seq it applied (the server replays from it
+//! inclusive) and drops what it already has.
 //!
-//! A cursor at or above [`TIME_CURSOR_MIN`] is a time (µs) instead, which the
-//! instance translates to the first seq it saw at or after it. So a time
-//! works as a v2 cursor: a new source's start, a bulk build's, or a cursor a
-//! v1 consumer saved under the same source name. A time older than the
-//! instance holds is clamped to its oldest event and announced with an
-//! `#info OutdatedCursor` frame, the same gap as `CursorTooOld`.
+//! The one cursor that isn't a seq is a time: the server reads a `cursor` of
+//! 1e15 or more as unix µs and seeks to the first event witnessed then. A
+//! source that starts from a bulk-built snapshot uses that, and switches to
+//! seqs with its first event.
 //!
-//! An op's time is the event's `witnessedAt`: when the instance saw it,
-//! which rises with `seq` and which a timestamp import never changes. An
-//! instance from before `witnessedAt` sends only `time`, which after an import
-//! is when the network saw the event and can run backwards against `seq`;
-//! marco orders ops by time, so a source's times are kept from going back
-//! ([`TimeFloor`]).
+//! An op's time is the frame's `time`, which is what v1 calls `time_us`, so
+//! both versions order a record's create against its delete the same way.
 //!
-//! No zstd, as with v1: follows, blocks and account events are a few KB/s.
+//! No zstd: the dictionary has to be fetched and its id negotiated, and the
+//! few collections marco asks for are a few KB/s.
 
 use marco_core::Relations;
 use serde::Deserialize;
 
-use crate::{account_change, edge_uri, list_of, Change, Event, Kind, Op};
+use crate::jetstream::commit_change;
+use crate::{account_change, Change, Event, Kind};
 
-/// The XRPC path of the stream.
-pub const PATH: &str = "/xrpc/network.bsky.jetstream.subscribeEvents";
-
-/// Cursors at or above this are unix-µs times, below it seqs: Jetstream's
-/// own rule, so one saved cursor can hold either.
+/// The server reads a `cursor` at or above this as unix µs, not a seq.
 pub const TIME_CURSOR_MIN: u64 = 1_000_000_000_000_000;
 
-/// The pre-upgrade XRPC error for a seq older than the instance holds.
-pub const CURSOR_TOO_OLD: &str = "CursorTooOld";
+const SUBPROTOCOL: &str = "xrpc.v1.json";
+
+/// Offers the subprotocol, which the server echoes; tungstenite refuses an
+/// echo that wasn't asked for.
+pub(crate) fn offer_subprotocol(req: &mut tokio_tungstenite::tungstenite::handshake::client::Request) {
+    req.headers_mut()
+        .insert("sec-websocket-protocol", tokio_tungstenite::tungstenite::http::HeaderValue::from_static(SUBPROTOCOL));
+}
+
+const PATH: &str = "/xrpc/network.bsky.jetstream.subscribeEvents";
+
+/// What one frame is.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Frame {
+    Event(Event),
+    /// `#info`: `OutdatedCursor` (a time cursor was clamped up, so events may
+    /// be missing) or `FutureCursor` (a seq beyond the tip: the server starts
+    /// at the tip).
+    Info {
+        name: String,
+        message: String,
+    },
+    /// A terminal error frame (`ConsumerTooSlow`); the server closes after it.
+    Error(String),
+}
 
 #[derive(Deserialize)]
-struct Frame {
+struct Envelope {
     #[serde(rename = "$type")]
     ty: String,
     payload: Option<Payload>,
@@ -52,8 +65,6 @@ struct Payload {
     seq: Option<u64>,
     did: Option<String>,
     time: Option<String>,
-    #[serde(rename = "witnessedAt")]
-    witnessed_at: Option<String>,
     operation: Option<String>,
     collection: Option<String>,
     rkey: Option<String>,
@@ -69,62 +80,37 @@ struct RawAccount {
     status: Option<String>,
 }
 
-/// One frame.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Decoded {
-    Event(Event),
-    /// `#info OutdatedCursor`: the time cursor was older than the instance
-    /// holds, and the stream starts at its oldest event instead.
-    OutdatedCursor(String),
-    /// Another `#info`, by name.
-    Info(String),
-    /// A terminal error frame (`ConsumerTooSlow`); the instance closes next.
-    Error(String),
-}
-
-/// The subscribe URL: `base` (`wss://host` or the stream's URL) with the
-/// relations' collections and, when given, a cursor. No `kinds`, so
-/// #account, #identity and #sync arrive with the collections' commits.
+/// The subscribe URL: `base` (`wss://host`, or with the XRPC path) with the
+/// relations' collections, the kinds marco uses and, when given, a cursor
+/// (a seq, or a time of [`TIME_CURSOR_MIN`] or more).
+///
+/// `collections` limits only commits: account and sync events from every
+/// repo still come, which is what marco wants of them. Identity changes
+/// carry nothing marco keeps, so `kinds` leaves them out.
 pub fn subscribe_url(base: &str, rels: &Relations, cursor: Option<u64>) -> String {
     let mut u = base.trim_end_matches('/').to_string();
-    if !u.contains(PATH) {
+    if !u.contains("/xrpc/") {
         u.push_str(PATH);
     }
     let mut sep = if u.contains('?') { '&' } else { '?' };
+    let mut param = |u: &mut String, k: &str, v: &str| {
+        u.push(sep);
+        u.push_str(k);
+        u.push('=');
+        u.push_str(v);
+        sep = '&';
+    };
     // a companion's collection is its relation's: ask for each once
     for r in rels.list.iter().filter(|r| r.owner_of.is_none() && r.reverse_of.is_none()) {
-        u.push(sep);
-        u.push_str("collections=");
-        u.push_str(&r.collection);
-        sep = '&';
+        param(&mut u, "collections", &r.collection);
+    }
+    for k in ["commit", "account", "sync"] {
+        param(&mut u, "kinds", k);
     }
     if let Some(c) = cursor {
-        u.push(sep);
-        u.push_str(&format!("cursor={c}"));
+        param(&mut u, "cursor", &c.to_string());
     }
     u
-}
-
-/// The cursor to ask for after `saved`: the next seq, or a saved time less
-/// `overlap_us`, since times may repeat.
-pub fn resume_cursor(saved: u64, overlap_us: u64) -> u64 {
-    if saved >= TIME_CURSOR_MIN {
-        saved.saturating_sub(overlap_us).max(TIME_CURSOR_MIN)
-    } else {
-        saved + 1
-    }
-}
-
-/// Keeps a source's op times from going back: each event's time is at
-/// least the last one's.
-#[derive(Default)]
-pub struct TimeFloor(i64);
-
-impl TimeFloor {
-    fn lift(&mut self, t: i64) -> i64 {
-        self.0 = self.0.max(t);
-        self.0
-    }
 }
 
 fn time_us(t: Option<&str>) -> i64 {
@@ -132,86 +118,68 @@ fn time_us(t: Option<&str>) -> i64 {
 }
 
 /// One frame; Err is the decode-error label.
-pub fn decode(frame: &[u8], rels: &Relations, floor: &mut TimeFloor) -> Result<Decoded, &'static str> {
-    let f: Frame = serde_json::from_slice(frame).map_err(|_| "json")?;
-    match f.ty.as_str() {
+pub fn decode(frame: &[u8], rels: &Relations) -> Result<Frame, &'static str> {
+    let env: Envelope = serde_json::from_slice(frame).map_err(|_| "json")?;
+    match env.ty.as_str() {
+        "error" => return Ok(Frame::Error(env.error.unwrap_or_default())),
         "message" => {}
-        "error" => return Ok(Decoded::Error(f.error.unwrap_or_default())),
-        _ => return Err("bad_frame"),
+        _ => return Err("frame_type"),
     }
-    let p = f.payload.ok_or("no_payload")?;
+    let p = env.payload.ok_or("no_payload")?;
     let kind = p.ty.rsplit_once('#').map_or("", |(_, k)| k);
     if kind == "info" {
-        let name = p.name.unwrap_or_default();
-        if name == "OutdatedCursor" {
-            return Ok(Decoded::OutdatedCursor(p.message.unwrap_or_default()));
-        }
-        return Ok(Decoded::Info(name));
+        return Ok(Frame::Info { name: p.name.unwrap_or_default(), message: p.message.unwrap_or_default() });
     }
+    let kind = match kind {
+        "commit" => Kind::Commit,
+        "account" => Kind::Account,
+        "identity" => Kind::Identity,
+        "sync" => Kind::Sync,
+        // a kind a newer server adds: only the cursor moves
+        _ => Kind::Other,
+    };
     let seq = p.seq.ok_or("no_seq")?;
+    if seq >= TIME_CURSOR_MIN {
+        return Err("bad_seq");
+    }
     let did = p.did.ok_or("no_did")?;
-    let time_us = floor.lift(time_us(p.witnessed_at.as_deref().or(p.time.as_deref())));
-    let mut ev = Event { cursor: seq, time_us, kind: Kind::Other, change: Change::None, skipped: vec![] };
+    let mut ev =
+        Event { cursor: seq, time_us: time_us(p.time.as_deref()), kind, change: Change::None, skipped: vec![] };
     match kind {
-        "commit" => {
-            ev.kind = Kind::Commit;
-            let (Some(coll), Some(rkey), Some(op)) = (p.collection, p.rkey, p.operation) else {
-                return Err("bad_commit");
+        Kind::Commit => {
+            let (Some(op), Some(coll), Some(rkey)) = (&p.operation, &p.collection, &p.rkey) else {
+                return Err("no_commit");
             };
-            let Some(rel) = rels.by_collection(&coll) else { return Ok(Decoded::Event(ev)) };
-            let Some(uri) = edge_uri(rels, &did, &coll, &rkey) else {
-                ev.skipped.push("bad_uri");
-                return Ok(Decoded::Event(ev));
-            };
-            match op.as_str() {
-                // As in v1: an update replaces what the key held, and a record
-                // that isn't an edge empties the key.
-                "create" | "update" => {
-                    let subject = p.record.as_ref().and_then(|r| rels.get(rel).subject_of(r));
-                    let list = p.record.as_ref().and_then(|r| rels.get(rel).list_of(r));
-                    match (subject, list_of(rels, rel, &uri, list)) {
-                        (Some(s), Ok(list)) if rels.get(rel).valid_subject(s) => {
-                            ev.change = Change::Ops(vec![Op::Add { uri, subject: s.to_string(), list, time_us }]);
-                        }
-                        (_, list) => {
-                            ev.skipped.push(if list.is_err() { "bad_list" } else { "bad_subject" });
-                            ev.change = Change::Ops(vec![Op::Delete { uri, time_us }]);
-                        }
-                    }
-                }
-                "delete" => ev.change = Change::Ops(vec![Op::Delete { uri, time_us }]),
-                _ => ev.skipped.push("bad_operation"),
-            }
+            commit_change(rels, &did, op, coll, rkey, p.record.as_ref(), &mut ev);
         }
-        "account" => {
-            ev.kind = Kind::Account;
+        Kind::Account => {
             let a = p.account.ok_or("no_account")?;
             ev.change = account_change(&did, a.active, a.status.as_deref());
         }
-        "identity" => ev.kind = Kind::Identity,
-        "sync" => ev.kind = Kind::Sync,
         _ => {}
     }
-    Ok(Decoded::Event(ev))
+    Ok(Frame::Event(ev))
 }
 
-/// The XRPC error name of a refused subscribe, from its response body.
-pub fn refusal(body: Option<&[u8]>) -> Option<String> {
+/// The error name of a pre-upgrade XRPC rejection's JSON body.
+pub fn rejection(body: &[u8]) -> Option<String> {
     #[derive(Deserialize)]
-    struct Envelope {
+    struct E {
         error: String,
     }
-    serde_json::from_slice::<Envelope>(body?).ok().map(|e| e.error)
+    serde_json::from_slice::<E>(body).ok().map(|e| e.error)
 }
 
-/// Whether the instance still holds time `t` (µs): subscribed from it, the
-/// first frame is an event, not `#info OutdatedCursor`. Some(the info's
-/// message) when it doesn't.
-pub async fn outdated(base: &str, rels: &Relations, t: u64) -> anyhow::Result<Option<String>> {
+/// The time of the first event the instance sends from the time `cursor`. A
+/// cursor older than the instance holds is clamped up to its oldest event
+/// (with an `#info OutdatedCursor`), so a first event well past the cursor
+/// is a gap no replay fills.
+pub async fn first_event_us(base: &str, rels: &Relations, cursor: u64) -> anyhow::Result<i64> {
     use anyhow::Context;
     use futures::StreamExt;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::Message;
-    let url = subscribe_url(base, rels, Some(t.max(TIME_CURSOR_MIN)));
+    let url = subscribe_url(base, rels, Some(cursor));
     let connector = if url.starts_with("wss://") {
         tokio_tungstenite::Connector::Rustls(crate::conn::tls())
     } else {
@@ -219,29 +187,25 @@ pub async fn outdated(base: &str, rels: &Relations, t: u64) -> anyhow::Result<Op
     };
     let cfg = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
         .max_message_size(Some(crate::conn::MAX_FRAME_BYTES));
-    let dial = tokio_tungstenite::connect_async_tls_with_config(url.as_str(), Some(cfg), true, Some(connector));
+    let mut req = url.as_str().into_client_request()?;
+    offer_subprotocol(&mut req);
+    let dial = tokio_tungstenite::connect_async_tls_with_config(req, Some(cfg), true, Some(connector));
     let (mut ws, _) = tokio::time::timeout(std::time::Duration::from_secs(15), dial)
         .await
         .context("dial timed out")?
         .with_context(|| format!("dial {url}"))?;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-    let mut floor = TimeFloor::default();
     while let Ok(Some(m)) = tokio::time::timeout_at(deadline, ws.next()).await {
         let b = match m? {
             Message::Text(t) => t.as_bytes().to_vec(),
             Message::Binary(b) => b.to_vec(),
             _ => continue,
         };
-        match decode(&b, rels, &mut floor) {
-            Ok(Decoded::OutdatedCursor(msg)) => {
+        if let Ok(Frame::Event(ev)) = decode(&b, rels) {
+            if ev.time_us > 0 {
                 let _ = ws.close(None).await;
-                return Ok(Some(msg));
+                return Ok(ev.time_us);
             }
-            Ok(Decoded::Event(_)) => {
-                let _ = ws.close(None).await;
-                return Ok(None);
-            }
-            _ => continue,
         }
     }
     anyhow::bail!("{url}: no event within 30 s")
@@ -250,165 +214,140 @@ pub async fn outdated(base: &str, rels: &Relations, t: u64) -> anyhow::Result<Op
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Status;
+    use crate::{Op, Status};
 
-    /// Frames as live Jetstream v2 sent them (follows, blocks, listitems,
-    /// accounts, identities), cut from a capture.
+    /// Frames as the public instance sent them (follow, block and listitem
+    /// commits and #account events), cut from a capture.
     const CAPTURE: &str = include_str!("../testdata/jetstream2.jsonl");
-
-    fn event(line: &str, floor: &mut TimeFloor) -> Event {
-        match decode(line.as_bytes(), &Relations::bsky_default(), floor) {
-            Ok(Decoded::Event(ev)) => ev,
-            other => panic!("{other:?}: {line}"),
-        }
-    }
 
     #[test]
     fn url() {
         let r = Relations::bsky_default();
-        let colls =
-            "collections=app.bsky.graph.follow&collections=app.bsky.graph.block&collections=app.bsky.graph.listitem&collections=app.bsky.graph.listblock";
-        assert_eq!(subscribe_url("wss://js.example", &r, Some(5)), format!("wss://js.example{PATH}?{colls}&cursor=5"));
+        let want = "collections=app.bsky.graph.follow&collections=app.bsky.graph.block&collections=app.bsky.graph.listitem&collections=app.bsky.graph.listblock&kinds=commit&kinds=account&kinds=sync";
         assert_eq!(
-            subscribe_url(&format!("ws://127.0.0.1:9{PATH}"), &r, None),
-            format!("ws://127.0.0.1:9{PATH}?{colls}")
+            subscribe_url("wss://js.example", &r, None),
+            format!("wss://js.example/xrpc/network.bsky.jetstream.subscribeEvents?{want}")
+        );
+        assert_eq!(
+            subscribe_url("wss://js.example/", &r, Some(27_079_043_958)),
+            format!("wss://js.example/xrpc/network.bsky.jetstream.subscribeEvents?{want}&cursor=27079043958")
+        );
+        assert_eq!(
+            subscribe_url("ws://127.0.0.1:9/xrpc/network.bsky.jetstream.subscribeEvents?x=1", &r, Some(5)),
+            format!("ws://127.0.0.1:9/xrpc/network.bsky.jetstream.subscribeEvents?x=1&{want}&cursor=5")
         );
     }
 
     #[test]
-    fn resume() {
-        assert_eq!(resume_cursor(41, 1_000_000), 42, "a seq: the next one, no overlap");
-        let t = 1_762_900_000_000_000;
-        assert_eq!(resume_cursor(t, 1_000_000), t - 1_000_000, "a time: less the overlap");
-        assert_eq!(resume_cursor(TIME_CURSOR_MIN, 1_000_000), TIME_CURSOR_MIN, "still a time");
-    }
-
-    #[test]
     fn captured_frames() {
-        let mut floor = TimeFloor::default();
-        let (mut adds, mut dels, mut statuses, mut clears, mut lists) = (0, 0, 0, 0, 0);
+        let rels = Relations::bsky_default();
+        let (mut adds, mut dels, mut statuses, mut clears) = (0, 0, 0, 0);
         let mut last = 0;
         for line in CAPTURE.lines() {
-            let ev = event(line, &mut floor);
+            let Frame::Event(ev) = decode(line.as_bytes(), &rels).unwrap_or_else(|e| panic!("{e}: {line}")) else {
+                panic!("not an event: {line}")
+            };
+            assert!(ev.cursor > last, "seq goes back");
+            last = ev.cursor;
             let v: serde_json::Value = serde_json::from_str(line).unwrap();
             let p = &v["payload"];
             assert_eq!(ev.cursor, p["seq"].as_u64().unwrap());
-            assert!(ev.cursor > last, "seq goes back");
-            last = ev.cursor;
-            let witnessed = chrono::DateTime::parse_from_rfc3339(p["witnessedAt"].as_str().unwrap()).unwrap();
-            assert_eq!(ev.time_us, witnessed.timestamp_micros());
+            assert_eq!(
+                ev.time_us,
+                chrono::DateTime::parse_from_rfc3339(p["time"].as_str().unwrap()).unwrap().timestamp_micros()
+            );
+            assert!(ev.skipped.is_empty(), "{:?}", ev.skipped);
             match &ev.change {
                 Change::Ops(ops) => {
+                    assert_eq!(ev.kind, Kind::Commit);
                     for op in ops {
                         match op {
                             Op::Add { uri, subject, list, time_us } => {
                                 adds += 1;
-                                lists += list.is_some() as usize;
                                 assert_eq!(*time_us, ev.time_us);
                                 assert_eq!(subject, p["record"]["subject"].as_str().unwrap());
-                                assert!(uri.ends_with(p["rkey"].as_str().unwrap()));
+                                assert_eq!(list.as_deref(), p["record"]["list"].as_str());
+                                assert_eq!(
+                                    uri,
+                                    &format!(
+                                        "at://{}/{}/{}",
+                                        p["did"].as_str().unwrap(),
+                                        p["collection"].as_str().unwrap(),
+                                        p["rkey"].as_str().unwrap()
+                                    )
+                                );
                             }
                             Op::Delete { .. } => {
                                 dels += 1;
-                                assert!(p["record"].is_null(), "{line}");
+                                assert!(p["record"].is_null());
                             }
                         }
                     }
                 }
                 Change::Status { status: Some(s), .. } => {
                     statuses += 1;
-                    let want = if *s == Status::Deleted { "deleted" } else { "takendown" };
-                    assert_eq!(p["account"]["status"], want);
+                    assert_eq!(*s, Status::Takendown);
+                    assert_eq!(p["account"]["status"], "takendown");
                 }
-                Change::Status { status: None, .. } => {
+                Change::Status { status: None, did } => {
                     clears += 1;
+                    assert_eq!(did, p["did"].as_str().unwrap());
                     assert_eq!(p["account"]["active"], true);
                 }
-                Change::None => assert!(ev.kind != Kind::Commit || !ev.skipped.is_empty(), "{line}"),
+                Change::None => {
+                    assert_eq!(ev.kind, Kind::Account, "a deactivation changes nothing: {line}");
+                    assert_eq!(p["account"]["status"], "deactivated");
+                }
             }
         }
-        assert!(
-            adds > 0 && dels > 0 && statuses > 0 && clears > 0 && lists > 0,
-            "{adds} {dels} {statuses} {clears} {lists}"
-        );
-    }
-
-    #[test]
-    fn times_never_go_back() {
-        let frame = |seq: u64, time: &str, witnessed: Option<&str>| {
-            let w = witnessed.map_or(String::new(), |w| format!(r#","witnessedAt":"{w}""#));
-            format!(
-                r#"{{"$type":"message","payload":{{"$type":"network.bsky.jetstream.subscribeEvents#identity","seq":{seq},"did":"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa","time":"{time}"{w},"identity":{{}}}}}}"#
-            )
-        };
-        let mut floor = TimeFloor::default();
-        let a = event(&frame(1, "2026-11-11T10:00:00.000000Z", Some("2026-11-11T10:00:00.000002Z")), &mut floor);
-        assert_eq!(a.time_us % 1_000_000, 2, "witnessedAt over time");
-        // an imported time from before, from an instance without witnessedAt
-        let b = event(&frame(2, "2024-01-01T00:00:00.000000Z", None), &mut floor);
-        assert_eq!(b.time_us, a.time_us, "held at the last time");
+        assert!(adds > 0 && dels > 0 && statuses > 0 && clears > 0, "{adds} {dels} {statuses} {clears}");
     }
 
     #[test]
     fn other_frames() {
         let rels = Relations::bsky_default();
-        let mut floor = TimeFloor::default();
-        let info = |name: &str| {
-            format!(
-                r#"{{"$type":"message","payload":{{"$type":"network.bsky.jetstream.subscribeEvents#info","name":"{name}","message":"resumed from seq 7"}}}}"#
-            )
-        };
+        let info = br#"{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribeEvents#info","message":"beyond the tip","name":"FutureCursor"}}"#;
         assert_eq!(
-            decode(info("OutdatedCursor").as_bytes(), &rels, &mut floor),
-            Ok(Decoded::OutdatedCursor("resumed from seq 7".into()))
+            decode(info, &rels),
+            Ok(Frame::Info { name: "FutureCursor".into(), message: "beyond the tip".into() })
         );
-        assert_eq!(decode(info("Later").as_bytes(), &rels, &mut floor), Ok(Decoded::Info("Later".into())));
-        assert_eq!(
-            decode(br#"{"$type":"error","error":"ConsumerTooSlow","message":"bye"}"#, &rels, &mut floor),
-            Ok(Decoded::Error("ConsumerTooSlow".into()))
-        );
-        assert_eq!(decode(b"{", &rels, &mut floor), Err("json"));
-        assert_eq!(decode(br#"{"$type":"what"}"#, &rels, &mut floor), Err("bad_frame"));
-        let like = br#"{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribeEvents#commit","seq":9,"did":"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa","time":"2026-11-11T10:00:00Z","rev":"3k","operation":"create","collection":"app.bsky.feed.like","rkey":"3k","record":{}}}"#;
-        match decode(like, &rels, &mut floor) {
-            Ok(Decoded::Event(ev)) => assert_eq!((ev.cursor, ev.change), (9, Change::None)),
-            other => panic!("{other:?}"),
-        }
+        let err = br#"{"$type":"error","error":"ConsumerTooSlow","message":"too slow"}"#;
+        assert_eq!(decode(err, &rels), Ok(Frame::Error("ConsumerTooSlow".into())));
+        let sync = br#"{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribeEvents#sync","did":"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa","seq":41,"sync":{"did":"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa","rev":"3k","seq":3},"time":"2026-11-11T21:55:21.789604Z","witnessedAt":"2026-11-11T21:55:21.789604Z"}}"#;
+        let Ok(Frame::Event(ev)) = decode(sync, &rels) else { panic!() };
+        assert_eq!((ev.cursor, ev.kind, ev.change), (41, Kind::Sync, Change::None));
+        // a kind a newer server adds moves only the cursor
+        let new = br#"{"$type":"message","payload":{"$type":"network.bsky.jetstream.subscribeEvents#tombstone","did":"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa","seq":42,"time":"2026-11-11T21:55:21.789604Z"}}"#;
+        let Ok(Frame::Event(ev)) = decode(new, &rels) else { panic!() };
+        assert_eq!((ev.cursor, ev.kind, ev.change), (42, Kind::Other, Change::None));
     }
 
     #[test]
-    fn a_listblock_names_a_list_in_another_repo() {
+    fn junk() {
         let rels = Relations::bsky_default();
-        let frame = |subject: &str| {
-            format!(
-                r#"{{"$type":"message","payload":{{"$type":"network.bsky.jetstream.subscribeEvents#commit","seq":9,"did":"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa","time":"2026-11-11T10:00:00Z","rev":"3k","operation":"create","collection":"app.bsky.graph.listblock","rkey":"3kaaaaaaaaa22","record":{{"subject":"{subject}"}}}}}}"#
-            )
-        };
-        let list = "at://did:plc:bbbbbbbbbbbbbbbbbbbbbbbb/app.bsky.graph.list/3kaaaaaaaaa2a";
-        let uri = "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.graph.listblock/3kaaaaaaaaa22";
-        match decode(frame(list).as_bytes(), &rels, &mut TimeFloor::default()) {
-            Ok(Decoded::Event(ev)) => assert_eq!(
-                ev.change,
-                Change::Ops(vec![Op::Add { uri: uri.into(), subject: list.into(), list: None, time_us: ev.time_us }])
-            ),
-            other => panic!("{other:?}"),
-        }
-        match decode(frame("did:plc:bbbbbbbbbbbbbbbbbbbbbbbb").as_bytes(), &rels, &mut TimeFloor::default()) {
-            Ok(Decoded::Event(ev)) => {
-                assert_eq!(ev.skipped, vec!["bad_subject"], "an account isn't a list");
-                assert!(matches!(&ev.change, Change::Ops(ops) if matches!(ops[0], Op::Delete { .. })));
-            }
-            other => panic!("{other:?}"),
-        }
+        assert_eq!(decode(b"{", &rels), Err("json"));
+        assert_eq!(decode(br#"{"$type":"binary"}"#, &rels), Err("frame_type"));
+        assert_eq!(decode(br#"{"$type":"message"}"#, &rels), Err("no_payload"));
+        let no_seq = br#"{"$type":"message","payload":{"$type":"x#commit","did":"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"}}"#;
+        assert_eq!(decode(no_seq, &rels), Err("no_seq"));
+        // a time where a seq belongs would be read as a time cursor on the next dial
+        let big = br#"{"$type":"message","payload":{"$type":"x#commit","did":"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa","seq":1700000000000000}}"#;
+        assert_eq!(decode(big, &rels), Err("bad_seq"));
+        let no_op =
+            br#"{"$type":"message","payload":{"$type":"x#commit","did":"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa","seq":5}}"#;
+        assert_eq!(decode(no_op, &rels), Err("no_commit"));
+        let bad = br#"{"$type":"message","payload":{"$type":"x#commit","did":"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa","seq":5,"time":"2026-11-11T21:55:21.789604Z","operation":"create","collection":"app.bsky.graph.follow","rkey":"3k","record":{"subject":"bob.test"}}}"#;
+        let Ok(Frame::Event(ev)) = decode(bad, &rels) else { panic!() };
+        assert_eq!(ev.skipped, vec!["bad_subject"]);
+        assert!(
+            matches!(ev.change, Change::Ops(ref o) if matches!(o[0], Op::Delete { .. })),
+            "a record that isn't an edge empties its key"
+        );
     }
 
     #[test]
-    fn refusals() {
-        assert_eq!(
-            refusal(Some(br#"{"error":"CursorTooOld","message":"floor seq 100"}"#)).as_deref(),
-            Some("CursorTooOld")
-        );
-        assert_eq!(refusal(Some(b"Bad Request")), None);
-        assert_eq!(refusal(None), None);
+    fn rejections() {
+        assert_eq!(rejection(br#"{"error":"CursorTooOld","message":"floor 5"}"#).as_deref(), Some("CursorTooOld"));
+        assert_eq!(rejection(b"<html>"), None);
     }
 }

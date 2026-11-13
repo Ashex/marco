@@ -107,3 +107,39 @@ pub static QUEUED: LazyLock<IntGaugeVec> = LazyLock::new(|| {
 pub static CONNECTED: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     register_int_gauge_vec!("marco_ingest_connected", "1 while the stream is open", &["source"]).unwrap()
 });
+
+pub static SYNC_EVENTS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "marco_ingest_sync_events_total",
+        "#sync events (a repo reset): counted and not resynced, so the repo's edges can be stale until a rebuild",
+        &["source"]
+    )
+    .unwrap()
+});
+
+pub static CURSOR_NOTICES: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "marco_ingest_cursor_notices_total",
+        "Jetstream #info cursor notices, by source and name: OutdatedCursor (events may be missing), FutureCursor",
+        &["source", "name"]
+    )
+    .unwrap()
+});
+
+pub static CURSOR_TOO_OLD: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "marco_ingest_cursor_too_old_total",
+        "Dials a Jetstream v2 instance refused with CursorTooOld, which ends the source",
+        &["source"]
+    )
+    .unwrap()
+});
+
+pub static DEDUPED: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "marco_ingest_deduped_events_total",
+        "Jetstream v2 events at or below the last seq read, dropped (the overlap of a resume)",
+        &["source"]
+    )
+    .unwrap()
+});

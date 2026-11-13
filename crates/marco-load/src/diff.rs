@@ -78,6 +78,53 @@ fn one_way(x: &Graph, y: &Graph, rel: RelId, coll: &str, samples: usize) -> Side
     s
 }
 
+/// A `.by` companion's record, as a build-independent key: its key holds the
+/// actor's low id bits (and a probe past a taken key), so it matches by the
+/// record time and the actor's DID.
+fn by_key(g: &Graph, k: u64, actor: u32) -> (u64, String) {
+    let t = if marco_core::rkey::is_tid(k) { k >> 10 } else { 0 };
+    (t, g.did_of(actor).unwrap_or_default())
+}
+
+/// [`one_way`] for a `.by` companion: its subjects are the records' actors.
+fn one_way_by(x: &Graph, y: &Graph, rel: RelId, coll: &str, samples: usize) -> Side {
+    let s = Side {
+        records: AtomicU64::new(0),
+        matched: AtomicU64::new(0),
+        subject_differs: AtomicU64::new(0),
+        samples: Mutex::new(Vec::new()),
+    };
+    (0..x.n_ids()).into_par_iter().with_min_len(4096).for_each(|id| {
+        let out = x.read(|cx| x.out_all(cx, rel, id)).unwrap();
+        if out.is_empty() {
+            return;
+        }
+        s.records.fetch_add(out.len() as u64, Relaxed);
+        let Some(did) = x.did_of(id) else { return };
+        let theirs: std::collections::HashSet<(u64, String)> = y
+            .id_of(&did)
+            .map(|yid| y.read(|cx| y.out_all(cx, rel, yid)).unwrap())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(k, a)| by_key(y, k, a))
+            .collect();
+        let mut m = 0u64;
+        for &(k, actor) in &out {
+            let key = by_key(x, k, actor);
+            if theirs.contains(&key) {
+                m += 1;
+            } else {
+                let mut v = s.samples.lock().unwrap();
+                if v.len() < samples {
+                    v.push(format!("{} -> {coll} by {did} at {}", key.1, key.0));
+                }
+            }
+        }
+        s.matched.fetch_add(m, Relaxed);
+    });
+    s
+}
+
 pub fn run(a: &Args) -> Result<Value> {
     let t = Instant::now();
     let ga = Graph::open(&a.a)?;
@@ -90,8 +137,9 @@ pub fn run(a: &Args) -> Result<Value> {
             equal = false;
             continue;
         };
-        let x = one_way(&ga, &gb, ri as RelId, &r.collection, a.samples);
-        let y = one_way(&gb, &ga, rb, &r.collection, a.samples);
+        let way = if r.reverse_of.is_some() { one_way_by } else { one_way };
+        let x = way(&ga, &gb, ri as RelId, &r.collection, a.samples);
+        let y = way(&gb, &ga, rb, &r.collection, a.samples);
         let (na, nb, m) = (x.records.load(Relaxed), y.records.load(Relaxed), x.matched.load(Relaxed));
         let only_a = na - m;
         let only_b = nb - y.matched.load(Relaxed);

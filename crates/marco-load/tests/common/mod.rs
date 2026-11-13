@@ -1,4 +1,4 @@
-//! What the Scylla tests share: synthetic build input, the binary, configs.
+//! What the scan tests share: synthetic build input, the binary, configs.
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -91,7 +91,7 @@ pub fn write_input(dir: &Path, rel: &str, n: u64, actors: u64, seed: u64) -> u64
 
 /// Rows (string columns, time_us, op) as build input files, bucketed by the
 /// first column, the repo.
-fn write_files<'a>(dir: &Path, rel: &str, rows: impl Iterator<Item = (Vec<&'a str>, i64, u8)>) {
+pub fn write_files<'a>(dir: &Path, rel: &str, rows: impl Iterator<Item = (Vec<&'a str>, i64, u8)>) {
     let mut files: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     for (cols, us, op) in rows {
         let plc = cols[0].strip_prefix("did:plc:").filter(|r| r.len() == 24);
@@ -302,6 +302,7 @@ pub fn rel<'a>(d: &'a Value, name: &str) -> &'a Value {
     d["relations"].as_array().unwrap().iter().find(|r| r["relation"] == name).unwrap()
 }
 
+#[cfg(feature = "scylla")]
 pub async fn drop_keyspaces(node: &str, names: &[String]) {
     let session = scylla::client::session_builder::SessionBuilder::new().known_node(node).build().await.unwrap();
     for k in names {
