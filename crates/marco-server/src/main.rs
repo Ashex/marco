@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! marco serve --snapshot DIR [--admin-token-file F]   serve a snapshot (and write to it)
-//!     [--jetstream URL | --firehose URL]               and fill it from a stream
+//!     [--jetstream URL | --jetstream-v2 URL | --firehose URL]               and fill it from a stream
 //! marco synth --out DIR [--actors N]                   write a synthetic snapshot (fake DIDs)
 //! ```
 
@@ -94,7 +94,7 @@ struct Serve {
     #[arg(long, env = "MARCO_READ_ONLY")]
     read_only: bool,
     /// Don't route Graph writes on --listen at all (404, token or not). The admin
-    /// listener and --jetstream/--firehose still write.
+    /// listener and --jetstream/--jetstream-v2/--firehose still write.
     #[arg(long, env = "MARCO_API_READ_ONLY")]
     api_read_only: bool,
     /// A built console (ui/dist) to serve instead of the one built into the binary.
@@ -151,10 +151,12 @@ struct Serve {
     /// for tests that want a starved cache.
     #[arg(long, env = "MARCO_MAX_FRAMES", hide = true)]
     max_frames: Option<u32>,
-    /// Follow a Jetstream instance for the relations' collections: v1 (wss://host or wss://host/subscribe)
-    /// or v2 (wss://host/xrpc/network.bsky.jetstream.subscribeEvents).
-    #[arg(long, env = "MARCO_JETSTREAM", conflicts_with = "firehose")]
+    /// Follow a Jetstream instance (wss://host or wss://host/subscribe) for the relations' collections.
+    #[arg(long, env = "MARCO_JETSTREAM", conflicts_with_all = ["jetstream_v2", "firehose"])]
     jetstream: Option<String>,
+    /// Follow a Jetstream v2 instance's network.bsky.jetstream.subscribeEvents (wss://host) by seq.
+    #[arg(long, env = "MARCO_JETSTREAM_V2", conflicts_with = "firehose")]
+    jetstream_v2: Option<String>,
     /// Follow a relay's com.atproto.sync.subscribeRepos (wss://host).
     #[arg(long, env = "MARCO_FIREHOSE")]
     firehose: Option<String>,
@@ -164,7 +166,7 @@ struct Serve {
     #[arg(long, env = "MARCO_SOURCE_RETENTION_HOURS", default_value_t = 36.0)]
     source_retention_hours: f64,
     /// Follow a bulk-built snapshot past the retention, or from a firehose (which
-    /// starts at the live tail), or a Jetstream v2 source past a time it no longer holds.
+    /// starts at the live tail).
     #[arg(long, env = "MARCO_ALLOW_GAP")]
     allow_gap: bool,
 }
@@ -204,6 +206,7 @@ fn flags(m: &ArgMatches, s: &Serve) -> Vec<FlagInfo> {
         ("memory_limit", s.memory_limit.clone().unwrap_or_else(|| "cgroup".into())),
         ("miss_threads", s.miss_threads.to_string()),
         ("jetstream", s.jetstream.clone().unwrap_or_else(|| "—".into())),
+        ("jetstream_v2", s.jetstream_v2.clone().unwrap_or_else(|| "—".into())),
         ("firehose", s.firehose.clone().unwrap_or_else(|| "—".into())),
         ("source_retention_hours", s.source_retention_hours.to_string()),
         ("allow_gap", s.allow_gap.to_string()),
@@ -305,9 +308,10 @@ fn main() -> Result<()> {
             if s.segment_interval <= 0.0 || s.checkpoint_age <= 0.0 {
                 bail!("--segment-interval and --checkpoint-age must be above 0");
             }
-            let source = match (&s.jetstream, &s.firehose) {
-                (Some(u), _) => Some(Source::new(Proto::jetstream(u), u)?),
-                (_, Some(u)) => Some(Source::new(Proto::Firehose, u)?),
+            let source = match (&s.jetstream, &s.jetstream_v2, &s.firehose) {
+                (Some(u), _, _) => Some(Source::new(Proto::Jetstream, u)?),
+                (_, Some(u), _) => Some(Source::new(Proto::JetstreamV2, u)?),
+                (_, _, Some(u)) => Some(Source::new(Proto::Firehose, u)?),
                 _ => None,
             };
             if source.is_some() && s.read_only {
@@ -377,8 +381,7 @@ fn main() -> Result<()> {
                         let retention = std::time::Duration::from_secs_f64(s.source_retention_hours.max(0.0) * 3600.0);
                         let start = marco_server::ingest::start_point(&app, &src, retention, s.allow_gap).await?;
                         eprintln!("following {} ({})", src.name, src.url);
-                        let opts = marco_ingest::Options { start, allow_gap: s.allow_gap, ..Default::default() };
-                        Some(marco_server::ingest::start(&app, src, opts, stopped))
+                        Some(marco_server::ingest::start(&app, src, start, stopped))
                     }
                     None => None,
                 };

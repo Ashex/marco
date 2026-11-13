@@ -13,9 +13,8 @@ pub const SNAPSHOT_TIME: &str = "time_us";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Proto {
-    /// v1's `/subscribe`.
     Jetstream,
-    /// v2's `network.bsky.jetstream.subscribeEvents`.
+    /// Jetstream v2's `subscribeEvents`, resumed by seq.
     JetstreamV2,
     Firehose,
 }
@@ -24,7 +23,7 @@ impl Proto {
     pub fn as_str(self) -> &'static str {
         match self {
             Proto::Jetstream => "jetstream",
-            Proto::JetstreamV2 => "jetstream-v2",
+            Proto::JetstreamV2 => "jetstreamv2",
             Proto::Firehose => "firehose",
         }
     }
@@ -35,29 +34,6 @@ impl Proto {
             Proto::JetstreamV2 | Proto::Firehose => "seq",
         }
     }
-
-    /// The Jetstream wire a URL names: v2 by its XRPC path, v1 otherwise.
-    pub fn jetstream(url: &str) -> Proto {
-        if url.contains(crate::jetstream2::PATH) {
-            Proto::JetstreamV2
-        } else {
-            Proto::Jetstream
-        }
-    }
-
-    pub fn is_jetstream(self) -> bool {
-        matches!(self, Proto::Jetstream | Proto::JetstreamV2)
-    }
-
-    /// What a source's name starts with, which keys its cursor. Both Jetstream
-    /// wires share one, so a v2 consumer resumes from where a v1 consumer of
-    /// the same instance left off: its saved time is a v2 time cursor.
-    fn family(self) -> &'static str {
-        match self {
-            Proto::Jetstream | Proto::JetstreamV2 => "jetstream",
-            Proto::Firehose => "firehose",
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,7 +41,7 @@ pub struct Source {
     pub proto: Proto,
     /// `ws://` or `wss://`.
     pub url: String,
-    /// `jetstream:<host>` or `firehose:<host>`: the key its cursor is kept by.
+    /// `jetstream:<host>`, `jetstreamv2:<host>` or `firehose:<host>`: the key its cursor is kept by.
     pub name: String,
 }
 
@@ -85,7 +61,7 @@ impl Source {
         if host.is_empty() {
             bail!("{url:?} has no host");
         }
-        Ok(Source { proto, name: format!("{}:{host}", proto.family()), url })
+        Ok(Source { proto, name: format!("{}:{host}", proto.as_str()), url })
     }
 }
 
@@ -197,15 +173,9 @@ mod tests {
         let s = Source::new(Proto::Firehose, "https://relay.example").unwrap();
         assert_eq!((s.name.as_str(), s.url.as_str()), ("firehose:relay.example", "wss://relay.example"));
         assert_eq!(Source::new(Proto::Jetstream, "ws://127.0.0.1:7/x").unwrap().name, "jetstream:127.0.0.1:7");
+        let s = Source::new(Proto::JetstreamV2, "https://js2.example").unwrap();
+        assert_eq!((s.name.as_str(), s.proto.cursor_kind()), ("jetstreamv2:js2.example", "seq"));
         assert!(Source::new(Proto::Jetstream, "ftp://x").is_err());
         assert!(Source::new(Proto::Jetstream, "wss:///x").is_err());
-        let v2 = "wss://js.example/xrpc/network.bsky.jetstream.subscribeEvents";
-        assert_eq!(Proto::jetstream(v2), Proto::JetstreamV2);
-        assert_eq!(Proto::jetstream("wss://js.example"), Proto::Jetstream);
-        assert_eq!(
-            Source::new(Proto::JetstreamV2, v2).unwrap().name,
-            "jetstream:js.example",
-            "one cursor for both wires"
-        );
     }
 }

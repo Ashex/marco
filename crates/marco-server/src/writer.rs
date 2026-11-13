@@ -366,7 +366,7 @@ impl Writer {
         // A stream source now has its own cursor, in this segment: the bulk
         // build's time has done its job, and a source added later mustn't
         // start from it.
-        if (source.starts_with("jetstream:") || source.starts_with("firehose:"))
+        if ["jetstream:", "jetstreamv2:", "firehose:"].iter().any(|p| source.starts_with(p))
             && self.cursors.remove(marco_ingest::SNAPSHOT_TIME).is_some()
         {
             self.app.forget_source(marco_ingest::SNAPSHOT_TIME);

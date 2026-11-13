@@ -48,6 +48,14 @@ impl SubjectKind {
     fn is_did(&self) -> bool {
         *self == SubjectKind::Did
     }
+
+    /// Whether `s` is a subject of this kind.
+    pub fn admits(self, s: &str) -> bool {
+        match self {
+            SubjectKind::Did => crate::did::classify(s).is_some(),
+            SubjectKind::List => s.starts_with("at://") && parse_uri(s).is_some(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,10 +92,7 @@ impl Relation {
 
     /// Whether `s` is the kind of subject this relation names.
     pub fn valid_subject(&self, s: &str) -> bool {
-        match self.subject_kind {
-            SubjectKind::Did => crate::did::classify(s).is_some(),
-            SubjectKind::List => s.starts_with("at://") && parse_uri(s).is_some(),
-        }
+        self.subject_kind.admits(s)
     }
 }
 

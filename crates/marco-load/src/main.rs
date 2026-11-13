@@ -11,6 +11,8 @@
 //! marco-load scan-scylla --config TOML --out DIR [--snapshot SNAP]   Scylla tables -> build input (-> snapshot)
 //! marco-load sweep-hubble --out DIR [--snapshot SNAP]                 a Hubble mirror's repos -> build input (-> snapshot)
 //! marco-load fill-scylla --config TOML --input DIR   build input -> Scylla tables (tests, benchmarks)
+//! marco-load scan-hubble --out DIR [--host URL] [--snapshot SNAP]   a sync-API host's repos -> build input (-> snapshot)
+//! marco-load scan-jetstream --out DIR [--host URL] [--snapshot SNAP]   a Jetstream v2 archive -> build input (-> snapshot)
 //! ```
 //!
 //! The build's input format is in this crate's README.
@@ -27,10 +29,16 @@ mod cql;
 mod diff;
 #[cfg(feature = "hubble")]
 mod hubble;
+#[cfg(feature = "jetstream")]
+mod jetstream;
 mod lists_bench;
 mod metrics;
 mod rows;
+#[cfg(any(feature = "scylla", feature = "hubble"))]
+mod spill;
 mod stats;
+#[cfg(feature = "sweep-hubble")]
+mod sweep_hubble;
 mod sys;
 mod verify;
 
@@ -99,12 +107,18 @@ enum Cmd {
     /// Scan Scylla tables into build input (see the README), then optionally build.
     #[cfg(feature = "scylla")]
     ScanScylla(Box<cql::scan::Args>),
-    /// Download every repo on a Hubble mirror into build input (and with --snapshot, build it).
-    #[cfg(feature = "hubble")]
-    SweepHubble(Box<hubble::Args>),
+    /// Download every repo on a Hubble mirror as STAR-lite into build input, with each repo's rev (and with --snapshot, build it).
+    #[cfg(feature = "sweep-hubble")]
+    SweepHubble(Box<sweep_hubble::Args>),
     /// Load build input into Scylla tables as current state (tests, benchmarks).
     #[cfg(feature = "scylla")]
     FillScylla(cql::fill::Args),
+    /// Fetch every repo a sync-API host lists (Hubble by default) into build input, then optionally build.
+    #[cfg(feature = "hubble")]
+    ScanHubble(Box<hubble::Args>),
+    /// Replay a Jetstream v2 instance's sealed archive of the relations into build input, then optionally build.
+    #[cfg(feature = "jetstream")]
+    ScanJetstream(Box<jetstream::Args>),
 }
 
 fn main() -> Result<()> {
@@ -163,10 +177,14 @@ fn main() -> Result<()> {
         Cmd::Diff(a) => diff::run(&a)?,
         #[cfg(feature = "scylla")]
         Cmd::ScanScylla(a) => cql::scan::run(&a)?,
-        #[cfg(feature = "hubble")]
-        Cmd::SweepHubble(a) => hubble::run(&a)?,
+        #[cfg(feature = "sweep-hubble")]
+        Cmd::SweepHubble(a) => sweep_hubble::run(&a)?,
         #[cfg(feature = "scylla")]
         Cmd::FillScylla(a) => cql::fill::run(&a)?,
+        #[cfg(feature = "hubble")]
+        Cmd::ScanHubble(a) => hubble::run(&a)?,
+        #[cfg(feature = "jetstream")]
+        Cmd::ScanJetstream(a) => jetstream::run(&a)?,
     };
     let s = serde_json::to_string_pretty(&report)?;
     if let Some(p) = cli.report {
