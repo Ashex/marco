@@ -112,7 +112,7 @@ async fn pod_with(
     seek_server::metrics::init();
     std::fs::create_dir_all(art_dir).unwrap();
     let m = marco_addr
-        .map(|a| seek_server::marco::Marco::new(&format!("http://{a}"), Duration::from_secs(5), 10_000).unwrap());
+        .map(|a| seek_server::marco::Marco::new(&format!("http://{a}"), 2, Duration::from_secs(5), 10_000).unwrap());
     let cfg = Config {
         params: Default::default(),
         replay_window: Duration::from_secs(3600),

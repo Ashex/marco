@@ -102,6 +102,9 @@ enum Cmd {
         /// marco's API for logged-in queries; without it every query is logged out.
         #[arg(long, env = "SEEK_MARCO")]
         marco: Option<String>,
+        /// h2 connections to marco, calls spread round-robin (one tops out at ~43k Filters/s).
+        #[arg(long, env = "SEEK_MARCO_CONNECTIONS", default_value_t = 4)]
+        marco_connections: usize,
         #[arg(long, env = "SEEK_MARCO_TIMEOUT_MS", default_value_t = 500)]
         marco_timeout_ms: u64,
         /// The most follows a viewer's entry reads (newest first).
@@ -312,6 +315,7 @@ async fn run(cli: Cli) -> Result<()> {
             data,
             poll_seconds,
             marco,
+            marco_connections,
             marco_timeout_ms,
             max_follows,
             viewer_cache_mb,
@@ -347,7 +351,7 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             }
             let marco = marco
-                .map(|u| marco::Marco::new(&u, Duration::from_millis(marco_timeout_ms), max_follows))
+                .map(|u| marco::Marco::new(&u, marco_connections, Duration::from_millis(marco_timeout_ms), max_follows))
                 .transpose()?;
             let cfg = serve::Config {
                 params: seek_core::query::Params { policy: follows_policy(&follows)?, ..Default::default() },

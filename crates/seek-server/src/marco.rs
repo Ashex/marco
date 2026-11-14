@@ -2,6 +2,7 @@
 //! viewer's follows and mutuals once a session, and one block filter a
 //! keystroke. Each call is timed, bounded and counted by method.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
@@ -18,7 +19,10 @@ const LIST_PAGE: u32 = 1000;
 const INTERSECT_PAGE: u32 = 10_000;
 
 pub struct Marco {
-    c: GraphClient<HttpClient>,
+    /// One client per h2 connection: one connection to marco tops out well
+    /// below what marco serves (docs/seek.md, Throughput).
+    cs: Vec<GraphClient<HttpClient>>,
+    next: AtomicUsize,
     timeout: Duration,
     /// Past this many follows a viewer's entry stops reading: the newest are kept.
     pub max_follows: usize,
@@ -32,9 +36,16 @@ enum M {
 }
 
 impl Marco {
-    pub fn new(url: &str, timeout: Duration, max_follows: usize) -> Result<Marco> {
-        let cfg = ClientConfig::new(url.parse().map_err(|e| anyhow!("--marco {url}: {e}"))?);
-        Ok(Marco { c: GraphClient::new(HttpClient::plaintext_http2_only(), cfg), timeout, max_follows })
+    pub fn new(url: &str, connections: usize, timeout: Duration, max_follows: usize) -> Result<Marco> {
+        let uri: http::Uri = url.parse().map_err(|e| anyhow!("--marco {url}: {e}"))?;
+        let cs = (0..connections.max(1))
+            .map(|_| GraphClient::new(HttpClient::plaintext_http2_only(), ClientConfig::new(uri.clone())))
+            .collect();
+        Ok(Marco { cs, next: AtomicUsize::new(0), timeout, max_follows })
+    }
+
+    fn c(&self) -> &GraphClient<HttpClient> {
+        &self.cs[self.next.fetch_add(1, Ordering::Relaxed) % self.cs.len()]
     }
 
     async fn call<T, F>(&self, m: M, hists: &QueryHists, f: F) -> Result<T>
@@ -76,7 +87,7 @@ impl Marco {
                 distinct: true,
                 ..Default::default()
             };
-            let r = self.call(M::ListOut, hists, async { Ok(self.c.list_out(req).await?.into_owned()) }).await?;
+            let r = self.call(M::ListOut, hists, async { Ok(self.c().list_out(req).await?.into_owned()) }).await?;
             out.extend(r.edges.iter().map(|e| e.subject.clone()));
             if r.cursor.is_empty() || r.edges.is_empty() || out.len() >= self.max_follows {
                 out.truncate(self.max_follows);
@@ -101,7 +112,7 @@ impl Marco {
                 cursor: cursor.clone(),
                 ..Default::default()
             };
-            let r = self.call(M::Intersect, hists, async { Ok(self.c.intersect(req).await?.into_owned()) }).await?;
+            let r = self.call(M::Intersect, hists, async { Ok(self.c().intersect(req).await?.into_owned()) }).await?;
             out.extend(r.actors.iter().cloned());
             if r.cursor.is_empty() || r.actors.is_empty() || out.len() >= self.max_follows {
                 return Ok(out);
@@ -127,7 +138,7 @@ impl Marco {
             count_limit: 10_000,
             ..Default::default()
         };
-        let r = self.call(M::Intersect, hists, async { Ok(self.c.intersect(req).await?.into_owned()) }).await?;
+        let r = self.call(M::Intersect, hists, async { Ok(self.c().intersect(req).await?.into_owned()) }).await?;
         Ok(r.total)
     }
 
@@ -143,7 +154,7 @@ impl Marco {
             drop: vec![drop(Dir::DIR_OUT), drop(Dir::DIR_IN)],
             ..Default::default()
         };
-        let r = self.call(M::Filter, hists, async { Ok(self.c.filter(req).await?.into_owned()) }).await?;
+        let r = self.call(M::Filter, hists, async { Ok(self.c().filter(req).await?.into_owned()) }).await?;
         Ok(r.actors)
     }
 }

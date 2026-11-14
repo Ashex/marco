@@ -119,7 +119,7 @@ impl Tally {
 pub async fn run(a: Args) -> Result<Value> {
     let ix = Index::open(&a.artifact, false)?;
     let ov = Overlay::new(&ix);
-    let marco = Marco::new(&a.marco, std::time::Duration::from_secs(10), 50_000)?;
+    let marco = Marco::new(&a.marco, 1, std::time::Duration::from_secs(10), 50_000)?;
     let hists = QueryHists::new();
     let mut all = rows(&a.mentions)?;
     let mut x = a.seed | 1;

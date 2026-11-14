@@ -110,6 +110,7 @@ Every flag has an env var. `seek serve`:
 | `--data` | `SEEK_DATA` | `/var/lib/seek` | Where the mapped artifacts live: two at a swap. Never the source's directory |
 | `--poll-seconds` | `SEEK_POLL_SECONDS` | 30 | Between source polls |
 | `--marco` | `SEEK_MARCO` | | marco's API listener |
+| `--marco-connections` | `SEEK_MARCO_CONNECTIONS` | 4 | h2 connections to marco, calls spread round-robin over them |
 | `--marco-timeout-ms` | `SEEK_MARCO_TIMEOUT_MS` | 500 | Each marco call |
 | `--viewer-deadline-ms` | `SEEK_VIEWER_DEADLINE_MS` | 2000 | A viewer's follows and mutuals, every page. Past it the query answers without follows first; blocks are still filtered. 0 turns follows first off |
 | `--max-follows` | `SEEK_MAX_FOLLOWS` | 50000 | Follows read per viewer, newest first |
@@ -330,8 +331,8 @@ over loopback, with the same 500 cached viewers, so each query was one Filter in
 query (47 µs in marco's process). With two pods it's throttled in nearly every 100 ms period (145 to
 156 of 150 in a 15 s window), so its cgroup quota is the limit. With one pod it stops at 43,000/s with its VM at 3.5 cores
 and never throttled: each vCPU thread at 0.7 to 0.85 of a core, the virtio-net thread at 0.65. That
-limit is the pod's single h2 connection to marco, not marco. More pods, or more connections from
-each, reach the quota. marco's miss pool stayed idle (`marco_store_miss_pool_busy` 0) and no query
+limit is one h2 connection to marco, not marco: these runs used one connection a pod, and two
+reach the quota. A pod opens `--marco-connections` (4) and spreads its calls over them. marco's miss pool stayed idle (`marco_store_miss_pool_busy` 0) and no query
 errored. Per query, marco's CPU falls from 316 µs at 1 in flight to 54 µs at the top as deeper
 queues batch more calls per h2 frame and wakeup.
 
