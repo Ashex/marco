@@ -200,7 +200,7 @@ enum Cmd {
         #[command(flatten)]
         common: Common,
     },
-    /// Query latency through a running pod, logged out and in, at each trace ratio.
+    /// Query latency through a running pod, logged out and in, at each trace ratio; or throughput (--mode closed|open).
     Bench(bench::Args),
     /// Ranking quality on recorded mentions, searched as their author: the follows-first sweep and second degree.
     Eval(eval::Args),

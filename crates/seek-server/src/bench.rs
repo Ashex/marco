@@ -6,6 +6,9 @@
 //! and the display name of actors drawn from the artifact: half from the top
 //! million by rank ("popular"), half uniformly. Logged in, viewers come from
 //! a file of DIDs (one a line), each asking a few targets' prefixes.
+//!
+//! `--mode closed` and `--mode open` measure throughput instead (load.rs):
+//! a concurrency sweep, or fixed offered rates.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -18,6 +21,8 @@ use seek_api::connect::bsky::ServiceClient;
 use seek_core::index::Index;
 use serde_json::{json, Value};
 
+use crate::load::Rng;
+
 #[derive(clap::Args)]
 pub struct Args {
     /// The pod's API.
@@ -26,9 +31,18 @@ pub struct Args {
     /// The pod's ops listener, to set the trace ratio for each pass.
     #[arg(long, default_value = "http://127.0.0.1:7311")]
     ops: String,
+    /// single (one query at a time, at each trace ratio), closed (a concurrency sweep) or open (offered rates).
+    #[arg(long, default_value = "single")]
+    mode: String,
     /// The artifact the pod serves (for query targets).
     #[arg(long)]
-    artifact: PathBuf,
+    artifact: Option<PathBuf>,
+    /// Queries one a line, in place of drawing them from --artifact (closed and open).
+    #[arg(long)]
+    queries: Option<PathBuf>,
+    /// Write the queries drawn from --artifact here, one a line, and exit.
+    #[arg(long)]
+    write_queries: Option<PathBuf>,
     /// Viewer DIDs for logged-in queries, one a line.
     #[arg(long)]
     viewers: Option<PathBuf>,
@@ -41,16 +55,8 @@ pub struct Args {
     ratios: Vec<f64>,
     #[arg(long, default_value_t = 7)]
     seed: u64,
-}
-
-struct Rng(u64);
-impl Rng {
-    fn below(&mut self, n: u64) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0 % n.max(1)
-    }
+    #[command(flatten)]
+    load: crate::load::LoadArgs,
 }
 
 fn pct(mut v: Vec<u64>) -> Value {
@@ -86,27 +92,62 @@ fn typed(ix: &Index, id: u32) -> Vec<String> {
     out
 }
 
-pub async fn run(a: Args) -> Result<Value> {
-    let ix = Index::open(&a.artifact, false)?;
+/// The queries, and the artifact's actors in rank order.
+fn draw(ix: &Index, a: &Args, rng: &mut Rng) -> (Vec<String>, Vec<u32>) {
     let n = ix.len();
     let mut order: Vec<u32> = (0..n).collect();
     let ranks = ix.ranks();
     order.sort_unstable_by_key(|&i| std::cmp::Reverse(ranks[i as usize]));
-    let mut rng = Rng(a.seed | 1);
     let mut qs = Vec::new();
     for _ in 0..a.targets {
-        qs.extend(typed(&ix, order[rng.below(order.len().min(1_000_000) as u64) as usize]));
-        qs.extend(typed(&ix, rng.below(n as u64) as u32));
+        qs.extend(typed(ix, order[rng.below(order.len().min(1_000_000) as u64) as usize]));
+        qs.extend(typed(ix, rng.below(n as u64) as u32));
     }
-    let viewers: Vec<String> = match &a.viewers {
-        Some(p) => std::fs::read_to_string(p)?
-            .lines()
-            .map(str::trim)
-            .filter(|l| l.starts_with("did:"))
-            .map(String::from)
-            .collect(),
+    (qs, order)
+}
+
+fn lines(p: &std::path::Path, keep: impl Fn(&str) -> bool) -> Result<Vec<String>> {
+    Ok(std::fs::read_to_string(p)
+        .with_context(|| format!("read {}", p.display()))?
+        .lines()
+        .map(str::trim)
+        .filter(|l| keep(l))
+        .map(String::from)
+        .collect())
+}
+
+pub async fn run(a: Args) -> Result<Value> {
+    let mut rng = Rng(a.seed | 1);
+    let viewers = match &a.viewers {
+        Some(p) => lines(p, |l| l.starts_with("did:"))?,
         None => Vec::new(),
     };
+    if let Some(out) = &a.write_queries {
+        let ix = Index::open(a.artifact.as_ref().context("--write-queries needs --artifact")?, false)?;
+        let (qs, _) = draw(&ix, &a, &mut rng);
+        std::fs::write(out, qs.iter().map(|q| format!("{q}\n")).collect::<String>())?;
+        return Ok(json!({"queries": qs.len(), "written": out}));
+    }
+    if a.mode != "single" {
+        anyhow::ensure!(a.mode == "closed" || a.mode == "open", "--mode {:?}: single, closed or open", a.mode);
+        let queries = match (&a.queries, &a.artifact) {
+            (Some(p), _) => lines(p, |l| !l.is_empty())?,
+            (None, Some(art)) => draw(&Index::open(art, false)?, &a, &mut rng).0,
+            (None, None) => anyhow::bail!("--queries or --artifact"),
+        };
+        let load = crate::load::Load {
+            target: a.target.clone(),
+            pod_metrics: Some(format!("{}/metrics", a.ops.trim_end_matches('/'))),
+            queries: queries.into(),
+            viewers: viewers.into(),
+            seed: a.seed,
+            args: a.load.clone(),
+        };
+        return load.run(a.mode == "open").await;
+    }
+    let ix = Index::open(a.artifact.as_ref().context("--mode single needs --artifact")?, false)?;
+    let n = ix.len();
+    let (qs, order) = draw(&ix, &a, &mut rng);
     let cfg = ClientConfig::new(a.target.parse().context("--target")?).with_protocol(Protocol::Grpc);
     let c = ServiceClient::new(HttpClient::plaintext_http2_only(), cfg);
     let http = reqwest::Client::new();

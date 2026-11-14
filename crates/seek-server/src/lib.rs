@@ -5,6 +5,7 @@ pub mod builder;
 pub mod eval;
 pub mod hist;
 pub mod jetstream;
+pub mod load;
 pub mod marco;
 pub mod metrics;
 pub mod serve;

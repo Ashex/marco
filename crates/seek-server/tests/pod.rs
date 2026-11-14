@@ -316,3 +316,58 @@ async fn swap_guards_and_lag() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(p.pod.readiness().0, "{}", p.pod.readiness().1);
 }
+
+fn load_args(logged_in: bool) -> seek_server::load::LoadArgs {
+    seek_server::load::LoadArgs {
+        logged_in,
+        connections: 2,
+        concurrency: vec![1, 4],
+        rates: vec![200.0, 1e6],
+        step_seconds: 0.4,
+        warmup_seconds: 0.1,
+        max_in_flight: 16,
+        marco_metrics: None,
+        marco_hist: "marco_rpc_seconds".into(),
+        marco_hist_filter: String::new(),
+        health: vec![],
+        stop_error_ratio: 0.01,
+        stop_p99_ms: None,
+        sample_ms: 100,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn load_sweeps() {
+    let (maddr, _mdir) = marco().await;
+    let dir = tempfile::tempdir().unwrap();
+    let p = pod(Some(maddr), dir.path(), Duration::from_secs(5)).await;
+    ready(&p).await;
+    for logged_in in [false, true] {
+        let l = seek_server::load::Load {
+            args: load_args(logged_in),
+            target: format!("http://{}", p.addr),
+            pod_metrics: None,
+            queries: Arc::new(vec!["jo".into(), "jo-".into(), "view".into()]),
+            viewers: Arc::new(vec![did(V)]),
+            seed: 7,
+        };
+        let closed = l.run(false).await.unwrap();
+        let steps = closed["steps"].as_array().unwrap();
+        assert_eq!(steps.len(), 2, "{closed}");
+        for s in steps {
+            assert_eq!(s["errors"], 0, "{s}");
+            assert!(s["per_s"].as_f64().unwrap() > 10.0, "{s}");
+            assert!(s["latency"]["p99_us"].as_f64().unwrap() > 0.0, "{s}");
+        }
+        assert!(closed["stopped"].is_null(), "{closed}");
+        let open = l.run(true).await.unwrap();
+        let steps = open["steps"].as_array().unwrap();
+        // 200/s is met; an absurd rate saturates and stops the sweep
+        assert_eq!(steps.len(), 2, "{open}");
+        let s = &steps[0];
+        assert_eq!(s["errors"], 0, "{s}");
+        assert!((s["per_s"].as_f64().unwrap() - 200.0).abs() < 30.0, "{s}");
+        assert!(s["latency"]["n"].as_u64().unwrap() >= 70, "{s}");
+        assert!(open["stopped"].as_str().unwrap().starts_with("saturated"), "{open}");
+    }
+}

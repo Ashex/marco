@@ -223,3 +223,86 @@ atomic load and allocates no span. A traced query is one span with a child for t
 (with the prefix, personal and global times as fields) and the filter. The request header
 `x-seek-trace: 1` traces that query whatever the ratio. Spans go out as OTLP/HTTP through a batch
 queue of 65,536, so a slow collector drops spans and never holds a query.
+
+## Throughput
+
+```facts
+- { value: "~45k", unit: req/s, label: per core logged out, note: "1 to 4 cores, bare metal; 490k on 8 cores with SMT", tone: accent }
+- { value: "22", unit: µs, label: CPU per query at peak, note: "the match itself is 7 µs p50, 110 µs p99", tone: blue }
+- { value: "2.6", unit: GB, label: RSS at any load, note: "the mapped artifact; load adds nothing", tone: muted }
+- { value: "~115", unit: µs, label: marco CPU per logged-in query, note: "~300 µs at low rates, where nothing batches", tone: violet }
+```
+
+`seek bench --mode closed` keeps N queries in flight over several h2 connections and steps N up.
+`--mode open` offers fixed rates and times each query from when it was due, so a stalled pod can't
+hide its queue. Each step samples `process_cpu_seconds_total` and `process_resident_memory_bytes`
+from the pod's ops listener, and marco's with `--marco-metrics` (a URL it can read without a
+token). The queries are the latency
+bench's mix: every prefix of the handles and names of 2,000 actors, half from the top million.
+
+```bash local
+seek bench --artifact latest.seek --write-queries queries.txt    # once, where the artifact is
+seek bench --mode closed --queries queries.txt --target http://pod:7310 --ops http://pod:7311 \
+  --connections 16 --concurrency 1,2,4,8,16,32,64,128,256,512 --step-seconds 15
+seek bench --mode open --queries queries.txt --target http://pod:7310 --ops http://pod:7311 \
+  --rates 10000,20000,40000 --logged-in --viewers viewers.txt --health http://pod:7310/readyz
+```
+
+The output is JSON on stdout and a table on stderr. A sweep stops after a step with over 1% errors
+(`--stop-error-ratio`), past `--stop-p99-ms`, when a `--health` URL fails, or when an open-loop
+step can't keep up with its rate.
+
+**Logged out, on bare metal.** A pod on a 16-core Ryzen AI Max+ 395 serving the whole network's
+artifact (43M actors), pinned with `taskset` to cores on one CCD, with the load generator on the
+other CCD:
+
+| Pod CPUs | Peak req/s | Per core | Closed loop, p99 ≤ 1 ms | Pod RSS |
+|---|---|---|---|---|
+| 1 core | 44,600 | 44,600 | 36,500 (2 in flight) | 2.60 GB |
+| 2 cores | 89,900 | 44,900 | 71,900 (32 in flight) | 2.60 GB |
+| 4 cores | 179,000 | 44,800 | 148,000 (64 in flight) | 2.61 GB |
+| 8 cores | 292,000 | 36,600 | 247,000 (64 in flight) | 2.62 GB |
+| 8 cores, 16 threads | 490,000 | 61,200 | 423,000 (128 in flight) | 2.64 GB |
+
+Peaks are at 512 in flight. Throughput keeps climbing past full CPU as deeper queues batch more
+queries per h2 frame and syscall, at the cost of latency. CPU per query is about 32 µs at 1 in
+flight and 22 µs at the peak on 1 to 4 cores, of which the match is a small part (`seek_query_seconds`: 7 µs p50, 110 µs
+p99). The rest is gRPC, h2 and the kernel. It scales linearly to 4 cores, 8 cores give 18% less
+per core, and SMT adds 68%.
+
+The latency curve, 2 cores:
+
+| Load | 4 in flight | 32 in flight | 512 in flight | 22,500/s offered | 44,900/s | 71,900/s |
+|---|---|---|---|---|---|---|
+| req/s | 67,200 | 71,900 | 89,900 | 22,500 | 44,900 | 71,900 |
+| p50 | 52 µs | 428 µs | 5.8 ms | 66 µs | 69 µs | 198 µs |
+| p99 | 154 µs | 999 µs | 11.9 ms | 186 µs | 6.8 ms | 12.3 ms |
+
+Open loop, p99 stays near 200 µs up to about a quarter of the peak, at least 11,000/s a core, and
+then jumps to a few milliseconds (on 16 threads: 206 µs at 49,000/s, then 1.5 to 2.6 ms from
+122,000/s to 441,000/s). The generator adds 0.3 ms at p99 and the match 0.1 ms, so the rest is
+bursts queueing in the pod's transport. Fewer or more connections, and fewer in flight, don't
+change it.
+
+**The 2-vCPU microVM.** The same artifact in a cloud-hypervisor microVM with 2 vCPUs, its load
+generated on the host (a 64-core EPYC 7713). The VM's cgroup quota of 2 CPUs covers the vCPUs and
+the VMM's virtio-net thread, so seek itself gets about 1.5 cores, and the VM hits the quota from 4
+queries in flight. Past that it's throttled for 100 to 670 ms of every second, and each throttle
+stalls the whole VM until the next 100 ms period. That's the 20 to 40 ms p99.
+
+| | Closed loop, short queue | Open loop, low p99 | Peak | seek's CPU per query |
+|---|---|---|---|---|
+| Logged out | 12,500/s at 8 in flight, p99 1.2 ms | 6,000/s, p99 0.7 ms | 29,500/s at 512 in flight, p50 15 ms | 113 µs at 1 in flight, 53 µs at peak |
+| Logged in | 2,600/s at 2 in flight, p99 2.6 ms | 2,700/s, p99 4.4 ms | 10,800/s at 256 in flight, p50 20 ms | 290 µs at 2 in flight, 144 µs at peak |
+
+CPU per query counts seek's process. The whole VM uses 1.3 to 2.5 times that, the virtio-net path
+and the guest kernel being the rest. Logged in, the ceiling is seek's quota too: marco's VM
+(4 vCPUs) peaks at 1.75 cores and is never throttled. Each logged-in query costs marco's VM
+about 300 µs of CPU at low rates and 115 µs at seek's ceiling, so its 4 vCPUs would carry about
+35,000 logged-in queries a second if that holds. marco's own `marco_rpc_seconds` p99 is 0.4 to
+0.7 ms at low load and climbs to 24 to 51 ms as seek's VM throttles harder, with marco's CPU to
+spare: its replies most likely wait on a reader that's stalled.
+
+An artifact swap takes the 2-vCPU pod a few seconds of CPU (the download, its check and the swap).
+At 21,000/s offered, logged out, one step that overlapped it backed up to a 2.7 s p50. During the
+swap RSS reached 4.87 GB, with both artifacts mapped, against the VM's 5 GB.
