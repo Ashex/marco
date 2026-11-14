@@ -112,7 +112,7 @@ async fn a_lease_copies_one_checkpoint() {
                 .to_vec()
         };
         assert_eq!(bytes.len() as u64, f["bytes"].as_u64().unwrap(), "{name}");
-        assert_eq!(format!("{:016x}", xxhash_rust::xxh3::xxh3_64(&bytes)), f["xxh3"].as_str().unwrap(), "{name}");
+        assert!(f.get("xxh3").is_none(), "the lease carries no sums");
         std::fs::write(copy.join(name), &bytes).unwrap();
     }
     std::fs::write(copy.join("manifest.json"), serde_json::to_vec(&lease["manifest"]).unwrap()).unwrap();
@@ -205,4 +205,39 @@ async fn the_export_token_and_the_limits() {
         "{}",
         text.lines().filter(|l| l.contains("export")).collect::<Vec<_>>().join("\n")
     );
+}
+
+/// A lease answers from file sizes: with background I/O paced to 1 kB/s a single read of one file
+/// would take longer than the test, and no file bytes are served for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lease_reads_no_file_contents() {
+    let dir = tempfile::tempdir().unwrap();
+    let snap = dir.path().join("snap");
+    marco_server::synth::write(&snap, N, 4).unwrap();
+    let auth = AuthConfig { export_token: Some(EXPORT.into()), ..Default::default() };
+    let background = marco_core::store::io::Rate { bytes_per_s: 1000, ops_per_s: 0 };
+    let app = App::open(Config { auth, background, ..Config::new(snap.clone()) }).unwrap();
+    let ui = Arc::new(marco_server::ui::Ui::load(None).unwrap());
+    let (_api, admin) = marco_server::serve(app, ui).await.unwrap();
+    let c = reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)).build().unwrap();
+    let t = std::time::Instant::now();
+    let l: serde_json::Value = c
+        .get(format!("http://{admin}/admin/checkpoint"))
+        .bearer_auth(EXPORT)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(t.elapsed() < std::time::Duration::from_secs(5));
+    let files = l["files"].as_array().unwrap();
+    assert!(files.len() > 2);
+    for f in files {
+        let n = f["name"].as_str().unwrap();
+        assert_eq!(f["bytes"].as_u64().unwrap(), std::fs::metadata(snap.join(n)).unwrap().len(), "{n}");
+        assert!(f.get("xxh3").is_none());
+    }
 }

@@ -335,6 +335,14 @@ impl StoreFile {
     }
 }
 
+/// Checks one snapshot file alone (its footer, every pinned section and every page) against its
+/// own checksums, reading it from disk through `engine`: a mirror's check of a file it just fetched,
+/// before any manifest names it.
+pub fn verify_file(path: &Path, engine: &Engine) -> Result<()> {
+    let f = StoreFile::open(path, engine, false)?;
+    f.verify_checksums(engine).with_context(|| path.display().to_string())
+}
+
 /// The directory file: every section pinned.
 pub struct DirFile {
     pub file: StoreFile,

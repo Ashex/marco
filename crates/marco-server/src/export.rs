@@ -3,7 +3,7 @@
 //! file by file while this one keeps serving, checkpointing and compacting.
 //!
 //! ```text
-//! GET    /admin/checkpoint?ttl=SECS        a lease: the manifest, every file it names (bytes, xxh3)
+//! GET    /admin/checkpoint?ttl=SECS        a lease: the manifest, every file it names (name, bytes)
 //! GET    /admin/checkpoint?peek=1          the checkpoint number only, no lease
 //! GET    /admin/checkpoint/files/NAME?lease=ID   one file, Range for a resume
 //! DELETE /admin/checkpoint?lease=ID        the lease's end
@@ -12,7 +12,9 @@
 //! A lease hard-links the files its manifest names into a directory beside
 //! the snapshot's (the same filesystem), so a compaction or a newer
 //! checkpoint can delete them meanwhile and the copy still reads them. It
-//! goes on DELETE or once its ttl passes. Every read goes through the
+//! goes on DELETE or once its ttl passes. The lease carries no checksums (files are immutable and
+//! named by checkpoint number; every section carries its own xxh3, which the reader checks).
+//! Every file stream goes through the
 //! background I/O bucket (`--background-io`), so requests go first.
 
 use std::collections::HashMap;
@@ -46,10 +48,6 @@ static REFUSED: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| {
     )
     .unwrap()
 });
-static HASHED: LazyLock<IntCounter> = LazyLock::new(|| {
-    register_int_counter!("marco_export_hashed_bytes_total", "Bytes read to sum checkpoint files for a lease").unwrap()
-});
-
 const MAX_TTL: u64 = 6 * 3600;
 /// Leases at once: each holds hard links that keep a checkpoint's files on disk.
 pub const MAX_LEASES: usize = 4;
@@ -66,8 +64,6 @@ pub struct Export {
     root: PathBuf,
     snapshot: PathBuf,
     leases: Mutex<HashMap<String, Lease>>,
-    /// Shard files never change once written, so a sum is kept by (name, length).
-    sums: Mutex<HashMap<(String, u64), u64>>,
     seq: std::sync::atomic::AtomicU64,
     streams: std::sync::atomic::AtomicUsize,
 }
@@ -87,7 +83,7 @@ fn remove_later(dir: PathBuf) {
 }
 
 /// A lease being made: if the call ends before it's handed over (an error, or the client gone
-/// during the first sum), the lease and its links go.
+/// during the links), the lease and its links go.
 struct Pending {
     ex: Arc<Export>,
     id: String,
@@ -122,7 +118,6 @@ impl Export {
         LazyLock::force(&BYTES);
         LazyLock::force(&FILES);
         LazyLock::force(&LEASES);
-        LazyLock::force(&HASHED);
         LazyLock::force(&STREAMS);
         for r in ["leases", "streams"] {
             REFUSED.with_label_values(&[r]);
@@ -131,7 +126,6 @@ impl Export {
             root,
             snapshot: snapshot.to_path_buf(),
             leases: Mutex::new(HashMap::new()),
-            sums: Mutex::new(HashMap::new()),
             seq: Default::default(),
             streams: Default::default(),
         })
@@ -205,29 +199,6 @@ async fn paced(app: &App, n: usize) {
     }
 }
 
-async fn sum_file(app: &App, ex: &Export, dir: &Path, name: &str) -> std::io::Result<(u64, u64)> {
-    let p = dir.join(name);
-    let len = tokio::fs::metadata(&p).await?.len();
-    if let Some(&s) = ex.sums.lock().unwrap().get(&(name.to_string(), len)) {
-        return Ok((len, s));
-    }
-    let mut f = tokio::fs::File::open(&p).await?;
-    let mut h = xxhash_rust::xxh3::Xxh3::new();
-    let mut buf = vec![0u8; CHUNK];
-    loop {
-        paced(app, CHUNK).await;
-        let n = f.read(&mut buf).await?;
-        if n == 0 {
-            break;
-        }
-        HASHED.inc_by(n as u64);
-        h.update(&buf[..n]);
-    }
-    let s = h.digest();
-    ex.sums.lock().unwrap().insert((name.to_string(), len), s);
-    Ok((len, s))
-}
-
 #[derive(Deserialize)]
 pub struct Q {
     ttl: Option<u64>,
@@ -241,7 +212,7 @@ fn err(code: StatusCode, m: impl std::fmt::Display) -> Response {
     (code, format!("{m}\n")).into_response()
 }
 
-async fn checkpoint(State((app, ex)): State<St>, Query(q): Query<Q>) -> Response {
+async fn checkpoint(State((_, ex)): State<St>, Query(q): Query<Q>) -> Response {
     ex.sweep();
     if q.peek.is_some() {
         return match std::fs::read(ex.snapshot.join(MANIFEST))
@@ -285,10 +256,9 @@ async fn checkpoint(State((app, ex)): State<St>, Query(q): Query<Q>) -> Response
     names.extend(m.shards.values().flat_map(|s| s.files().map(String::from)));
     let mut files = Vec::with_capacity(names.len());
     for n in names {
-        match sum_file(&app, &ex, &dir, &n).await {
-            Ok((bytes, sum)) => {
-                files.push(serde_json::json!({"name": n, "bytes": bytes, "xxh3": format!("{sum:016x}")}))
-            }
+        // a handful of stat calls per file, thousands of files at most: cheap beside the links
+        match std::fs::metadata(dir.join(&n)) {
+            Ok(md) => files.push(serde_json::json!({"name": n, "bytes": md.len()})),
             Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("{n}: {e}")),
         }
     }

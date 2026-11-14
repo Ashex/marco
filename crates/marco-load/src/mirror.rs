@@ -1,7 +1,8 @@
 //! `marco-load mirror`: keeps a local copy of a running marco's current
 //! checkpoint, through its admin listener's checkpoint export. It takes a
-//! lease, downloads only the files it doesn't have (each checked against its
-//! xxh3, a partial one resumed with Range), then links them into a snapshot
+//! lease, downloads only the files it doesn't have by name and size (a
+//! partial one resumed with Range), checks each fetched file against its
+//! own section checksums at local disk speed, then links them into a snapshot
 //! directory, `DIR/snap-<checkpoint>`, and points `DIR/current` at it. Files
 //! no snapshot names any more go. PageRank and seek's builder read
 //! `DIR/current` with `--snapshot`.
@@ -39,7 +40,6 @@ pub struct Args {
 struct FileInfo {
     name: String,
     bytes: u64,
-    xxh3: String,
 }
 
 #[derive(Deserialize)]
@@ -59,20 +59,6 @@ fn safe_name(n: &str) -> bool {
         && n != "current"
         && !n.starts_with("snap-")
         && n.bytes().all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
-}
-
-fn sum_of(p: &Path) -> Result<u64> {
-    use std::io::Read;
-    let mut f = std::fs::File::open(p)?;
-    let mut h = xxhash_rust::xxh3::Xxh3::new();
-    let mut buf = vec![0u8; 4 << 20];
-    loop {
-        let n = f.read(&mut buf)?;
-        if n == 0 {
-            return Ok(h.digest());
-        }
-        h.update(&buf[..n]);
-    }
 }
 
 pub fn run(a: &Args) -> Result<Value> {
@@ -104,13 +90,7 @@ async fn sync(a: &Args) -> Result<Value> {
             auth(c.get(format!("{base}/admin/checkpoint?peek=1"))).send().await?.error_for_status()?.json().await?;
         return Ok(json!({"marco": v, "mirror": current_checkpoint(&a.dir)}));
     }
-    // the lease answers only once marco has summed every file, minutes for a checkpoint it hasn't
-    // summed since it started, so only this call waits that long
-    let lc = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .read_timeout(std::time::Duration::from_secs(1800))
-        .build()?;
-    let lr: LeaseResp = auth(lc.get(format!("{base}/admin/checkpoint?ttl={}", a.lease_seconds)))
+    let lr: LeaseResp = auth(c.get(format!("{base}/admin/checkpoint?ttl={}", a.lease_seconds)))
         .send()
         .await?
         .error_for_status()
@@ -150,8 +130,7 @@ async fn sync(a: &Args) -> Result<Value> {
     }
     for e in std::fs::read_dir(&files_dir)?.flatten() {
         let n = e.file_name().to_string_lossy().into_owned();
-        let named = n.strip_prefix('.').and_then(|x| x.strip_suffix(".xxh3")).unwrap_or(&n);
-        if !keep.contains(named) && !n.ends_with(".part") {
+        if !keep.contains(n.as_str()) && !n.ends_with(".part") {
             std::fs::remove_file(e.path())?;
             dropped += 1;
         }
@@ -173,20 +152,13 @@ async fn fetch(
     use futures::StreamExt;
     use tokio::io::AsyncWriteExt;
     let (mut fetched, mut bytes, mut resumed) = (0, 0u64, 0);
+    // unpaced: this reads the local disk, not marco's
+    let engine = marco_core::store::Storage::from_env()?.engine_paced(marco_core::store::io::Rate::UNLIMITED)?;
     for f in &lr.files {
-        let want = u64::from_str_radix(&f.xxh3, 16).context("xxh3")?;
         let p = files_dir.join(&f.name);
-        // sums of files already here are kept beside them: a file never changes under its name
-        let sum_p = files_dir.join(format!(".{}.xxh3", f.name));
-        if p.exists() && std::fs::metadata(&p)?.len() == f.bytes {
-            let have = match std::fs::read_to_string(&sum_p).ok().and_then(|s| u64::from_str_radix(s.trim(), 16).ok()) {
-                Some(s) => s,
-                None => sum_of(&p)?,
-            };
-            if have == want {
-                std::fs::write(&sum_p, &f.xxh3)?;
-                continue;
-            }
+        // a file is renamed into place only after it passed its checks, and never changes under its name
+        if std::fs::metadata(&p).is_ok_and(|m| m.len() == f.bytes) {
+            continue;
         }
         let part = files_dir.join(format!("{}.part", f.name));
         let mut from = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
@@ -213,13 +185,17 @@ async fn fetch(
             }
             out.sync_all().await?;
         }
-        let got = sum_of(&part)?;
-        if got != want {
+        if std::fs::metadata(&part)?.len() != f.bytes {
+            // kept: the next run resumes it
+            bail!("{}: {} bytes fetched, the lease says {}", f.name, std::fs::metadata(&part)?.len(), f.bytes);
+        }
+        let (part2, engine2) = (part.clone(), engine.clone());
+        let ok = tokio::task::spawn_blocking(move || marco_core::store::verify_file(&part2, &engine2)).await?;
+        if let Err(e) = ok {
             std::fs::remove_file(&part)?;
-            bail!("{}: xxh3 {got:016x}, the lease says {}", f.name, f.xxh3);
+            bail!("{}: failed its checksums, removed: {e:#}", f.name);
         }
         std::fs::rename(&part, &p)?;
-        std::fs::write(&sum_p, &f.xxh3)?;
         fetched += 1;
     }
     Ok((fetched, bytes, resumed))
@@ -301,5 +277,115 @@ mod tests {
             .filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().starts_with("snap-"))
             .count();
         assert_eq!(snaps, 1);
+    }
+
+    fn start_server(
+        rt: &tokio::runtime::Runtime,
+        dir: &Path,
+    ) -> (PathBuf, std::net::SocketAddr, PathBuf, Arc<marco_server::app::App>) {
+        let snap = dir.join("snap");
+        marco_server::synth::write(&snap, 300, 4).unwrap();
+        let token = dir.join("export-token");
+        std::fs::write(&token, "export-token-0123456789").unwrap();
+        let (app, addr) = rt.block_on(async {
+            let auth = marco_server::auth::AuthConfig {
+                export_token: Some("export-token-0123456789".into()),
+                ..Default::default()
+            };
+            let app = marco_server::app::App::open(marco_server::app::Config {
+                auth,
+                ..marco_server::app::Config::new(snap.clone())
+            })
+            .unwrap();
+            let ui = Arc::new(marco_server::ui::Ui::load(None).unwrap());
+            let (_api, admin) = marco_server::serve(app.clone(), ui).await.unwrap();
+            (app, admin)
+        });
+        (snap, addr, token, app)
+    }
+
+    fn biggest(snap: &Path) -> (String, Vec<u8>) {
+        let mut best = (String::new(), Vec::new());
+        for e in std::fs::read_dir(snap).unwrap().flatten() {
+            let n = e.file_name().to_string_lossy().into_owned();
+            if n.ends_with(".json") {
+                continue;
+            }
+            let b = std::fs::read(e.path()).unwrap();
+            if b.len() > best.1.len() {
+                best = (n, b);
+            }
+        }
+        best
+    }
+
+    fn args_for(addr: std::net::SocketAddr, token: &Path, dir: &Path) -> Args {
+        Args {
+            url: format!("http://{addr}"),
+            token_file: Some(token.to_path_buf()),
+            dir: dir.to_path_buf(),
+            lease_seconds: 60,
+            peek: false,
+        }
+    }
+
+    /// A partial file is finished with Range, and a file already there by name and size isn't fetched.
+    #[test]
+    fn resumes_a_partial_file_and_skips_whole_ones() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (snap, addr, token, _app) = start_server(&rt, dir.path());
+        let (name, bytes) = biggest(&snap);
+        let m = dir.path().join("mirror");
+        let files = m.join("files");
+        std::fs::create_dir_all(&files).unwrap();
+        let half = bytes.len() / 2 / 4096 * 4096;
+        std::fs::write(files.join(format!("{name}.part")), &bytes[..half]).unwrap();
+        // a whole file under another name, kept as is: it's skipped by name and size, not read
+        let (other, ob) = std::fs::read_dir(&snap)
+            .unwrap()
+            .flatten()
+            .map(|e| (e.file_name().to_string_lossy().into_owned(), e.path()))
+            .filter(|(n, _)| n != &name && !n.ends_with(".json"))
+            .map(|(n, p)| (n, std::fs::read(p).unwrap()))
+            .next()
+            .unwrap();
+        std::fs::write(files.join(&other), &ob).unwrap();
+        let r = rt.block_on(sync(&args_for(addr, &token, &m))).unwrap();
+        assert_eq!(r["resumed"], 1);
+        assert_eq!(r["fetched"].as_u64().unwrap() + 1, r["files"].as_u64().unwrap());
+        assert_eq!(
+            r["bytes_fetched"].as_u64().unwrap(),
+            r["bytes_total"].as_u64().unwrap() - ob.len() as u64 - half as u64
+        );
+        assert_eq!(std::fs::read(files.join(&name)).unwrap(), bytes);
+        assert!(!files.join(format!("{name}.part")).exists());
+    }
+
+    /// A fetched file that fails its section checksums fails the sync and is removed, so the next
+    /// run fetches it again and succeeds.
+    #[test]
+    fn a_corrupt_fetched_file_is_removed() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (snap, addr, token, _app) = start_server(&rt, dir.path());
+        let (name, bytes) = biggest(&snap);
+        let m = dir.path().join("mirror");
+        let files = m.join("files");
+        std::fs::create_dir_all(&files).unwrap();
+        let half = bytes.len() / 2 / 4096 * 4096;
+        let mut bad = bytes[..half].to_vec();
+        for page in bad.chunks_mut(4096) {
+            page[100] ^= 0xff;
+        }
+        let part = files.join(format!("{name}.part"));
+        std::fs::write(&part, &bad).unwrap();
+        let e = rt.block_on(sync(&args_for(addr, &token, &m))).unwrap_err();
+        assert!(format!("{e:#}").contains("checksum"), "{e:#}");
+        assert!(!part.exists() && !files.join(&name).exists());
+        assert!(!m.join("current").exists());
+        let r = rt.block_on(sync(&args_for(addr, &token, &m))).unwrap();
+        assert_eq!(r["resumed"], 0);
+        assert_eq!(std::fs::read(files.join(&name)).unwrap(), bytes);
     }
 }

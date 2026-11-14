@@ -37,7 +37,7 @@ block. The design and its measurements are in [the design doc](seek.html).
 
 | Part | What it does | State |
 |---|---|---|
-| `seek builder` | Holds every actor's handle claim, display name and status. It follows Jetstream into them, verifies handles, and every 15 minutes builds the artifact and serves it at `/artifact/latest` (uploading it to a bucket when one is configured). On each new marco checkpoint it mirrors the checkpoint and runs PageRank on the mirror. | Its volume: the names state, the artifacts, the mirror and the ranks |
+| `seek builder` | Holds every actor's handle claim, display name and status. It follows Jetstream into them, verifies handles, and every 15 minutes builds the artifact and serves it at `/artifact/latest` (uploading it to a bucket when one is configured). On each new marco checkpoint it mirrors the checkpoint (files it already has by name and size are skipped, and each fetched file is checked against its section checksums) and runs PageRank on the mirror. | Its volume: the names state, the artifacts, the mirror and the ranks |
 | `seek serve` (a pod) | Downloads the newest artifact, checks it, maps it, replays Jetstream from the artifact's cursor into a small live overlay, and answers queries. A newer artifact is swapped in without a pause. | None: a scratch directory for the mapped artifacts |
 | marco | Gives a pod each viewer's follows and mutuals (once per session) and filters every logged-in page by blocks both ways. It exports its checkpoint to the builder's mirror. | Its own |
 

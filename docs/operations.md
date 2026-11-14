@@ -200,7 +200,6 @@ A scraper that can't send the token reads the same text from `--ops-listen`, whi
 | `marco_build_info` | `version`, `commit` | 1 |
 | `marco_export_leases` | | Checkpoint export leases open |
 | `marco_export_bytes_total`, `marco_export_files_total` | | Checkpoint file bytes and file reads the export served |
-| `marco_export_hashed_bytes_total` | | Bytes read to sum checkpoint files for a lease (once per file: they never change) |
 
 What to watch:
 
@@ -228,7 +227,7 @@ and 8 file streams run at once; past that a call gets 429.
 
 | Call | What it does |
 |---|---|
-| `GET /admin/checkpoint?ttl=SECS` | A lease (default 1800 s, at most 6 h): the manifest, its checkpoint number, and every file it names with its bytes and xxh3 |
+| `GET /admin/checkpoint?ttl=SECS` | A lease (default 1800 s, at most 6 h): the manifest, its checkpoint number, and every file it names with its name and size (no file is read: it answers at once) |
 | `GET /admin/checkpoint?peek=1` | The checkpoint number, build and time only, no lease |
 | `GET /admin/checkpoint/files/NAME?lease=ID` | One file, with `Range: bytes=A-` to resume |
 | `DELETE /admin/checkpoint?lease=ID` | Ends the lease |
@@ -236,14 +235,16 @@ and 8 file streams run at once; past that a call gets 429.
 A lease hard-links the files its manifest names into `<snapshot>.export/<lease>/`, so the snapshot's
 filesystem has to allow hard links (it's the same one). A compaction or a newer checkpoint can delete
 the originals meanwhile and the copy still reads the leased checkpoint. The links go when the lease is
-deleted or its ttl passes, and a restart clears them all. Reads and sums go through `--background-io`,
-so requests go first. The first lease after a start sums every file once. A file never changes under its
-name, so later leases sum only files they haven't seen. Copied files plus the manifest are a snapshot
+deleted or its ttl passes, and a restart clears them all. File streams go through `--background-io`,
+so requests go first. The lease carries no checksums: a file never changes under its name (the
+checkpoint number is in it), and every section of a snapshot file has its own xxh3, which the reader
+checks. Copied files plus the manifest are a snapshot
 directory `marco serve` or `marco-load` can open.
 
 `marco-load mirror --url ADMIN --token-file FILE --dir DIR` keeps a local copy in sync. It takes a
-lease, downloads only the files it doesn't have (each checked against its xxh3, a partial one resumed),
-links them into `DIR/snap-<checkpoint>` and points `DIR/current` at it, then drops files no snapshot
+lease, downloads only the files it doesn't have by name and size (a partial one resumed with Range),
+checks each fetched file against its own section checksums at local disk speed, unpaced (a file that
+fails is deleted and the sync fails, so the next run fetches it again), links them into `DIR/snap-<checkpoint>` and points `DIR/current` at it, then drops files no snapshot
 names. The first sync copies the whole snapshot, and later ones copy what the checkpoints since wrote.
 
 ## Profiling and tracing
