@@ -24,7 +24,7 @@ pub struct Marco {
     cs: Vec<GraphClient<HttpClient>>,
     next: AtomicUsize,
     timeout: Duration,
-    /// Past this many follows a viewer's entry stops reading: the newest are kept.
+    /// A viewer following more than this gets no follows first: their follows aren't read.
     pub max_follows: usize,
 }
 
@@ -33,6 +33,7 @@ enum M {
     Filter = 0,
     ListOut = 1,
     Intersect = 2,
+    Counts = 3,
 }
 
 impl Marco {
@@ -74,7 +75,14 @@ impl Marco {
         }
     }
 
-    /// The accounts `viewer` follows, newest first, up to `max_follows`.
+    /// How many accounts `viewer` follows (distinct subjects).
+    pub async fn follow_count(&self, viewer: &str, hists: &QueryHists) -> Result<u64> {
+        let req = CountsRequest { actors: vec![viewer.into()], rels: vec![FOLLOW.into()], ..Default::default() };
+        let r = self.call(M::Counts, hists, async { Ok(self.c().counts(req).await?.into_owned()) }).await?;
+        Ok(r.counts.first().and_then(|c| c.rels.first()).map_or(0, |r| r.out_subjects))
+    }
+
+    /// The accounts `viewer` follows, newest first, up to `max_follows`: no page past it is read.
     pub async fn follows(&self, viewer: &str, hists: &QueryHists) -> Result<Vec<String>> {
         let mut out = Vec::new();
         let mut cursor = String::new();
@@ -82,7 +90,7 @@ impl Marco {
             let req = ListOutRequest {
                 rel: FOLLOW.into(),
                 actor: viewer.into(),
-                limit: LIST_PAGE,
+                limit: LIST_PAGE.min(self.max_follows.saturating_sub(out.len()).max(1) as u32),
                 cursor: cursor.clone(),
                 distinct: true,
                 ..Default::default()
@@ -97,7 +105,8 @@ impl Marco {
         }
     }
 
-    /// The viewer's mutuals: accounts they follow that follow them back.
+    /// The viewer's mutuals: accounts they follow that follow them back, up to `max_follows` (one
+    /// page while that's under Intersect's 10,000).
     pub async fn mutuals(&self, viewer: &str, hists: &QueryHists) -> Result<Vec<String>> {
         let side =
             |dir: Dir| ListSide { rel: FOLLOW.into(), dir: dir.into(), actor: viewer.into(), ..Default::default() };
@@ -107,7 +116,7 @@ impl Marco {
             let req = IntersectRequest {
                 a: side(Dir::DIR_OUT).into(),
                 b: side(Dir::DIR_IN).into(),
-                limit: INTERSECT_PAGE,
+                limit: INTERSECT_PAGE.min(self.max_follows.saturating_sub(out.len()).max(1) as u32),
                 op: SetOp::SET_OP_AND.into(),
                 cursor: cursor.clone(),
                 ..Default::default()
@@ -115,6 +124,7 @@ impl Marco {
             let r = self.call(M::Intersect, hists, async { Ok(self.c().intersect(req).await?.into_owned()) }).await?;
             out.extend(r.actors.iter().cloned());
             if r.cursor.is_empty() || r.actors.is_empty() || out.len() >= self.max_follows {
+                out.truncate(self.max_follows);
                 return Ok(out);
             }
             cursor = r.cursor;

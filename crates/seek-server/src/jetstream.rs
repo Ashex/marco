@@ -44,10 +44,12 @@ pub enum Ev {
         time_us: u64,
         active: bool,
     },
-    /// The DID followed or unfollowed someone.
+    /// The DID followed or unfollowed someone: `subject` on a follow (an unfollow's delete doesn't
+    /// say whom).
     Follow {
         did: String,
         time_us: u64,
+        subject: Option<String>,
     },
     /// The replay started past the cursor asked for: events between were lost.
     Gap {
@@ -120,7 +122,16 @@ pub fn parse(text: &str) -> Option<Ev> {
                         .map(|s| s.chars().take(256).collect());
                     Ev::Profile { did, time_us, name: if deleted { None } else { name }, deleted }
                 }
-                FOLLOW => Ev::Follow { did, time_us },
+                FOLLOW => {
+                    let subject = c
+                        .record
+                        .as_ref()
+                        .and_then(|v| v.get("subject"))
+                        .and_then(|v| v.as_str())
+                        .filter(|s| s.starts_with("did:") && s.len() <= 2048)
+                        .map(String::from);
+                    Ev::Follow { did, time_us, subject }
+                }
                 _ => return None,
             }
         }
@@ -283,7 +294,11 @@ mod tests {
         let f = parse(
             r#"{"did":"did:plc:a","time_us":9,"kind":"commit","commit":{"operation":"create","collection":"app.bsky.graph.follow","rkey":"3k","record":{"subject":"did:plc:b"}}}"#,
         );
-        assert_eq!(f, Some(Ev::Follow { did: "did:plc:a".into(), time_us: 9 }));
+        assert_eq!(f, Some(Ev::Follow { did: "did:plc:a".into(), time_us: 9, subject: Some("did:plc:b".into()) }));
+        let u = parse(
+            r#"{"did":"did:plc:a","time_us":10,"kind":"commit","commit":{"operation":"delete","collection":"app.bsky.graph.follow","rkey":"3k"}}"#,
+        );
+        assert_eq!(u, Some(Ev::Follow { did: "did:plc:a".into(), time_us: 10, subject: None }));
         assert!(parse(r#"{"did":"did:plc:a","time_us":9,"kind":"commit","commit":{"operation":"create","collection":"app.bsky.feed.post","rkey":"3k"}}"#).is_none());
         assert!(parse("not json").is_none());
     }

@@ -57,29 +57,108 @@ pub fn prepare(q: &str) -> Query {
     Query { folded: cut(&f).to_string(), exact }
 }
 
-/// The viewer's side of a logged-in query, built once per viewer and artifact: the keys of the
-/// accounts they follow, sorted, and which are mutuals.
+/// The viewer's side of a logged-in query against one artifact: the ids of the accounts they
+/// follow and of the mutuals among them, and where those accounts' keys are. A follow's base keys
+/// are their positions in the base's sorted keys, so the follows matching a prefix are the
+/// positions inside the prefix's range; only follows the overlay speaks for keep their keys.
 #[derive(Default)]
 pub struct Viewer {
-    pub keys: Vec<(Box<[u8]>, u32)>,
-    pub follows: FxHashSet<u32>,
-    pub mutual: FxHashSet<u32>,
+    /// Sorted.
+    pub follows: Box<[u32]>,
+    /// Sorted, all of them in `follows`.
+    pub mutual: Box<[u32]>,
+    /// The base positions of the keys of the follows the overlay didn't speak for, sorted.
+    pub pos: Box<[u32]>,
+    /// The keys and postings of the follows the overlay spoke for, sorted.
+    pub keys: Box<[(Box<[u8]>, u32)]>,
+}
+
+/// A [`Viewer`] being built: its follows' keys are folded a slice at a time, so a caller can let go
+/// of the overlay between slices.
+pub struct ViewerBuild {
+    follows: Vec<u32>,
+    mutual: Vec<u32>,
+    pos: Vec<u32>,
+    keys: Vec<(Box<[u8]>, u32)>,
+}
+
+impl ViewerBuild {
+    /// From the ids of the accounts the viewer follows and the mutuals among them, any order. A
+    /// mutual that isn't a follow doesn't count.
+    pub fn new(mut follows: Vec<u32>, mut mutual: Vec<u32>) -> ViewerBuild {
+        follows.sort_unstable();
+        follows.dedup();
+        mutual.sort_unstable();
+        mutual.dedup();
+        mutual.retain(|m| follows.binary_search(m).is_ok());
+        ViewerBuild { pos: Vec::with_capacity(follows.len() * 2), follows, mutual, keys: Vec::new() }
+    }
+
+    pub fn len(&self) -> usize {
+        self.follows.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.follows.is_empty()
+    }
+
+    /// Folds the keys of `follows[from..to]` against `base` and `ov`.
+    pub fn fold(&mut self, base: &Index, ov: &Overlay, from: usize, to: usize) {
+        for &f in &self.follows[from..to] {
+            if ov.shadows(f) || f >= base.len() {
+                ov.keys_of(base, f, |k, t| self.keys.push((k.into(), crate::index::posting(f, t))));
+            } else {
+                self.pos.extend_from_slice(base.positions(f));
+            }
+        }
+    }
+
+    pub fn finish(mut self) -> Viewer {
+        self.pos.sort_unstable();
+        self.keys.sort_unstable();
+        Viewer {
+            follows: self.follows.into(),
+            mutual: self.mutual.into(),
+            pos: self.pos.into(),
+            keys: self.keys.into(),
+        }
+    }
 }
 
 impl Viewer {
-    /// From the ids of the accounts the viewer follows and the mutuals among them.
     pub fn build(base: &Index, ov: &Overlay, follows: &[u32], mutual: &[u32]) -> Viewer {
-        let mut keys = Vec::with_capacity(follows.len() * 2);
-        for &f in follows {
-            ov.keys_of(base, f, |k, t| keys.push((k.into(), crate::index::posting(f, t))));
-        }
-        keys.sort_unstable();
-        Viewer { keys, follows: follows.iter().copied().collect(), mutual: mutual.iter().copied().collect() }
+        let mut b = ViewerBuild::new(follows.to_vec(), mutual.to_vec());
+        b.fold(base, ov, 0, b.len());
+        b.finish()
     }
 
-    pub fn bytes(&self) -> usize {
-        self.keys.iter().map(|(k, _)| k.len() + 24).sum::<usize>() + (self.follows.len() + self.mutual.len()) * 8
+    #[inline]
+    pub fn follows(&self, id: u32) -> bool {
+        self.follows.binary_search(&id).is_ok()
     }
+
+    #[inline]
+    pub fn mutual(&self, id: u32) -> bool {
+        self.mutual.binary_search(&id).is_ok()
+    }
+
+    /// The heap it holds: each allocation at its jemalloc size class.
+    pub fn bytes(&self) -> usize {
+        let key = std::mem::size_of::<(Box<[u8]>, u32)>();
+        [self.follows.len(), self.mutual.len(), self.pos.len()].iter().map(|&n| alloc_size(4 * n)).sum::<usize>()
+            + alloc_size(key * self.keys.len())
+            + self.keys.iter().map(|(k, _)| alloc_size(k.len())).sum::<usize>()
+    }
+}
+
+/// What an allocation of `n` bytes takes in jemalloc: 16-byte classes to 128, then four classes
+/// per doubling.
+pub fn alloc_size(n: usize) -> usize {
+    if n == 0 {
+        return 0;
+    }
+    let k = usize::BITS - (n - 1).leading_zeros();
+    n.next_multiple_of((1usize << k.saturating_sub(3)).max(16))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -120,12 +199,12 @@ impl Ctx<'_> {
         let id = actor(p);
         let mut s = base_score(self.ov.rank(self.base, id), p) as i64;
         if let Some(v) = self.viewer {
-            if v.follows.contains(&id) {
+            if v.follows(id) {
                 s += match self.p.policy {
                     FollowPolicy::Wall => WALL,
                     FollowPolicy::Boost(b) => b as i64,
                 };
-                if v.mutual.contains(&id) {
+                if v.mutual(id) {
                     s += self.p.mutual as i64;
                 }
             }
@@ -133,8 +212,13 @@ impl Ctx<'_> {
         s
     }
 
+    /// The score of an actor the viewer doesn't follow.
+    fn stranger(&self, p: u32) -> i64 {
+        base_score(self.ov.rank(self.base, actor(p)), p) as i64
+    }
+
     fn followed(&self, id: u32) -> bool {
-        self.viewer.is_some_and(|v| v.follows.contains(&id))
+        self.viewer.is_some_and(|v| v.follows(id))
     }
 }
 
@@ -173,6 +257,15 @@ pub fn parts(base: &Index, ov: &Overlay, viewer: Option<&Viewer>, qq: &Query, wa
     let t = std::time::Instant::now();
 
     if let Some(v) = viewer {
+        let post = base.post();
+        let at = v.pos.partition_point(|&p| (p as usize) < lo);
+        for &p in v.pos[at..].iter().take_while(|&&p| (p as usize) < hi) {
+            let post = post[p as usize];
+            let id = actor(post);
+            if !gone(id) {
+                out.follows.push(Hit { id, score: cx.score(post), exact: false, followed: true });
+            }
+        }
         let at = v.keys.partition_point(|(k, _)| &**k < q);
         for (k, post) in &v.keys[at..] {
             if !k.starts_with(q) {
@@ -199,20 +292,20 @@ pub fn parts(base: &Index, ov: &Overlay, viewer: Option<&Viewer>, qq: &Query, wa
                     break;
                 }
                 if !skip(actor(post)) {
-                    global.push((cx.score(post), post));
+                    global.push((cx.stranger(post), post));
                 }
             }
         }
         _ => {
             let hi = hi.min(lo + SCAN_MAX);
             out.scanned = hi - lo;
-            global.extend(base.post()[lo..hi].iter().filter(|&&p| !skip(actor(p))).map(|&p| (cx.score(p), p)));
+            global.extend(base.post()[lo..hi].iter().filter(|&&p| !skip(actor(p))).map(|&p| (cx.stranger(p), p)));
         }
     }
     for (_, post) in ov.range(q) {
         let id = actor(post);
         if !gone(id) && !cx.followed(id) {
-            global.push((cx.score(post), post));
+            global.push((cx.stranger(post), post));
         }
     }
     out.global = best(global, want, |s, post| Hit { id: actor(post), score: s, exact: false, followed: false });
@@ -314,6 +407,52 @@ mod tests {
         let got = ids(&ix, &ps, &search(&ix, &ov, Some(&v), "j", 10, &small));
         assert_eq!(got[0], "bob.bsky.social");
         assert_eq!(got.len(), 4, "each actor once");
+    }
+
+    #[test]
+    fn viewer_keys_from_positions_and_the_overlay() {
+        let ps = people();
+        let ix = build_people(&ps, &[]);
+        let mut ov = Overlay::new(&ix);
+        // a renamed follow speaks through the overlay; a new account has only overlay keys
+        ov.set_name(&ix, &ps[0].did, Some("Jo Alice"));
+        let new = crate::index::tests::did_n(99);
+        ov.set_name(&ix, &new, Some("Jo New"));
+        let (alice, bob) = (ix.id_of(&ps[0].did).unwrap(), ix.id_of(&ps[3].did).unwrap());
+        let newid = ov.id_of(&ix, &crate::did::key_of(&new)).unwrap();
+        assert!(newid >= ix.len());
+        let v = Viewer::build(&ix, &ov, &[newid, bob, alice, bob], &[bob, 12345]);
+        assert_eq!(&*v.follows, &{
+            let mut f = vec![alice, bob, newid];
+            f.sort();
+            f
+        });
+        assert_eq!(&*v.mutual, &[bob], "a mutual that isn't a follow doesn't count");
+        assert_eq!([1, 16, 17, 129, 4097].map(alloc_size), [16, 16, 32, 160, 5120]);
+        assert_eq!(v.pos.len(), ix.key_count(bob));
+        let got = search(&ix, &ov, Some(&v), "jo", 10, &Params::default());
+        let followed: Vec<u32> = got.iter().filter(|h| h.followed).map(|h| h.id).collect();
+        assert_eq!(followed.len(), 3, "{got:?}");
+        assert_eq!(followed[0], bob, "the mutual first");
+        // the same page as the keys themselves would give: every follow's keys, sorted, prefix-matched
+        for q in ["j", "jo", "jos", "jo a", "jo n", "alice", "bob", "zz"] {
+            let qq = prepare(q);
+            let mut want: Vec<u32> = Vec::new();
+            for &f in v.follows.iter() {
+                ov.keys_of(&ix, f, |k, _| {
+                    if k.starts_with(qq.folded.as_bytes()) {
+                        want.push(f)
+                    }
+                });
+            }
+            want.sort();
+            want.dedup();
+            let pt = parts(&ix, &ov, Some(&v), &qq, 10, &Params::default());
+            let mut have: Vec<u32> = pt.follows.iter().map(|h| h.id).collect();
+            have.sort();
+            have.dedup();
+            assert_eq!(have, want, "{q}");
+        }
     }
 
     #[test]

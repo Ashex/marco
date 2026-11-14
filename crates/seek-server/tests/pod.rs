@@ -27,6 +27,8 @@ const C: u32 = 3; // blocks V
 const D: u32 = 4; // V blocks D; D's handle is typed out in full below
 const E: u32 = 5; // V follows E, not mutual
 const F: u32 = 6; // V blocks F, whose handle folds like D's
+const G: u32 = 7; // V follows G, which isn't in the first artifact (only the overlay, once named)
+const H: u32 = 8; // V follows H, which nothing names until the second artifact
 
 fn tid(k: u64) -> String {
     vlatproto::tid::Tid::from_parts(1_704_067_200_000_000 + k * 1_000_000, 0).to_string()
@@ -43,6 +45,8 @@ async fn marco() -> (std::net::SocketAddr, tempfile::TempDir) {
     rec(&mut g, V, "app.bsky.graph.follow", A);
     rec(&mut g, A, "app.bsky.graph.follow", V);
     rec(&mut g, V, "app.bsky.graph.follow", E);
+    rec(&mut g, V, "app.bsky.graph.follow", G);
+    rec(&mut g, V, "app.bsky.graph.follow", H);
     rec(&mut g, C, "app.bsky.graph.block", V);
     rec(&mut g, V, "app.bsky.graph.block", D);
     rec(&mut g, V, "app.bsky.graph.block", F);
@@ -56,8 +60,12 @@ async fn marco() -> (std::net::SocketAddr, tempfile::TempDir) {
 }
 
 fn state(cursor_us: u64) -> State {
+    state_with(cursor_us, &[])
+}
+
+fn state_with(cursor_us: u64, more: &[(u32, &str, &str)]) -> State {
     let mut s = State::default();
-    for (i, h, n) in [
+    let base = [
         (V, "viewer.bsky.social", "Viewer"),
         (A, "jo-a.bsky.social", "Jo Mutual"),
         (B, "jo-b.bsky.social", "Jo Stranger"),
@@ -65,7 +73,8 @@ fn state(cursor_us: u64) -> State {
         (D, "jo.example.com", "Jo Blocked"),
         (E, "jo-e.bsky.social", "Jo Followed"),
         (F, "jo-example.com", "Lookalike"),
-    ] {
+    ];
+    for &(i, h, n) in base.iter().chain(more) {
         let a = s.get_mut(&did(i));
         a.handle = Some(h.into());
         a.verified_us = 1;
@@ -100,7 +109,7 @@ struct Pods {
 }
 
 async fn pod(marco_addr: Option<std::net::SocketAddr>, art_dir: &std::path::Path, viewer_deadline: Duration) -> Pods {
-    pod_with(marco_addr, art_dir, viewer_deadline, Duration::from_secs(300)).await
+    pod_with(marco_addr, art_dir, viewer_deadline, Duration::from_secs(300), 10_000).await
 }
 
 async fn pod_with(
@@ -108,11 +117,13 @@ async fn pod_with(
     art_dir: &std::path::Path,
     viewer_deadline: Duration,
     max_lag: Duration,
+    max_follows: usize,
 ) -> Pods {
     seek_server::metrics::init();
     std::fs::create_dir_all(art_dir).unwrap();
-    let m = marco_addr
-        .map(|a| seek_server::marco::Marco::new(&format!("http://{a}"), 2, Duration::from_secs(5), 10_000).unwrap());
+    let m = marco_addr.map(|a| {
+        seek_server::marco::Marco::new(&format!("http://{a}"), 2, Duration::from_secs(5), max_follows).unwrap()
+    });
     let cfg = Config {
         params: Default::default(),
         replay_window: Duration::from_secs(3600),
@@ -121,6 +132,7 @@ async fn pod_with(
         replay_keep: Duration::from_secs(3600),
         max_lag,
         viewer_deadline,
+        marco_lag: Duration::from_millis(500),
     };
     let pod = Pod::new(cfg, m);
     let (art, art_rx) = mpsc::channel(1);
@@ -277,7 +289,7 @@ async fn send(p: &Pods, dir: &std::path::Path, cursor: u64) -> String {
 async fn swap_guards_and_lag() {
     let (maddr, _mdir) = marco().await;
     let dir = tempfile::tempdir().unwrap();
-    let p = pod_with(Some(maddr), dir.path(), Duration::from_secs(5), Duration::from_secs(1)).await;
+    let p = pod_with(Some(maddr), dir.path(), Duration::from_secs(5), Duration::from_secs(1), 10_000).await;
     ready(&p).await;
     let first = p.pod.current().unwrap().version.clone();
     let start = p.pod.current().unwrap().index.meta.cursor_us;
@@ -315,6 +327,181 @@ async fn swap_guards_and_lag() {
         .unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(p.pod.readiness().0, "{}", p.pod.readiness().1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn viewer_entries_overlay_swap_and_cap() {
+    use seek_server::serve::CachedViewer;
+    let (maddr, _mdir) = marco().await;
+    let dir = tempfile::tempdir().unwrap();
+    let p = pod(Some(maddr), dir.path(), Duration::from_secs(5)).await;
+    ready(&p).await;
+
+    // G exists only in the overlay: still a follow, ahead of every stranger
+    p.js.send(Ev::Profile { did: did(G), time_us: now_us(), name: Some("Jo New".into()), deleted: false })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let g1 = p.pod.current().unwrap();
+    assert!(g1.overlay.read().id_of(&g1.index, &seek_core::did::key_of(&did(G))).unwrap() >= g1.index.len());
+    assert_eq!(ask(p.addr, Protocol::Connect, "jo", V).await, vec![did(A), did(E), did(G), did(B)]);
+    let Some(CachedViewer::Keyed { gen, follows: 3, mutuals: 1, unresolved: 1, read_ms, weight }) =
+        p.pod.cached_viewer(&did(V)).await
+    else {
+        panic!("{:?}", p.pod.cached_viewer(&did(V)).await)
+    };
+    assert_eq!(gen, g1.id);
+    assert!(weight > 320 && weight < 1024, "{weight}");
+
+    // a swap to an artifact whose ids moved (twenty more actors) and that names H: the sweep after
+    // the swap moves the entry onto the new ids without asking marco again
+    let more: Vec<(u32, String)> = (100..120).map(|i| (i, format!("x{i}.bsky.social"))).collect();
+    let mut extra: Vec<(u32, &str, &str)> = more.iter().map(|(i, h)| (*i, h.as_str(), "")).collect();
+    extra.push((G, "jo-g.bsky.social", "Jo New"));
+    extra.push((H, "jo-h.bsky.social", "Jo Late"));
+    tokio::time::sleep(Duration::from_millis(3)).await;
+    let mut st = state_with(now_us(), &extra);
+    let out = builder::build(&mut st, Some(&ranks(dir.path())), IndexSet::Profiles, dir.path()).unwrap();
+    p.art.send((out.path.clone(), out.meta.version.clone())).await.unwrap();
+    for _ in 0..100 {
+        if p.pod.current().unwrap().version == out.meta.version {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let g2 = p.pod.current().unwrap();
+    assert_eq!(g2.version, out.meta.version);
+    assert!(
+        [A, E].iter().any(|&x| g1.index.id_of(&did(x)) != g2.index.id_of(&did(x))),
+        "the new artifact's ids should differ"
+    );
+    drop(g1);
+    for _ in 0..100 {
+        if matches!(p.pod.cached_viewer(&did(V)).await, Some(CachedViewer::Keyed { gen, .. }) if gen == g2.id) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let got = ask(p.addr, Protocol::Connect, "jo", V).await;
+    assert_eq!(got[..2], [did(A), did(E)]);
+    let mut mid = got[2..4].to_vec();
+    mid.sort();
+    let mut want = vec![did(G), did(H)];
+    want.sort();
+    assert_eq!(mid, want, "{got:?}");
+    assert_eq!(got[4], did(B));
+    assert_eq!(
+        p.pod.cached_viewer(&did(V)).await,
+        Some(CachedViewer::Keyed {
+            gen: g2.id,
+            follows: 4,
+            mutuals: 1,
+            unresolved: 0,
+            read_ms,
+            weight: match p.pod.cached_viewer(&did(V)).await {
+                Some(CachedViewer::Keyed { weight, .. }) => weight,
+                _ => 0,
+            },
+        })
+    );
+    assert!(seek_server::metrics::VIEWER_REKEYS.get() >= 1);
+
+    // past --max-follows: no follows first, blocks still filtered, and the verdict is cached
+    let capped =
+        pod_with(Some(maddr), &dir.path().join("capped"), Duration::from_secs(5), Duration::from_secs(300), 3).await;
+    ready(&capped).await;
+    for _ in 0..2 {
+        assert_eq!(ask(capped.addr, Protocol::Connect, "jo", V).await, vec![did(B), did(E), did(A)]);
+        assert_eq!(capped.pod.cached_viewer(&did(V)).await, Some(CachedViewer::Capped));
+    }
+    assert!(seek_server::metrics::VIEWER_CAPPED.get() >= 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn viewer_drops_old_queries_and_double_swaps() {
+    use seek_server::serve::CachedViewer;
+    use std::time::Instant;
+    let (maddr, _mdir) = marco().await;
+    let dir = tempfile::tempdir().unwrap();
+    let p = pod(Some(maddr), dir.path(), Duration::from_secs(5)).await;
+    ready(&p).await;
+    let cached = |v: u32| {
+        let pod = p.pod.clone();
+        async move { pod.cached_viewer(&did(v)).await }
+    };
+    let follow = |from: u32, to: Option<u32>| Ev::Follow { did: did(from), time_us: now_us(), subject: to.map(did) };
+    let want = vec![did(A), did(E), did(B)];
+
+    // a follow event while E's first entry is being built, or just before: whichever comes first,
+    // the cache doesn't keep a build that may have read marco without the follow (marco_lag 500 ms)
+    assert_eq!(cached(E).await, None);
+    let t = Instant::now();
+    let (got, sent) = tokio::join!(ask(p.addr, Protocol::Connect, "jo", E), p.js.send(follow(E, None)));
+    sent.unwrap();
+    assert!(!got.is_empty());
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(cached(E).await, None);
+    // past the margin a build is kept, until the second drop at twice it
+    tokio::time::sleep(Duration::from_millis(700).saturating_sub(t.elapsed())).await;
+    ask(p.addr, Protocol::Connect, "jo", E).await;
+    assert!(cached(E).await.is_some(), "kept past the margin");
+    tokio::time::sleep(Duration::from_millis(1250).saturating_sub(t.elapsed())).await;
+    assert_eq!(cached(E).await, None, "dropped again at twice the margin");
+    // and a build inside the margin after that drop is used but not kept
+    let unkept = seek_server::metrics::VIEWER_UNKEPT.get();
+    ask(p.addr, Protocol::Connect, "jo", E).await;
+    assert_eq!(cached(E).await, None);
+    assert!(seek_server::metrics::VIEWER_UNKEPT.get() > unkept);
+
+    // a follow of A changes A's mutuals: A's entry goes too
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    ask(p.addr, Protocol::Connect, "jo", A).await;
+    assert!(cached(A).await.is_some());
+    p.js.send(follow(B, Some(A))).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(cached(A).await, None);
+
+    // a query that loaded the old artifact, after the sweep moved V's entry to the new one: it
+    // answers from the new one and leaves the entry alone
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert_eq!(ask(p.addr, Protocol::Connect, "jo", V).await, want);
+    let Some(CachedViewer::Keyed { read_ms, .. }) = cached(V).await else { panic!("{:?}", cached(V).await) };
+    let g1 = p.pod.current().unwrap();
+    let v2 = send(&p, dir.path(), now_us()).await;
+    let g2 = p.pod.current().unwrap();
+    assert_eq!(g2.version, v2);
+    for _ in 0..100 {
+        if matches!(cached(V).await, Some(CachedViewer::Keyed { gen, .. }) if gen == g2.id) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let old: Vec<String> =
+        p.pod.search_on(g1.clone(), "jo", &did(V), 10).await.unwrap().into_iter().map(|(d, _)| d).collect();
+    assert_eq!(old, want);
+    let Some(CachedViewer::Keyed { gen, read_ms: r2, .. }) = cached(V).await else { panic!() };
+    assert_eq!((gen, r2), (g2.id, read_ms), "the newer entry stays, unbuilt");
+    drop((g1, g2));
+
+    // two swaps back to back: V's entry ends on the last one's ids, moved or rebuilt, and answers
+    // the same
+    let mut st = state(now_us());
+    let a = builder::build(&mut st, Some(&ranks(dir.path())), IndexSet::Profiles, dir.path()).unwrap();
+    tokio::time::sleep(Duration::from_millis(3)).await;
+    let mut st = state(now_us());
+    let b = builder::build(&mut st, Some(&ranks(dir.path())), IndexSet::Profiles, dir.path()).unwrap();
+    p.art.send((a.path.clone(), a.meta.version.clone())).await.unwrap();
+    p.art.send((b.path.clone(), b.meta.version.clone())).await.unwrap();
+    for _ in 0..200 {
+        if p.pod.current().unwrap().version == b.meta.version {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let g3 = p.pod.current().unwrap();
+    assert_eq!(g3.version, b.meta.version);
+    assert_eq!(ask(p.addr, Protocol::Connect, "jo", V).await, want);
+    assert!(matches!(cached(V).await, Some(CachedViewer::Keyed { gen, .. }) if gen == g3.id));
 }
 
 fn load_args(logged_in: bool) -> seek_server::load::LoadArgs {

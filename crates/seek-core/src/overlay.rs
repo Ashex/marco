@@ -70,6 +70,11 @@ impl Overlay {
         base.id_of_key(did).or_else(|| self.new_ids.get(did).copied())
     }
 
+    /// The DIDs this overlay gave ids to, in id order from `base.len()`.
+    pub fn new_dids(&self) -> &[DidKey] {
+        &self.new_dids
+    }
+
     pub fn did(&self, base: &Index, id: u32) -> Option<String> {
         if id < self.base_n {
             base.did(id)

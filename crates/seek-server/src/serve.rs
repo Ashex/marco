@@ -18,9 +18,9 @@ use connectrpc::{ConnectError, RequestContext, Response, ServiceRequest, Service
 use parking_lot::RwLock;
 use seek_api::bsky::{SearchActorResult, SearchActorsTypeaheadRequest, SearchActorsTypeaheadResponse};
 use seek_core::did::{key_of, DidKey};
-use seek_core::index::Index;
+use seek_core::index::{Index, NO_ID};
 use seek_core::overlay::Overlay;
-use seek_core::query::{self, Params, Viewer};
+use seek_core::query::{self, alloc_size, Params, Viewer, ViewerBuild};
 use tokio::sync::mpsc;
 
 use crate::jetstream::Ev;
@@ -63,52 +63,222 @@ pub enum Change {
     Hidden(String, bool),
 }
 
-struct ViewerEntry {
-    follows: Vec<DidKey>,
-    mutuals: Vec<DidKey>,
-    keys: Mutex<Option<(u64, Arc<Viewer>)>>,
+/// A viewer's side of their logged-in queries, as the cache keeps it.
+pub enum ViewerEntry {
+    /// More follows than `--max-follows`: no follows first. Kept so the next keystroke doesn't ask
+    /// marco again.
+    Capped {
+        read_ms: u64,
+    },
+    Keyed(Keyed),
 }
 
+/// A viewer's follows as one generation's ids. Ids are per artifact: [`Rekey`] moves an entry onto
+/// the next artifact's without asking marco again.
+pub struct Keyed {
+    pub gen: u64,
+    /// When marco's follows were read (unix ms), kept across re-keys.
+    pub read_ms: u64,
+    pub viewer: Viewer,
+    /// Follows no generation has had an id for yet (no handle or name seen), each with whether it's
+    /// a mutual: tried again at each re-key.
+    pub unresolved: Box<[(DidKey, bool)]>,
+}
+
+/// What the cache spends on an entry besides its value: moka's entry and its deque node, the key
+/// (a DID) and the Arc (fitted to RSS growth over 60,000 entries).
+const ENTRY_BYTES: usize = 512;
+
 impl ViewerEntry {
-    /// What the entry holds once its keys are folded: the DIDs, and per follow about two keys
-    /// (~24 bytes each plus the Vec entry) and its set slots.
     fn weight(&self) -> u32 {
-        let bytes = self.follows.len() * (40 + 2 * 48 + 16) + self.mutuals.len() * (40 + 16) + 256;
+        let bytes = match self {
+            ViewerEntry::Capped { .. } => ENTRY_BYTES,
+            ViewerEntry::Keyed(k) => {
+                let other = |d: &DidKey| match d {
+                    DidKey::Other(s) => alloc_size(s.len()),
+                    DidKey::Plc(_) => 0,
+                };
+                ENTRY_BYTES
+                    + k.viewer.bytes()
+                    + alloc_size(std::mem::size_of::<(DidKey, bool)>() * k.unresolved.len())
+                    + k.unresolved.iter().map(|(d, _)| other(d)).sum::<usize>()
+            }
+        };
         bytes.min(u32::MAX as usize) as u32
     }
 
-    /// The viewer's keys against `g`, folded once per generation. The overlay's read lock is taken
-    /// a chunk of follows at a time, so a heavy follower never holds writers off for long.
-    fn viewer(&self, g: &Gen) -> Arc<Viewer> {
-        if let Some((id, v)) = &*self.keys.lock().unwrap() {
-            if *id == g.id {
-                return v.clone();
-            }
+    /// When marco was read for it (unix ms).
+    fn read_ms(&self) -> u64 {
+        match self {
+            ViewerEntry::Capped { read_ms } => *read_ms,
+            ViewerEntry::Keyed(k) => k.read_ms,
         }
+    }
+}
+
+impl Keyed {
+    /// Folds the follows' keys against `g`, taking the overlay's read lock a chunk of follows at
+    /// a time, so a heavy follower never holds writers off for long.
+    fn build(g: &Gen, follows: Vec<u32>, mutual: Vec<u32>, unresolved: Vec<(DidKey, bool)>, read_ms: u64) -> Keyed {
         let t = Instant::now();
-        let ids = |ks: &[DidKey]| -> Vec<u32> {
-            ks.chunks(VIEWER_CHUNK)
-                .flat_map(|c| {
-                    let ov = g.overlay.read();
-                    c.iter().filter_map(|k| ov.id_of(&g.index, k)).collect::<Vec<_>>()
-                })
-                .collect()
-        };
-        let (follows, mutuals) = (ids(&self.follows), ids(&self.mutuals));
-        let mut keys = Vec::with_capacity(follows.len() * 2);
+        let mut b = ViewerBuild::new(follows, mutual);
+        let mut at = 0;
+        while at < b.len() {
+            let to = (at + VIEWER_CHUNK).min(b.len());
+            b.fold(&g.index, &g.overlay.read(), at, to);
+            at = to;
+        }
+        let viewer = b.finish();
+        VIEWER_KEYS.with(&[]).since(t);
+        Keyed { gen: g.id, read_ms, viewer, unresolved: unresolved.into() }
+    }
+
+    /// From marco's answer: each DID's id in `g`, base or overlay.
+    fn resolve(g: &Gen, follows: &[String], mutuals: &[String], read_ms: u64) -> Keyed {
+        let m: rustc_hash::FxHashSet<&str> = mutuals.iter().map(String::as_str).collect();
+        let (mut fi, mut mi, mut un) = (Vec::with_capacity(follows.len()), Vec::new(), Vec::new());
         for c in follows.chunks(VIEWER_CHUNK) {
             let ov = g.overlay.read();
-            for &f in c {
-                ov.keys_of(&g.index, f, |k, t| keys.push((k.into(), seek_core::index::posting(f, t))));
+            for d in c {
+                let k = key_of(d);
+                let mutual = m.contains(d.as_str());
+                match ov.id_of(&g.index, &k) {
+                    Some(id) => {
+                        fi.push(id);
+                        if mutual {
+                            mi.push(id)
+                        }
+                    }
+                    None => un.push((k, mutual)),
+                }
             }
         }
-        keys.sort_unstable();
-        let v =
-            Arc::new(Viewer { keys, follows: follows.into_iter().collect(), mutual: mutuals.into_iter().collect() });
-        VIEWER_KEYS.with(&[]).since(t);
-        *self.keys.lock().unwrap() = Some((g.id, v.clone()));
-        v
+        Keyed::build(g, fi, mi, un, read_ms)
     }
+
+    /// This entry on `g`'s ids, by `rk` (built from this entry's generation to `g`).
+    fn rekey(&self, rk: &Rekey, g: &Gen) -> Keyed {
+        let v = &self.viewer;
+        let (mut fi, mut mi, mut un) = (Vec::with_capacity(v.follows.len()), Vec::new(), Vec::new());
+        for &id in v.follows.iter() {
+            let mutual = v.mutual(id);
+            match rk.ids.get(id as usize) {
+                Some(&n) if n != NO_ID => {
+                    fi.push(n);
+                    if mutual {
+                        mi.push(n)
+                    }
+                }
+                _ => {
+                    if let Some(k) = rk.gone.get(&id) {
+                        un.push((k.clone(), mutual))
+                    }
+                }
+            }
+        }
+        // the map's misses and the follows no generation had: the overlay may have them now
+        let ask: Vec<(DidKey, bool)> = un.drain(..).chain(self.unresolved.iter().cloned()).collect();
+        let ov = g.overlay.read();
+        for (k, mutual) in ask.iter() {
+            match ov.id_of(&g.index, k) {
+                Some(n) => {
+                    fi.push(n);
+                    if *mutual {
+                        mi.push(n)
+                    }
+                }
+                None => un.push((k.clone(), *mutual)),
+            }
+        }
+        drop(ov);
+        Keyed::build(g, fi, mi, un, self.read_ms)
+    }
+}
+
+/// Old ids to new across one swap: built while both generations are mapped, kept until the sweep
+/// has moved the cache onto the new ids.
+struct Rekey {
+    from: u64,
+    to: u64,
+    /// Indexed by the old generation's ids (base, then overlay): the new id, or `NO_ID`.
+    ids: Vec<u32>,
+    /// The DIDs of old ids with no new one, so an entry keeps them as unresolved.
+    gone: rustc_hash::FxHashMap<u32, DidKey>,
+}
+
+impl Rekey {
+    fn new(old: &Gen, new: &Gen) -> Rekey {
+        let t = Instant::now();
+        let mut ids = old.index.ids_in(&new.index);
+        let (oov, nov) = (old.overlay.read(), new.overlay.read());
+        let mut gone = rustc_hash::FxHashMap::default();
+        for (i, n) in ids.iter_mut().enumerate() {
+            if *n == NO_ID {
+                if let Some(k) = old.index.did(i as u32).map(|d| key_of(&d)) {
+                    match nov.id_of(&new.index, &k) {
+                        Some(id) => *n = id,
+                        None => {
+                            gone.insert(i as u32, k);
+                        }
+                    }
+                }
+            }
+        }
+        ids.reserve_exact(oov.new_dids().len());
+        for k in oov.new_dids() {
+            let n = nov.id_of(&new.index, k);
+            if n.is_none() {
+                gone.insert(ids.len() as u32, k.clone());
+            }
+            ids.push(n.unwrap_or(NO_ID));
+        }
+        tracing::info!(
+            ids = ids.len(),
+            gone = gone.len(),
+            ms = t.elapsed().as_millis() as u64,
+            "viewer ids mapped onto the new artifact"
+        );
+        Rekey { from: old.id, to: new.id, ids, gone }
+    }
+}
+
+/// The viewer cache's expiry: `--viewer-idle-seconds` after an entry is built or read. Moving an
+/// entry onto a new artifact's ids is an update and keeps its deadline, so the sweep at each swap
+/// doesn't keep idle viewers alive.
+struct Idle(Duration);
+
+impl moka::Expiry<String, Arc<ViewerEntry>> for Idle {
+    fn expire_after_create(&self, _: &String, _: &Arc<ViewerEntry>, _: std::time::Instant) -> Option<Duration> {
+        Some(self.0)
+    }
+
+    fn expire_after_read(
+        &self,
+        _: &String,
+        _: &Arc<ViewerEntry>,
+        _: std::time::Instant,
+        _: Option<Duration>,
+        _: std::time::Instant,
+    ) -> Option<Duration> {
+        Some(self.0)
+    }
+
+    fn expire_after_update(
+        &self,
+        _: &String,
+        _: &Arc<ViewerEntry>,
+        _: std::time::Instant,
+        left: Option<Duration>,
+    ) -> Option<Duration> {
+        left
+    }
+}
+
+/// What the cache holds for a viewer (`Pod::cached_viewer`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum CachedViewer {
+    Capped,
+    Keyed { gen: u64, follows: usize, mutuals: usize, unresolved: usize, read_ms: u64, weight: u32 },
 }
 
 pub struct Config {
@@ -123,6 +293,10 @@ pub struct Config {
     pub max_lag: Duration,
     /// One viewer's follows and mutuals from marco, all pages, within this.
     pub viewer_deadline: Duration,
+    /// How far marco's follows may trail Jetstream's. A build whose marco read starts before a
+    /// follow event for the viewer plus this isn't cached, and the entry is dropped again at twice
+    /// this after the event.
+    pub marco_lag: Duration,
 }
 
 pub struct Pod {
@@ -139,6 +313,11 @@ pub struct Pod {
     next_gen: AtomicU64,
     /// While marco fails, viewer builds wait until this (unix ms) instead of piling on.
     marco_down_until: AtomicU64,
+    /// The last swap's id map, while the viewer cache may still hold entries on the old ids.
+    rekey: ArcSwapOption<Rekey>,
+    /// When each DID's entry was last dropped by a follow event (unix ms), for `marco_lag` and the
+    /// longest build after it.
+    dropped: parking_lot::Mutex<rustc_hash::FxHashMap<String, u64>>,
 }
 
 impl Pod {
@@ -146,12 +325,13 @@ impl Pod {
         let viewers = moka::future::Cache::builder()
             .max_capacity(cfg.viewer_cache_bytes)
             .weigher(|_: &String, v: &Arc<ViewerEntry>| v.weight())
-            .time_to_idle(cfg.viewer_idle)
+            .expire_after(Idle(cfg.viewer_idle))
             .eviction_listener(|_, _, cause| {
                 let c = match cause {
                     moka::notification::RemovalCause::Expired => "idle",
                     moka::notification::RemovalCause::Size => "size",
-                    _ => "invalidated",
+                    moka::notification::RemovalCause::Replaced => return,
+                    moka::notification::RemovalCause::Explicit => "invalidated",
                 };
                 VIEWER_EVICTIONS.with_label_values(&[c]).inc();
             })
@@ -172,6 +352,8 @@ impl Pod {
             lagging: AtomicBool::new(false),
             next_gen: AtomicU64::new(1),
             marco_down_until: AtomicU64::new(0),
+            rekey: ArcSwapOption::empty(),
+            dropped: Default::default(),
         })
     }
 
@@ -281,40 +463,193 @@ impl Pod {
         }
     }
 
-    async fn viewer_entry(&self, viewer: &str) -> Result<Arc<ViewerEntry>, String> {
+    /// What the cache holds for `viewer`, for tests and debugging.
+    pub async fn cached_viewer(&self, viewer: &str) -> Option<CachedViewer> {
+        let e = self.viewers.get(viewer).await?;
+        Some(match &*e {
+            ViewerEntry::Capped { .. } => CachedViewer::Capped,
+            ViewerEntry::Keyed(k) => CachedViewer::Keyed {
+                gen: k.gen,
+                follows: k.viewer.follows.len(),
+                mutuals: k.viewer.mutual.len(),
+                unresolved: k.unresolved.len(),
+                read_ms: k.read_ms,
+                weight: e.weight(),
+            },
+        })
+    }
+
+    /// `e` for a query on `g`: as it is when it's on `g`'s ids or a newer generation's (the query
+    /// moves to that one), re-keyed by the last swap's map, or None when it's on older ids that
+    /// map doesn't cover.
+    async fn on_gen(&self, viewer: &str, e: Arc<ViewerEntry>, g: &Gen) -> Option<Arc<ViewerEntry>> {
+        let ViewerEntry::Keyed(k) = &*e else { return Some(e) };
+        if k.gen >= g.id {
+            return Some(e);
+        }
+        let rk = self.rekey.load_full().filter(|r| r.from == k.gen && r.to == g.id)?;
+        let n = Arc::new(ViewerEntry::Keyed(k.rekey(&rk, g)));
+        self.replace(viewer, &e, Some(n.clone())).await;
+        Some(n)
+    }
+
+    /// Puts `n` in `old`'s place (or removes it for None), unless the entry changed since (a follow
+    /// event dropped it, or a build or a re-key replaced it). An update keeps the entry's idle
+    /// deadline (`Idle`).
+    async fn replace(&self, viewer: &str, old: &Arc<ViewerEntry>, n: Option<Arc<ViewerEntry>>) {
+        use moka::ops::compute::{CompResult, Op};
+        let r = self
+            .viewers
+            .entry_by_ref(viewer)
+            .and_compute_with(|cur| async move {
+                match (cur, n) {
+                    (Some(c), Some(n)) if Arc::ptr_eq(c.value(), old) => Op::Put(n),
+                    (Some(c), None) if Arc::ptr_eq(c.value(), old) => Op::Remove,
+                    _ => Op::Nop,
+                }
+            })
+            .await;
+        if matches!(r, CompResult::ReplacedWith(_)) {
+            VIEWER_REKEYS.inc();
+        }
+    }
+
+    /// Drops `did`'s entry on a follow event, theirs or of them. Their next build isn't kept if its
+    /// marco read starts within `marco_lag` of now, when marco may not have the follow yet; a build
+    /// already reading isn't kept either.
+    async fn drop_viewer(&self, did: &str) {
+        self.dropped.lock().insert(did.to_string(), (now_secs() * 1e3) as u64);
+        self.viewers.invalidate(did).await;
+    }
+
+    /// Whether a build whose marco read started at `read_ms` may have missed a follow event.
+    fn read_before_drop(&self, viewer: &str, read_ms: u64) -> bool {
+        let lag = self.cfg.marco_lag.as_millis() as u64;
+        self.dropped.lock().get(viewer).is_some_and(|&t| read_ms < t + lag)
+    }
+
+    /// Moves every entry on the swapped-out generation's ids onto the new one's, a batch at a time
+    /// on a blocking thread, so a viewer back hours later still finds their entry. It stops when a
+    /// newer swap comes (that swap's sweep takes over, and entries it can't move are rebuilt when
+    /// next used). Then the map goes.
+    async fn sweep(self: Arc<Pod>, rk: Arc<Rekey>) {
+        let t = Instant::now();
+        let n = self.sweep_entries(&rk).await;
+        let _ = self.rekey.compare_and_swap(&Some(rk), None);
+        tracing::info!(entries = n, ms = t.elapsed().as_millis() as u64, "viewer cache moved onto the new artifact");
+    }
+
+    async fn sweep_entries(&self, rk: &Arc<Rekey>) -> usize {
+        let todo: Vec<(Arc<String>, Arc<ViewerEntry>)> =
+            self.viewers.iter().filter(|(_, e)| matches!(&**e, ViewerEntry::Keyed(k) if k.gen == rk.from)).collect();
+        let mut it = todo.into_iter();
+        let mut moved = 0;
+        loop {
+            let Some(g) = self.current().filter(|g| g.id == rk.to) else { break };
+            let batch: Vec<_> = it.by_ref().take(256).collect();
+            if batch.is_empty() {
+                break;
+            }
+            let rk2 = rk.clone();
+            let Ok(done) = tokio::task::spawn_blocking(move || {
+                batch
+                    .into_iter()
+                    .filter_map(|(v, e)| match &*e {
+                        ViewerEntry::Keyed(k) => {
+                            let n = Arc::new(ViewerEntry::Keyed(k.rekey(&rk2, &g)));
+                            Some((v, e, n))
+                        }
+                        ViewerEntry::Capped { .. } => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await
+            else {
+                break;
+            };
+            moved += done.len();
+            for (v, e, n) in done {
+                self.replace(&v, &e, Some(n)).await;
+            }
+        }
+        moved
+    }
+
+    async fn viewer_entry(&self, viewer: &str, g: &Arc<Gen>) -> Result<Arc<ViewerEntry>, String> {
         let Some(marco) = self.marco.as_ref() else { return Err("no marco".into()) };
         let t = Instant::now();
         let mut miss = false;
         let now_ms = (now_secs() * 1e3) as u64;
         let down = self.marco_down_until.load(Ordering::Relaxed) > now_ms;
-        let r = match self.viewers.get(viewer).await {
+        let max_age = self.cfg.viewer_idle.as_millis() as u64;
+        let cached = match self.viewers.get(viewer).await {
+            None => None,
+            // marco read more than the idle time ago: read it again, whatever events were missed
+            Some(e) if e.read_ms() + max_age < now_ms => {
+                self.replace(viewer, &e, None).await;
+                None
+            }
+            Some(e) => match self.on_gen(viewer, e.clone(), g).await {
+                Some(e) => Some(e),
+                None => {
+                    self.replace(viewer, &e, None).await;
+                    None
+                }
+            },
+        };
+        let r = match cached {
             Some(e) => Ok(e),
             None if self.cfg.viewer_deadline.is_zero() => Err("viewer builds off (deadline 0)".to_string()),
             None if down => Err("marco failing: viewer builds paused".to_string()),
-            None => self
-                .viewers
-                .try_get_with(viewer.to_string(), async {
-                    miss = true;
-                    let tb = Instant::now();
-                    let both = async {
-                        tokio::try_join!(marco.follows(viewer, &self.hists), marco.mutuals(viewer, &self.hists))
-                    };
-                    let (f, m) = tokio::time::timeout(self.cfg.viewer_deadline, both)
-                        .await
-                        .map_err(|_| anyhow::anyhow!("viewer build past {:?}", self.cfg.viewer_deadline))??;
-                    VIEWER_BUILD.with(&[]).since(tb);
-                    VIEWER_FOLLOWS.with(&[]).observe(f.len() as u64);
-                    Ok::<_, anyhow::Error>(Arc::new(ViewerEntry {
-                        follows: f.iter().map(|d| key_of(d)).collect(),
-                        mutuals: m.iter().map(|d| key_of(d)).collect(),
-                        keys: Mutex::new(None),
-                    }))
-                })
-                .await
-                .map_err(|e| {
-                    self.marco_down_until.store(now_ms + 2000, Ordering::Relaxed);
-                    e.to_string()
-                }),
+            None => {
+                let built = self
+                    .viewers
+                    .try_get_with(viewer.to_string(), async {
+                        miss = true;
+                        let tb = Instant::now();
+                        let both = async {
+                            let n = marco.follow_count(viewer, &self.hists).await?;
+                            VIEWER_FOLLOWS.with(&[]).observe(n);
+                            if n > marco.max_follows as u64 {
+                                VIEWER_CAPPED.inc();
+                                return Ok(None);
+                            }
+                            let fm = tokio::try_join!(
+                                marco.follows(viewer, &self.hists),
+                                marco.mutuals(viewer, &self.hists)
+                            )?;
+                            Ok::<_, anyhow::Error>(Some(fm))
+                        };
+                        let fm = tokio::time::timeout(self.cfg.viewer_deadline, both)
+                            .await
+                            .map_err(|_| anyhow::anyhow!("viewer build past {:?}", self.cfg.viewer_deadline))??;
+                        VIEWER_BUILD.with(&[]).since(tb);
+                        Ok::<_, anyhow::Error>(Arc::new(match fm {
+                            None => ViewerEntry::Capped { read_ms: now_ms },
+                            Some((f, m)) => ViewerEntry::Keyed(Keyed::resolve(g, &f, &m, now_ms)),
+                        }))
+                    })
+                    .await
+                    .map_err(|e| {
+                        self.marco_down_until.store(now_ms + 2000, Ordering::Relaxed);
+                        e.to_string()
+                    });
+                match built {
+                    Ok(e) => {
+                        if miss && self.read_before_drop(viewer, now_ms) {
+                            // a follow event came during or just before the read: this query uses
+                            // it, the cache doesn't keep it
+                            VIEWER_UNKEPT.inc();
+                            self.replace(viewer, &e, None).await;
+                        }
+                        // a build another query started on an artifact older than this query's
+                        self.on_gen(viewer, e, g)
+                            .await
+                            .ok_or_else(|| "viewer built on an artifact older than the query's".to_string())
+                    }
+                    Err(e) => Err(e),
+                }
+            }
         };
         if miss {
             VIEWER_MISSES.inc()
@@ -344,7 +679,7 @@ impl Pod {
                 seek.results = tracing::field::Empty
             )
         });
-        let fut = self.search_in(q, viewer, limit);
+        let fut = self.search_in(q, viewer, limit, None);
         let r = match &span {
             Some(s) => tracing::Instrument::instrument(fut, s.clone()).await,
             None => fut.await,
@@ -366,7 +701,24 @@ impl Pod {
         r
     }
 
-    async fn search_in(&self, q: &str, viewer: &str, limit: i32) -> Result<Vec<(String, f64)>, (&'static str, String)> {
+    /// A query on `g`, as one that loaded `g` just before a swap runs: for tests.
+    pub async fn search_on(
+        &self,
+        g: Arc<Gen>,
+        q: &str,
+        viewer: &str,
+        limit: i32,
+    ) -> Result<Vec<(String, f64)>, (&'static str, String)> {
+        self.search_in(q, viewer, limit, Some(g)).await
+    }
+
+    async fn search_in(
+        &self,
+        q: &str,
+        viewer: &str,
+        limit: i32,
+        on: Option<Arc<Gen>>,
+    ) -> Result<Vec<(String, f64)>, (&'static str, String)> {
         if !self.ready.load(Ordering::Relaxed) {
             return Err(("not_ready", self.why.lock().unwrap().clone()));
         }
@@ -379,8 +731,9 @@ impl Pod {
         if qq.folded.is_empty() {
             return Ok(Vec::new());
         }
-        let entry = if logged_in {
-            let fut = self.viewer_entry(viewer);
+        let Some(mut g) = on.or_else(|| self.current()) else { return Err(("not_ready", "no artifact".into())) };
+        let mut entry = if logged_in {
+            let fut = self.viewer_entry(viewer, &g);
             let r = match stage_span("viewer") {
                 Some(s) => tracing::Instrument::instrument(fut, s).await,
                 None => fut.await,
@@ -399,14 +752,30 @@ impl Pod {
         } else {
             None
         };
-        let Some(g) = self.current() else { return Err(("not_ready", "no artifact".into())) };
-        let v = entry.as_ref().map(|e| e.viewer(&g));
+        // the entry moved on to a newer artifact than this query loaded: the query does too
+        let newer = match entry.as_deref() {
+            Some(ViewerEntry::Keyed(k)) if k.gen != g.id => Some(k.gen),
+            _ => None,
+        };
+        if let Some(gen) = newer {
+            match self.current() {
+                Some(c) if c.id == gen => g = c,
+                _ => {
+                    FALLBACKS.inc();
+                    entry = None;
+                }
+            }
+        }
+        let v = match entry.as_deref() {
+            Some(ViewerEntry::Keyed(k)) => Some(&k.viewer),
+            _ => None,
+        };
         let want = if logged_in { k + MARGIN } else { k };
         let hits = {
             let s = stage_span("match");
             let _e = s.as_ref().map(|s| s.enter());
             let ov = g.overlay.read();
-            let parts = query::parts(&g.index, &ov, v.as_deref(), &qq, want, &self.cfg.params);
+            let parts = query::parts(&g.index, &ov, v, &qq, want, &self.cfg.params);
             let hits = query::merge(&parts, want);
             let hits = hits.into_iter().filter_map(|h| ov.did(&g.index, h.id).map(|d| (d, h))).collect::<Vec<_>>();
             drop(ov);
@@ -522,7 +891,26 @@ impl Pod {
                         gap_until = None;
                         self.stale.store(false, Ordering::Relaxed);
                     }
+                    // the viewer cache's entries move onto the new ids: a sweep after the swap, and
+                    // any query that gets to one first
+                    let (g, rk) = match (self.current(), self.marco.is_some()) {
+                        (Some(old), true) => {
+                            let (g, rk) = tokio::task::spawn_blocking(move || {
+                                let rk = Rekey::new(&old, &g);
+                                (g, rk)
+                            })
+                            .await
+                            .expect("rekey panicked");
+                            let rk = Arc::new(rk);
+                            self.rekey.store(Some(rk.clone()));
+                            (g, Some(rk))
+                        }
+                        _ => (g, None),
+                    };
                     self.publish_gen(g);
+                    if let Some(rk) = rk {
+                        tokio::spawn(self.clone().sweep(rk));
+                    }
                     SWAPS.inc();
                     SWAP_SECONDS.with(&[]).since(t);
                     self.set_state();
@@ -539,8 +927,27 @@ impl Pod {
                             self.set_state();
                             None
                         }
-                        Ev::Follow { did, .. } => {
-                            self.viewers.invalidate(&did).await;
+                        Ev::Follow { did, subject, .. } => {
+                            // the follower's follows changed, and the subject's mutuals
+                            let who: Vec<String> = std::iter::once(did).chain(subject).collect();
+                            if self.caught_up.load(Ordering::Relaxed) {
+                                for d in &who {
+                                    self.drop_viewer(d).await;
+                                }
+                                // marco may apply the follow later than a build that started past
+                                // the guard: drop them once more when it surely has
+                                let (pod, again) = (self.clone(), self.cfg.marco_lag * 2);
+                                tokio::spawn(async move {
+                                    tokio::time::sleep(again).await;
+                                    for d in &who {
+                                        pod.drop_viewer(d).await;
+                                    }
+                                });
+                            } else {
+                                for d in &who {
+                                    self.viewers.invalidate(d).await;
+                                }
+                            }
                             None
                         }
                         Ev::Profile { did, name, .. } => Some(Change::Name(did, name)),
@@ -590,6 +997,9 @@ impl Pod {
                     ring.push_back((at, c));
                 }
                 _ = tick.tick() => {
+                    let hold = (self.cfg.marco_lag + self.cfg.viewer_deadline).as_millis() as u64 + 1000;
+                    let now_ms = (now_secs() * 1e3) as u64;
+                    self.dropped.lock().retain(|_, t| now_ms < *t + hold);
                     let keep = self.cfg.replay_keep.as_micros() as u64;
                     while ring.front().is_some_and(|(t, _)| now_us().saturating_sub(*t) > keep) {
                         if let Some((t, _)) = ring.pop_front() {

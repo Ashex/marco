@@ -751,7 +751,59 @@ impl Index {
         let foff = self.foff();
         (foff[id as usize + 1] - foff[id as usize]) as usize
     }
+
+    /// The positions (into [`Index::post`]) of the actor's keys. Positions are in key order, so a
+    /// key starts with `q` exactly when its position is in `range(q)`.
+    pub fn positions(&self, id: u32) -> &[u32] {
+        let foff = self.foff();
+        &self.fwd()[foff[id as usize] as usize..foff[id as usize + 1] as usize]
+    }
+
+    /// For each of this index's ids, the id the same DID has in `to`, or [`NO_ID`]. Both DID
+    /// tables are sorted (did:plc packed, then the rest by string), so it's one merge.
+    pub fn ids_in(&self, to: &Index) -> Vec<u32> {
+        fn merge<'a>(
+            n: (usize, usize),
+            a: impl Fn(usize) -> &'a [u8],
+            b: impl Fn(usize) -> &'a [u8],
+            mut hit: impl FnMut(usize, usize),
+        ) {
+            let (mut i, mut j) = (0, 0);
+            while i < n.0 && j < n.1 {
+                match a(i).cmp(b(j)) {
+                    std::cmp::Ordering::Less => i += 1,
+                    std::cmp::Ordering::Greater => j += 1,
+                    std::cmp::Ordering::Equal => {
+                        hit(i, j);
+                        i += 1;
+                        j += 1;
+                    }
+                }
+            }
+        }
+        let mut out = vec![NO_ID; self.n as usize];
+        let (a, b): (&[u8], &[u8]) = (sl!(self, plc, u8), sl!(to, plc, u8));
+        merge(
+            (self.n_plc as usize, to.n_plc as usize),
+            |i| &a[i * PACKED..(i + 1) * PACKED],
+            |j| &b[j * PACKED..(j + 1) * PACKED],
+            |i, j| out[i] = j as u32,
+        );
+        let (ao, bo): (&[u8], &[u8]) = (sl!(self, oth, u8), sl!(to, oth, u8));
+        let (af, bf) = (self.ooff(), to.ooff());
+        let (np, tp) = (self.n_plc as usize, to.n_plc);
+        merge(
+            ((self.n - self.n_plc) as usize, (to.n - to.n_plc) as usize),
+            |i| &ao[af[i] as usize..af[i + 1] as usize],
+            |j| &bo[bf[j] as usize..bf[j + 1] as usize],
+            |i, j| out[np + i] = tp + j as u32,
+        );
+        out
+    }
 }
+
+/// No id: [`Index::ids_in`]'s answer for a DID the other index doesn't have.
+pub const NO_ID: u32 = u32::MAX;
 
 #[cfg(test)]
 pub mod tests {
@@ -888,5 +940,33 @@ pub mod tests {
         assert!(ranks.windows(2).all(|w| w[0] >= w[1]));
         assert_eq!(ranks[0], 999);
         assert!(ix.top(b"j1").is_none());
+    }
+
+    #[test]
+    fn ids_across_indexes() {
+        let ps = people();
+        let old = build_people(&ps[..5], &[]);
+        let mut more = people();
+        more.push(Person { did: "did:web:a.example".into(), handle: "a.example", name: "", rank: 1 });
+        for i in 100..120 {
+            more.push(Person { did: did_n(i), handle: "x.bsky.social", name: "", rank: 1 });
+        }
+        more.remove(0);
+        let new = build_people(&more, &[]);
+        let map = old.ids_in(&new);
+        assert_eq!(map.len(), old.len() as usize);
+        for p in &ps[..5] {
+            let (o, n) = (old.id_of(&p.did).unwrap(), new.id_of(&p.did));
+            assert_eq!(map[o as usize], n.unwrap_or(NO_ID), "{}", p.did);
+        }
+        assert_eq!(map[old.id_of(&ps[0].did).unwrap() as usize], NO_ID);
+        assert!((0..old.len()).any(|i| map[i as usize] != i && map[i as usize] != NO_ID), "ids moved");
+        let back = new.ids_in(&old);
+        let web = new.id_of("did:web:jay.example.org").unwrap();
+        assert_eq!(back[web as usize], NO_ID);
+        let mut pos = new.positions(new.id_of(&ps[1].did).unwrap()).to_vec();
+        pos.sort();
+        let (lo, hi) = new.range(b"mary");
+        assert!(pos.iter().any(|&p| (lo..hi).contains(&(p as usize))));
     }
 }

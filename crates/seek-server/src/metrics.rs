@@ -35,7 +35,7 @@ macro_rules! fgauge {
 pub const MODES: [&str; 2] = ["logged_out", "logged_in"];
 pub const STAGES: [&str; 5] = ["viewer", "prefix", "personal", "global", "filter"];
 pub const QUERY_ERRORS: [&str; 5] = ["bad_request", "not_ready", "marco", "no_marco", "internal"];
-pub const MARCO_METHODS: [&str; 3] = ["filter", "list_out", "intersect"];
+pub const MARCO_METHODS: [&str; 4] = ["filter", "list_out", "intersect", "counts"];
 pub const MARCO_ERRORS: [&str; 3] = ["timeout", "unavailable", "other"];
 pub const EVENT_KINDS: [&str; 5] = ["profile", "identity", "account", "follow", "skipped"];
 pub const VERIFY_RESULTS: [&str; 4] = ["ok", "mismatch", "error", "rate_limited"];
@@ -82,6 +82,16 @@ pub static VIEWER_EVICTIONS: LazyLock<IntCounterVec> = counter_vec!(
     "seek_viewer_cache_evictions_total",
     "Viewer cache entries removed, by cause (idle, size, invalidated)",
     &["cause"]
+);
+pub static VIEWER_REKEYS: LazyLock<IntCounter> =
+    counter!("seek_viewer_cache_rekeys_total", "Viewer entries moved onto a new artifact's ids (no marco call)");
+pub static VIEWER_UNKEPT: LazyLock<IntCounter> = counter!(
+    "seek_viewer_builds_unkept_total",
+    "Viewer builds used for their query but not cached: a follow event for the viewer came during or just before marco's read"
+);
+pub static VIEWER_CAPPED: LazyLock<IntCounter> = counter!(
+    "seek_viewer_capped_total",
+    "Viewer builds that found more follows than --max-follows: those viewers get no follows first"
 );
 pub static VIEWER_ENTRIES: LazyLock<IntGauge> = gauge!("seek_viewer_cache_entries", "Viewers in the cache");
 pub static VIEWER_BYTES: LazyLock<IntGauge> = gauge!("seek_viewer_cache_bytes", "The viewer cache's weighed size");
@@ -275,6 +285,9 @@ pub fn init() {
     LazyLock::force(&FALLBACKS);
     LazyLock::force(&VIEWER_HITS);
     LazyLock::force(&VIEWER_MISSES);
+    LazyLock::force(&VIEWER_REKEYS);
+    LazyLock::force(&VIEWER_CAPPED);
+    LazyLock::force(&VIEWER_UNKEPT);
     LazyLock::force(&VIEWER_ENTRIES);
     LazyLock::force(&VIEWER_BYTES);
     LazyLock::force(&VIEWER_BUILD).with(&[]);
@@ -318,7 +331,7 @@ pub fn init() {
 pub struct QueryHists {
     pub mode: [Arc<Hist>; 2],
     pub stage: [Arc<Hist>; 5],
-    pub marco: [Arc<Hist>; 3],
+    pub marco: [Arc<Hist>; 4],
     /// seek_queries_total by mode, then result (ok, empty, error).
     pub queries: [[IntCounter; 3]; 2],
     pub results: [IntCounter; 2],
