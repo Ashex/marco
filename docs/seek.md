@@ -230,7 +230,7 @@ queue of 65,536, so a slow collector drops spans and never holds a query.
 - { value: "~45k", unit: req/s, label: per core logged out, note: "1 to 4 cores, bare metal; 490k on 8 cores with SMT", tone: accent }
 - { value: "22", unit: µs, label: CPU per query at peak, note: "the match itself is 7 µs p50, 110 µs p99", tone: blue }
 - { value: "2.6", unit: GB, label: RSS at any load, note: "the mapped artifact; load adds nothing", tone: muted }
-- { value: "~115", unit: µs, label: marco CPU per logged-in query, note: "~300 µs at low rates, where nothing batches", tone: violet }
+- { value: "~68k", unit: req/s, label: marco's logged-in ceiling, note: "4 vCPUs, 54 µs a query; ~1,300 viewer builds/s", tone: violet }
 ```
 
 `seek bench --mode closed` keeps N queries in flight over several h2 connections and steps N up.
@@ -284,25 +284,79 @@ then jumps to a few milliseconds (on 16 threads: 206 µs at 49,000/s, then 1.5 t
 bursts queueing in the pod's transport. Fewer or more connections, and fewer in flight, don't
 change it.
 
-**The 2-vCPU microVM.** The same artifact in a cloud-hypervisor microVM with 2 vCPUs, its load
-generated on the host (a 64-core EPYC 7713). The VM's cgroup quota of 2 CPUs covers the vCPUs and
-the VMM's virtio-net thread, so seek itself gets about 1.5 cores, and the VM hits the quota from 4
-queries in flight. Past that it's throttled for 100 to 670 ms of every second, and each throttle
-stalls the whole VM until the next 100 ms period. That's the 20 to 40 ms p99.
+**The 4-vCPU microVM.** The same artifact in a cloud-hypervisor microVM with 4 vCPUs and 8 GB, its
+load generated on the host (a 64-core EPYC 7713). Logged-in queries go to marco in its own 4-vCPU VM
+on the same host. agent sets each VM's cgroup quota (`cpu.max`) to one CPU per vCPU, and the quota
+covers the VMM and its virtio-net thread as well as the vCPUs, so the guest never gets all 4.
+Raising the pod's quota to 8 CPUs lets the 4 vCPUs run flat out with the NIC beside them. That's what a pod
+sized at 4 vCPUs plus NIC headroom does.
 
-| | Closed loop, short queue | Open loop, low p99 | Peak | seek's CPU per query |
+| | Quota | Closed loop, short queue | Open loop, low p99 | Peak |
 |---|---|---|---|---|
-| Logged out | 12,500/s at 8 in flight, p99 1.2 ms | 6,000/s, p99 0.7 ms | 29,500/s at 512 in flight, p50 15 ms | 113 µs at 1 in flight, 53 µs at peak |
-| Logged in | 2,600/s at 2 in flight, p99 2.6 ms | 2,700/s, p99 4.4 ms | 10,800/s at 256 in flight, p50 20 ms | 290 µs at 2 in flight, 144 µs at peak |
+| Logged out | 4 CPUs | 13,100/s at 4 in flight, p99 0.59 ms | | 74,700/s at 2,048 in flight, p50 26 ms |
+| Logged out | 8 CPUs | 13,700/s at 4 in flight, p99 0.54 ms | | 80,400/s at 2,048 in flight, p50 24 ms |
+| Logged in | 4 CPUs | 2,200/s at 2 in flight, p99 2.8 ms | 6,000/s, p99 21 ms | 23,900/s at 1,024 in flight; open loop 21,400/s |
+| Logged in | 8 CPUs | 4,800/s at 4 in flight, p99 2.4 ms | 7,000/s, p99 2.7 ms | 28,000/s at 2,048 in flight; open loop 22,500/s |
 
-CPU per query counts seek's process. The whole VM uses 1.3 to 2.5 times that, the virtio-net path
-and the guest kernel being the rest. Logged in, the ceiling is seek's quota too: marco's VM
-(4 vCPUs) peaks at 1.75 cores and is never throttled. Each logged-in query costs marco's VM
-about 300 µs of CPU at low rates and 115 µs at seek's ceiling, so its 4 vCPUs would carry about
-35,000 logged-in queries a second if that holds. marco's own `marco_rpc_seconds` p99 is 0.4 to
-0.7 ms at low load and climbs to 24 to 51 ms as seek's VM throttles harder, with marco's CPU to
-spare: its replies most likely wait on a reader that's stalled.
+Logged in, every viewer is in seek's viewer cache, so a query costs one marco Filter (500 viewers).
+At agent's quota the VM is throttled from 256 in flight logged out (520 to 630 ms of every second at
+the top) and from 8 in flight logged in. At 8 CPUs it's never throttled. The logged-out peak is the
+same at both quotas within 8%, because seek's own process reaches 3.4 to 3.9 cores either way. The
+low-load logged-in p99 of 19 to 26 ms at agent's quota at 2,400 to 6,000/s came with little or no
+throttling, so the quota doesn't explain it.
 
-An artifact swap takes the 2-vCPU pod a few seconds of CPU (the download, its check and the swap).
+What the whole VM costs next to seek's process, per query:
+
+| | 1 in flight, seek | 1 in flight, VM | Peak, seek | Peak, VM |
+|---|---|---|---|---|
+| Logged out, 8 CPUs | 112 µs | 272 µs | 48 µs | 53 µs |
+| Logged in, 8 CPUs | 282 µs | 751 µs | 134 µs | 154 µs |
+
+At low rates the guest kernel and virtio-net cost 1.5 to 2.5 times seek's own CPU (every query is
+its own wakeup and packet). At the peak, deep queues batch them and they add 10 to 15%.
+
+**marco under logged-in load.** To take the pod out of the way, `seek serve` ran on the host
+itself, not in a VM, on 8 cores (16 threads) that no VM uses. It sent logged-in queries to marco's API
+over loopback, with the same 500 cached viewers, so each query was one Filter in marco:
+
+| seek on the host | Logged-in req/s | p99 | marco CPU (process / VM) | marco VM per query | marco p50 / p99 |
+|---|---|---|---|---|---|
+| Open loop, 10,700/s | 10,700 | 1.6 ms | 1.3 / 2.4 cores | 223 µs | 48 µs / 0.25 ms |
+| Open loop, 34,300/s | 34,300 | 11 ms | 2.5 / 3.6 cores | 102 µs | 45 µs / 1.3 ms |
+| One pod, peak | 42,900 | 10 ms (closed, 256 in flight) | 2.7 / 3.5 cores | 80 µs | 95 µs / 3.9 ms |
+| Two pods, peak | 67,900 | 20 ms (closed, 256 in flight each) | 3.2 / 3.9 cores | 54 µs | 0.65 ms / 7.3 ms |
+
+**marco tops out at about 68,000 logged-in queries a second** on its 4 vCPUs, 54 µs of VM CPU a
+query (47 µs in marco's process). With two pods it's throttled in nearly every 100 ms period (145 to
+156 of 150 in a 15 s window), so its cgroup quota is the limit. With one pod it stops at 43,000/s with its VM at 3.5 cores
+and never throttled: each vCPU thread at 0.7 to 0.85 of a core, the virtio-net thread at 0.65. That
+limit is the pod's single h2 connection to marco, not marco. More pods, or more connections from
+each, reach the quota. marco's miss pool stayed idle (`marco_store_miss_pool_busy` 0) and no query
+errored. Per query, marco's CPU falls from 316 µs at 1 in flight to 54 µs at the top as deeper
+queues batch more calls per h2 frame and wakeup.
+
+**Viewer builds.** A viewer that isn't cached costs marco a ListOut of their follows and an
+Intersect for their mutuals, a page at a time, about 2.5 to 3.8 ms of marco's VM CPU per query that builds one
+(ListOut averages 0.95 ms in the op, Intersect 0.22 ms, Filter 18 µs). The 256 MB viewer cache
+(`--viewer-cache-mb`) holds about 5,000 viewers of a realistic mix: 63,318 accounts that posted a
+mention in the last two days, 1,250 follows each on average, about 53 KB a cache entry. Against the
+live pod with that mix, most queries rebuild their viewer:
+
+| 63,318 viewers | Logged-in req/s | p50 | p99 | marco VM cores | marco VM per query |
+|---|---|---|---|---|---|
+| 1 in flight | 147 | 2.3 ms | 99 ms | 0.6 | 3.8 ms |
+| 256 in flight | 1,045 | 190 ms | 2.0 s | 3.1 | 2.9 ms |
+| 1,024 in flight | 1,323 | 665 ms | 2.4 s | 3.4 | 2.5 ms |
+| Open loop, 3,170/s | 3,223 | 403 ms | 1.6 s | 3.2 | 12% errors |
+
+So marco carries about 1,300 viewer builds a second, against 68,000 Filters. Past that, marco calls
+pass seek's 500 ms timeout (`seek_marco_errors_total`). A failed build pauses viewer builds for 2 s,
+and those queries are answered without follows first, which is why a closed sweep at 2,048 in flight
+jumps to 12,700/s with 2% errors. marco's RSS grew from 8.9 to 11.8 GB as its cache filled towards
+its 12 GiB budget, and its `/healthz` stayed up throughout. Even 2,000 viewers (about 4% misses once
+the cache was full of others) held marco at 2.5 cores and the pod at 1,500 to 15,000/s, so the viewer
+cache's size, not marco's Filter rate, sets the logged-in ceiling for a real viewer stream.
+
+On 2 vCPUs, an artifact swap takes the pod a few seconds of CPU (the download, its check and the swap).
 At 21,000/s offered, logged out, one step that overlapped it backed up to a 2.7 s p50. During the
 swap RSS reached 4.87 GB, with both artifacts mapped, against the VM's 5 GB.
