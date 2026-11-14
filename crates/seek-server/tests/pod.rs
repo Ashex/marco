@@ -1,7 +1,8 @@
 //! A pod end to end against a real marco server (in-process, on a small
 //! graph) and a builder-made artifact, over Connect and gRPC: logged out by
-//! rank, logged in with follows first, blocks dropped both ways, an exact
-//! handle kept through a block, the overlay's changes, and a swap.
+//! rank, logged in with follows first, blocks dropped both ways (spaced
+//! queries' matches too), an exact handle kept through a block, the overlay's
+//! changes, and a swap.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,6 +30,7 @@ const E: u32 = 5; // V follows E, not mutual
 const F: u32 = 6; // V blocks F, whose handle folds like D's
 const G: u32 = 7; // V follows G, which isn't in the first artifact (only the overlay, once named)
 const H: u32 = 8; // V follows H, which nothing names until the second artifact
+const I: u32 = 9; // V blocks I, found by its handle typed with a space or its name's words reversed
 
 fn tid(k: u64) -> String {
     vlatproto::tid::Tid::from_parts(1_704_067_200_000_000 + k * 1_000_000, 0).to_string()
@@ -50,6 +52,7 @@ async fn marco() -> (std::net::SocketAddr, tempfile::TempDir) {
     rec(&mut g, C, "app.bsky.graph.block", V);
     rec(&mut g, V, "app.bsky.graph.block", D);
     rec(&mut g, V, "app.bsky.graph.block", F);
+    rec(&mut g, V, "app.bsky.graph.block", I);
     rec(&mut g, B, "app.bsky.graph.follow", C);
     let snap = dir.path().join("snap");
     g.write_snapshot(&snap).unwrap();
@@ -73,6 +76,7 @@ fn state_with(cursor_us: u64, more: &[(u32, &str, &str)]) -> State {
         (D, "jo.example.com", "Jo Blocked"),
         (E, "jo-e.bsky.social", "Jo Followed"),
         (F, "jo-example.com", "Lookalike"),
+        (I, "kimrook.bsky.social", "Sam Ostrander"),
     ];
     for &(i, h, n) in base.iter().chain(more) {
         let a = s.get_mut(&did(i));
@@ -88,15 +92,16 @@ fn state_with(cursor_us: u64, more: &[(u32, &str, &str)]) -> State {
 
 fn ranks(dir: &std::path::Path) -> seek_core::ranks::RanksFile {
     let p = dir.join("r.ranks");
-    let mut rows: Vec<seek_core::ranks::Row> = [(V, 1), (A, 10), (B, 5000), (C, 6000), (D, 100), (E, 20), (F, 7000)]
-        .into_iter()
-        .map(|(i, r)| seek_core::ranks::Row {
-            did: seek_core::did::key_of(&did(i)),
-            rank16: r,
-            followers: 0,
-            hidden: false,
-        })
-        .collect();
+    let mut rows: Vec<seek_core::ranks::Row> =
+        [(V, 1), (A, 10), (B, 5000), (C, 6000), (D, 100), (E, 20), (F, 7000), (I, 50)]
+            .into_iter()
+            .map(|(i, r)| seek_core::ranks::Row {
+                did: seek_core::did::key_of(&did(i)),
+                rank16: r,
+                followers: 0,
+                hidden: false,
+            })
+            .collect();
     seek_core::ranks::write(&p, &Default::default(), &mut rows).unwrap();
     seek_core::ranks::RanksFile::open(&p).unwrap()
 }
@@ -214,6 +219,11 @@ async fn pod_against_marco() {
         // the blocked account's exact handle stays; one that only folds the same doesn't
         assert_eq!(ask(p.addr, proto, "jo.example.com", V).await, vec![did(D)]);
         assert_eq!(ask(p.addr, proto, "jo-example.com", V).await, vec![did(F)]);
+        // a spaced query's matches go through the block filter too
+        for q in ["kim ro", "ostrander sam"] {
+            assert_eq!(ask(p.addr, proto, q, OUT).await, vec![did(I)], "{proto:?} {q}");
+            assert!(ask(p.addr, proto, q, V).await.is_empty(), "{proto:?} {q}");
+        }
         // the API's largest page on a one-letter query answers from the top list
         assert_eq!(try_ask(p.addr, proto, "j", OUT, 100).await.unwrap().len(), 6);
         assert!(ask(p.addr, proto, "", V).await.is_empty());

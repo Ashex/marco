@@ -18,7 +18,8 @@ pub const NSEG: u8 = 3;
 /// Keys and queries are cut at this many bytes: a longer query matches on its first 32.
 pub const MAXK: usize = 32;
 const HANDLE_SEGMENTS: usize = 3;
-const NAME_WORDS: usize = 4;
+/// Later words of a display name that get a key: with the first, the name's words a query can start.
+pub const NAME_WORDS: usize = 4;
 
 pub type Key = (Box<[u8]>, u8);
 

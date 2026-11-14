@@ -5,12 +5,17 @@
 //! PageRank and the sum is integer math. An exact handle match always comes
 //! first. Signed in, the viewer's follows get [`FollowPolicy`]'s bonus and
 //! mutuals [`Params::mutual`] more.
+//!
+//! A query typed with spaces matches two more ways: with the spaces taken
+//! out, as a handle prefix at the handle's tiers, and as words that each
+//! start a different word of the display name, in any order, at a later
+//! word's tier.
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::fold::fold_into;
-use crate::index::{actor, base_score, Index, TOP};
-use crate::keys::{cut, MAXK};
+use crate::index::{actor, base_score, posting, tier, Index, TIER_W, TOP};
+use crate::keys::{cut, is_handle_tier, MAXK, NAME_WORDS, NSEG};
 use crate::overlay::Overlay;
 
 pub const EXACT: i64 = 1 << 40;
@@ -41,12 +46,20 @@ impl Default for Params {
 /// Postings a prefix with no top list may scan: only a query no fold produces gets here.
 pub const SCAN_MAX: usize = 1 << 16;
 
+/// Actors a query's words in any order checks against their names, best ranked first.
+pub const VERIFY_MAX: usize = 64;
+
 /// A query: its fold, cut to the key length, and the fingerprint of the handle it would be typed
 /// out in full (0 when it can't be one).
 #[derive(Clone, Debug, Default)]
 pub struct Query {
     pub folded: String,
     pub exact: u32,
+    /// Typed with spaces: its words may start the name's words in any order.
+    pub spaced: bool,
+    /// Typed with spaces: the query with its whitespace taken out, folded and cut as `folded` is,
+    /// matched as a handle prefix. Empty when that's `folded` itself.
+    pub joined: String,
 }
 
 pub fn prepare(q: &str) -> Query {
@@ -54,7 +67,16 @@ pub fn prepare(q: &str) -> Query {
     let mut f = String::new();
     fold_into(&raw, &mut f);
     let exact = if crate::did::valid_handle(&raw) { crate::index::handle_hash(&raw) } else { 0 };
-    Query { folded: cut(&f).to_string(), exact }
+    let folded = cut(&f).to_string();
+    let spaced = raw.contains(char::is_whitespace);
+    let mut joined = String::new();
+    if spaced {
+        fold_into(&raw.split_whitespace().collect::<String>(), &mut f);
+        if cut(&f) != folded {
+            joined = cut(&f).to_string();
+        }
+    }
+    Query { folded, exact, spaced, joined }
 }
 
 /// The viewer's side of a logged-in query against one artifact: the ids of the accounts they
@@ -149,6 +171,16 @@ impl Viewer {
             + alloc_size(key * self.keys.len())
             + self.keys.iter().map(|(k, _)| alloc_size(k.len())).sum::<usize>()
     }
+
+    /// The postings of the follows' keys that start with `q`, whose range in `base` is `lo..hi`:
+    /// the base positions inside the range, then the overlay's keys.
+    fn range<'a>(&'a self, base: &'a Index, q: &'a [u8], (lo, hi): (usize, usize)) -> impl Iterator<Item = u32> + 'a {
+        let post = base.post();
+        let at = self.pos.partition_point(|&p| (p as usize) < lo);
+        let in_base = self.pos[at..].iter().take_while(move |&&p| (p as usize) < hi).map(move |&p| post[p as usize]);
+        let at = self.keys.partition_point(|(k, _)| &**k < q);
+        in_base.chain(self.keys[at..].iter().take_while(move |(k, _)| k.starts_with(q)).map(|(_, p)| *p))
+    }
 }
 
 /// What an allocation of `n` bytes takes in jemalloc: 16-byte classes to 128, then four classes
@@ -220,6 +252,114 @@ impl Ctx<'_> {
     fn followed(&self, id: u32) -> bool {
         self.viewer.is_some_and(|v| v.follows(id))
     }
+
+    /// Whether each of `words` starts a different one of the actor's name keys, so a different one
+    /// of its name's first five words. A base actor's key starts with a word when its position is
+    /// in the word's range, so nothing is decoded.
+    fn name_has(&self, id: u32, words: &[Word]) -> bool {
+        if let Some(keys) = self.ov.name_keys(id) {
+            // one slot per string, as the base keeps them (two long words can cut the same)
+            let fits =
+                |j: usize, i: usize| keys[i].0.starts_with(words[j].0) && !keys[..i].iter().any(|k| k.0 == keys[i].0);
+            return assign(words.len(), keys.len(), 0, &fits);
+        }
+        if id >= self.base.len() {
+            return false;
+        }
+        let post = self.base.post();
+        let within = |p: usize, j: usize| (words[j].1 .0..words[j].1 .1).contains(&p);
+        let (mut at, mut n) = ([0usize; NAME_WORDS + 1], 0);
+        for &p in self.base.positions(id) {
+            let p = p as usize;
+            if n < at.len() && (0..words.len()).any(|j| within(p, j)) && !is_handle_tier(tier(post[p])) {
+                at[n] = p;
+                n += 1;
+            }
+        }
+        assign(words.len(), n, 0, &|j, i| within(at[i], j))
+    }
+}
+
+/// A spaced query's words in any order: candidates scored as a later word, then checked against
+/// their names.
+struct AnyOrder<'a> {
+    words: &'a [Word<'a>],
+    /// The page's last score once it's full: a candidate below it can't make the page.
+    floor: i64,
+    /// The page's actors, matched already.
+    on_page: FxHashSet<u32>,
+    cands: Vec<(i64, u32)>,
+}
+
+impl<'a> AnyOrder<'a> {
+    /// Against `page`, the best `want` matched so far (from [`best`]).
+    fn new(words: &'a [Word<'a>], page: &[(i64, u32)], want: usize) -> Self {
+        AnyOrder {
+            words,
+            floor: if page.len() < want { i64::MIN } else { page[want - 1].0 },
+            on_page: page.iter().map(|&(_, p)| actor(p)).collect(),
+            cands: Vec::new(),
+        }
+    }
+
+    /// Takes the actors of `posts` that `score` puts at least at the floor and `keep` takes. A top
+    /// list is in order of its own score, which bounds a later word's, so it stops at the floor.
+    fn add(
+        &mut self,
+        posts: impl Iterator<Item = u32>,
+        top: bool,
+        score: impl Fn(u32) -> i64,
+        keep: impl Fn(u32) -> bool,
+    ) {
+        for p in posts {
+            let id = actor(p);
+            let s = score(posting(id, NSEG));
+            let own = s + (TIER_W[tier(p) as usize] - TIER_W[NSEG as usize]) as i64;
+            if top && own < self.floor {
+                break;
+            }
+            if s >= self.floor && !self.on_page.contains(&id) && keep(id) {
+                self.cands.push((s, posting(id, NSEG)));
+            }
+        }
+    }
+
+    /// The best `want` candidates whose name has each word, as later-word postings. Only the best
+    /// [`VERIFY_MAX`] are checked.
+    fn found(mut self, cx: &Ctx, want: usize) -> Vec<(i64, u32)> {
+        let by = |a: &(i64, u32), b: &(i64, u32)| b.0.cmp(&a.0).then(a.1.cmp(&b.1));
+        // an actor comes once per name key the word starts: keep enough that VERIFY_MAX distinct survive
+        let m = VERIFY_MAX * (NAME_WORDS + 1);
+        let c = &mut self.cands;
+        if c.len() > m {
+            c.select_nth_unstable_by(m - 1, by);
+            c.truncate(m);
+        }
+        c.sort_unstable_by(by);
+        c.dedup_by_key(|e| e.1);
+        c.truncate(VERIFY_MAX);
+        self.cands.into_iter().filter(|&(_, p)| cx.name_has(actor(p), self.words)).take(want).collect()
+    }
+}
+
+/// A spaced query's word and its range in the base.
+type Word<'a> = (&'a [u8], (usize, usize));
+
+/// Whether each of `words` words `fits` a different one of `names` names, those in `used` taken by
+/// the first words.
+fn assign(words: usize, names: usize, used: u32, fits: &impl Fn(usize, usize) -> bool) -> bool {
+    let j = used.count_ones() as usize;
+    j == words || (0..names).any(|i| used & 1 << i == 0 && fits(j, i) && assign(words, names, used | 1 << i, fits))
+}
+
+/// The base postings that answer prefix `q`, whose range is `lo..hi`: a heavy prefix's top list
+/// when the page fits it (true), else the range, at most [`SCAN_MAX`] of it.
+fn source<'a>(base: &'a Index, q: &[u8], (lo, hi): (usize, usize), want: usize) -> (&'a [u32], bool) {
+    let heavy = hi - lo > base.meta.heavy_min as usize;
+    match if heavy { base.top(q) } else { None } {
+        Some(l) if want <= TOP => (l, true),
+        _ => (&base.post()[lo..hi.min(lo + SCAN_MAX)], false),
+    }
 }
 
 /// Candidates for query `qq`: exact handles, the viewer's matching follows, and the best `want`
@@ -253,68 +393,87 @@ pub fn parts(base: &Index, ov: &Overlay, viewer: Option<&Viewer>, qq: &Query, wa
             }
         }
     }
+    // typed with spaces: the handle it may spell, and the word whose range is narrowest, which
+    // draws the candidates for the words in any order
+    let joined = qq.joined.as_bytes();
+    let joined = (!joined.is_empty()).then(|| (joined, base.range(joined)));
+    let n = if qq.spaced { q.split(|&b| b == b' ').count() } else { 0 };
+    let words: Vec<Word> = if (2..=NAME_WORDS + 1).contains(&n) {
+        q.split(|&b| b == b' ').map(|w| (w, base.range(w))).collect()
+    } else {
+        Vec::new()
+    };
+    let anchor = words.iter().min_by_key(|&&(_, (lo, hi))| hi - lo).copied();
+    let handle_key = |p: u32| is_handle_tier(tier(p));
+    let name_key = |p: u32| !is_handle_tier(tier(p));
     out.prefix_ns = t.elapsed().as_nanos() as u64;
     let t = std::time::Instant::now();
 
     if let Some(v) = viewer {
-        let post = base.post();
-        let at = v.pos.partition_point(|&p| (p as usize) < lo);
-        for &p in v.pos[at..].iter().take_while(|&&p| (p as usize) < hi) {
-            let post = post[p as usize];
-            let id = actor(post);
-            if !gone(id) {
-                out.follows.push(Hit { id, score: cx.score(post), exact: false, followed: true });
-            }
+        let follow = |(score, post): (i64, u32)| Hit { id: actor(post), score, exact: false, followed: true };
+        let live = |p: &u32| !gone(actor(*p));
+        out.follows.extend(v.range(base, q, (lo, hi)).filter(live).map(|p| follow((cx.score(p), p))));
+        if let Some((j, r)) = joined {
+            let mine = v.range(base, j, r).filter(|&p| handle_key(p)).filter(live);
+            out.follows.extend(mine.map(|p| follow((cx.score(p), p))));
         }
-        let at = v.keys.partition_point(|(k, _)| &**k < q);
-        for (k, post) in &v.keys[at..] {
-            if !k.starts_with(q) {
-                break;
-            }
-            let id = actor(*post);
-            if !gone(id) {
-                out.follows.push(Hit { id, score: cx.score(*post), exact: false, followed: true });
-            }
+        if let Some((w, r)) = anchor {
+            let page = best(out.follows.iter().map(|h| (h.score, h.id)).collect(), want);
+            let mut any = AnyOrder::new(&words, &page, want);
+            any.add(v.range(base, w, r).filter(|&p| name_key(p)), false, |p| cx.score(p), |id| !gone(id));
+            out.follows.extend(any.found(&cx, want).into_iter().map(follow));
         }
     }
 
     out.personal_ns = t.elapsed().as_nanos() as u64;
     let t = std::time::Instant::now();
     let skip = |id: u32| ov.shadows(id) || gone(id) || cx.followed(id);
+    let skip_ov = |id: u32| gone(id) || cx.followed(id);
     let mut global: Vec<(i64, u32)> = Vec::new();
-    let heavy = hi - lo > base.meta.heavy_min as usize;
-    let list = if heavy { base.top(q) } else { None };
-    match list {
-        Some(l) if want <= TOP => {
-            out.top_list = true;
-            for &post in l {
-                if global.len() >= want {
-                    break;
-                }
-                if !skip(actor(post)) {
-                    global.push((cx.stranger(post), post));
-                }
-            }
-        }
-        _ => {
-            let hi = hi.min(lo + SCAN_MAX);
-            out.scanned = hi - lo;
-            global.extend(base.post()[lo..hi].iter().filter(|&&p| !skip(actor(p))).map(|&p| (cx.stranger(p), p)));
+    let (src, top) = source(base, q, (lo, hi), want);
+    let mine = src.iter().filter(|&&p| !skip(actor(p))).map(|&p| (cx.stranger(p), p));
+    if top {
+        out.top_list = true;
+        global.extend(mine.take(want));
+    } else {
+        out.scanned = src.len();
+        global.extend(mine);
+    }
+    global.extend(ov.range(q).map(|(_, p)| p).filter(|&p| !skip_ov(actor(p))).map(|p| (cx.stranger(p), p)));
+    let mut page = best(global, want);
+    if let Some((j, r)) = joined {
+        // ranked apart from the query's own range, so one actor's keys in both don't crowd `best`
+        let (src, top) = source(base, j, r, want);
+        let mine = src.iter().filter(|&&p| handle_key(p) && !skip(actor(p))).map(|&p| (cx.stranger(p), p));
+        let mut more: Vec<(i64, u32)> = mine.take(if top { want } else { usize::MAX }).collect();
+        let ov_mine = ov.range(j).map(|(_, p)| p).filter(|&p| handle_key(p) && !skip_ov(actor(p)));
+        more.extend(ov_mine.map(|p| (cx.stranger(p), p)));
+        if !more.is_empty() {
+            page.extend(best(more, want));
+            page = best(page, want);
         }
     }
-    for (_, post) in ov.range(q) {
-        let id = actor(post);
-        if !gone(id) && !cx.followed(id) {
-            global.push((cx.stranger(post), post));
+    if let Some((w, r)) = anchor {
+        let mut any = AnyOrder::new(&words, &page, want);
+        // a top list keeps an actor's best key alone, so its handle keys count too
+        let (src, top) = source(base, w, r, want);
+        let score = |p: u32| cx.stranger(p);
+        any.add(src.iter().copied().filter(|&p| top || name_key(p)), top, score, |id| !skip(id));
+        any.add(ov.range(w).map(|(_, p)| p).filter(|&p| name_key(p)), false, score, |id| !skip_ov(id));
+        let found = any.found(&cx, want);
+        if !found.is_empty() {
+            page.extend(found);
+            page = best(page, want);
         }
     }
-    out.global = best(global, want, |s, post| Hit { id: actor(post), score: s, exact: false, followed: false });
+    out.global =
+        page.into_iter().map(|(score, p)| Hit { id: actor(p), score, exact: false, followed: false }).collect();
     out.global_ns = t.elapsed().as_nanos() as u64;
     out
 }
 
 /// The best `k` entries by score, one per actor.
-fn best(mut v: Vec<(i64, u32)>, k: usize, hit: impl Fn(i64, u32) -> Hit) -> Vec<Hit> {
+fn best(mut v: Vec<(i64, u32)>, k: usize) -> Vec<(i64, u32)> {
     // an actor appears once per matching key; keep a margin so k distinct actors survive
     let m = (k * 4).min(v.len());
     if m > 0 && v.len() > m {
@@ -323,7 +482,7 @@ fn best(mut v: Vec<(i64, u32)>, k: usize, hit: impl Fn(i64, u32) -> Hit) -> Vec<
     }
     v.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
     let mut seen = FxHashSet::default();
-    v.into_iter().filter(|&(_, p)| seen.insert(actor(p))).take(k).map(|(s, p)| hit(s, p)).collect()
+    v.into_iter().filter(|&(_, p)| seen.insert(actor(p))).take(k).collect()
 }
 
 /// The page: every part's hits by score, each actor once at its best, at most `k`.
@@ -355,6 +514,7 @@ pub fn search(base: &Index, ov: &Overlay, viewer: Option<&Viewer>, q: &str, k: u
 mod tests {
     use super::*;
     use crate::index::tests::{build_people, people, Person};
+    use crate::index::NAT;
 
     fn ids(ix: &Index, ps: &[Person], hits: &[Hit]) -> Vec<&'static str> {
         hits.iter()
@@ -497,5 +657,208 @@ mod tests {
             merge(&pt2, 10).iter().map(|h| h.score).collect::<Vec<_>>(),
             hits.iter().map(|h| h.score).collect::<Vec<_>>()
         );
+    }
+
+    fn spaced_people() -> Vec<Person> {
+        let p = |i: u32, handle, name, rank| Person { did: crate::index::tests::did_n(i), handle, name, rank };
+        vec![
+            p(0, "tomrook.bsky.social", "", 100),
+            p(1, "tom.rookery.com", "", 300),
+            p(2, "kit-tomrook.example.com", "", 50),
+            p(3, "rook.bsky.social", "Tom Rook", 400),
+            p(4, "", "Tomrook Fan", 900),
+            p(5, "marlowpine.bsky.social", "", 200),
+            p(6, "pf.bsky.social", "Paula Fennimore", 300),
+            p(7, "pkf.bsky.social", "Paula K. Fennimore", 200),
+            p(8, "jkb.bsky.social", "Juniper K. Brightwater", 100),
+            p(9, "ps.bsky.social", "Paula Smith", 400),
+            p(10, "fen.bsky.social", "Fennimore", 500),
+        ]
+    }
+
+    #[test]
+    fn a_handle_typed_with_spaces() {
+        let ps = spaced_people();
+        let ix = build_people(&ps, &[]);
+        let ov = Overlay::new(&ix);
+        let p = Params::default();
+        let q = |s: &str| ids(&ix, &ps, &search(&ix, &ov, None, s, 10, &p));
+        // the name and the dotted handle as typed, then the joined handle, then its later label (-1 nat)
+        let tom = vec!["rook.bsky.social", "tom.rookery.com", "tomrook.bsky.social", "kit-tomrook.example.com"];
+        assert_eq!(q("tom rook"), tom);
+        assert_eq!(q("tom r"), tom);
+        assert_eq!(q("marlow pi"), vec!["marlowpine.bsky.social"]);
+        // ranked as the handle prefix it is
+        let score = |s: &str, h: &str| {
+            let id = ix.id_of(&ps.iter().find(|x| x.handle == h).unwrap().did).unwrap();
+            search(&ix, &ov, None, s, 10, &p).iter().find(|x| x.id == id).map(|x| x.score)
+        };
+        assert_eq!(score("tom rook", "tomrook.bsky.social"), score("tomrook", "tomrook.bsky.social"));
+        assert_eq!(score("tom rook", "tomrook.bsky.social"), Some(100));
+        assert_eq!(score("tom rook", "kit-tomrook.example.com"), Some(50 - NAT as i64));
+        // without a space the query is as it was: a dot is a word break, not a join
+        assert_eq!(q("tom.rook"), vec!["rook.bsky.social", "tom.rookery.com"]);
+        assert_eq!(q("tomrook"), vec!["", "tomrook.bsky.social", "kit-tomrook.example.com"]);
+    }
+
+    #[test]
+    fn name_words_in_any_order() {
+        let ps = spaced_people();
+        let ix = build_people(&ps, &[]);
+        let ov = Overlay::new(&ix);
+        let p = Params::default();
+        let q = |s: &str| ids(&ix, &ps, &search(&ix, &ov, None, s, 10, &p));
+        assert_eq!(q("fennimore paula"), vec!["pf.bsky.social", "pkf.bsky.social"]);
+        assert_eq!(q("paula fen"), vec!["pf.bsky.social", "pkf.bsky.social"]);
+        assert_eq!(q("brightwater jun"), vec!["jkb.bsky.social"]);
+        assert_eq!(q("fen k paula"), vec!["pkf.bsky.social"]);
+        // each word starts a different word of the name
+        assert!(q("paula paula").is_empty());
+        assert!(q("fen fennimore").is_empty());
+        assert!(q("paula fen smi").is_empty());
+        assert_eq!(q("rook tom"), vec!["rook.bsky.social"]);
+        // one word: as it was
+        assert_eq!(q("fennimore"), vec!["fen.bsky.social", "pf.bsky.social", "pkf.bsky.social"]);
+        let one = prepare("fennimore");
+        assert!(!one.spaced && one.joined.is_empty());
+        assert!(prepare("tom 🌻").joined.is_empty(), "nothing to join");
+    }
+
+    #[test]
+    fn spaced_tiers() {
+        let p = |i: u32, handle, name| Person { did: crate::index::tests::did_n(i), handle, name, rank: 1000 };
+        let ps = vec![
+            p(0, "a0.bsky.social", "Ada Lin"),
+            p(1, "adal.bsky.social", ""),
+            p(2, "a2.bsky.social", "Lin Ada"),
+            p(3, "a3.bsky.social", "Mo Ada Lin"),
+            p(4, "x-adal.example.com", ""),
+            p(5, "a5.bsky.social", "Lin Q. Ada"),
+        ];
+        let ix = build_people(&ps, &[]);
+        let ov = Overlay::new(&ix);
+        let got = search(&ix, &ov, None, "ada l", 10, &Params::default());
+        let tiers: Vec<(&str, i64)> = ids(&ix, &ps, &got).into_iter().zip(got.iter().map(|h| h.score)).collect();
+        let mut top: Vec<_> = tiers.iter().filter(|t| t.1 == 1000).map(|t| t.0).collect();
+        top.sort();
+        // the name's start and the joined handle's start at 0
+        assert_eq!(top, ["a0.bsky.social", "adal.bsky.social"]);
+        // a later word, the words in any order, with a gap, and the joined handle's later label at -1 nat
+        let mut later: Vec<_> = tiers.iter().filter(|t| t.1 == 1000 - NAT as i64).map(|t| t.0).collect();
+        later.sort();
+        assert_eq!(later, ["a2.bsky.social", "a3.bsky.social", "a5.bsky.social", "x-adal.example.com"]);
+        assert_eq!(got.len(), 6);
+        assert!(got.iter().all(|h| !h.exact && !h.followed));
+    }
+
+    #[test]
+    fn spaced_matches_follows_first_and_skip_the_hidden() {
+        let ps = spaced_people();
+        let ix = build_people(&ps, &["pf.bsky.social", "tomrook.bsky.social"]);
+        let mut ov = Overlay::new(&ix);
+        let p = Params::default();
+        let q = |ov: &Overlay, v: Option<&Viewer>, s: &str| ids(&ix, &ps, &search(&ix, ov, v, s, 10, &p));
+        assert_eq!(q(&ov, None, "fennimore paula"), vec!["pkf.bsky.social"]);
+        assert!(!q(&ov, None, "tom rook").contains(&"tomrook.bsky.social"));
+        // taken down after the build: the overlay hides it from both
+        ov.set_hidden(&ix, &ps[7].did, true);
+        ov.set_hidden(&ix, &ps[2].did, true);
+        assert!(q(&ov, None, "fennimore paula").is_empty());
+        assert!(!q(&ov, None, "tom rook").contains(&"kit-tomrook.example.com"));
+        let ov = Overlay::new(&ix);
+
+        // followed: ahead of everyone, flagged, and a hidden follow stays out
+        let id = |h: &str| ix.id_of(&ps.iter().find(|x| x.handle == h).unwrap().did).unwrap();
+        let follows = [id("pkf.bsky.social"), id("kit-tomrook.example.com"), id("pf.bsky.social")];
+        let v = Viewer::build(&ix, &ov, &follows, &[]);
+        let got = search(&ix, &ov, Some(&v), "fennimore paula", 10, &p);
+        assert_eq!(ids(&ix, &ps, &got), vec!["pkf.bsky.social"]);
+        assert!(got[0].followed && got[0].score == WALL + 200 - NAT as i64);
+        let got = search(&ix, &ov, Some(&v), "tom rook", 10, &p);
+        assert_eq!(ids(&ix, &ps, &got)[0], "kit-tomrook.example.com");
+        assert!(got[0].followed && !got[1].followed);
+        assert!(got.iter().all(|h| !h.exact), "none is kept through a block");
+    }
+
+    #[test]
+    fn spaced_matches_read_the_overlay() {
+        let ps = spaced_people();
+        let ix = build_people(&ps, &[]);
+        let mut ov = Overlay::new(&ix);
+        let p = Params::default();
+        ov.set_name(&ix, &ps[6].did, Some("Quincy Adams"));
+        ov.set_handle(&ix, &ps[9].did, Some("quincyadams.example.com"));
+        let q = |s: &str| ids(&ix, &ps, &search(&ix, &ov, None, s, 10, &p));
+        assert_eq!(q("adams quin"), vec!["pf.bsky.social"]);
+        assert_eq!(q("quincy ad"), vec!["ps.bsky.social", "pf.bsky.social"]);
+        assert_eq!(q("fennimore paula"), vec!["pkf.bsky.social"], "the old name's words go");
+        let new = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+        ov.set_name(&ix, new, Some("Wren Okafor"));
+        let got = search(&ix, &ov, None, "okafor w", 10, &p);
+        assert_eq!(got.len(), 1);
+        assert_eq!(ov.did(&ix, got[0].id).unwrap(), new);
+    }
+
+    #[test]
+    fn spaced_follows_from_positions_and_the_overlay() {
+        let ps = spaced_people();
+        let ix = build_people(&ps, &[]);
+        let mut ov = Overlay::new(&ix);
+        ov.set_name(&ix, &ps[6].did, Some("Quincy Adams"));
+        ov.set_handle(&ix, &ps[9].did, Some("quincyadams.example.com"));
+        let id = |i: usize| ix.id_of(&ps[i].did).unwrap();
+        // two follows the overlay speaks for (keys), one it doesn't (positions)
+        let v = Viewer::build(&ix, &ov, &[id(6), id(9), id(7)], &[]);
+        assert!(!v.keys.is_empty());
+        assert_eq!(v.pos.len(), ix.key_count(id(7)));
+        let p = Params::default();
+        let followed = |s: &str| {
+            let got = search(&ix, &ov, Some(&v), s, 10, &p);
+            let mut f: Vec<&str> =
+                ids(&ix, &ps, &got).into_iter().zip(&got).filter(|(_, h)| h.followed).map(|t| t.0).collect();
+            f.sort();
+            f
+        };
+        assert_eq!(followed("adams quin"), ["pf.bsky.social"]);
+        assert_eq!(followed("quincy ad"), ["pf.bsky.social", "ps.bsky.social"]);
+        assert_eq!(followed("fennimore paula"), ["pkf.bsky.social"]);
+        assert_eq!(followed("paula k fen"), ["pkf.bsky.social"]);
+        // a handle change keeps the name's words
+        assert_eq!(followed("smith paula"), ["ps.bsky.social"]);
+    }
+
+    #[test]
+    fn an_actor_is_checked_once_however_many_of_its_words_match() {
+        // 40 higher-ranked actors each start two name words with the anchor ("sam"), a 2:1 crowd
+        let p = |i: u32, name: &'static str, rank| Person {
+            did: crate::index::tests::did_n(i),
+            handle: Box::leak(format!("x{i}.bsky.social").into_boxed_str()),
+            name,
+            rank,
+        };
+        let mut ps: Vec<Person> = (0..40).map(|i| p(i, "Sam Samson", 1000)).collect();
+        ps.extend((40..140).map(|i| p(i, "Lee", 0)));
+        ps.push(p(140, "Sam Lee", 10));
+        let ix = build_people(&ps, &[]);
+        let ov = Overlay::new(&ix);
+        let hits = search(&ix, &ov, None, "lee sam", 10, &Params::default());
+        assert_eq!(ids(&ix, &ps, &hits), vec!["x140.bsky.social"]);
+    }
+
+    #[test]
+    fn heavy_words_in_any_order_read_the_top_list() {
+        let ps: Vec<Person> = (0..3000u32)
+            .map(|i| Person {
+                did: crate::index::tests::did_n(i),
+                handle: Box::leak(format!("s{i}.bsky.social").into_boxed_str()),
+                name: "Sam Lee",
+                rank: (i % 1000) as u16,
+            })
+            .collect();
+        let ix = build_people(&ps, &[]);
+        let ov = Overlay::new(&ix);
+        let hits = search(&ix, &ov, None, "lee sam", 10, &Params::default());
+        assert_eq!(hits.len(), 10);
+        assert!(hits.iter().all(|h| ix.rank(h.id) >= 996 && h.score == ix.rank(h.id) as i64 - NAT as i64));
     }
 }

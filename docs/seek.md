@@ -87,13 +87,27 @@ A `viewer` makes the query logged in. A pod without `--marco` refuses those with
 
 ## Ranking
 
-A score is the actor's u16 log PageRank (about 4,400 a nat) plus its match tier's weight. The
-folded handle and display name start at 0, a later label or word at −1 nat. An exact handle match
-comes first and stays on the page even when a block would drop it, as the reference AppView does,
-so a user can find who they blocked. Exact means the handle itself: each actor's handle fingerprint
-has to match the typed query, not just its fold. Signed in, follows sort ahead of everyone
-(`--follows wall`), and mutuals get +1 nat among them. `--follows N` gives follows a boost of N nats
-instead.
+| Match | Example | Weight |
+|---|---|---|
+| The handle, typed out in full | `jane.bsky.social` finds `jane.bsky.social` | First, always |
+| The start of the handle or the display name | `jane` finds `janefoster.bsky.social` and Jane Foster | 0 |
+| The start of a later label or name word | `jane` finds `mary-jane.bsky.social` and Mary Jane Doe | −1 nat |
+| Typed with spaces: the start of the handle without them | `jane fos` finds `janefoster.bsky.social` | 0, a later label −1 nat |
+| Typed with spaces: each word starts a different word of the name, in any order | `foster jane` and `jane f` find Jane Q. Foster | −1 nat |
+
+A score is the actor's u16 log PageRank (about 4,400 a nat) plus its match's weight. Exact means
+the handle itself: each actor's handle fingerprint has to match the typed query, not just its fold.
+An exact match stays on the page even when a block would drop it, as the reference AppView does, so
+a user can find who they blocked. Signed in, follows sort ahead of everyone (`--follows wall`),
+however they matched, and mutuals get +1 nat among them. `--follows N` gives follows a boost of N
+nats instead.
+
+The two spaced matches are for a query with a space in it: a handle typed the way it reads, and a
+name's words in the order someone remembers them. The query's words are its fold's, two to five,
+and the name's are its first five, the ones with keys. Candidates come from the query word with the
+fewest postings (its top list when it's heavy, else its range), and the 64 best ranked are checked
+against their keys, so two common words find the best-ranked accounts with both, not every one. A
+dot or hyphen is a word break, not a space: `jane.fos` doesn't find `janefoster.bsky.social`.
 
 Blocks are marco's `block` records both ways. Moderation-list blocks (`listblock`) aren't covered:
 marco has no listblock relation, so the AppView still filters those at hydration.
@@ -165,7 +179,7 @@ thread, as marco's op histograms are.
 |---|---|---|
 | `seek_queries_total` | `mode` (`logged_out`, `logged_in`), `result` (`ok`, `empty`, `error`) | Queries answered |
 | `seek_query_seconds` | `mode` | Query latency inside seek |
-| `seek_query_stage_seconds` | `stage`: `viewer`, `prefix`, `personal`, `global`, `filter` | The viewer's cache entry (marco on a miss), the prefix's range and exact handles, the viewer's matching follows, the global fill, marco's block filter |
+| `seek_query_stage_seconds` | `stage`: `viewer`, `prefix`, `personal`, `global`, `filter` | The viewer's cache entry (marco on a miss), the prefix's ranges (a spaced query's words and joined handle too) and exact handles, the viewer's matching follows, the global fill, marco's block filter |
 | `seek_query_results_total` | `mode` | Actors returned |
 | `seek_query_errors_total` | `kind`: `bad_request`, `not_ready`, `marco`, `no_marco`, `internal` | Failed queries |
 | `seek_queries_in_flight` | | |

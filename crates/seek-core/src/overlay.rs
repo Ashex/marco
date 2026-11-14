@@ -125,6 +125,11 @@ impl Overlay {
         }
     }
 
+    /// The display name's keys of an actor the overlay speaks for.
+    pub fn name_keys(&self, id: u32) -> Option<&[Key]> {
+        self.actors.get(&id).map(|a| &a.name[..])
+    }
+
     fn take(&mut self, base: &Index, did: &str, create: bool) -> Option<(u32, Actor)> {
         let key = key_of(did);
         let id = match self.id_of(base, &key) {
