@@ -63,6 +63,7 @@ pub struct Query {
 }
 
 pub fn prepare(q: &str) -> Query {
+    let q = strip_syntax(q);
     let raw = q.trim().trim_start_matches('@').to_ascii_lowercase();
     let mut f = String::new();
     fold_into(&raw, &mut f);
@@ -77,6 +78,54 @@ pub fn prepare(q: &str) -> Query {
         }
     }
     Query { folded, exact, spaced, joined }
+}
+
+/// The query's words without the post-search syntax the app's search box sends too, as the
+/// reference typeahead takes it out (tango's `StripQueryOperators` and `HasPositiveQuery`). Its
+/// tokens are split at whitespace outside double quotes. One in quotes is text. Otherwise a negated
+/// one (`-word`) goes, as does an operator no actor has (`lang:ja`, `since:`, `media:true`, a URL,
+/// `from:me`), while `from:`, `to:` and `mentions:` leave the handle or DID they name; a hashtag's
+/// `#`s are word breaks. Quotes are word breaks everywhere. A token of none of these is as typed.
+fn strip_syntax(q: &str) -> String {
+    let mut quoted = false;
+    let tokens = q.split(move |c: char| {
+        if c == '"' {
+            quoted = !quoted;
+        }
+        c.is_whitespace() && !quoted
+    });
+    let mut out = String::with_capacity(q.len());
+    for t in tokens.filter(|t| !t.is_empty()) {
+        let mut breaks: &[char] = &['"'];
+        let t = if t.starts_with('"') {
+            t
+        } else if t.starts_with('-') {
+            continue;
+        } else if t.starts_with('#') {
+            breaks = &['"', '#'];
+            t
+        } else {
+            match t.split_once(':') {
+                Some(("from" | "to" | "mentions", v)) => {
+                    let v = v.strip_prefix('@').unwrap_or(v);
+                    if !crate::did::valid_handle(&v.to_ascii_lowercase()) && marco_core::did::classify(v).is_none() {
+                        continue;
+                    }
+                    v
+                }
+                Some(("http" | "https" | "domain" | "lang" | "since" | "until", _)) => continue,
+                Some(("media" | "video" | "following" | "replies", "true" | "false")) => continue,
+                _ => t,
+            }
+        };
+        for w in t.split(breaks).filter(|w| !w.is_empty()) {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(w);
+        }
+    }
+    out
 }
 
 /// The viewer's side of a logged-in query against one artifact: the ids of the accounts they
@@ -548,6 +597,95 @@ mod tests {
 
         assert!(q("").is_empty());
         assert!(q("zz").is_empty());
+    }
+
+    #[test]
+    fn search_syntax_goes() {
+        let cases = [
+            ("", ""),
+            ("jersey", "jersey"),
+            // operators no actor has
+            ("from:me", ""),
+            ("from:me jersey", "jersey"),
+            ("to:me jersey", "jersey"),
+            ("domain:nytimes.com jersey", "jersey"),
+            ("lang:en jersey", "jersey"),
+            ("lang:ja\u{3000}山田", "山田"),
+            ("since:2026-01-01 jersey", "jersey"),
+            ("until:2026-01-01", ""),
+            ("media:true", ""),
+            ("video:false", ""),
+            ("following:true", ""),
+            ("replies:false", ""),
+            ("https://example.com/post", ""),
+            ("lang:", ""),
+            // an identity operator leaves the handle or DID it names, and only that
+            ("from:alice.bsky.social", "alice.bsky.social"),
+            ("from:@Alice.bsky.social jo", "Alice.bsky.social jo"),
+            ("to:did:plc:z72i7hdynmk6r22z27h6tvur", "did:plc:z72i7hdynmk6r22z27h6tvur"),
+            ("mentions:alice.bsky.social", "alice.bsky.social"),
+            ("from:alice", ""),
+            ("from:", ""),
+            // quotes are word breaks, and what's in them is text
+            ("\"paul frazee\"", "paul frazee"),
+            ("\"paul fraz", "paul fraz"),
+            ("\"from:me\" jersey", "from:me jersey"),
+            ("\"-cats\"", "-cats"),
+            ("\"\"", ""),
+            // a hashtag's #s are word breaks
+            ("#bluesky", "bluesky"),
+            ("#부산#오", "부산 오"),
+            ("#art jo", "art jo"),
+            // negated words
+            ("-cats", ""),
+            ("-", ""),
+            ("dogs -cats", "dogs"),
+            ("-\"cats dogs\" jo", "jo"),
+            ("-cats \"\"", ""),
+            // the rest as typed
+            ("jay.bsky.team", "jay.bsky.team"),
+            ("@Jay.bsky.team", "@Jay.bsky.team"),
+            ("o'brien", "o'brien"),
+            ("mary-jane", "mary-jane"),
+            ("c#", "c#"),
+            ("12:30", "12:30"),
+            ("re: hello", "re: hello"),
+            ("did:plc:z72i7hdynmk6r22z27h6tvur", "did:plc:z72i7hdynmk6r22z27h6tvur"),
+            ("From:me", "From:me"),
+            ("following:elon media:cats", "following:elon media:cats"),
+            ("  tom \t rook ", "tom rook"),
+        ];
+        for (q, want) in cases {
+            assert_eq!(strip_syntax(q), want, "{q:?}");
+        }
+    }
+
+    #[test]
+    fn search_syntax_finds_what_its_words_do() {
+        let ps = people();
+        let ix = build_people(&ps, &[]);
+        let ov = Overlay::new(&ix);
+        let p = Params::default();
+        let q = |s: &str| ids(&ix, &ps, &search(&ix, &ov, None, s, 10, &p));
+        assert_eq!(q("from:me ali"), vec!["alice.bsky.social"]);
+        assert_eq!(q("lang:ja 山田"), vec!["yamada.bsky.social"]);
+        assert_eq!(q("#jose"), vec!["bob.bsky.social"]);
+        assert_eq!(q("ali -bob"), q("ali"));
+        assert_eq!(q("\"mary jane\""), q("mary jane"));
+        // a run of hashtags is words, in any order
+        assert_eq!(q("#jane#mary"), vec!["mary-jane.bsky.social"]);
+        assert_eq!(q("#jane#mary"), q("jane mary"));
+        // nothing positive left: no one, and no error
+        for s in ["from:me", "lang:ja", "-ali", "-\"mary jane\"", "\"\"", "https://bsky.app"] {
+            assert!(prepare(s).folded.is_empty(), "{s}");
+        }
+        // an identity operator's handle is the handle typed out
+        let got = search(&ix, &ov, None, "from:@Jay.Example.com", 10, &p);
+        assert!(got[0].exact);
+        let (a, b) = (prepare("\"paul frazee\""), prepare("paul frazee"));
+        assert_eq!((a.folded, a.spaced, a.joined), (b.folded, b.spaced, b.joined));
+        let tag = prepare("#부산#오");
+        assert_eq!((tag.folded.as_str(), tag.spaced, tag.joined.as_str()), ("부산 오", true, "부산오"));
     }
 
     #[test]

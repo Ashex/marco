@@ -109,6 +109,13 @@ fewest postings (its top list when it's heavy, else its range), and the 64 best 
 against their keys, so two common words find the best-ranked accounts with both, not every one. A
 dot or hyphen is a word break, not a space: `jane.fos` doesn't find `janefoster.bsky.social`.
 
+The app's search box sends post-search syntax too, and a query loses it before it's folded, as the
+reference typeahead's does. An operator no actor has goes (`from:me`, `lang:ja`, `since:`,
+`media:true`, a URL), while `from:`, `to:` and `mentions:` leave the handle or DID they name. A
+negated word (`-spam`) goes. Double quotes and a hashtag's `#`s are spaces, so `"jane foster"` is
+`jane foster` and `#jane#foster` is too. What's in quotes is never an operator or a negation, and a
+query with nothing else left finds no one. An apostrophe is not a quote.
+
 Blocks are marco's `block` records both ways. Moderation-list blocks (`listblock`) aren't covered:
 marco has no listblock relation, so the AppView still filters those at hydration.
 
