@@ -117,7 +117,7 @@ negated word (`-spam`) goes. Double quotes and a hashtag's `#`s are spaces, so `
 query with nothing else left finds no one. An apostrophe is not a quote.
 
 Blocks are marco's `block` records both ways. Moderation-list blocks (`listblock`) aren't covered:
-marco has no listblock relation, so the AppView still filters those at hydration.
+seek reads no listblock relation, so the AppView still filters those at hydration.
 
 ## Flags
 

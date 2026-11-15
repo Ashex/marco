@@ -88,7 +88,8 @@ record naming the other (`outUri`) and the other's record naming the actor (`inU
 ```
 
 Answers come in the request's order. `rels` empty means every relation between actors (`follow`
-and `block` by default). This is the call a profile's viewer state and a
+and `block` by default), which leaves out list relations and relations whose subjects are records
+([Records as subjects](relations.md#records-as-subjects)). This is the call a profile's viewer state and a
 feed's hydration make. 50 others × 2 relations take ~30 µs in the engine and ~100 µs over HTTP/2
 ([Throughput and latency](perf.html)).
 

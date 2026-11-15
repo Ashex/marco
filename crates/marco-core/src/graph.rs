@@ -41,7 +41,7 @@ use crate::inset::{self, InList, PagedIn};
 use crate::obs::{self, Applied, Op};
 use crate::outlog::{self, OutBytes, OutList, PagedOut};
 use crate::read::{Engine, Hold, ReadCx, StorageError, R};
-use crate::relation::{parse_uri, RelId, Relations};
+use crate::relation::{parse_uri, RelId, Relations, Skip};
 use crate::rkey::{self, is_tid, key_of};
 use crate::segment::{Rec, Status};
 use crate::snapshot::{
@@ -1691,17 +1691,20 @@ impl Graph {
         let Some((did, coll, rkey_s)) = parse_uri(uri) else { bail!("{uri:?} isn't a record URI") };
         let Some(rel) = self.rels.by_collection(coll) else { bail!("no relation for {coll}") };
         let owner = self.rels.owner_rel(rel);
-        let list = match (owner, list) {
-            (None, _) => None,
-            (Some(_), None) => bail!("{coll} records name their list"),
-            (Some(_), Some(l)) => match parse_uri(l) {
-                Some((o, _, _)) if o == did => Some(l),
-                Some(_) => bail!("{l} isn't in {did}'s repo"),
-                None => bail!("{l:?} isn't a record URI"),
-            },
+        let r = self.rels.get(rel);
+        let list = match r.check_list(uri, list) {
+            Ok(l) => l,
+            Err(Skip::NoList) => bail!("{coll} records name their list"),
+            Err(Skip::CrossRepo) => bail!("{} isn't in {did}'s repo", list.unwrap_or_default()),
+            Err(_) => bail!("{:?} isn't a record URI", list.unwrap_or_default()),
         };
+        if r.check_subject(uri, subject).is_err() {
+            bail!("{subject:?} isn't {}", r.subject_desc());
+        }
+        // a record's URI is a node, as a list is
+        let uri_subject = r.subject_records().is_some();
         let a = self.intern(did)?;
-        let s = self.intern(subject)?;
+        let s = if uri_subject { self.intern_node(subject)? } else { self.intern(subject)? };
         let l = list.map(|l| self.intern_node(l)).transpose()?;
         let (key, side) = key_of(rkey_s);
         let rec = owner.unwrap_or(rel);

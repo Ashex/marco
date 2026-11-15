@@ -8,7 +8,6 @@ use std::io::Read;
 use anyhow::{bail, ensure, Context, Result};
 use vlatproto::cbor::ValueRef;
 
-use crate::build::own_list;
 use crate::hubble::repo::path_of;
 use crate::rows::put_row;
 use crate::spill::bucket_of;
@@ -192,11 +191,11 @@ pub fn rows(b: &[u8]) -> Result<Vec<Row<'_>>> {
     Ok(out)
 }
 
-/// A scanned relation: its collection, and where its records keep the subject and list.
+/// A scanned relation: its collection, and the relation whose rule says
+/// what its records are.
 pub struct Wanted {
     pub collection: Vec<u8>,
-    pub subject: String,
-    pub list: Option<String>,
+    pub rel: marco_core::Relation,
 }
 
 impl Wanted {
@@ -206,11 +205,7 @@ impl Wanted {
             .into_iter()
             .map(|id| {
                 let r = rels.get(id);
-                Wanted {
-                    collection: r.collection.clone().into_bytes(),
-                    subject: r.subject.clone(),
-                    list: r.list.clone(),
-                }
+                Wanted { collection: r.collection.clone().into_bytes(), rel: r.clone() }
             })
             .collect()
     }
@@ -316,35 +311,28 @@ pub fn take(block: &[u8], lo: u64, hi: u64, wanted: &[Wanted], out: &mut Out) ->
     Ok(())
 }
 
-/// A commit's row, as the live path reads it: a create or update whose
-/// record isn't an edge (no DID subject, a list in another repo) empties
-/// its key, as a delete does.
+/// A commit's row, as the live path reads it ([`marco_core::Relation::edge`]):
+/// a create or update whose record isn't an edge (a bad subject, a list in
+/// another repo, one `when` doesn't keep) empties its key, as a delete does.
 fn commit(r: &Row, did: &str, w: usize, want: &Wanted, out: &mut Out) {
     let Ok(rkey) = std::str::from_utf8(r.rkey) else { return out.skip("bad_uri") };
     let coll = std::str::from_utf8(r.collection).unwrap_or("");
-    if marco_core::relation::parse_uri(&format!("at://{did}/{coll}/{rkey}")).is_none() {
+    let uri = format!("at://{did}/{coll}/{rkey}");
+    if marco_core::relation::parse_uri(&uri).is_none() {
         return out.skip("bad_uri");
     }
-    let listed = want.list.is_some();
+    let listed = want.rel.list.is_some();
     let edge = if r.kind == KIND_DELETE {
         Err(None)
     } else {
-        (|| -> Result<(String, Option<String>), &'static str> {
-            let rec = ValueRef::decode(r.payload).map_err(|_| "bad_record")?;
-            let subject = path_of(&rec, &want.subject).ok_or("no_subject")?;
-            if marco_core::did::classify(subject).is_none() {
-                return Err("bad_subject");
-            }
-            let list = match &want.list {
-                None => None,
-                Some(p) => {
-                    let l = path_of(&rec, p).ok_or("no_list")?;
-                    Some(own_list(did.as_bytes(), l.as_bytes()).ok_or("cross_repo")?.to_string())
-                }
-            };
-            Ok((subject.to_string(), list))
-        })()
-        .map_err(Some)
+        match ValueRef::decode(r.payload) {
+            Err(_) => Err(Some("bad_record")),
+            Ok(rec) => want
+                .rel
+                .edge(&uri, |p| path_of(&rec, p))
+                .map(|e| (e.subject.to_string(), e.list.map(str::to_string)))
+                .map_err(|why| Some(why.as_str())),
+        }
     };
     let rows = out.buckets.entry((w, bucket_of(did))).or_default();
     match edge {
@@ -439,6 +427,85 @@ mod tests {
             }
         }
         assert_eq!(at, events.len());
+    }
+
+    /// Commit rows as the live path reads them: a listblock names a list's
+    /// URI, a list is its owner's `modlist` edge while it's a mod list, and
+    /// an update to another purpose writes a delete row.
+    #[test]
+    fn list_subjects_and_purpose() {
+        use crate::hubble::repo::tests::record;
+        let rels = marco_core::Relations::parse_toml(
+            r#"
+[[relation]]
+name = "listblock"
+collection = "app.bsky.graph.listblock"
+subject = "subject"
+subject_collection = "app.bsky.graph.list"
+
+[[relation]]
+name = "modlist"
+collection = "app.bsky.graph.list"
+subject = "$self"
+when = { purpose = "app.bsky.graph.defs#modlist" }
+"#,
+        )
+        .unwrap();
+        let wanted = Wanted::of(&rels);
+        let me = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+        let theirs = "at://did:plc:bbbbbbbbbbbbbbbbbbbbbbbb/app.bsky.graph.list/3kaaaaaaaaa2a";
+        let list = |p: &str| record("app.bsky.graph.list", &[("name", "n"), ("purpose", p)]).to_cbor();
+        let rows = [
+            (1, KIND_CREATE, "app.bsky.graph.list", "3kaaaaaaaaa22", list("app.bsky.graph.defs#modlist")),
+            (2, KIND_UPDATE, "app.bsky.graph.list", "3kaaaaaaaaa22", list("app.bsky.graph.defs#curatelist")),
+            (3, KIND_CREATE, "app.bsky.graph.listblock", "3kaaaaaaaaa23", {
+                record("app.bsky.graph.listblock", &[("subject", theirs)]).to_cbor()
+            }),
+            (4, KIND_CREATE, "app.bsky.graph.listblock", "3kaaaaaaaaa24", {
+                record("app.bsky.graph.listblock", &[("subject", me)]).to_cbor()
+            }),
+        ];
+        let mut out = Out::new(wanted.len());
+        for (seq, kind, coll, rkey, payload) in &rows {
+            let r = Row {
+                seq: *seq,
+                witnessed_at: 0,
+                indexed_at: 100 + *seq as i64,
+                kind: *kind,
+                collection: coll.as_bytes(),
+                did: me.as_bytes(),
+                rkey: rkey.as_bytes(),
+                payload,
+            };
+            let w = wanted.iter().position(|w| w.collection == r.collection).unwrap();
+            commit(&r, me, w, &wanted[w], &mut out);
+        }
+        assert_eq!(out.skipped, std::collections::BTreeMap::from([("bad_subject", 1), ("unmatched", 1)]));
+        assert_eq!((out.ops.clone(), out.deletes.clone()), (vec![1, 1], vec![1, 1]));
+        // (repo, rkey, subject, time_us, op) of each relation's rows
+        let read = |w: usize| {
+            let raw: Vec<u8> = out.buckets.iter().filter(|(k, _)| k.0 == w).flat_map(|(_, v)| v.clone()).collect();
+            let tmp = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(tmp.path(), zstd::bulk::compress(&raw, 1).unwrap()).unwrap();
+            let mut r = crate::rows::Rows::open(tmp.path()).unwrap();
+            let mut c = vec![Vec::new(); 3];
+            let mut v = Vec::new();
+            while r.next(&mut c).unwrap() {
+                let s = |i: usize| String::from_utf8(c[i].clone()).unwrap();
+                v.push((s(1), s(2), r.i64().unwrap(), r.u8().unwrap()));
+            }
+            v
+        };
+        let own = format!("at://{me}/app.bsky.graph.list/3kaaaaaaaaa22");
+        assert_eq!(
+            read(1),
+            [("3kaaaaaaaaa22".into(), own, 101, 1), ("3kaaaaaaaaa22".into(), String::new(), 102, 3)],
+            "a mod list, then a curation list: its key empties"
+        );
+        assert_eq!(
+            read(0),
+            [("3kaaaaaaaaa23".into(), theirs.into(), 103, 1), ("3kaaaaaaaaa24".into(), String::new(), 104, 3)]
+        );
     }
 
     #[test]

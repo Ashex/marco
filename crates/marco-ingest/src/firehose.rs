@@ -17,7 +17,7 @@ use marco_core::Relations;
 use vlatproto::cbor::ValueRef;
 use vlatproto::cid::Cid;
 
-use crate::{account_change, edge_uri, list_of, valid_subject, Change, Event, Kind, Op};
+use crate::{account_change, edge_uri, upsert, Change, Event, Kind, Op};
 
 /// The subscribe URL: `base` (`wss://host`, or the full XRPC path) with a
 /// cursor when given.
@@ -58,8 +58,8 @@ fn time_us(v: Option<&ValueRef<'_>>) -> i64 {
     text(v).and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok()).map_or(0, |t| t.timestamp_micros())
 }
 
-/// The subject by a relation's dotted path in a DAG-CBOR record.
-fn subject_of<'a>(record: &ValueRef<'a>, path: &str) -> Option<&'a str> {
+/// A dotted path's string in a DAG-CBOR record.
+fn path_of<'a>(record: &ValueRef<'a>, path: &str) -> Option<&'a str> {
     path.split('.').try_fold(record, |v, k| v.get(k))?.as_str()
 }
 
@@ -128,18 +128,9 @@ pub fn decode(frame: &[u8], rels: &Relations) -> Result<Frame, &'static str> {
                             ev.skipped.push("bad_record");
                             continue;
                         };
-                        let r = rels.get(rel);
-                        let list = r.list.as_deref().and_then(|p| subject_of(&rec, p));
-                        match (subject_of(&rec, &r.subject), list_of(rels, rel, &uri, list)) {
-                            (Some(s), Ok(list)) if valid_subject(s) => {
-                                out.push(Op::Add { uri, subject: s.to_string(), list, time_us: ev.time_us })
-                            }
-                            (_, list) => {
-                                // a record that isn't an edge leaves its key empty
-                                ev.skipped.push(if list.is_err() { "bad_list" } else { "bad_subject" });
-                                out.push(Op::Delete { uri, time_us: ev.time_us });
-                            }
-                        }
+                        // a record that isn't an edge leaves its key empty
+                        let get = |p: &str| path_of(&rec, p);
+                        out.push(upsert(rels.get(rel), uri, ev.time_us, get, &mut ev.skipped));
                     }
                     "delete" => out.push(Op::Delete { uri, time_us: ev.time_us }),
                     _ => ev.skipped.push("bad_op"),
@@ -363,6 +354,70 @@ mod tests {
                     uri: "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.graph.listitem/3kaaaaaaaaa23".into(),
                     time_us: 1_767_225_600_000_000,
                 },
+            ])
+        );
+    }
+
+    /// From CBOR records, the same rule as Jetstream's: a mod list's own URI
+    /// is its owner's `modlist` edge and a curation list empties the key, and
+    /// a listblock names a list.
+    #[test]
+    fn list_subjects_and_purpose() {
+        use vlatproto::cbor::Value;
+        use vlatproto::events;
+        let rec = |fields: &[(&str, &str)]| {
+            let mut m: Vec<(String, Value)> =
+                fields.iter().map(|(k, v)| (k.to_string(), Value::Text(v.to_string()))).collect();
+            m.sort_by(|a, b| vlatproto::cbor::key_cmp(&a.0, &b.0));
+            Value::Map(m).to_cbor()
+        };
+        let them = "at://did:plc:cccccccccccccccccccccccc/app.bsky.graph.list/3kaaaaaaaaa2a";
+        let recs = [
+            rec(&[("$type", "app.bsky.graph.list"), ("name", "n"), ("purpose", "app.bsky.graph.defs#modlist")]),
+            rec(&[("$type", "app.bsky.graph.list"), ("name", "n"), ("purpose", "app.bsky.graph.defs#curatelist")]),
+            rec(&[("$type", "app.bsky.graph.listblock"), ("subject", them)]),
+            rec(&[("$type", "app.bsky.graph.listblock"), ("subject", "did:plc:cccccccccccccccccccccccc")]),
+        ];
+        let cids: Vec<Cid> = recs.iter().map(|r| Cid::dag_cbor(r)).collect();
+        let mut car = Vec::new();
+        vlatproto::car::write_header(&mut car, &cids[0]);
+        for (c, r) in cids.iter().zip(&recs) {
+            vlatproto::car::write_block(&mut car, c, r);
+        }
+        let paths = [
+            "app.bsky.graph.list/3kaaaaaaaaa22",
+            "app.bsky.graph.list/3kaaaaaaaaa23",
+            "app.bsky.graph.listblock/3kaaaaaaaaa24",
+            "app.bsky.graph.listblock/3kaaaaaaaaa25",
+        ];
+        let ops: Vec<events::RepoOp> = paths
+            .iter()
+            .zip(&cids)
+            .map(|(p, c)| events::RepoOp { action: "create", path: p, cid: Some(*c), prev: None })
+            .collect();
+        let f = events::commit_frame(&events::CommitFrame {
+            repo: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+            rev: "3kabc",
+            since: None,
+            commit: cids[0],
+            prev_data: None,
+            blocks: &car,
+            ops: &ops,
+            time: "2026-01-01T00:00:00Z",
+        });
+        let mut b = Vec::new();
+        f.finish(44, &mut b);
+        let Frame::Event(ev) = decode(&b, &crate::list_rels()).unwrap() else { panic!() };
+        assert_eq!(ev.skipped, vec!["unmatched", "bad_subject"]);
+        let uri = |p: &str| format!("at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/{p}");
+        let time_us = 1_767_225_600_000_000;
+        assert_eq!(
+            ev.change,
+            Change::Ops(vec![
+                Op::Add { uri: uri(paths[0]), subject: uri(paths[0]), list: None, time_us },
+                Op::Delete { uri: uri(paths[1]), time_us },
+                Op::Add { uri: uri(paths[2]), subject: them.into(), list: None, time_us },
+                Op::Delete { uri: uri(paths[3]), time_us },
             ])
         );
     }

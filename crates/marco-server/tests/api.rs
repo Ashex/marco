@@ -53,6 +53,20 @@ async fn start_auth(read_only: bool, api_read_only: bool, auth: AuthConfig) -> S
     Srv { api, admin, ops, app, _dir: dir }
 }
 
+/// A server on a snapshot of `rels` holding one follow.
+async fn start_rels(rels: marco_core::Relations) -> Srv {
+    let dir = tempfile::tempdir().unwrap();
+    let snap = dir.path().join("snap");
+    let mut g = marco_core::Graph::new(rels);
+    g.add(&uri(&did(0), FOLLOW, &tid(1, 0)), &did(1)).unwrap();
+    g.write_snapshot(&snap).unwrap();
+    let auth = AuthConfig { token: Some(TOKEN.into()), ..Default::default() };
+    let app = App::open(Config { auth, ..Config::new(snap) }).unwrap();
+    let ui = Arc::new(marco_server::ui::Ui::load(None).unwrap());
+    let (api, admin) = marco_server::serve(app.clone(), ui).await.unwrap();
+    Srv { api, admin, ops: admin, app, _dir: dir }
+}
+
 fn cfg(addr: SocketAddr, token: Option<&str>) -> ClientConfig {
     let mut c = ClientConfig::new(format!("http://{addr}").parse().unwrap());
     if let Some(t) = token {
@@ -1190,4 +1204,120 @@ async fn lists() {
     assert_eq!(outcome(&r.results[0]), format!("removed {a7}"));
     let m = g.list_out(page(true)).await.unwrap().into_owned();
     assert_eq!(m.edges.len(), 1);
+}
+
+/// `listblock` takes a list's URI as the subject and `modlist` a list
+/// record's own URI. The write API refuses any other subject, and reads
+/// between actors leave both out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn list_subjects() {
+    let rels = marco_core::Relations::parse_toml(
+        r#"
+[[relation]]
+name = "follow"
+collection = "app.bsky.graph.follow"
+subject = "subject"
+
+[[relation]]
+name = "block"
+collection = "app.bsky.graph.block"
+subject = "subject"
+
+[[relation]]
+name = "listitem"
+collection = "app.bsky.graph.listitem"
+subject = "subject"
+list = "list"
+
+[[relation]]
+name = "listblock"
+collection = "app.bsky.graph.listblock"
+subject = "subject"
+subject_collection = "app.bsky.graph.list"
+
+[[relation]]
+name = "modlist"
+collection = "app.bsky.graph.list"
+subject = "$self"
+when = { purpose = "app.bsky.graph.defs#modlist" }
+"#,
+    )
+    .unwrap();
+    let s = start_rels(rels).await;
+    let g = graph(s.api, Some(TOKEN));
+    let (o, v, t) = (did(1), did(2), did(3));
+    let (l, l2) = (list_uri(&o, 1), list_uri(&o, 2));
+    let lb = |k: u64| uri(&v, "app.bsky.graph.listblock", &tid(k, 0));
+    let w = |ops: Vec<WriteOp>| WriteBatchRequest { ops, ..Default::default() };
+    let r = g
+        .write_batch(w(vec![
+            add(&lb(1), &l),
+            add(&lb(2), &l2),
+            add(&l, &l),
+            add_item(&uri(&o, LISTITEM, &tid(3, 0)), &t, &l),
+        ]))
+        .await
+        .unwrap()
+        .into_owned();
+    assert!(r.results.iter().all(|x| outcome(x) == "added"), "{:?}", r.results);
+    for (op, why) in [
+        (add(&lb(4), &t), "a DID isn't a list"),
+        (add(&lb(4), &uri(&o, FOLLOW, &tid(4, 0))), "a record in another collection"),
+        (add(&l2, &l), "a $self subject is the record's own URI"),
+        (add(&uri(&v, FOLLOW, &tid(4, 0)), &l), "a follow names a DID"),
+    ] {
+        let err = g.write_batch(w(vec![add(&lb(5), &l), op])).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument, "{why}");
+    }
+    let n = g
+        .counts(CountsRequest { actors: vec![v.clone()], rels: vec!["listblock".into()], ..Default::default() })
+        .await
+        .unwrap()
+        .into_owned();
+    assert_eq!(n.counts[0].rels[0].out_records, 2, "a refused batch changes nothing");
+
+    assert_eq!(has(&g, "listblock", &v, &l).await, lb(1));
+    assert_eq!(has(&g, "modlist", &o, &l).await, l);
+    assert_eq!(has(&g, "modlist", &o, &l2).await, "");
+    let out = g
+        .list_out(ListOutRequest { rel: "listblock".into(), actor: v.clone(), ..Default::default() })
+        .await
+        .unwrap()
+        .into_owned();
+    let subjects: Vec<&str> = out.edges.iter().map(|e| e.subject.as_str()).collect();
+    assert_eq!(subjects, [l2.as_str(), l.as_str()]);
+
+    let rs = g
+        .relationships(RelationshipsRequest { actor: v.clone(), others: vec![t.clone()], ..Default::default() })
+        .await
+        .unwrap()
+        .into_owned();
+    let names: Vec<&str> = rs.relationships[0].rels.iter().map(|r| r.rel.as_str()).collect();
+    assert_eq!(names, ["follow", "block"], "the relations between actors");
+    let rs = g
+        .relationships(RelationshipsRequest {
+            actor: v.clone(),
+            others: vec![l.clone(), l2.clone()],
+            rels: vec!["listblock".into()],
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_owned();
+    let outs: Vec<&str> = rs.relationships.iter().map(|r| r.rels[0].out_uri.as_str()).collect();
+    assert_eq!(outs, [lb(1), lb(2)], "named, they answer for list URIs");
+    for rel in ["listblock", "modlist"] {
+        let pair = BlockPair { a: v.clone(), b: t.clone(), ..Default::default() };
+        let req = BlockPairsRequest { pairs: vec![pair], rels: vec![rel.into()], ..Default::default() };
+        assert_eq!(g.block_pairs(req).await.unwrap_err().code, ErrorCode::InvalidArgument, "{rel}");
+    }
+
+    let r = g.write_batch(w(vec![del(&l)])).await.unwrap().into_owned();
+    assert_eq!(outcome(&r.results[0]), format!("removed {l}"), "a list that stopped being a mod list");
+    assert_eq!(has(&g, "modlist", &o, &l).await, "");
+}
+
+async fn has(g: &GraphClient<HttpClient>, rel: &str, from: &str, to: &str) -> String {
+    let req = HasRequest { rel: rel.into(), from: from.into(), to: to.into(), ..Default::default() };
+    g.has(req).await.unwrap().into_owned().uri
 }

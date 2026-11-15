@@ -499,7 +499,7 @@ pub fn filter_(g: &Graph, cx: &ReadCx<'_>, q: &FilterArgs, req: &FilterRequest) 
 }
 
 /// The relations a BlockPairs request names: block by default, and no
-/// list relation.
+/// list relation or relation whose subjects are records.
 pub fn block_pair_rels(g: &Graph, names: &[String]) -> Result<Vec<RelId>, ConnectError> {
     let rels = if names.is_empty() {
         vec![g.relations().by_name("block").ok_or_else(|| bad("no relation \"block\": name rels"))?]
@@ -508,6 +508,9 @@ pub fn block_pair_rels(g: &Graph, names: &[String]) -> Result<Vec<RelId>, Connec
     };
     if let Some(&r) = rels.iter().find(|&&r| g.relations().is_list(r)) {
         return Err(bad(format!("{:?} is a list relation", g.relations().get(r).name)));
+    }
+    if let Some(&r) = rels.iter().find(|&&r| g.relations().is_uri_subject(r)) {
+        return Err(bad(format!("{:?}'s subjects are records", g.relations().get(r).name)));
     }
     Ok(rels)
 }

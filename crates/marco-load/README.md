@@ -53,7 +53,7 @@ Decompressed, it is rows back to back, in ClickHouse's RowBinary encoding:
 |-----------|--------|-------------------------------------------|
 | `repo`    | String | LEB128 length, then UTF-8 bytes           |
 | `rkey`    | String | the same                                  |
-| `subject` | String | the same; empty for a delete              |
+| `subject` | String | the same; empty for a delete. A record's AT URI for a relation whose subjects are records |
 | `list`    | String | only in a list relation's files: the list's AT URI; empty for a delete |
 | `time_us` | Int64  | 8 bytes little-endian: when the op happened |
 | `op`      | UInt8  | 1 create, 2 update, 3 delete              |
@@ -87,8 +87,12 @@ mixed, in any order. An exporter that has current state, like
    while it's reduced. Two-character prefixes keep the whole network's
    follows (2.7B records) at about 3M rows a file.
 
-Rows whose repo or subject isn't a DID are counted (`bad_repo`,
-`bad_subject` in the report) and skipped.
+Rows whose repo isn't a DID, or whose subject isn't one the relation
+takes, are counted (`bad_repo`, `bad_subject` in the report) and skipped.
+A relation with `subject_collection` takes the AT URI of a record in that
+collection, and one whose subject is `$self` takes the row's own record
+URI (`at://<repo>/<collection>/<rkey>`). Those subjects are interned with
+the lists, so a list's URI is one id whichever relation names it.
 
 **Relations.** The build reads one directory per relation in its
 relations config (`--relations`, default follow, block and listitem), and a

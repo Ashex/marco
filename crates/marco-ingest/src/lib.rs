@@ -99,26 +99,55 @@ pub(crate) fn edge_uri(rels: &marco_core::Relations, did: &str, coll: &str, rkey
     marco_core::relation::parse_uri(&uri).is_some().then_some(uri)
 }
 
-pub(crate) fn valid_subject(s: &str) -> bool {
-    marco_core::did::classify(s).is_some()
+/// A create or update of record `uri` as its op: an add of its edge
+/// ([`marco_core::Relation::edge`]), or a delete when it isn't one, so the
+/// key empties and the live graph ends where a rebuild of the same records
+/// does. `get` reads a dotted path from the record. The skip label goes
+/// into `skipped`.
+pub(crate) fn upsert<'a>(
+    rel: &marco_core::Relation,
+    uri: String,
+    time_us: i64,
+    get: impl Fn(&str) -> Option<&'a str>,
+    skipped: &mut Vec<&'static str>,
+) -> Op {
+    let edge = rel.edge(&uri, |p| get(p)).map(|e| (e.subject.to_string(), e.list.map(str::to_string)));
+    match edge {
+        Ok((subject, list)) => Op::Add { uri, subject, list, time_us },
+        Err(why) => {
+            skipped.push(skip_label(why));
+            Op::Delete { uri, time_us }
+        }
+    }
 }
 
-/// A list relation's record: its list, which must be in the record's own
-/// repo (the appview refuses the rest too). Ok(None) for other relations.
-pub(crate) fn list_of(
-    rels: &marco_core::Relations,
-    rel: marco_core::RelId,
-    uri: &str,
-    list: Option<&str>,
-) -> Result<Option<String>, ()> {
-    if !rels.is_list(rel) {
-        return Ok(None);
+/// The live consumers' label for a record that isn't an edge
+/// (`marco_ingest_skipped_ops_total{reason}`).
+fn skip_label(why: marco_core::relation::Skip) -> &'static str {
+    use marco_core::relation::Skip;
+    match why {
+        Skip::Unmatched => "unmatched",
+        Skip::NoSubject | Skip::BadSubject => "bad_subject",
+        Skip::NoList | Skip::BadList | Skip::CrossRepo => "bad_list",
     }
-    let owner = marco_core::relation::parse_uri(uri).map(|x| x.0);
-    match list.and_then(|l| marco_core::relation::parse_uri(l).map(|x| (l, x.0))) {
-        Some((l, o)) if Some(o) == owner => Ok(Some(l.to_string())),
-        _ => Err(()),
+}
+
+/// The defaults, then a relation whose subject is a list and one holding a
+/// mod list's own URI.
+#[cfg(test)]
+pub(crate) fn list_rels() -> marco_core::Relations {
+    let mut toml = String::new();
+    for (name, coll, keys) in [
+        ("follow", "app.bsky.graph.follow", ""),
+        ("block", "app.bsky.graph.block", ""),
+        ("listitem", "app.bsky.graph.listitem", "list = \"list\"\n"),
+        ("listblock", "app.bsky.graph.listblock", "subject_collection = \"app.bsky.graph.list\"\n"),
+    ] {
+        toml += &format!("[[relation]]\nname = \"{name}\"\ncollection = \"{coll}\"\nsubject = \"subject\"\n{keys}\n");
     }
+    toml += "[[relation]]\nname = \"modlist\"\ncollection = \"app.bsky.graph.list\"\nsubject = \"$self\"\n";
+    toml += "when = { purpose = \"app.bsky.graph.defs#modlist\" }\n";
+    marco_core::Relations::parse_toml(&toml).unwrap()
 }
 
 pub(crate) fn account_change(did: &str, active: bool, status: Option<&str>) -> Change {

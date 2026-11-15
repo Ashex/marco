@@ -606,7 +606,9 @@ impl App {
         self.graph().hidden(did)
     }
 
-    /// Checks ops before any applies, so a bad batch changes nothing.
+    /// Checks ops before any applies, so a bad batch changes nothing. The
+    /// subject and list rules are the ones every ingest path applies; an op
+    /// carries no record, so a relation's `when` isn't checked here.
     pub fn validate(g: &Graph, ops: &[Op]) -> Result<(), String> {
         for (i, op) in ops.iter().enumerate() {
             let uri = match op {
@@ -617,15 +619,12 @@ impl App {
                 return Err(format!("op {i}: no relation for {coll}"));
             };
             if let Op::Add { subject, list, .. } = op {
-                if classify(subject).is_none() {
-                    return Err(format!("op {i}: subject {subject:?} isn't a DID"));
+                let r = g.relations().get(rel);
+                if r.check_subject(uri, subject).is_err() {
+                    return Err(format!("op {i}: subject {subject:?} isn't {}", r.subject_desc()));
                 }
-                if g.relations().is_list(rel) {
-                    let owner = parse_uri(uri).map(|x| x.0);
-                    match list.as_deref().and_then(parse_uri) {
-                        Some((o, _, _)) if Some(o) == owner => {}
-                        _ => return Err(format!("op {i}: {coll} needs a list in the record's own repo")),
-                    }
+                if r.check_list(uri, list.as_deref()).is_err() {
+                    return Err(format!("op {i}: {coll} needs a list in the record's own repo"));
                 }
             }
         }
