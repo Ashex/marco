@@ -10,10 +10,13 @@
 //! The first run copies the whole snapshot; later ones only what the
 //! checkpoints since wrote (their patches and new bases).
 
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
+use marco_core::snapshot::{PagedFooter, TRAILER};
+use marco_core::store::DIR_FILE;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -103,7 +106,10 @@ async fn sync(a: &Args) -> Result<Value> {
     }
     let files_dir = a.dir.join("files");
     std::fs::create_dir_all(&files_dir)?;
-    let r = fetch(&c, &auth, &base, &lr, &files_dir).await;
+    let r = match drop_stale_dir(&files_dir, &lr) {
+        Ok(()) => fetch(&c, &auth, &base, &lr, &files_dir).await,
+        Err(e) => Err(e),
+    };
     let _ = auth(c.delete(format!("{base}/admin/checkpoint?lease={}", lr.lease))).send().await;
     let (fetched, bytes, resumed) = r?;
 
@@ -140,6 +146,48 @@ async fn sync(a: &Args) -> Result<Value> {
         "bytes_fetched": bytes, "bytes_total": lr.files.iter().map(|f| f.bytes).sum::<u64>(), "dropped": dropped,
         "secs": t0.elapsed().as_secs_f64(), "snapshot": snap,
     }))
+}
+
+/// A snapshot file's footer, read from its last page and the JSON before it.
+fn read_footer(p: &Path) -> Result<PagedFooter> {
+    let mut f = std::fs::File::open(p).with_context(|| format!("open {}", p.display()))?;
+    let len = f.metadata()?.len();
+    let mut trailer = [0u8; TRAILER];
+    f.seek(SeekFrom::Start(len.saturating_sub(TRAILER as u64)))?;
+    f.read_exact(&mut trailer)?;
+    let r = PagedFooter::footer_range(len, &trailer)?;
+    let mut json = vec![0u8; (r.end - r.start) as usize];
+    f.seek(SeekFrom::Start(r.start))?;
+    f.read_exact(&mut json)?;
+    PagedFooter::parse(&json, r.start)
+}
+
+/// The build a directory file names, if it reads as one.
+fn dir_build(p: &Path) -> Option<u64> {
+    read_footer(p).ok()?.meta.get("build")?.as_u64()
+}
+
+/// Removes a directory file in `files_dir` that isn't the checkpoint's
+/// build. Every build's directory file has the one name, so a copy of
+/// another build's (a peer that rebuilt) the same size would pass for this
+/// one by name and size, and the snapshot would never open. The same goes
+/// for a download of one that finished but wasn't renamed into place; one
+/// still partial doesn't read as a directory yet and resumes (a resume onto
+/// another build's bytes fails its checksums and is removed).
+fn drop_stale_dir(files_dir: &Path, lr: &LeaseResp) -> Result<()> {
+    let build = lr.manifest.get("build").and_then(Value::as_u64);
+    let local = files_dir.join(DIR_FILE);
+    let part = files_dir.join(format!("{DIR_FILE}.part"));
+    let stale = |p: &Path, whole: bool| match dir_build(p) {
+        Some(b) => Some(b) != build,
+        None => whole,
+    };
+    for (p, whole) in [(&local, true), (&part, false)] {
+        if p.exists() && stale(p, whole) {
+            std::fs::remove_file(p).with_context(|| format!("remove {}", p.display()))?;
+        }
+    }
+    Ok(())
 }
 
 async fn fetch(
@@ -327,6 +375,39 @@ mod tests {
             lease_seconds: 60,
             peek: false,
         }
+    }
+
+    /// A directory file another build left in the mirror, the same size as
+    /// the checkpoint's, is fetched again rather than kept by its name and
+    /// size, so the mirror opens.
+    #[test]
+    fn a_directory_of_another_build_is_fetched_again() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (snap, addr, token, _app) = start_server(&rt, dir.path());
+        let other = dir.path().join("other");
+        marco_server::synth::write(&other, 300, 4).unwrap();
+        let theirs = std::fs::read(snap.join(DIR_FILE)).unwrap();
+        let stale = std::fs::read(other.join(DIR_FILE)).unwrap();
+        assert!(stale.len() == theirs.len() && stale != theirs, "a same-sized directory of another build");
+        let m = dir.path().join("stale");
+        std::fs::create_dir_all(m.join("files")).unwrap();
+        std::fs::write(m.join("files").join(DIR_FILE), &stale).unwrap();
+        let r = rt.block_on(sync(&args_for(addr, &token, &m))).unwrap();
+        assert_eq!(r["fetched"], r["files"]);
+        assert_eq!(std::fs::read(m.join("files").join(DIR_FILE)).unwrap(), theirs);
+        assert!(marco_core::Graph::open(&m.join("current")).is_ok());
+        // the checkpoint's own directory is kept
+        let again = rt.block_on(sync(&args_for(addr, &token, &m))).unwrap();
+        assert_eq!(again["fetched"], 0);
+        // a finished download of another build's, never renamed into place, is fetched again too
+        let m = dir.path().join("stale-part");
+        std::fs::create_dir_all(m.join("files")).unwrap();
+        std::fs::write(m.join("files").join(format!("{DIR_FILE}.part")), &stale).unwrap();
+        let r = rt.block_on(sync(&args_for(addr, &token, &m))).unwrap();
+        assert_eq!((r["fetched"].clone(), r["resumed"].clone()), (r["files"].clone(), json!(0)));
+        assert_eq!(std::fs::read(m.join("files").join(DIR_FILE)).unwrap(), theirs);
+        assert!(marco_core::Graph::open(&m.join("current")).is_ok());
     }
 
     /// A partial file is finished with Range, and a file already there by name and size isn't fetched.
