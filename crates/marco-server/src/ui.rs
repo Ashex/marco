@@ -69,7 +69,7 @@ struct Head<'a> {
     kind: &'a str,
 }
 
-const SITE_DESCRIPTION: &str = "A graph database for atproto actor-to-actor edges: follows, blocks, list items and any record whose subject is a DID.";
+const SITE_DESCRIPTION: &str = "A graph database for atproto's social graph: follows, blocks, list items and any record whose subject is a DID or a record such as a list.";
 const OG_IMAGE: &str = "/og/marco.png";
 
 pub struct Ui {

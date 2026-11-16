@@ -947,6 +947,182 @@ fn an_update_moves_a_listitem() {
     }
 }
 
+/// The defaults, then `listblock` (actor -> a list's URI) and `modlist` (an
+/// owner -> its own list record, while its purpose is a mod list).
+fn list_subjects() -> Relations {
+    Relations::parse_toml(
+        r#"
+[[relation]]
+name = "follow"
+collection = "app.bsky.graph.follow"
+subject = "subject"
+
+[[relation]]
+name = "block"
+collection = "app.bsky.graph.block"
+subject = "subject"
+
+[[relation]]
+name = "listitem"
+collection = "app.bsky.graph.listitem"
+subject = "subject"
+list = "list"
+
+[[relation]]
+name = "listblock"
+collection = "app.bsky.graph.listblock"
+subject = "subject"
+subject_collection = "app.bsky.graph.list"
+
+[[relation]]
+name = "modlist"
+collection = "app.bsky.graph.list"
+subject = "$self"
+when = { purpose = "app.bsky.graph.defs#modlist" }
+"#,
+    )
+    .unwrap()
+}
+
+const LISTBLOCK: u8 = 4;
+const MODLIST: u8 = 5;
+
+fn listblock(a: &str, rkey: &str) -> String {
+    format!("at://{a}/app.bsky.graph.listblock/{rkey}")
+}
+
+/// A list's URI is the subject of a listblock and of its owner's modlist
+/// edge, and the actor of its listitems: one node, one id, through a
+/// snapshot too.
+#[test]
+fn records_as_subjects_share_the_list_nodes() {
+    let (o, v, w, t) = (did(1), did(2), did(3), did(4));
+    let (l1, l2) = (list_uri(&o, 1), list_uri(&o, 2));
+    for snapshot_between in [false, true] {
+        let mut g = Graph::new(list_subjects());
+        g.shards = 3;
+        assert_eq!(g.add_rec(&listitem(&o, &tid(1)), &t, Some(&l1), 1).unwrap(), Added::Added);
+        assert_eq!(g.add_at(&listblock(&v, &tid(2)), &l1, 2).unwrap(), Added::Added);
+        assert_eq!(g.add_at(&listblock(&v, &tid(3)), &l2, 3).unwrap(), Added::Added);
+        assert_eq!(g.add_at(&listblock(&w, &tid(4)), &l1, 4).unwrap(), Added::Added);
+        assert_eq!(g.add_at(&l1, &l1, 5).unwrap(), Added::Added, "a mod list's record names itself");
+        assert!(g.add_at(&listblock(&v, &tid(9)), &t, 9).is_err(), "a DID isn't a list");
+        assert!(g.add_at(&listblock(&v, &tid(9)), &follow(&o, &tid(1)), 9).is_err(), "a record in another collection");
+        assert!(g.add_at(&l2, &l1, 9).is_err(), "a $self subject is the record's own URI");
+        assert!(g.add_at(&follow(&v, &tid(9)), &l1, 9).is_err(), "a follow's subject is a DID");
+        if snapshot_between {
+            g = reopen(&g);
+        }
+        let id = |g: &Graph, s: &str| g.id_of(s).unwrap();
+        let blocked_by: BTreeSet<u32> =
+            g.read(|cx| g.in_set(cx, LISTBLOCK, id(&g, &l1))).unwrap().into_iter().collect();
+        assert_eq!(blocked_by, [id(&g, &v), id(&g, &w)].into());
+        let on: Vec<u32> = g.read(|cx| g.in_set(cx, LIST, id(&g, &t))).unwrap();
+        assert_eq!(on, [id(&g, &l1)], "the listitem's list is the listblock's subject");
+        let (subs, _) = g.read(|cx| g.out_list(cx, LISTBLOCK, &v, 10, None)).unwrap();
+        assert_eq!(subs, vec![(listblock(&v, &tid(3)), l2.clone()), (listblock(&v, &tid(2)), l1.clone())]);
+        assert_eq!(g.read(|cx| g.has(cx, LISTBLOCK, &v, &l1)).unwrap(), Some(listblock(&v, &tid(2))));
+        assert_eq!(g.read(|cx| g.has(cx, MODLIST, &o, &l1)).unwrap(), Some(l1.clone()));
+        assert_eq!(g.read(|cx| g.has(cx, MODLIST, &o, &l2)).unwrap(), None);
+        assert_eq!(g.read(|cx| g.counts(cx, MODLIST, &l1)).unwrap(), (0, 1));
+        let r = g.read(|cx| g.relationships(cx, &v, &[&l1, &l2, &t], &[LISTBLOCK, LIST])).unwrap();
+        assert_eq!(r[0][0].out, Some(listblock(&v, &tid(2))), "a batch Has over list URIs");
+        assert_eq!(r[1][0].out, Some(listblock(&v, &tid(3))));
+        assert_eq!((r[2][0].out.as_deref(), r[0][1].inn.as_deref()), (None, None));
+
+        // a list updated to a curation list is a delete of its modlist edge, and back an add
+        assert_eq!(g.delete_at(&l1, 10).unwrap(), removed(&l1));
+        assert_eq!(g.read(|cx| g.has(cx, MODLIST, &o, &l1)).unwrap(), None);
+        assert_eq!(g.add_at(&l1, &l1, 11).unwrap(), Added::Added, "newer than the tombstone");
+        assert_eq!(g.delete(&listblock(&v, &tid(2))).unwrap(), removed(&l1));
+        assert_eq!(g.read(|cx| g.counts(cx, LISTBLOCK, &l1)).unwrap(), (0, 1));
+
+        g.set_status(&o, Some(Status::Takendown), 0).unwrap();
+        assert!(g.hidden(&l1), "a list subject hides with its owner");
+        g.set_status(&o, None, 0).unwrap();
+        assert_eq!(g.set_status(&w, Some(Status::Deleted), 20).unwrap(), 1, "an account's listblocks go with it");
+        assert_eq!(g.read(|cx| g.counts(cx, LISTBLOCK, &l1)).unwrap(), (0, 0));
+    }
+}
+
+/// A snapshot names the relation features it needs in its directory meta,
+/// and that directory is format 7, which a reader of format 6 alone refuses.
+/// A snapshot of the defaults without the fork's `listblock` names none and is
+/// format 6 with the meta keys it always had; with it, the defaults need
+/// `record_subjects`. A feature or a format this build doesn't know is refused,
+/// saying a newer build is needed.
+#[test]
+fn a_snapshot_requires_its_relation_features() {
+    use marco_core::snapshot::{PagedFooter, PAGED_FORMAT, REQUIRES_FORMAT};
+    use marco_core::store::DIR_FILE;
+    let dir = tempfile::tempdir().unwrap();
+    let footer = |snap: &std::path::Path| PagedFooter::read(&std::fs::read(snap.join(DIR_FILE)).unwrap()).unwrap();
+    // the check a reader of format 6 alone makes of the directory meta, word for word
+    let format_6_reader = |meta: &serde_json::Value| -> Result<(), String> {
+        match meta["format"].as_u64() {
+            Some(6) => Ok(()),
+            f => Err(format!("snapshot format {}, this build reads 6: rebuild the snapshot", f.unwrap_or(0))),
+        }
+    };
+    let plain = dir.path().join("plain");
+    let no_listblock = Relations::bsky_default().list.into_iter().filter(|r| r.name != "listblock").collect();
+    let mut g = Graph::new(Relations::new(no_listblock).unwrap());
+    g.add(&follow(&did(1), &tid(1)), &did(2)).unwrap();
+    g.write_snapshot(&plain).unwrap();
+    let meta = footer(&plain).meta;
+    let mut keys: Vec<&str> = meta.as_object().unwrap().keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    let before = ["build", "format", "layout", "n_ids", "n_other", "n_plc", "relations", "shard_width", "subj_index"];
+    assert_eq!(keys, before, "the keys the meta always had, and no requires");
+    assert_eq!((meta["format"].as_u64(), PAGED_FORMAT), (Some(6), 6));
+    assert_eq!(format_6_reader(&meta), Ok(()));
+
+    let forks = dir.path().join("forks");
+    let mut g = graph();
+    g.add(&follow(&did(1), &tid(1)), &did(2)).unwrap();
+    g.write_snapshot(&forks).unwrap();
+    assert_eq!(footer(&forks).meta["requires"], serde_json::json!(["record_subjects"]), "the fork's defaults");
+
+    let lists = dir.path().join("lists");
+    let mut g = Graph::new(list_subjects());
+    g.shards = 3;
+    let l = list_uri(&did(1), 1);
+    g.add_at(&listblock(&did(2), &tid(2)), &l, 2).unwrap();
+    g.add_at(&l, &l, 3).unwrap();
+    g.write_snapshot(&lists).unwrap();
+    let f = footer(&lists);
+    assert_eq!(f.meta["requires"], serde_json::json!(["record_subjects", "when"]));
+    assert_eq!((f.meta["format"].as_u64(), REQUIRES_FORMAT), (Some(7), 7));
+    assert_eq!(f.format, 6, "the file's own format stays 6");
+    assert_eq!(
+        format_6_reader(&f.meta),
+        Err("snapshot format 7, this build reads 6: rebuild the snapshot".into()),
+        "a reader of format 6 refuses it"
+    );
+    let g = Graph::open(&lists).unwrap();
+    assert_eq!(g.read(|cx| g.has(cx, MODLIST, &did(1), &l)).unwrap(), Some(l.clone()));
+    drop(g);
+
+    // the same directory, its meta edited as a newer build might write it
+    let p = lists.join(DIR_FILE);
+    let original = std::fs::read(&p).unwrap();
+    let rewrite = |edit: &dyn Fn(&mut serde_json::Value)| {
+        let mut f = PagedFooter::read(&original).unwrap();
+        let end = f.sections.iter().map(|s| s.off + s.len()).max().unwrap();
+        edit(&mut f.meta);
+        let mut out = original[..end as usize].to_vec();
+        out.extend(f.encode(end).unwrap());
+        std::fs::write(&p, out).unwrap();
+        format!("{:#}", Graph::open(&lists).err().expect("refused"))
+    };
+    let e = rewrite(&|m| m["requires"] = serde_json::json!(["record_subjects", "when", "someday"]));
+    assert!(e.contains("\"someday\"") && e.contains("doesn't know") && e.contains("newer build"), "{e}");
+    let e = rewrite(&|m| m["format"] = serde_json::json!(8));
+    assert!(e.contains("format 8 is newer than this build reads (6 or 7)") && e.contains("newer build"), "{e}");
+    let e = rewrite(&|m| m["format"] = serde_json::json!(5));
+    assert!(e.contains("format 5, this build reads 6 or 7: rebuild the snapshot"), "{e}");
+}
+
 #[test]
 fn a_graph_with_fewer_ids_than_shards_reopens() {
     let mut g = Graph::new(Relations::bsky_default());
@@ -1265,12 +1441,6 @@ fn combine_counted_on_long_lists() {
         }
     }
     assert!(exact_over_1000, "some pair has an exact total past 1,000");
-}
-
-const LISTBLOCK: u8 = 4;
-
-fn listblock(a: &str, rkey: &str) -> String {
-    format!("at://{a}/app.bsky.graph.listblock/{rkey}")
 }
 
 #[test]

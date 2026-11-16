@@ -46,6 +46,7 @@ rewrites), and `--memory` for marco's own cache of the snapshot's pages, which i
 | Graph writes | token | token or proxy login |
 | `marco.v1.Admin` | no | token or proxy login (`GetSession` is open) |
 | `/metrics`, `/debug/*` | no | token or proxy login |
+| `/admin/checkpoint` (checkpoint export) | no | token or proxy login |
 | `/admin` (console) | no | the page is open, its data needs a login |
 | `/docs`, `/healthz`, `/readyz` | open | open |
 | `/` | the landing page and explorer | redirects to `/admin/` |
@@ -97,6 +98,7 @@ console's Settings page shows each one's value and where it came from.
 | `--admin-operators` | `MARCO_ADMIN_OPERATORS` | | The logins the header may name, comma-separated. |
 | `--proxy-protocol-from` | `MARCO_PROXY_PROTOCOL_FROM` | | Addresses (CIDRs) whose connections start with a PROXY v2 header naming the caller. |
 | `--admin-proxy-peers` | `MARCO_ADMIN_PROXY_PEERS` | | The callers (TLV `0xE0`) whose header login is believed, comma-separated. |
+| `--export-token-file` | `MARCO_EXPORT_TOKEN_FILE` | | A token (16 characters at least, not the admin token) good for the checkpoint export alone: `/admin/checkpoint` and its files. Anywhere else on the admin listener it's a 403. |
 | `--jetstream URL` | `MARCO_JETSTREAM` | | Follow a Jetstream instance. |
 | `--jetstream-v2 URL` | `MARCO_JETSTREAM_V2` | | Follow a Jetstream v2 instance (`subscribeEvents`) by seq. Conflicts with `--jetstream` and `--firehose`. |
 | `--firehose URL` | `MARCO_FIREHOSE` | | Follow a relay's `subscribeRepos`. Conflicts with `--jetstream` and `--jetstream-v2`. |
@@ -157,7 +159,7 @@ A scraper that can't send the token reads the same text from `--ops-listen`, whi
 | `marco_ingest_connected` | `source` | 1 while the stream is open |
 | `marco_ingest_events_total` | `source`, `kind` | Events read |
 | `marco_ingest_ops_total` | `source`, `op` | Ops applied (`add`, `delete`, `status`) |
-| `marco_ingest_skipped_ops_total` | `source`, `reason` | Ops marco couldn't use (`bad_subject`, `bad_list`, `missing_block`…) |
+| `marco_ingest_skipped_ops_total` | `source`, `reason` | Ops marco couldn't use (`bad_subject`, `bad_list`, `missing_block`…), and records a relation's `when` doesn't keep (`unmatched`) |
 | `marco_ingest_decode_errors_total` | `source`, `reason` | Events that didn't decode |
 | `marco_ingest_reconnects_total` | `source`, `reason` | Streams dialled again |
 | `marco_ingest_apply_errors_total` | `source` | Sink writes that failed and were retried |
@@ -196,6 +198,8 @@ A scraper that can't send the token reads the same text from `--ops-listen`, whi
 | `marco_snapshot_bytes` | `section` | Snapshot bytes by section |
 | `marco_snapshot_seconds` | `what` | Snapshot open and write times |
 | `marco_build_info` | `version`, `commit` | 1 |
+| `marco_export_leases` | | Checkpoint export leases open |
+| `marco_export_bytes_total`, `marco_export_files_total` | | Checkpoint file bytes and file reads the export served |
 
 What to watch:
 
@@ -212,6 +216,50 @@ A lag of a few seconds is usually the source's. In the durability tests, two pub
 differed by up to 53 s while marco's own share of the lag stayed under 205 ms, so compare against
 another instance before blaming marco ([Durability and restarts, measured](p1-results.html)). marco doesn't ship a
 Grafana dashboard yet.
+
+## Snapshot formats
+
+A snapshot's manifest, directory and shard files are format 6. The one exception is the directory
+of a snapshot whose relations use `subject_collection`, `$self` or `when`: it's format 7, and it
+names those features in `requires` ([Relations](relations.md#where-it-lives)). marco checks both
+before it serves or writes anything. A format or feature newer than the build fails with
+`... is newer than this build reads ...` or `... which this build doesn't know: open it with a newer
+build of marco`, and an older format with `... rebuild the snapshot`.
+
+Builds of marco from before those relation keys read format 6 alone. They refuse a format 7
+snapshot at open with `snapshot format 7, this build reads 6: rebuild the snapshot`, and serve
+nothing from it. So to roll a server back to such a build, give it a snapshot built without those
+relations first. A snapshot without them is format 6, and builds on either side open it.
+
+## Checkpoint export
+
+Another process can copy the current checkpoint while marco keeps serving, checkpointing and
+compacting: seek's builder mirrors it to run PageRank, and it seeds a replica or takes a backup the
+same way. All of it is on the admin listener, behind the admin token, a proxy login, or the
+export token (`--export-token-file`), which opens the export and nothing else. At most 4 leases
+and 8 file streams run at once; past that a call gets 429.
+
+| Call | What it does |
+|---|---|
+| `GET /admin/checkpoint?ttl=SECS` | A lease (default 1800 s, at most 6 h): the manifest, its checkpoint number, and every file it names with its name and size (no file is read: it answers at once) |
+| `GET /admin/checkpoint?peek=1` | The checkpoint number, build and time only, no lease |
+| `GET /admin/checkpoint/files/NAME?lease=ID` | One file, with `Range: bytes=A-` to resume |
+| `DELETE /admin/checkpoint?lease=ID` | Ends the lease |
+
+A lease hard-links the files its manifest names into `<snapshot>.export/<lease>/`, so the snapshot's
+filesystem has to allow hard links (it's the same one). A compaction or a newer checkpoint can delete
+the originals meanwhile and the copy still reads the leased checkpoint. The links go when the lease is
+deleted or its ttl passes, and a restart clears them all. File streams go through `--background-io`,
+so requests go first. The lease carries no checksums: a file never changes under its name (the
+checkpoint number is in it), and every section of a snapshot file has its own xxh3, which the reader
+checks. Copied files plus the manifest are a snapshot
+directory `marco serve` or `marco-load` can open.
+
+`marco-load mirror --url ADMIN --token-file FILE --dir DIR` keeps a local copy in sync. It takes a
+lease, downloads only the files it doesn't have by name and size (a partial one resumed with Range),
+checks each fetched file against its own section checksums at local disk speed, unpaced (a file that
+fails is deleted and the sync fails, so the next run fetches it again), links them into `DIR/snap-<checkpoint>` and points `DIR/current` at it, then drops files no snapshot
+names. The first sync copies the whole snapshot, and later ones copy what the checkpoints since wrote.
 
 ## Profiling and tracing
 

@@ -41,12 +41,11 @@ use crate::inset::{self, InList, PagedIn};
 use crate::obs::{self, Applied, Op};
 use crate::outlog::{self, OutBytes, OutList, PagedOut};
 use crate::read::{Engine, Hold, ReadCx, StorageError, R};
-use crate::relation::{parse_uri, RelId, Relations, SubjectKind};
+use crate::relation::{parse_uri, RelId, Relations, Skip};
 use crate::rkey::{self, is_tid, key_of};
 use crate::segment::{Rec, Status};
 use crate::snapshot::{
     decode_live, decode_stamps, decode_statuses, decode_tombs, write_directory, BaseDir, DidAt, DirParts, Meta, Side,
-    PAGED_FORMAT,
 };
 use crate::store::{Manifest, ShardFile, Store, DEFAULT_SHARDS};
 use crate::varint::u32_at;
@@ -1713,20 +1712,20 @@ impl Graph {
         let Some((did, coll, rkey_s)) = parse_uri(uri) else { bail!("{uri:?} isn't a record URI") };
         let Some(rel) = self.rels.by_collection(coll) else { bail!("no relation for {coll}") };
         let owner = self.rels.owner_rel(rel);
-        let list = match (owner, list) {
-            (None, _) => None,
-            (Some(_), None) => bail!("{coll} records name their list"),
-            (Some(_), Some(l)) => match parse_uri(l) {
-                Some((o, _, _)) if o == did => Some(l),
-                Some(_) => bail!("{l} isn't in {did}'s repo"),
-                None => bail!("{l:?} isn't a record URI"),
-            },
+        let r = self.rels.get(rel);
+        let list = match r.check_list(uri, list) {
+            Ok(l) => l,
+            Err(Skip::NoList) => bail!("{coll} records name their list"),
+            Err(Skip::CrossRepo) => bail!("{} isn't in {did}'s repo", list.unwrap_or_default()),
+            Err(_) => bail!("{:?} isn't a record URI", list.unwrap_or_default()),
         };
+        if r.check_subject(uri, subject).is_err() {
+            bail!("{subject:?} isn't {}", r.subject_desc());
+        }
+        // a record's URI is a node, as a list is
+        let uri_subject = r.subject_records().is_some();
         let a = self.intern(did)?;
-        let s = match self.rels.get(rel).subject_kind {
-            SubjectKind::Did => self.intern(subject)?,
-            SubjectKind::List => self.intern_node(subject)?,
-        };
+        let s = if uri_subject { self.intern_node(subject)? } else { self.intern(subject)? };
         let l = list.map(|l| self.intern_node(l)).transpose()?;
         let (key, side) = key_of(rkey_s);
         let rec = owner.unwrap_or(rel);
@@ -2194,8 +2193,9 @@ impl Graph {
             m.statuses = body.statuses;
             w.finish("shard", &m)?;
         }
+        let requires = self.rels.requires();
         let meta = Meta {
-            format: PAGED_FORMAT,
+            format: crate::snapshot::dir_format(&requires),
             build: set.build,
             shard_width: set.width,
             n_ids: n,
@@ -2204,6 +2204,7 @@ impl Graph {
             subj_index: self.subj_index as u32,
             relations: self.rels.list.clone(),
             layout: crate::format6::LAYOUT,
+            requires,
         };
         set.finish(&meta, BTreeMap::new())?;
         Ok(())

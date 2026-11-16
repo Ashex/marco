@@ -25,8 +25,8 @@ Keep each one where it is: additive, in `marco-ingest`, `marco-load` and new fil
 
 | Patch | Files | What |
 |---|---|---|
-| `listblock` | `marco-core/src/relation.rs` (`SubjectKind` and `admits`, `valid_subject`, `actor_rels`), one line in `graph.rs` `add_`; `marco-ingest` decoders (`valid_subject` per relation, in v1, v2 and the firehose); `marco-load/src/build.rs` (`list_subject`, the directory pass and `out_chunk`), `jetstream/archive.rs` (`Wanted::subject_kind`); tests in `marco-core/tests/semantics.rs`, `build.rs`, `hubble/repo.rs`, `jetstream/archive.rs`, `tests/hubble.rs`, `tests/jetstream.rs` | A relation can name a list (`subject_kind = "list"`): its subject is a list's AT URI in any repo, stored as the list's node. The defaults gain `listblock` as relation 4, last, so the others keep their ids. A list-based block is the viewer's `listblock` out set intersected with the other account's `listitem` in set. **A bulk build with the default relations now needs a `listblock/` input directory**: `scan-hubble`, `scan-jetstream` and `sweep-hubble` write one (they scan `Relations::user()`) |
-| Followers newest first | `marco-core/src/relation.rs` (`newest_in`, the `.by` companion, `reverse_rel`), `graph.rs` (`put_rev`/`remove_rev` at `put_id`/`remove_id`, `rev_key`, `in_newest`, the account-deletion skip); `marco-load/src/build.rs` (`Mode::Reverse`, the reverse spill in `out_chunk`, `rev_shard6`), `diff.rs` (`one_way_by`: a `.by` key holds actor id bits, so it matches by time and actor DID); `proto/marco/v1/graph.proto` `ListInRequest.newest_first` and the regenerated code; `marco-server/src/graph_svc.rs`; the subscribe URLs (`jetstream.rs`, `jetstream2.rs`) and admin config skip the companion | A relation with `newest_in` (default: `follow`) keeps its records a second time under the subject, keyed by the record's time with the actor's low id bits, so `ListIn` can page a subject's followers newest first. Built from a subject-bucketed spill of the out pass (after the input's account cuts), then a reverse phase before the in sets. A second copy of every follow: plan for it when sizing |
+| `listblock` as a default | `marco-core/src/relation.rs` (`bsky_default` only: `listblock` is relation 4, with upstream's `subject_collection = "app.bsky.graph.list"`); tests in `marco-core/tests/semantics.rs`, `marco-server/tests/api.rs`, `marco-load/src/build.rs` | Upstream's records-as-subjects (`subject_collection`, `$self`, `when`, 2026-11) replaced our own `subject_kind = "list"` and its decoder, builder and archive hooks, which were dropped. All that's left is the default: the defaults gain `listblock` as relation 4, last, so the others keep their ids. A list-based block is the viewer's `listblock` out set intersected with the other account's `listitem` in set. **A bulk build with the default relations needs a `listblock/` input directory** (`scan-hubble`, `scan-jetstream` and `sweep-hubble` write one), and **its snapshot's directory is format 7** (`requires` names `record_subjects`), which a build from before upstream's relation keys refuses |
+| Followers newest first | `marco-core/src/relation.rs` (`newest_in`, `reverse_of`, the `.by` companion, `reverse_rel`, both in `RELATION_KEYS`), `graph.rs` (`put_rev`/`remove_rev` at `put_id`/`remove_id`, `rev_key`, `in_newest`, the account-deletion skip); `marco-load/src/build.rs` (`Mode::Reverse`, the reverse spill in `out_chunk`, `rev_shard6`), `diff.rs` (`one_way_by`: a `.by` key holds actor id bits, so it matches by time and actor DID); `proto/marco/v1/graph.proto` `ListInRequest.newest_first` and the regenerated code; `marco-server/src/graph_svc.rs`; the subscribe URLs (`jetstream.rs`, `jetstream2.rs`) and admin config skip the companion | A relation with `newest_in` (default: `follow`) keeps its records a second time under the subject, keyed by the record's time with the actor's low id bits, so `ListIn` can page a subject's followers newest first. Built from a subject-bucketed spill of the out pass (after the input's account cuts), then a reverse phase before the in sets. A second copy of every follow: plan for it when sizing |
 | Hubble sweep | `marco-load/src/sweep_hubble/` (new), `marco-load/src/main.rs`, `Cargo.toml` (the `sweep-hubble` feature), `README.md` | `marco-load sweep-hubble`: every repo on a Hubble mirror as STAR-lite into build input, plus `revs.tsv` (each repo's revision) for graph-sync. Beside upstream's `scan-hubble` (`src/hubble/`), which fetches whole CARs and writes no revisions |
 
 ## When upstream changes under a patch
@@ -37,13 +37,15 @@ Keep each one where it is: additive, in `marco-ingest`, `marco-load` and new fil
   `build::build_scanned`. If upstream changes those, the sweep's tests fail first; adapt the sweep,
   not spill.
 - A new upstream loader must scan `Relations::user()` (so it writes `listblock/`) and check a
-  subject with the relation's kind, not as a DID, or the default build fails or drops every
-  listblock.
+  subject with `Relation::edge` or `check_subject`, not as a DID, or the default build fails or
+  drops every listblock. `sweep_hubble` does the same.
 - If upstream ships something a patch does, prefer upstream's and drop ours once graph-sync's tests
   pass against it. Dropped so far: our Jetstream v2 consumer (2026-11, for upstream's
-  `--jetstream-v2`).
+  `--jetstream-v2`), and our `subject_kind = "list"` (2026-11-16, for upstream's
+  `subject_collection`: snapshots the old fork built carry `subject_kind` in their directory and
+  need a rebuild).
 - Upstream encourages forks to build what they need rather than wait (2026-11-12), so the fork
-  carries `listblock` and time-ordered followers itself.
+  carries `listblock` as a default and time-ordered followers itself.
 
 ## Worth asking upstream for
 

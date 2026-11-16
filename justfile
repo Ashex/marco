@@ -97,11 +97,12 @@ tools:
         (cd ui && npm ci)
     fi
 
-gen_dirs := "crates/marco-proto/src/gen ui/src/gen"
+gen_dirs := "crates/marco-proto/src/gen ui/src/gen crates/seek-api/src/gen"
 
 # Regenerate the API code from proto/
 gen: tools
     cd proto && buf lint && buf generate
+    cd crates/seek-api/proto && buf lint && buf generate
 
 # Fail if the generated code is stale: regenerate it and compare
 check-gen: tools
@@ -111,9 +112,28 @@ check-gen: tools
     trap 'rm -rf "$tmp"' EXIT
     for d in {{gen_dirs}}; do mkdir -p "$tmp/$d" && cp -R "$d/." "$tmp/$d"; done
     (cd proto && buf lint && buf generate)
+    (cd crates/seek-api/proto && buf lint && buf generate)
     for d in {{gen_dirs}}; do diff -r "$tmp/$d" "$d"; done
 
 # The server on a snapshot (see marco serve --help)
 serve *args:
     cargo build --release -p marco-server
     ${CARGO_TARGET_DIR:-target}/release/marco serve {{args}}
+
+# seek's bucket test against a throwaway MinIO in Docker (the vlpds harness's image, build/Dockerfile.minio there)
+seek-minio-test port="19400":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    name="seek-minio-test-{{port}}-$$"
+    img=${SEEK_MINIO_IMAGE:-vlpds-minio:local}
+    docker image inspect "$img" >/dev/null 2>&1 || docker build -t "$img" -f ../vlpds/build/Dockerfile.minio ../vlpds/build
+    docker run -d --rm --name "$name" -p 127.0.0.1:{{port}}:9000 -e MINIO_ROOT_USER=seektest -e MINIO_ROOT_PASSWORD=seektestsecret "$img" server /data >/dev/null
+    trap 'docker rm -f "$name" >/dev/null' EXIT
+    until curl -sf http://127.0.0.1:{{port}}/minio/health/ready >/dev/null; do sleep 0.5; done
+    docker exec "$name" mc alias set local http://127.0.0.1:9000 seektest seektestsecret >/dev/null
+    docker exec "$name" mc mb local/seek-test >/dev/null
+    creds=$(mktemp)
+    echo '{"access_key_id": "seektest", "secret_access_key": "seektestsecret"}' > "$creds"
+    SEEK_TEST_S3=http://127.0.0.1:{{port}} SEEK_TEST_S3_BUCKET=seek-test SEEK_TEST_S3_CREDENTIALS="$creds" \
+      cargo test -p seek-server --test bucket -- --ignored
+    rm -f "$creds"

@@ -345,6 +345,35 @@ mod tests {
         );
     }
 
+    /// v2 shares v1's commit rule: a list's purpose decides its `modlist`
+    /// edge, and a listblock's subject is a list's URI.
+    #[test]
+    fn list_subjects_and_purpose() {
+        let rels = crate::list_rels();
+        assert!(subscribe_url("wss://js.example", &rels, None)
+            .contains("&collections=app.bsky.graph.listblock&collections=app.bsky.graph.list&kinds="));
+        let frame = |seq: u64, op: &str, coll: &str, record: &str| {
+            let f = format!(
+                r#"{{"$type":"message","payload":{{"$type":"x#commit","did":"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa","seq":{seq},"time":"2026-11-11T21:55:21.789604Z","operation":"{op}","collection":"{coll}","rkey":"3kaaaaaaaaa22","record":{record}}}}}"#
+            );
+            let Ok(Frame::Event(ev)) = decode(f.as_bytes(), &rels) else { panic!("{f}") };
+            ev
+        };
+        let own = "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.graph.list/3kaaaaaaaaa22";
+        let ev = frame(5, "create", "app.bsky.graph.list", r#"{"purpose":"app.bsky.graph.defs#modlist"}"#);
+        assert!(
+            matches!(ev.change, Change::Ops(ref o) if matches!(&o[0], Op::Add { uri, subject, .. } if uri == own && subject == own))
+        );
+        let ev = frame(6, "update", "app.bsky.graph.list", r#"{"purpose":"app.bsky.graph.defs#referencelist"}"#);
+        assert_eq!(ev.skipped, vec!["unmatched"]);
+        assert!(matches!(ev.change, Change::Ops(ref o) if matches!(&o[0], Op::Delete { uri, .. } if uri == own)));
+        let list = "at://did:plc:cccccccccccccccccccccccc/app.bsky.graph.list/3kaaaaaaaaa2a";
+        let ev = frame(7, "create", "app.bsky.graph.listblock", &format!(r#"{{"subject":"{list}"}}"#));
+        assert!(matches!(ev.change, Change::Ops(ref o) if matches!(&o[0], Op::Add { subject, .. } if subject == list)));
+        let ev = frame(8, "create", "app.bsky.graph.listblock", r#"{"subject":"did:plc:cccccccccccccccccccccccc"}"#);
+        assert_eq!(ev.skipped, vec!["bad_subject"], "a DID isn't a list");
+    }
+
     #[test]
     fn rejections() {
         assert_eq!(rejection(br#"{"error":"CursorTooOld","message":"floor 5"}"#).as_deref(), Some("CursorTooOld"));

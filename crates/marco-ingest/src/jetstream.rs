@@ -6,10 +6,11 @@
 //! No zstd: Jetstream compresses with a custom dictionary a client has to
 //! carry, and follows, blocks and account events together are a few KB/s.
 
+use marco_core::relation::json_path;
 use marco_core::Relations;
 use serde::Deserialize;
 
-use crate::{account_change, edge_uri, list_of, Change, Event, Kind, Op};
+use crate::{account_change, edge_uri, upsert, Change, Event, Kind, Op};
 
 /// Jetstream's `time_us` is per instance and may repeat across events, so a
 /// resume starts this far back and replays the overlap.
@@ -78,20 +79,19 @@ pub(crate) fn commit_change(
     };
     match operation {
         // An update is an add, which replaces what the key held. A record
-        // that isn't an edge (a bad subject or list) leaves the key empty,
-        // as a delete, so the live graph ends where a rebuild does.
+        // that isn't an edge (a bad subject or list, or one `when` doesn't
+        // keep) leaves the key empty, as a delete, so the live graph ends
+        // where a rebuild does.
         "create" | "update" => {
-            let subject = record.and_then(|r| rels.get(rel).subject_of(r));
-            let list = record.and_then(|r| rels.get(rel).list_of(r));
-            match (subject, list_of(rels, rel, &uri, list)) {
-                (Some(s), Ok(list)) if rels.get(rel).valid_subject(s) => {
-                    ev.change = Change::Ops(vec![Op::Add { uri, subject: s.to_string(), list, time_us: ev.time_us }]);
-                }
-                (_, list) => {
-                    ev.skipped.push(if list.is_err() { "bad_list" } else { "bad_subject" });
-                    ev.change = Change::Ops(vec![Op::Delete { uri, time_us: ev.time_us }]);
-                }
-            }
+            // a relation can need nothing from the record ($self, no when), so
+            // one that's missing or isn't an object is caught here
+            let Some(record) = record.filter(|r| r.is_object()) else {
+                ev.skipped.push("bad_record");
+                ev.change = Change::Ops(vec![Op::Delete { uri, time_us: ev.time_us }]);
+                return;
+            };
+            let get = |p: &str| json_path(record, p);
+            ev.change = Change::Ops(vec![upsert(rels.get(rel), uri, ev.time_us, get, &mut ev.skipped)]);
         }
         "delete" => ev.change = Change::Ops(vec![Op::Delete { uri, time_us: ev.time_us }]),
         _ => ev.skipped.push("bad_operation"),
@@ -275,5 +275,86 @@ mod tests {
             time_us: 9,
         }]);
         assert_eq!((ev.change, ev.skipped), (gone, vec!["bad_list"]), "not an edge: its key empties");
+    }
+
+    /// A create or update whose record is missing or isn't an object is a
+    /// bad record and empties its key, whatever the relation needs from it: a
+    /// `$self` relation with no `when` reads nothing.
+    #[test]
+    fn a_record_that_isnt_an_object() {
+        let rels = marco_core::Relations::parse_toml(
+            "[[relation]]\nname = \"follow\"\ncollection = \"app.bsky.graph.follow\"\nsubject = \"subject\"\n\n\
+             [[relation]]\nname = \"lists\"\ncollection = \"app.bsky.graph.list\"\nsubject = \"$self\"\n",
+        )
+        .unwrap();
+        let own = "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.graph.list/3kaaaaaaaaa22";
+        let line = |op: &str, record: &str| {
+            format!(
+                r#"{{"did":"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa","time_us":9,"kind":"commit","commit":{{"operation":"{op}","collection":"app.bsky.graph.list","rkey":"3kaaaaaaaaa22"{record}}}}}"#
+            )
+        };
+        let gone = Change::Ops(vec![Op::Delete { uri: own.into(), time_us: 9 }]);
+        for (op, record) in [
+            ("create", ""),
+            ("create", r#","record":null"#),
+            ("update", r#","record":"x""#),
+            ("create", r#","record":[1]"#),
+        ] {
+            let ev = decode(line(op, record).as_bytes(), &rels).unwrap();
+            assert_eq!((ev.change, ev.skipped), (gone.clone(), vec!["bad_record"]), "{op} {record}");
+        }
+        let ev = decode(line("create", r#","record":{"name":"n"}"#).as_bytes(), &rels).unwrap();
+        let add = Change::Ops(vec![Op::Add { uri: own.into(), subject: own.into(), list: None, time_us: 9 }]);
+        assert_eq!((ev.change, ev.skipped), (add, vec![]), "any object is its own edge");
+    }
+
+    /// A listblock's subject is a list's URI, and a list's own URI is its
+    /// owner's `modlist` edge while its purpose is a mod list: an update to
+    /// another purpose empties the key, and one back adds it again.
+    #[test]
+    fn list_subjects_and_purpose() {
+        let rels = crate::list_rels();
+        assert!(subscribe_url("wss://js.example", &rels, None)
+            .ends_with("&wantedCollections=app.bsky.graph.listblock&wantedCollections=app.bsky.graph.list"));
+        let line = |op: &str, coll: &str, rkey: &str, record: &str| {
+            format!(
+                r#"{{"did":"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa","time_us":9,"kind":"commit","commit":{{"operation":"{op}","collection":"{coll}","rkey":"{rkey}","record":{record}}}}}"#
+            )
+        };
+        let list = "at://did:plc:cccccccccccccccccccccccc/app.bsky.graph.list/3kaaaaaaaaa2a";
+        let block = "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.graph.listblock/3kaaaaaaaaa22";
+        let ev = decode(
+            line("create", "app.bsky.graph.listblock", "3kaaaaaaaaa22", &format!(r#"{{"subject":"{list}"}}"#))
+                .as_bytes(),
+            &rels,
+        )
+        .unwrap();
+        let add = |uri: &str, subject: &str| {
+            Change::Ops(vec![Op::Add { uri: uri.into(), subject: subject.into(), list: None, time_us: 9 }])
+        };
+        let gone = |uri: &str| Change::Ops(vec![Op::Delete { uri: uri.into(), time_us: 9 }]);
+        assert_eq!((ev.change, ev.skipped), (add(block, list), vec![]));
+        let follow = "at://did:plc:cccccccccccccccccccccccc/app.bsky.graph.follow/3kaaaaaaaaa2a";
+        let ev = decode(
+            line("update", "app.bsky.graph.listblock", "3kaaaaaaaaa22", &format!(r#"{{"subject":"{follow}"}}"#))
+                .as_bytes(),
+            &rels,
+        )
+        .unwrap();
+        assert_eq!((ev.change, ev.skipped), (gone(block), vec!["bad_subject"]), "a record in another collection");
+
+        let own = "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.graph.list/3kaaaaaaaaa23";
+        let purpose = |op: &str, p: &str| {
+            let rec = format!(r#"{{"name":"n","purpose":"app.bsky.graph.defs#{p}"}}"#);
+            decode(line(op, "app.bsky.graph.list", "3kaaaaaaaaa23", &rec).as_bytes(), &rels).unwrap()
+        };
+        let ev = purpose("create", "modlist");
+        assert_eq!((ev.change, ev.skipped), (add(own, own), vec![]));
+        let ev = purpose("update", "curatelist");
+        assert_eq!((ev.change, ev.skipped), (gone(own), vec!["unmatched"]), "no longer a mod list");
+        let ev = purpose("update", "modlist");
+        assert_eq!(ev.change, add(own, own), "a mod list again");
+        let ev = decode(line("delete", "app.bsky.graph.list", "3kaaaaaaaaa23", "null").as_bytes(), &rels).unwrap();
+        assert_eq!((ev.change, ev.skipped), (gone(own), vec![]));
     }
 }

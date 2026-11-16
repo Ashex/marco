@@ -7281,6 +7281,29 @@ pub struct RelationInfo {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
     )]
     pub owner_of: ::buffa::alloc::string::String,
+    /// Subjects are AT URIs of records in this collection, not DIDs. A
+    /// subject of "$self" is the record's own URI, in collection.
+    ///
+    /// Field 10: `subject_collection`
+    #[serde(
+        rename = "subjectCollection",
+        alias = "subject_collection",
+        with = "::buffa::json_helpers::proto_string",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    )]
+    pub subject_collection: ::buffa::alloc::string::String,
+    /// Dotted paths and the string each holds while a record is an edge.
+    ///
+    /// Field 11: `when`
+    #[serde(
+        rename = "when",
+        skip_serializing_if = "::buffa::__private::HashMap::is_empty",
+        deserialize_with = "::buffa::json_helpers::null_as_default"
+    )]
+    pub when: ::buffa::__private::HashMap<
+        ::buffa::alloc::string::String,
+        ::buffa::alloc::string::String,
+    >,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -7297,6 +7320,8 @@ impl ::core::fmt::Debug for RelationInfo {
             .field("non_tid", &self.non_tid)
             .field("list", &self.list)
             .field("owner_of", &self.owner_of)
+            .field("subject_collection", &self.subject_collection)
+            .field("when", &self.when)
             .finish()
     }
 }
@@ -7354,6 +7379,18 @@ impl ::buffa::Message for RelationInfo {
         if !self.owner_of.is_empty() {
             size += 1u64 + ::buffa::types::string_encoded_len(&self.owner_of) as u64;
         }
+        if !self.subject_collection.is_empty() {
+            size
+                += 1u64
+                    + ::buffa::types::string_encoded_len(&self.subject_collection)
+                        as u64;
+        }
+        size
+            += ::buffa::map_codec::field_len::<
+                ::buffa::map_codec::Str,
+                ::buffa::map_codec::Str,
+                _,
+            >(&self.when, 1u64);
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -7391,6 +7428,14 @@ impl ::buffa::Message for RelationInfo {
         if !self.owner_of.is_empty() {
             ::buffa::types::put_string_field(9u32, &self.owner_of, buf);
         }
+        if !self.subject_collection.is_empty() {
+            ::buffa::types::put_string_field(10u32, &self.subject_collection, buf);
+        }
+        ::buffa::map_codec::write_field::<
+            ::buffa::map_codec::Str,
+            ::buffa::map_codec::Str,
+            _,
+        >(&self.when, 11u32, buf);
         self.__buffa_unknown_fields.write_to(buf);
     }
     fn merge_field(
@@ -7467,6 +7512,24 @@ impl ::buffa::Message for RelationInfo {
                 )?;
                 ::buffa::types::merge_string(&mut self.owner_of, buf)?;
             }
+            10u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.subject_collection, buf)?;
+            }
+            11u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::map_codec::merge_entry::<
+                    ::buffa::map_codec::Str,
+                    ::buffa::map_codec::Str,
+                    _,
+                >(&mut self.when, buf, ctx)?;
+            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -7484,6 +7547,8 @@ impl ::buffa::Message for RelationInfo {
         self.non_tid = 0u64;
         self.list.clear();
         self.owner_of.clear();
+        self.subject_collection.clear();
+        self.when.clear();
         self.__buffa_unknown_fields.clear();
     }
 }

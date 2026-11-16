@@ -27,11 +27,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use futures::StreamExt;
+use marco_core::relation::Skip;
 use marco_core::{RelId, Relations};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::build::{own_list, CURSORS, SNAPSHOT_TIME};
+use crate::build::{CURSORS, SNAPSHOT_TIME};
 use crate::rows::put_row;
 use crate::spill::{bucket_of, Spill, BUCKETS};
 use client::{Client, FetchError, Repo};
@@ -211,22 +212,21 @@ fn rows_of(
             c.bad_record += 1;
             continue;
         };
-        let r = rels.get(rel);
-        let Some(subject) = path_of(&v, &r.subject).filter(|s| r.valid_subject(s)) else {
-            c.bad_subject += 1;
-            continue;
+        let uri = format!("at://{did}/{coll}/{rkey}");
+        let edge = match rels.get(rel).edge(&uri, |p| path_of(&v, p)) {
+            Ok(e) => e,
+            // a record `when` doesn't keep isn't this relation's
+            Err(Skip::Unmatched) => continue,
+            Err(Skip::NoList | Skip::BadList | Skip::CrossRepo) => {
+                c.cross_repo_rows += 1;
+                continue;
+            }
+            Err(Skip::NoSubject | Skip::BadSubject) => {
+                c.bad_subject += 1;
+                continue;
+            }
         };
-        let list = match &r.list {
-            Some(p) => match path_of(&v, p).and_then(|l| own_list(did.as_bytes(), l.as_bytes())) {
-                Some(l) => Some(l.to_string()),
-                None => {
-                    c.cross_repo_rows += 1;
-                    continue;
-                }
-            },
-            None => None,
-        };
-        out[idx[&rel]].push((rkey.to_string(), subject.to_string(), list));
+        out[idx[&rel]].push((rkey.to_string(), edge.subject.to_string(), edge.list.map(str::to_string)));
     }
     out
 }

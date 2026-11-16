@@ -17,6 +17,10 @@
 //! URI. They're read twice: by owner for the companion (owner -> list) and
 //! by list for the relation (list -> member). A list's URI starts with its
 //! owner's DID, so a repo-prefix file's lists are one id range too.
+//!
+//! A relation whose subjects are records (`subject_collection`, `$self`)
+//! has a URI in its subject column, interned with the lists, so a
+//! listblock's list and a listitem's list are one id.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
@@ -38,8 +42,7 @@ use marco_core::snapshot::{
     encode_side, rel_section, write_directory, DirParts, Meta, PagedFooter, PagedWriter, RelStats, ShardMeta,
     PAGED_FORMAT,
 };
-use marco_core::Relations;
-use marco_core::SubjectKind;
+use marco_core::{Relation, Relations};
 
 use crate::metrics;
 use crate::rows::Rows;
@@ -509,7 +512,8 @@ type RepoSpan = Option<(Vec<u8>, Vec<u8>)>;
 /// How a relation reads its files.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Mode {
-    /// (repo, rkey, subject): edges repo -> subject.
+    /// (repo, rkey, subject): edges repo -> subject, a DID or, for a
+    /// relation whose subjects are records, a record's URI node.
     Plain,
     /// (repo, rkey, subject, list): edges list -> subject.
     ByList,
@@ -537,18 +541,22 @@ pub(crate) fn own_list<'a>(repo: &[u8], list: &'a [u8]) -> Option<&'a str> {
     (owner.as_bytes() == repo).then_some(l)
 }
 
+/// The subject column's URI, for a relation whose subjects are records, if
+/// the relation takes it for record (repo, rkey) as the live path does
+/// ([`Relation::check_subject`]).
+fn uri_subject<'a>(rel: &Relation, repo: &[u8], rkey: &[u8], subject: &'a [u8]) -> Option<&'a str> {
+    let s = std::str::from_utf8(subject).ok()?;
+    let (repo, rkey) = (std::str::from_utf8(repo).ok()?, std::str::from_utf8(rkey).ok()?);
+    rel.check_subject(&format!("at://{repo}/{}/{rkey}", rel.collection), s).ok().map(|()| s)
+}
+
 /// The op column: 1 create, 2 update, 3 delete (repo_records' enum; crawl rows are creates).
 const OP_DELETE: u8 = 3;
 
-/// A list's record URI: what a relation naming lists has as its subject.
-fn list_subject(b: &[u8]) -> Option<&str> {
-    std::str::from_utf8(b).ok().filter(|s| s.starts_with("at://") && marco_core::relation::parse_uri(s).is_some())
-}
-
-/// `files`: (path, has a list column, subjects are lists). `extra`: DIDs to
+/// `files`: each with the configured relation it's for. `extra`: DIDs to
 /// have ids whether or not a row names them (those with a status).
 fn build_dir(
-    files: &[(PathBuf, bool, bool)],
+    files: &[(PathBuf, &Relation)],
     extra: &[String],
     c: &Counters,
 ) -> Result<(Dir, Vec<(RepoSpan, RepoSpan)>)> {
@@ -566,14 +574,16 @@ fn build_dir(
     };
     let spans = files
         .par_iter()
-        .map(|(f, has_list, subject_list)| -> Result<(RepoSpan, RepoSpan)> {
+        .map(|&(ref f, rel)| -> Result<(RepoSpan, RepoSpan)> {
             let t = Instant::now();
+            let has_list = rel.list.is_some();
+            // a record's URI as the subject is a node, as a list is
+            let uri_subjects = rel.subject_records().is_some();
             let mut rows = Rows::open(f)?;
-            let mut cols = vec![Vec::new(); if *has_list { 4 } else { 3 }];
+            let mut cols = vec![Vec::new(); if has_list { 4 } else { 3 }];
             let mut list_span: RepoSpan = None;
             let mut local_lists: HashSet<String> = HashSet::new();
-            let mut bad_list = 0u64;
-            let mut bad_node = 0u64;
+            let (mut bad_list, mut bad_uri) = (0u64, 0u64);
             let mut bufs: Vec<Vec<u128>> = (0..DIR_SHARDS).map(|_| Vec::with_capacity(4096)).collect();
             let mut local_other: HashSet<String> = HashSet::new();
             let mut last_repo: Vec<u8> = Vec::new();
@@ -613,19 +623,16 @@ fn build_dir(
                     }
                     last_repo.clone_from(&cols[0]);
                 }
-                if *subject_list {
-                    match list_subject(&cols[2]) {
-                        Some(l) => {
-                            if !local_lists.contains(l) {
-                                local_lists.insert(l.to_string());
-                            }
-                        }
-                        None => bad_node += 1,
+                if !uri_subjects {
+                    add(&cols[2], &mut bufs);
+                } else if let Some(s) = uri_subject(rel, &cols[0], &cols[1], &cols[2]) {
+                    if !local_lists.contains(s) {
+                        local_lists.insert(s.to_string());
                     }
                 } else {
-                    add(&cols[2], &mut bufs);
+                    bad_uri += 1;
                 }
-                if *has_list {
+                if has_list {
                     match own_list(&cols[0], &cols[3]) {
                         Some(l) => {
                             if !local_lists.contains(l) {
@@ -644,7 +651,7 @@ fn build_dir(
             }
             others.lock().unwrap().extend(local_other.into_iter().chain(local_lists));
             c.rows.fetch_add(n, Relaxed);
-            c.bad.fetch_add(bad + bad_list + bad_node, Relaxed);
+            c.bad.fetch_add(bad + bad_list + bad_uri, Relaxed);
             c.add(0, t);
             Ok((span, list_span))
         })
@@ -757,7 +764,7 @@ fn put_str(out: &mut Vec<u8>, s: &[u8]) {
 fn out_chunk(
     f: &Path,
     mode: Mode,
-    subject_list: bool,
+    rel: &Relation,
     dir: &Dir,
     lo: u32,
     hi: u32,
@@ -772,6 +779,7 @@ fn out_chunk(
     let t = Instant::now();
     let mut rows = Rows::open(f)?;
     let listed = mode != Mode::Plain;
+    let uri_subjects = rel.subject_records().is_some();
     let mut cols = vec![Vec::new(); if listed { 4 } else { 3 }];
     // per row: rkey, time_us, op; and id slots (repo, subject[, list]) filled below
     let w = if listed { 3 } else { 2 };
@@ -809,9 +817,9 @@ fn out_chunk(
             ids.push(u32::MAX);
         }
         if op != OP_DELETE {
-            if subject_list {
-                if let Some(l) = list_subject(&cols[2]) {
-                    ids[(w * row + 1) as usize] = dir.other_id(l);
+            if uri_subjects {
+                if let Some(s) = uri_subject(rel, &cols[0], &cols[1], &cols[2]) {
+                    ids[(w * row + 1) as usize] = dir.other_id(s);
                 }
             } else {
                 match std::str::from_utf8(&cols[2]).ok().and_then(classify) {
@@ -1072,12 +1080,11 @@ fn out_shard6(
             }
             let k = (lo / spills[ri].width.max(1)) as usize;
             let del = o.deletes.as_ref().map(|d| (d, o.rels.list[ri].name.as_str(), k));
-            // a companion reads its list relation's files, whose subjects are accounts
-            let subject_list = o.rels.list[ri].subject_kind == SubjectKind::List && o.rels.list[ri].owner_of.is_none();
+            let rel = &o.rels.list[ri];
             let mut co = out_chunk(
                 f,
                 *mode,
-                subject_list,
+                rel,
                 dir,
                 lo,
                 hi,
@@ -1275,18 +1282,20 @@ pub fn build(o: &Opts) -> Result<Report> {
             _ => (Mode::Plain, r.name.as_str()),
         })
         .collect();
-    let mut all: Vec<(PathBuf, bool, bool)> = Vec::new();
+    // each file with the configured relation whose directory holds it
+    let mut all: Vec<(PathBuf, &Relation)> = Vec::new();
     let mut per_rel: Vec<Vec<usize>> = Vec::new();
-    for (&(mode, dir), r) in modes.iter().zip(&o.rels.list) {
-        let subject_list = r.subject_kind == SubjectKind::List && r.owner_of.is_none();
+    for &(mode, dir) in &modes {
+        // a .by companion has no files: it's built from its relation's spill
         if mode == Mode::Reverse {
             per_rel.push(Vec::new());
             continue;
         }
+        let owner = o.rels.by_name(dir).map(|r| o.rels.get(r)).context("a companion without its list relation")?;
         let mut v = Vec::new();
         for f in files_of(&o.input, dir)? {
             let i = all.iter().position(|x| x.0 == f).unwrap_or_else(|| {
-                all.push((f, mode != Mode::Plain, subject_list));
+                all.push((f, owner));
                 all.len() - 1
             });
             v.push(i);
@@ -1505,8 +1514,9 @@ pub fn build(o: &Opts) -> Result<Report> {
         metrics::rel(&rr);
         rep.rels.push(rr);
     }
+    let requires = o.rels.requires();
     let meta = Meta {
-        format: PAGED_FORMAT,
+        format: marco_core::snapshot::dir_format(&requires),
         build: set.build,
         shard_width: width,
         n_ids: n,
@@ -1515,6 +1525,7 @@ pub fn build(o: &Opts) -> Result<Report> {
         subj_index: o.subj_index as u32,
         relations: o.rels.list.clone(),
         layout: marco_core::format6::LAYOUT,
+        requires,
     };
     let df = set.finish(&meta, o.cursors.clone())?;
     c.add(5, t);
@@ -1602,12 +1613,11 @@ mod tests {
 
     fn live(g: &mut Graph, coll: &str, mut ops: Vec<LiveOp>) {
         ops.sort_by_key(|r| (r.4, r.5));
+        let rel = g.relations().get(g.relations().by_collection(coll).unwrap()).clone();
         for (a, k, s, l, us, op) in ops {
             let uri = format!("at://{a}/{coll}/{k}");
-            let rels = g.relations();
-            let rel = rels.get(rels.by_collection(coll).unwrap());
             let edge = op != OP_DELETE
-                && rel.valid_subject(s)
+                && rel.check_subject(&uri, s).is_ok()
                 && l.is_none_or(|l| own_list(a.as_bytes(), l.as_bytes()).is_some());
             if edge {
                 g.add_rec(&uri, s, l, us).unwrap();
@@ -2127,6 +2137,142 @@ mod tests {
             .collect();
         let (rep, _) = build_lists(tmp.path(), &lops, 5);
         assert_eq!((rep.rels[2].rows, rep.rels[3].rows), (200, 200));
+    }
+
+    /// The defaults, then `listblock` (a list's URI as the subject) and
+    /// `modlist` (a list record's own URI, while it's a mod list).
+    fn list_subject_rels() -> Relations {
+        Relations::parse_toml(
+            r#"
+[[relation]]
+name = "follow"
+collection = "app.bsky.graph.follow"
+subject = "subject"
+
+[[relation]]
+name = "block"
+collection = "app.bsky.graph.block"
+subject = "subject"
+
+[[relation]]
+name = "listitem"
+collection = "app.bsky.graph.listitem"
+subject = "subject"
+list = "list"
+
+[[relation]]
+name = "listblock"
+collection = "app.bsky.graph.listblock"
+subject = "subject"
+subject_collection = "app.bsky.graph.list"
+
+[[relation]]
+name = "modlist"
+collection = "app.bsky.graph.list"
+subject = "$self"
+when = { purpose = "app.bsky.graph.defs#modlist" }
+"#,
+        )
+        .unwrap()
+    }
+
+    /// Records whose subjects are list URIs build as the add path holds
+    /// them: a listblock's list and a listitem's list are one id, a subject
+    /// in another collection (or a DID) is a bad row, and a list record's
+    /// subject has to be its own URI. A delete row stands for a list that
+    /// stopped being a mod list, as a scan writes it.
+    #[test]
+    fn list_subjects_build_as_the_live_path_adds_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("in");
+        let mut rng = crate::stats::Rng::new(13);
+        let rels = list_subject_rels();
+        let mut live_g = Graph::new(rels.clone());
+        let rk = |n: u64| vlatproto::tid::Tid::from_parts(1_700_000_000_000_000 + n * 997, 0).to_string();
+        write_export(&input, "follow", &[]);
+        write_export(&input, "block", &[]);
+        // owners 0..40, three lists each, a few members on lists 0 and 1
+        let mut lops: Vec<ListOp> = Vec::new();
+        for t in 0..2_000i64 {
+            let a = did(rng.below(40));
+            lops.push((a.clone(), rk(rng.below(1 << 20)), did(100 + rng.below(300)), list_uri(&a, rng.below(2)), t, 1));
+        }
+        live_lists(&mut live_g, &lops);
+        write_list_export(&input, &lops);
+        // subscribers 0..200 to any owner's list 0..3 (list 2 has no items), some deletes and bad subjects
+        let mut blocks: Vec<Op> = Vec::new();
+        for t in 0..6_000i64 {
+            let a = did(rng.below(200));
+            let list = list_uri(&did(rng.below(40)), rng.below(3));
+            let (s, op) = match rng.below(20) {
+                0..=3 => (String::new(), OP_DELETE),
+                4 => (did(rng.below(40)), 1),
+                5 => (list.replace("app.bsky.graph.list", "app.bsky.graph.follow"), 1),
+                _ => (list, 1 + rng.below(2) as u8),
+            };
+            blocks.push((a, rk(rng.below(3_000)), s, 10_000 + t, op));
+        }
+        // each owner's lists' own records: a create, then some flip away (a delete row) and back
+        let mut mods: Vec<Op> = Vec::new();
+        for o in 0..40u64 {
+            let a = did(o);
+            for l in 0..3u64 {
+                let k = format!("l{l}");
+                let own = list_uri(&a, l);
+                mods.push((a.clone(), k.clone(), own.clone(), 20_000, 1));
+                match rng.below(4) {
+                    0 => mods.push((a.clone(), k.clone(), String::new(), 20_001, OP_DELETE)),
+                    1 => {
+                        mods.push((a.clone(), k.clone(), String::new(), 20_001, OP_DELETE));
+                        mods.push((a.clone(), k.clone(), own, 20_002, 2));
+                    }
+                    2 => mods.push((a.clone(), format!("x{l}"), list_uri(&a, 9), 20_003, 1)),
+                    _ => {}
+                }
+            }
+        }
+        fn live_rows(ops: &[Op]) -> Vec<LiveOp<'_>> {
+            ops.iter().map(|r| (r.0.as_str(), r.1.as_str(), r.2.as_str(), None, r.3, r.4)).collect()
+        }
+        live(&mut live_g, "app.bsky.graph.listblock", live_rows(&blocks));
+        live(&mut live_g, "app.bsky.graph.list", live_rows(&mods));
+        write_export(&input, "listblock", &blocks);
+        write_export(&input, "modlist", &mods);
+        let out = tmp.path().join("snap");
+        let o = Opts {
+            input,
+            out: out.clone(),
+            tmp: tmp.path().join("spill"),
+            rels: rels.clone(),
+            subj_index: 8,
+            shards: 3,
+            sub_buckets: 2,
+            deletes: None,
+            cursors: BTreeMap::new(),
+            heat: None,
+        };
+        let rep = build(&o).unwrap();
+        let (lb, ml) = (rels.by_name("listblock").unwrap(), rels.by_name("modlist").unwrap());
+        assert!(rep.rels[lb as usize].bad_subject > 0, "a DID, a record in another collection");
+        assert!(rep.rels[ml as usize].bad_subject > 0, "a list record naming another list");
+        for (ri, x) in rep.rels.iter().enumerate() {
+            assert_eq!((x.out_records, x.in_pairs), live_g.records(ri as RelId), "{}", x.name);
+        }
+        let b = Graph::open(&out).unwrap();
+        b.snapshot().unwrap().verify_checksums().unwrap();
+        same_lists(&live_g, &b);
+        let w = tmp.path().join("rewritten");
+        b.write_snapshot(&w).unwrap();
+        same_by_id(&b, &Graph::open(&w).unwrap());
+        // one node: the listblocks of a list with items name its listitem actor
+        let li = rels.by_name("listitem").unwrap();
+        let l = (0..40).map(|o| list_uri(&did(o), 0)).find(|l| b.id_of(l).is_some()).unwrap();
+        let id = b.id_of(&l).unwrap();
+        assert!(b.read(|cx| b.out_count(cx, li, id)).unwrap() > 0);
+        assert!(b.read(|cx| b.in_count(cx, lb, id)).unwrap() > 0);
+        let owner = b.id_of(&did(0)).unwrap();
+        let mods_of_0 = b.read(|cx| b.out_set(cx, ml, owner)).unwrap();
+        assert!(mods_of_0.iter().all(|&m| b.did_of(m).unwrap().starts_with(&format!("at://{}/", did(0)))));
     }
 
     /// A snapshot of `follows` (and empty block, listitem and listblock

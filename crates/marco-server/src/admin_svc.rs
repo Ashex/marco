@@ -231,7 +231,7 @@ impl svc::Admin for AdminApi {
         let (auth, operator) = match ctx.extensions().get::<Caller>() {
             Some(Caller::Token) => ("token", String::new()),
             Some(Caller::Proxy(l)) => ("proxy", l.clone()),
-            None => ("", String::new()),
+            Some(Caller::Export) | None => ("", String::new()),
         };
         Response::ok(GetSessionResponse { auth: auth.into(), operator, ..Default::default() })
     }
@@ -570,6 +570,8 @@ impl svc::Admin for AdminApi {
                     non_tid: st.non_tid,
                     list: r.list.clone().unwrap_or_default(),
                     owner_of: r.owner_of.clone().unwrap_or_default(),
+                    subject_collection: r.subject_collection.clone().unwrap_or_default(),
+                    when: r.when.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
                     ..Default::default()
                 }
             })

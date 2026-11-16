@@ -56,7 +56,7 @@ tree at start, so a UI rebuild shows up after a restart.
 |---|---|---|
 | `repo` | LEB128 length, then UTF-8 | the record's repo DID |
 | `rkey` | the same | the record key |
-| `subject` | the same | the subject DID, empty for a delete |
+| `subject` | the same | the subject DID (a record's AT URI for a relation whose subjects are records), empty for a delete |
 | `list` | the same | only for a list relation (`listitem`): the list's AT URI |
 | `time_us` | Int64, little-endian | when the op happened |
 | `op` | UInt8 | 1 create, 2 update, 3 delete |

@@ -1,0 +1,403 @@
+//! Checkpoint export on the admin listener: another process (seek's
+//! builder, a replica being seeded, a backup) copies the current checkpoint
+//! file by file while this one keeps serving, checkpointing and compacting.
+//!
+//! ```text
+//! GET    /admin/checkpoint?ttl=SECS        a lease: the manifest, every file it names (name, bytes)
+//! GET    /admin/checkpoint?peek=1          the checkpoint number only, no lease
+//! GET    /admin/checkpoint/files/NAME?lease=ID   one file, Range for a resume
+//! DELETE /admin/checkpoint?lease=ID        the lease's end
+//! ```
+//!
+//! A lease hard-links the files its manifest names into a directory beside
+//! the snapshot's (the same filesystem), so a compaction or a newer
+//! checkpoint can delete them meanwhile and the copy still reads them. It
+//! goes on DELETE or once its ttl passes. The lease carries no checksums (files are immutable and
+//! named by checkpoint number; every section carries its own xxh3, which the reader checks).
+//! Every file stream goes through the
+//! background I/O bucket (`--background-io`), so requests go first.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
+
+use axum::extract::{Path as UrlPath, Query, State};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use marco_core::store::{Manifest, DIR_FILE, MANIFEST};
+use prometheus::{register_int_counter, register_int_gauge, IntCounter, IntGauge};
+use serde::Deserialize;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+use crate::app::App;
+
+static BYTES: LazyLock<IntCounter> =
+    LazyLock::new(|| register_int_counter!("marco_export_bytes_total", "Checkpoint file bytes served").unwrap());
+static FILES: LazyLock<IntCounter> =
+    LazyLock::new(|| register_int_counter!("marco_export_files_total", "Checkpoint file reads served").unwrap());
+static LEASES: LazyLock<IntGauge> =
+    LazyLock::new(|| register_int_gauge!("marco_export_leases", "Checkpoint export leases open").unwrap());
+static STREAMS: LazyLock<IntGauge> =
+    LazyLock::new(|| register_int_gauge!("marco_export_streams", "Checkpoint file streams open").unwrap());
+static REFUSED: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| {
+    prometheus::register_int_counter_vec!(
+        "marco_export_refused_total",
+        "Checkpoint export calls refused for room, by what was full (leases, streams)",
+        &["reason"]
+    )
+    .unwrap()
+});
+const MAX_TTL: u64 = 6 * 3600;
+/// Leases at once: each holds hard links that keep a checkpoint's files on disk.
+pub const MAX_LEASES: usize = 4;
+/// File streams at once, across leases.
+pub const MAX_STREAMS: usize = 8;
+const CHUNK: usize = 4 << 20;
+
+struct Lease {
+    dir: PathBuf,
+    expires: Instant,
+}
+
+pub struct Export {
+    root: PathBuf,
+    snapshot: PathBuf,
+    leases: Mutex<HashMap<String, Lease>>,
+    seq: std::sync::atomic::AtomicU64,
+    streams: std::sync::atomic::AtomicUsize,
+}
+
+/// Removes a directory off the async threads (a lease's links: thousands of files on a big graph).
+fn remove_later(dir: PathBuf) {
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) => {
+            h.spawn_blocking(move || {
+                let _ = std::fs::remove_dir_all(dir);
+            });
+        }
+        Err(_) => {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+/// A lease being made: if the call ends before it's handed over (an error, or the client gone
+/// during the links), the lease and its links go.
+struct Pending {
+    ex: Arc<Export>,
+    id: String,
+    armed: bool,
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        if self.armed {
+            self.ex.drop_lease(&self.id);
+        }
+    }
+}
+
+/// One file stream's slot, given back when the stream ends.
+struct Slot(Arc<Export>);
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.streams.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        STREAMS.dec();
+    }
+}
+
+impl Export {
+    /// Clears any leases a previous process left (`<snapshot>.export/`).
+    pub fn new(snapshot: &Path) -> Arc<Export> {
+        let mut root = snapshot.as_os_str().to_owned();
+        root.push(".export");
+        let root = PathBuf::from(root);
+        let _ = std::fs::remove_dir_all(&root);
+        LazyLock::force(&BYTES);
+        LazyLock::force(&FILES);
+        LazyLock::force(&LEASES);
+        LazyLock::force(&STREAMS);
+        for r in ["leases", "streams"] {
+            REFUSED.with_label_values(&[r]);
+        }
+        Arc::new(Export {
+            root,
+            snapshot: snapshot.to_path_buf(),
+            leases: Mutex::new(HashMap::new()),
+            seq: Default::default(),
+            streams: Default::default(),
+        })
+    }
+
+    fn drop_lease(&self, id: &str) {
+        let gone = self.leases.lock().unwrap().remove(id);
+        if let Some(l) = gone {
+            remove_later(l.dir);
+        }
+        LEASES.set(self.leases.lock().unwrap().len() as i64);
+    }
+
+    fn sweep(&self) {
+        let mut l = self.leases.lock().unwrap();
+        let now = Instant::now();
+        let mut gone = Vec::new();
+        l.retain(|_, x| {
+            let keep = x.expires > now;
+            if !keep {
+                gone.push(x.dir.clone());
+            }
+            keep
+        });
+        LEASES.set(l.len() as i64);
+        drop(l);
+        for d in gone {
+            remove_later(d);
+        }
+    }
+
+    /// Links the current checkpoint's files into a new lease directory.
+    fn link(&self, id: &str) -> anyhow::Result<(PathBuf, Vec<u8>, Manifest)> {
+        let dir = self.root.join(id);
+        let r = self.link_into(&dir);
+        if r.is_err() {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        r
+    }
+
+    fn link_into(&self, dir: &Path) -> anyhow::Result<(PathBuf, Vec<u8>, Manifest)> {
+        let dir = dir.to_path_buf();
+        for attempt in 0.. {
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir)?;
+            let raw = std::fs::read(self.snapshot.join(MANIFEST))?;
+            let m: Manifest = serde_json::from_slice(&raw)?;
+            let mut names: Vec<&str> = vec![DIR_FILE];
+            names.extend(m.shards.values().flat_map(|s| s.files()));
+            match names.iter().try_for_each(|f| std::fs::hard_link(self.snapshot.join(f), dir.join(f))) {
+                Ok(()) => {
+                    std::fs::write(dir.join(MANIFEST), &raw)?;
+                    return Ok((dir, raw, m));
+                }
+                // a compaction removed a file the manifest named: there's a newer manifest
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && attempt < 5 => continue,
+                Err(e) => return Err(anyhow::anyhow!("hard-link the checkpoint (same filesystem?): {e}")),
+            }
+        }
+        unreachable!()
+    }
+}
+
+async fn paced(app: &App, n: usize) {
+    let g = app.graph();
+    let bucket = g.engine().background().clone();
+    drop(g);
+    while let Err(w) = bucket.try_take(n as u64) {
+        tokio::time::sleep(w).await;
+    }
+}
+
+#[derive(Deserialize)]
+pub struct Q {
+    ttl: Option<u64>,
+    peek: Option<u8>,
+    lease: Option<String>,
+}
+
+type St = (Arc<App>, Arc<Export>);
+
+fn err(code: StatusCode, m: impl std::fmt::Display) -> Response {
+    (code, format!("{m}\n")).into_response()
+}
+
+async fn checkpoint(State((_, ex)): State<St>, Query(q): Query<Q>) -> Response {
+    ex.sweep();
+    if q.peek.is_some() {
+        return match std::fs::read(ex.snapshot.join(MANIFEST))
+            .map_err(anyhow::Error::from)
+            .and_then(|b| Ok(serde_json::from_slice::<Manifest>(&b)?))
+        {
+            Ok(m) => axum::Json(
+                serde_json::json!({"checkpoint": m.checkpoint, "build": m.build, "written_ms": m.written_ms}),
+            )
+            .into_response(),
+            Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
+        };
+    }
+    let id =
+        format!("{:x}{:04x}", crate::app::now_ms(), ex.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) & 0xffff);
+    let ttl = q.ttl.unwrap_or(1800).clamp(1, MAX_TTL);
+    // the slot is taken before the links are made, so concurrent calls can't pass the cap together
+    {
+        let mut l = ex.leases.lock().unwrap();
+        if l.len() >= MAX_LEASES {
+            REFUSED.with_label_values(&["leases"]).inc();
+            return err(
+                StatusCode::TOO_MANY_REQUESTS,
+                format!("{MAX_LEASES} leases are open: release one or wait for its ttl"),
+            );
+        }
+        let dir = ex.root.join(&id);
+        l.insert(id.clone(), Lease { dir, expires: Instant::now() + Duration::from_secs(ttl) });
+        LEASES.set(l.len() as i64);
+    }
+    let pending = Pending { ex: ex.clone(), id: id.clone(), armed: true };
+    let e2 = ex.clone();
+    let id2 = id.clone();
+    let linked = tokio::task::spawn_blocking(move || e2.link(&id2)).await;
+    let (dir, raw, m) = match linked {
+        Ok(Ok(x)) => x,
+        Ok(Err(e)) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+    let mut names: Vec<String> = vec![DIR_FILE.to_string()];
+    names.extend(m.shards.values().flat_map(|s| s.files().map(String::from)));
+    let mut files = Vec::with_capacity(names.len());
+    for n in names {
+        // a handful of stat calls per file, thousands of files at most: cheap beside the links
+        match std::fs::metadata(dir.join(&n)) {
+            Ok(md) => files.push(serde_json::json!({"name": n, "bytes": md.len()})),
+            Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("{n}: {e}")),
+        }
+    }
+    let manifest: serde_json::Value = serde_json::from_slice(&raw).unwrap_or_default();
+    let mut pending = pending;
+    pending.armed = false;
+    axum::Json(serde_json::json!({
+        "lease": id, "ttl_seconds": ttl, "checkpoint": m.checkpoint, "build": m.build,
+        "written_ms": m.written_ms, "manifest": manifest, "files": files,
+    }))
+    .into_response()
+}
+
+async fn release(State((_, ex)): State<St>, Query(q): Query<Q>) -> Response {
+    let Some(id) = q.lease else { return err(StatusCode::BAD_REQUEST, "lease is required") };
+    ex.drop_lease(&id);
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// A name the manifest could have written: no path separator, nothing hidden or relative.
+pub fn safe_name(n: &str) -> bool {
+    !n.is_empty()
+        && n.len() <= 255
+        && !n.starts_with('.')
+        && n.bytes().all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
+}
+
+/// `bytes=a-` or `bytes=a-b`.
+fn range(h: &HeaderMap, len: u64) -> Option<(u64, u64)> {
+    let v = h.get(header::RANGE)?.to_str().ok()?.strip_prefix("bytes=")?;
+    let (a, b) = v.split_once('-')?;
+    let a: u64 = a.parse().ok()?;
+    let b: u64 = if b.is_empty() { len.saturating_sub(1) } else { b.parse::<u64>().ok()?.min(len.saturating_sub(1)) };
+    (a <= b && a < len).then_some((a, b))
+}
+
+async fn file(
+    State((app, ex)): State<St>,
+    UrlPath(name): UrlPath<String>,
+    Query(q): Query<Q>,
+    h: HeaderMap,
+) -> Response {
+    ex.sweep();
+    let Some(id) = q.lease else { return err(StatusCode::BAD_REQUEST, "lease is required") };
+    let Some(dir) = ex.leases.lock().unwrap().get(&id).map(|l| l.dir.clone()) else {
+        return err(StatusCode::NOT_FOUND, "no such lease (expired?)");
+    };
+    if !safe_name(&name) {
+        return err(StatusCode::BAD_REQUEST, "bad file name");
+    }
+    let p = dir.join(&name);
+    let mut f = match tokio::fs::File::open(&p).await {
+        Ok(f) => f,
+        Err(_) => return err(StatusCode::NOT_FOUND, "not in this lease"),
+    };
+    let len = match f.metadata().await {
+        Ok(m) => m.len(),
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+    let (status, start, end) = match range(&h, len) {
+        Some((a, b)) => (StatusCode::PARTIAL_CONTENT, a, b + 1),
+        None if h.contains_key(header::RANGE) && len > 0 => return err(StatusCode::RANGE_NOT_SATISFIABLE, "bad range"),
+        None => (StatusCode::OK, 0, len),
+    };
+    if f.seek(std::io::SeekFrom::Start(start)).await.is_err() {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "seek");
+    }
+    if ex.streams.fetch_add(1, std::sync::atomic::Ordering::AcqRel) >= MAX_STREAMS {
+        ex.streams.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        REFUSED.with_label_values(&["streams"]).inc();
+        return err(StatusCode::TOO_MANY_REQUESTS, format!("{MAX_STREAMS} file streams are open"));
+    }
+    STREAMS.inc();
+    let slot = Slot(ex.clone());
+    FILES.inc();
+    let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<bytes::Bytes>>(4);
+    tokio::spawn(async move {
+        let _slot = slot;
+        let mut left = end - start;
+        let mut buf = vec![0u8; CHUNK];
+        while left > 0 {
+            let want = (left as usize).min(CHUNK);
+            paced(&app, want).await;
+            match f.read(&mut buf[..want]).await {
+                Ok(0) => return,
+                Ok(n) => {
+                    left -= n as u64;
+                    BYTES.inc_by(n as u64);
+                    if tx.send(Ok(bytes::Bytes::copy_from_slice(&buf[..n]))).await.is_err() {
+                        return;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                    return;
+                }
+            }
+        }
+    });
+    let body =
+        axum::body::Body::from_stream(futures::stream::unfold(
+            rx,
+            |mut rx| async move { rx.recv().await.map(|x| (x, rx)) },
+        ));
+    let mut r =
+        (status, [(header::CONTENT_LENGTH, (end - start).to_string()), (header::ACCEPT_RANGES, "bytes".into())], body)
+            .into_response();
+    if status == StatusCode::PARTIAL_CONTENT {
+        r.headers_mut().insert(header::CONTENT_RANGE, format!("bytes {start}-{}/{len}", end - 1).parse().unwrap());
+    }
+    r
+}
+
+/// The admin listener's export routes, behind its auth.
+pub fn routes(app: &Arc<App>, ex: Arc<Export>) -> axum::Router {
+    let e2 = ex.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            e2.sweep();
+        }
+    });
+    axum::Router::new()
+        .route("/admin/checkpoint", axum::routing::get(checkpoint).delete(release))
+        .route("/admin/checkpoint/files/{name}", axum::routing::get(file))
+        .with_state((app.clone(), ex))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn ranges() {
+        let mut h = super::HeaderMap::new();
+        assert_eq!(super::range(&h, 10), None);
+        h.insert(super::header::RANGE, "bytes=3-".parse().unwrap());
+        assert_eq!(super::range(&h, 10), Some((3, 9)));
+        h.insert(super::header::RANGE, "bytes=3-100".parse().unwrap());
+        assert_eq!(super::range(&h, 10), Some((3, 9)));
+        h.insert(super::header::RANGE, "bytes=12-".parse().unwrap());
+        assert_eq!(super::range(&h, 10), None);
+    }
+}

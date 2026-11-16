@@ -406,8 +406,14 @@ export function Explorer() {
   const rels = useMemo(() => ov.data?.relations.map((r) => r.name) ?? [], [ov.data])
   const rl = useRelations()
   const listRel = rl.data?.relations.find((r) => r.list)?.name ?? ''
-  // Relationships and Filter's viewer rules are between actors; set operands take any relation but companions
-  const actorRels = useMemo(() => rl.data?.relations.filter((r) => !r.list && !r.ownerOf).map((r) => r.name) ?? rels.filter((r) => !r.includes('.') && r !== 'listitem'), [rl.data, rels])
+  // Relationships and Filter's viewer rules are between actors (no list relation, companion or record subject);
+  // set operands take any relation but companions
+  const actorRels = useMemo(
+    () =>
+      rl.data?.relations.filter((r) => !r.list && !r.ownerOf && !r.subjectCollection && r.subject !== '$self').map((r) => r.name) ??
+      rels.filter((r) => !r.includes('.') && r !== 'listitem'),
+    [rl.data, rels],
+  )
   const setRels = useMemo(() => rl.data?.relations.filter((r) => !r.ownerOf).map((r) => r.name) ?? rels, [rl.data, rels])
   const recordColls = useMemo(() => new Set(rl.data?.relations.map((r) => r.collection) ?? []), [rl.data])
   const [text, setText] = useState(actor || uri)

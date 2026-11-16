@@ -23,7 +23,7 @@ COPY docs/ /src/docs/
 RUN npm run build
 
 # --- rust release build -------------------------------------------------------
-FROM rust:1.99.0-bookworm AS build
+FROM rust:1.100.0-bookworm AS build
 
 # cmake/clang: aws-lc-sys (rustls) and the vendored libsecp256k1 / jemalloc / zstd C builds
 RUN apt-get update \
@@ -48,10 +48,29 @@ ARG MARCO_COMMIT=""
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/src/target \
-    MARCO_COMMIT=$MARCO_COMMIT cargo build --profile "$CARGO_PROFILE" --locked -p marco-server -p marco-load \
-    && mkdir -p /out \
+    MARCO_COMMIT=$MARCO_COMMIT cargo build --profile "$CARGO_PROFILE" --locked -p marco-server -p marco-load -p seek-server \
+    && mkdir -p /out /out-seek \
     && cp target/$CARGO_PROFILE/marco target/$CARGO_PROFILE/marco-load /out/ \
-    && /out/marco --help >/dev/null
+    && cp target/$CARGO_PROFILE/seek target/$CARGO_PROFILE/marco-load /out-seek/ \
+    && /out/marco --help >/dev/null && /out-seek/seek --help >/dev/null
+
+# --- seek: docker build --target seek -t seek:local . --------------------------
+# seek (the pod and the builder) and marco-load, which the builder runs to mirror marco's checkpoint
+# and rank it.
+FROM debian:bookworm-slim AS seek
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl tini \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system --gid 10001 seek \
+    && useradd --system --uid 10001 --gid seek --home-dir /var/lib/seek --create-home seek
+USER seek:seek
+WORKDIR /var/lib/seek
+ENV SEEK_LISTEN=0.0.0.0:7310 SEEK_OPS_LISTEN=0.0.0.0:7311 SEEK_DATA=/var/lib/seek
+# 7310: bsky.Service/SearchActorsTypeahead, /healthz, /readyz; 7311: /metrics, /debug
+EXPOSE 7310 7311
+ENTRYPOINT ["/usr/bin/tini", "--", "seek"]
+CMD ["--help"]
+COPY --from=build /out-seek/ /usr/local/bin/
 
 # --- runtime ------------------------------------------------------------------
 FROM debian:bookworm-slim AS runtime

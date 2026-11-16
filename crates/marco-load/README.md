@@ -20,6 +20,7 @@ marco-load diff         --a SNAP --b SNAP                two snapshots, record b
 marco-load verify       --snapshot SNAP                  checksums, every list decoded, both directions agree
 marco-load open | bench | replay                         the P0 measurements
 marco-load bench-lists  --snapshot SNAP                  list sizes, lookups, set ops, listitem writes
+marco-load pagerank     --snapshot SNAP --out-dir DIR    PageRank over the follows -> a ranks file
 ```
 
 `--ops 127.0.0.1:PORT` serves `/metrics` and `/debug/pprof/*` while any of
@@ -53,7 +54,7 @@ Decompressed, it is rows back to back, in ClickHouse's RowBinary encoding:
 |-----------|--------|-------------------------------------------|
 | `repo`    | String | LEB128 length, then UTF-8 bytes           |
 | `rkey`    | String | the same                                  |
-| `subject` | String | the same; empty for a delete              |
+| `subject` | String | the same; empty for a delete. A record's AT URI for a relation whose subjects are records |
 | `list`    | String | only in a list relation's files: the list's AT URI; empty for a delete |
 | `time_us` | Int64  | 8 bytes little-endian: when the op happened |
 | `op`      | UInt8  | 1 create, 2 update, 3 delete              |
@@ -87,8 +88,18 @@ mixed, in any order. An exporter that has current state, like
    while it's reduced. Two-character prefixes keep the whole network's
    follows (2.7B records) at about 3M rows a file.
 
-Rows whose repo or subject isn't a DID are counted (`bad_repo`,
-`bad_subject` in the report) and skipped.
+Rows whose repo isn't a DID, or whose subject isn't one the relation
+takes, are counted (`bad_repo`, `bad_subject` in the report) and skipped.
+A relation with `subject_collection` takes the AT URI of a record in that
+collection, and one whose subject is `$self` takes the row's own record
+URI (`at://<repo>/<collection>/<rkey>`). Those subjects are interned with
+the lists, so a list's URI is one id whichever relation names it.
+
+Rows hold no record, so the build can't check a relation's `when`: it
+keeps every create or update row as an edge. An exporter writes a row only
+for a record whose `when` paths hold, and a delete row for one updated so
+they don't. `scan-jetstream` and `scan-hubble` read the records and do
+that themselves.
 
 **Relations.** The build reads one directory per relation in its
 relations config (`--relations`, default follow, block and listitem), and a
@@ -481,10 +492,10 @@ else's service, so ask its operator before raising `--rate`.
 | `too_big` | a CAR over `--max-car-mb` (1024) |
 
 and every record of a relation it left out (`skipped_records`):
-`no_subject`, `no_list`, `cross_repo`, `bad_list`, `bad_record` (not
-DAG-CBOR), `missing_block`, `bad_block` (its bytes don't match its CID). A
-subject that isn't a DID is left to the build, which counts it as
-`bad_subject`.
+`no_subject`, `bad_subject` (one the relation doesn't take), `no_list`,
+`cross_repo`, `bad_list`, `unmatched` (a record whose `when` paths don't
+hold), `bad_record` (not a DAG-CBOR map), `missing_block`, `bad_block`
+(its bytes don't match its CID).
 
 **Resume.** Rows go in the same files as `scan-scylla`'s, bucketed by repo
 DID prefix. A `listRepos` page is the unit of commit: its repos are fetched
@@ -632,7 +643,7 @@ come straight from the archive's own fold rules:
 | Archive row | Build input |
 |---|---|
 | create, update, a `#sync`'s replacement create | the record's subject (and list, for a list relation): create or update |
-| a create or update whose record isn't an edge (no subject, a subject not of its relation's kind: a DID, or a list's URI for `listblock`; a list in another repo) | a delete: the key ends empty, as it does live (`skipped` counts the reason) |
+| a create or update whose record isn't an edge (no subject, a subject the relation doesn't take, a list in another repo, `when` paths that don't hold) | a delete: the key ends empty, as it does live (`skipped` counts the reason) |
 | delete | a delete |
 | `#account` deleted, takendown, active | an `accounts.rb.zst` row: 1, 2, 0 |
 | `#account` deactivated, suspended, throttled, desynchronized | nothing: the account comes back as it was |
@@ -789,3 +800,48 @@ diffed against a direct build of the archive's events folded in the test
 the statuses and the cursor checked. Other tests cover a slice that
 straddles a unit at both ends, a pass to the new tip, a refused key and
 `--plan-only`.
+
+## PageRank
+
+`marco-load pagerank` ranks every actor in a snapshot by PageRank over its
+follows and writes a ranks file, which seek bakes into its typeahead index.
+Damping 0.85, a uniform teleport, dangling mass spread uniformly, one edge
+per (follower, subject), self-follows and taken-down or deleted accounts
+left out. What one follower passes along one edge is capped at
+`--max-pass` average ranks (default 1000, the excess to the teleport), so a
+sign-up hub followed by most of the network doesn't hand its rank to the
+few accounts it follows. It iterates until the L1 change is below `--tol`
+(1e-5), with sources renumbered by out-degree so a pass's random reads share
+cache lines.
+
+```sh
+# daily, next to a running marco: link its current checkpoint, warm-start from the last run
+marco-load pagerank --snapshot /data/snap --link /data/pr-link --out-dir /data/ranks
+```
+
+`--out-dir` warm-starts from `DIR/latest.ranks` (unless `--cold` or
+`--warm FILE`), writes `DIR/ranks-<UTC time>.ranks`, points `latest.ranks`
+at it and keeps the newest `--keep` (8). `--link DIR` hard-links the
+checkpoint's files into `DIR` (the same filesystem) and reads that, so a
+checkpoint or compaction on the live directory can't pull a file away
+mid-run. `--source inset` skips the in-edge CSR: about 10 GB peak instead of
+25 GB on the whole network, and each pass about six times slower.
+`--source csr-out --before-us T` keeps only follow records whose TID is
+older than `T`: the graph as it was, for evaluations.
+
+On the whole network (47M ids, 3.03B follows, 32 threads) a cold run takes
+34 passes and 38 s, a run warm from the day before 15 passes and 22 s.
+
+### The ranks file
+
+Little-endian, one row per actor in the snapshot's directory, keyed by DID:
+
+| Part | Bytes | |
+|---|---|---|
+| header | 128 | `mrcranks`, version 1, rows, did:plc rows, created ms, the snapshot's build and checkpoint, iterations, converged, damping, max pass, final L1, and the u16 scale's ln low and high |
+| DIDs | 15 per did:plc, then (u16 length, bytes) per other DID | did:plc packed as marco packs it, ascending, then the rest by string |
+| rank | 4 a row | f32, summing to 1 |
+| rank16 | 2 a row | ln(rank) scaled between the header's low (0) and high (65535) |
+| followers | 4 a row | distinct followers that pass rank: the in-degree a recency signal diffs |
+| flags | 1 a row | bit 0: hidden (taken down or deleted) |
+| trailer | 16 | xxh3-64 of everything before it, then `mrcranks` |

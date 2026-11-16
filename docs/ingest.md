@@ -64,14 +64,15 @@ curl -s localhost:7300/marco.v1.Graph/WriteBatch -H 'content-type: application/j
 | Field | |
 |---|---|
 | `add.uri` | `at://<repo DID>/<collection>/<rkey>`. The collection picks the relation. |
-| `add.subject` | The subject DID. |
+| `add.subject` | The subject DID, or a record's AT URI for a relation whose subjects are records ([Records as subjects](relations.md#records-as-subjects)). |
 | `add.list` | For a list relation, the list's AT URI, in the same repo as the record. |
 | `add.timeUs`, `delete.timeUs` | When your source saw the op, in µs. 0 (or left out) means when marco applies it: see the warning below. |
 | `cursor` | Your pipeline's position after these ops. Optional. |
 
 marco checks each request's ops before applying any of them. A URI whose collection no relation
-has, a subject that isn't a DID, or a listitem whose list is in another repo makes the request
-`invalid_argument`, and nothing in it applies. On a `Write` stream that's per message: each
+has, a subject its relation doesn't take, or a listitem whose list is in another repo makes the
+request `invalid_argument`, and nothing in it applies. An op carries no record, so a relation's
+`when` isn't checked. Send an add only for a record that holds it. On a `Write` stream that's per message: each
 message applies as it arrives, so a bad message k leaves messages before it applied, and the
 caller gets only the error. Resume such a stream from the cursor `ListSources` reports (below).
 Each op that applies gets one result, in order:
@@ -216,9 +217,10 @@ arrows:
 
 - An add of a key that holds another subject or list replaces the record everywhere, which is how
   an update works. A Jetstream or firehose update is an add.
-- A create or update that isn't an edge (a subject that isn't a DID, a listitem whose list is in
-  another repo) empties the key like a delete. That way the live graph ends where a rebuild of the
-  same records would.
+- A create or update that isn't an edge (a subject its relation doesn't take, a listitem whose list
+  is in another repo, a record whose `when` paths don't hold) empties the key like a delete. That way the
+  live graph ends where a rebuild of the same records would. So a list that stops being a mod list
+  loses its `modlist` edge ([Records as subjects](relations.md#records-as-subjects)).
 - Every delete leaves a tombstone with the time its source saw it. An add seen later than the
   tombstone re-creates the record, from any source (a re-create under a freed rkey). An add seen
   earlier stays deleted. Checkpoints drop tombstones older than `--tombstone-days` (7), well past

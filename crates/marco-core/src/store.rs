@@ -23,7 +23,8 @@ use crate::format6::{Entries, InSide, OutSide, Space};
 use crate::outlog::OutSpaces;
 use crate::read::{Engine, StorageError};
 use crate::snapshot::{
-    rel_section, BaseDir, DirRanges, FileKind, Meta, PagedFooter, PagedSection, ShardMeta, PAGED_FORMAT,
+    check_format, rel_section, BaseDir, DirRanges, FileKind, Meta, PagedFooter, PagedSection, ShardMeta, PAGED_FORMAT,
+    REQUIRES_FORMAT,
 };
 use crate::store::engine::{PagedFile, PinnedSections};
 use crate::store::page::{FileId, PAGE};
@@ -141,9 +142,7 @@ impl Manifest {
         let p = dir.join(MANIFEST);
         let b = std::fs::read(&p).with_context(|| format!("read {}", p.display()))?;
         let m: Manifest = serde_json::from_slice(&b).with_context(|| format!("parse {}", p.display()))?;
-        if m.format != PAGED_FORMAT {
-            bail!("snapshot format {}, this build reads {PAGED_FORMAT}: rebuild the snapshot", m.format);
-        }
+        check_format("snapshot", m.format as u64, &[PAGED_FORMAT])?;
         Ok(m)
     }
 
@@ -335,6 +334,14 @@ impl StoreFile {
     }
 }
 
+/// Checks one snapshot file alone (its footer, every pinned section and every page) against its
+/// own checksums, reading it from disk through `engine`: a mirror's check of a file it just fetched,
+/// before any manifest names it.
+pub fn verify_file(path: &Path, engine: &Engine) -> Result<()> {
+    let f = StoreFile::open(path, engine, false)?;
+    f.verify_checksums(engine).with_context(|| path.display().to_string())
+}
+
 /// The directory file: every section pinned.
 pub struct DirFile {
     pub file: StoreFile,
@@ -349,14 +356,18 @@ impl DirFile {
             bail!("{} isn't a directory file", path.display());
         }
         let meta: Meta = serde_json::from_value(file.footer().meta.clone()).context("directory meta")?;
-        if meta.format != PAGED_FORMAT {
-            bail!("snapshot format {}, this build reads {PAGED_FORMAT}: rebuild the snapshot", meta.format);
-        }
+        // 7 when the relations need features, which `requires` names
+        check_format("snapshot", meta.format as u64, &[PAGED_FORMAT, REQUIRES_FORMAT])?;
         if meta.layout != crate::format6::LAYOUT {
             bail!(
                 "snapshot block layout {}, this build reads {}: rebuild the snapshot",
                 meta.layout,
                 crate::format6::LAYOUT
+            );
+        }
+        if let Some(f) = meta.requires.iter().find(|f| !crate::relation::FEATURES.contains(&f.as_str())) {
+            bail!(
+                "the snapshot's relations need the feature {f:?}, which this build doesn't know: open it with a newer build of marco"
             );
         }
         if file.sections().iter().any(|s| s.is_paged() || file.pin(&s.name).is_some_and(|p| p.buf != 0)) {

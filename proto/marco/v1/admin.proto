@@ -409,6 +409,11 @@ message RelationInfo {
   string list = 8;
   // A companion: the list relation whose records it holds by owner.
   string owner_of = 9;
+  // Subjects are AT URIs of records in this collection, not DIDs. A
+  // subject of "$self" is the record's own URI, in collection.
+  string subject_collection = 10;
+  // Dotted paths and the string each holds while a record is an edge.
+  map<string, string> when = 11;
 }
 
 message GetListStatsRequest {

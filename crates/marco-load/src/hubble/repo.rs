@@ -8,15 +8,14 @@ use vlatproto::cbor::ValueRef;
 use vlatproto::cid::Cid;
 use vlatproto::mst::{self, Entry};
 
-use crate::build::own_list;
 use crate::rows::put_row;
 
-/// A scanned relation: its collection and where the record keeps its subject and list.
+/// A scanned relation: its collection, and the relation whose rule says
+/// what its records are.
 pub struct Wanted {
     /// `<collection>/`, the MST key prefix of its records.
     pub prefix: Vec<u8>,
-    pub subject: String,
-    pub list: Option<String>,
+    pub rel: marco_core::Relation,
 }
 
 impl Wanted {
@@ -25,11 +24,7 @@ impl Wanted {
             .into_iter()
             .map(|id| {
                 let r = rels.get(id);
-                Wanted {
-                    prefix: format!("{}/", r.collection).into_bytes(),
-                    subject: r.subject.clone(),
-                    list: r.list.clone(),
-                }
+                Wanted { prefix: format!("{}/", r.collection).into_bytes(), rel: r.clone() }
             })
             .collect()
     }
@@ -77,6 +72,8 @@ pub fn extract(did: &str, car: &[u8], wanted: &[Wanted]) -> Result<RepoRows, Bad
         nodes: 0,
     };
     let mut walk = Walk { blocks: &blocks, wanted, nodes: 0 };
+    // the record's URI, which the rule reads for its repo and `$self`
+    let mut uri = String::new();
     walk.node(*root, None, None, 0, &mut |key, val| {
         let Some(w) = wanted.iter().position(|w| key.starts_with(&w.prefix)) else { return };
         let mut skip = |why| *out.skipped.entry(why).or_default() += 1;
@@ -85,22 +82,24 @@ pub fn extract(did: &str, car: &[u8], wanted: &[Wanted]) -> Result<RepoRows, Bad
         if !vlatproto::car::block_matches(&val, data) {
             return skip("bad_block");
         }
-        let Ok(rec) = ValueRef::decode(data) else { return skip("bad_record") };
-        let Some(subject) = path_of(&rec, &wanted[w].subject) else { return skip("no_subject") };
-        let list = match &wanted[w].list {
-            None => None,
-            Some(p) => match path_of(&rec, p) {
-                None => return skip("no_list"),
-                Some(l) => match own_list(did.as_bytes(), l.as_bytes()) {
-                    Some(l) => Some(l),
-                    // the live path keeps an item only on a list in its own repo
-                    None if marco_core::relation::parse_uri(l).is_some() => return skip("cross_repo"),
-                    None => return skip("bad_list"),
-                },
-            },
-        };
-        put_row(&mut out.rows[w], did.as_bytes(), rkey, subject.as_bytes(), list.map(str::as_bytes), 0, 1);
-        out.records[w] += 1;
+        // a record is a map: a relation can need nothing from it ($self, no when)
+        let Ok(rec @ ValueRef::Map(_)) = ValueRef::decode(data) else { return skip("bad_record") };
+        let Ok(path) = std::str::from_utf8(key) else { return skip("bad_uri") };
+        uri.clear();
+        uri.push_str("at://");
+        uri.push_str(did);
+        uri.push('/');
+        uri.push_str(path);
+        // the live path's rule: a DID subject (or a record's URI), a list in
+        // the item's own repo, and the `when` values
+        match wanted[w].rel.edge(&uri, |p| path_of(&rec, p)) {
+            Ok(e) => {
+                let list = e.list.map(str::as_bytes);
+                put_row(&mut out.rows[w], did.as_bytes(), rkey, e.subject.as_bytes(), list, 0, 1);
+                out.records[w] += 1;
+            }
+            Err(why) => skip(why.as_str()),
+        }
     })?;
     out.nodes = walk.nodes;
     Ok(out)
@@ -271,6 +270,51 @@ pub mod tests {
         );
         assert_eq!(extract(them, &car, &wanted).err(), Some("did_mismatch"));
         assert_eq!(extract(me, &car[..car.len() / 2], &wanted).err(), Some("bad_car"));
+    }
+
+    /// A listblock keeps its list's URI as the subject, and a list is its
+    /// owner's `modlist` edge, its own URI the subject, only as a mod list.
+    #[test]
+    fn list_subjects_and_purpose() {
+        let me = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+        let them = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
+        let theirs = format!("at://{them}/app.bsky.graph.list/3kaaaaaaaaa2a");
+        let mod_list = |p: &str| record("app.bsky.graph.list", &[("name", "n"), ("purpose", p)]);
+        let recs = vec![
+            ("app.bsky.graph.list/3kaaaaaaaaa22".to_string(), mod_list("app.bsky.graph.defs#modlist")),
+            ("app.bsky.graph.list/3kaaaaaaaaa23".to_string(), mod_list("app.bsky.graph.defs#curatelist")),
+            (
+                "app.bsky.graph.listblock/3kaaaaaaaaa24".to_string(),
+                record("app.bsky.graph.listblock", &[("subject", &theirs)]),
+            ),
+            (
+                "app.bsky.graph.listblock/3kaaaaaaaaa25".to_string(),
+                record("app.bsky.graph.listblock", &[("subject", them)]),
+            ),
+        ];
+        let car = car(me, &recs);
+        let rels = marco_core::Relations::parse_toml(
+            r#"
+[[relation]]
+name = "listblock"
+collection = "app.bsky.graph.listblock"
+subject = "subject"
+subject_collection = "app.bsky.graph.list"
+
+[[relation]]
+name = "modlist"
+collection = "app.bsky.graph.list"
+subject = "$self"
+when = { purpose = "app.bsky.graph.defs#modlist" }
+"#,
+        )
+        .unwrap();
+        let r = extract(me, &car, &Wanted::of(&rels)).unwrap();
+        assert_eq!(r.records, [1, 1]);
+        assert_eq!(r.skipped, BTreeMap::from([("bad_subject", 1), ("unmatched", 1)]));
+        assert_eq!(rows(&r.rows[0], 3), [[me, "3kaaaaaaaaa24", theirs.as_str()]]);
+        let own = format!("at://{me}/app.bsky.graph.list/3kaaaaaaaaa22");
+        assert_eq!(rows(&r.rows[1], 3), [[me, "3kaaaaaaaaa22", own.as_str()]]);
     }
 
     #[test]

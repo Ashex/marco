@@ -44,9 +44,9 @@ const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" v
   <rect x="4.5" y="11" width="4" height="5" fill="${C.inn}" stroke="${C.sheet}"/><rect x="11.5" y="4" width="4" height="5" fill="${C.inn}" stroke="${C.sheet}"/>
 </g>
 <text x="190" y="199" class="mark">marco</text>
-<text x="96" y="292" class="tag">A graph database for atproto</text>
-<text x="96" y="344" class="tag">actor-to-actor edges</text>
-<text x="96" y="398" class="sub">follows · blocks · list items · any DID subject</text>
+<text x="96" y="292" class="tag">A graph database for</text>
+<text x="96" y="344" class="tag">atproto's social graph</text>
+<text x="96" y="398" class="sub">follows · blocks · lists · DID and list subjects</text>
 <g class="facts">
   <text x="96" y="506" class="v">2.97B</text><text x="96" y="536" class="l">edges, whole network</text>
   <text x="352" y="506" class="v">13 B</text><text x="352" y="536" class="l">per edge</text>
