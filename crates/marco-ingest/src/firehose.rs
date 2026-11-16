@@ -124,7 +124,8 @@ pub fn decode(frame: &[u8], rels: &Relations) -> Result<Frame, &'static str> {
                             ev.skipped.push("missing_block");
                             continue;
                         };
-                        let Ok(rec) = ValueRef::decode(rec) else {
+                        // a record is a map: a relation can need nothing from it ($self, no when)
+                        let Ok(rec @ ValueRef::Map(_)) = ValueRef::decode(rec) else {
                             ev.skipped.push("bad_record");
                             continue;
                         };

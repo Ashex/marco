@@ -82,7 +82,14 @@ pub(crate) fn commit_change(
         // keep) leaves the key empty, as a delete, so the live graph ends
         // where a rebuild does.
         "create" | "update" => {
-            let get = |p: &str| record.and_then(|r| json_path(r, p));
+            // a relation can need nothing from the record ($self, no when), so
+            // one that's missing or isn't an object is caught here
+            let Some(record) = record.filter(|r| r.is_object()) else {
+                ev.skipped.push("bad_record");
+                ev.change = Change::Ops(vec![Op::Delete { uri, time_us: ev.time_us }]);
+                return;
+            };
+            let get = |p: &str| json_path(record, p);
             ev.change = Change::Ops(vec![upsert(rels.get(rel), uri, ev.time_us, get, &mut ev.skipped)]);
         }
         "delete" => ev.change = Change::Ops(vec![Op::Delete { uri, time_us: ev.time_us }]),
@@ -267,6 +274,37 @@ mod tests {
             time_us: 9,
         }]);
         assert_eq!((ev.change, ev.skipped), (gone, vec!["bad_list"]), "not an edge: its key empties");
+    }
+
+    /// A create or update whose record is missing or isn't an object is a
+    /// bad record and empties its key, whatever the relation needs from it: a
+    /// `$self` relation with no `when` reads nothing.
+    #[test]
+    fn a_record_that_isnt_an_object() {
+        let rels = marco_core::Relations::parse_toml(
+            "[[relation]]\nname = \"follow\"\ncollection = \"app.bsky.graph.follow\"\nsubject = \"subject\"\n\n\
+             [[relation]]\nname = \"lists\"\ncollection = \"app.bsky.graph.list\"\nsubject = \"$self\"\n",
+        )
+        .unwrap();
+        let own = "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.graph.list/3kaaaaaaaaa22";
+        let line = |op: &str, record: &str| {
+            format!(
+                r#"{{"did":"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa","time_us":9,"kind":"commit","commit":{{"operation":"{op}","collection":"app.bsky.graph.list","rkey":"3kaaaaaaaaa22"{record}}}}}"#
+            )
+        };
+        let gone = Change::Ops(vec![Op::Delete { uri: own.into(), time_us: 9 }]);
+        for (op, record) in [
+            ("create", ""),
+            ("create", r#","record":null"#),
+            ("update", r#","record":"x""#),
+            ("create", r#","record":[1]"#),
+        ] {
+            let ev = decode(line(op, record).as_bytes(), &rels).unwrap();
+            assert_eq!((ev.change, ev.skipped), (gone.clone(), vec!["bad_record"]), "{op} {record}");
+        }
+        let ev = decode(line("create", r#","record":{"name":"n"}"#).as_bytes(), &rels).unwrap();
+        let add = Change::Ops(vec![Op::Add { uri: own.into(), subject: own.into(), list: None, time_us: 9 }]);
+        assert_eq!((ev.change, ev.skipped), (add, vec![]), "any object is its own edge");
     }
 
     /// A listblock's subject is a list's URI, and a list's own URI is its

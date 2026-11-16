@@ -442,8 +442,8 @@ else's service, so ask its operator before raising `--rate`.
 and every record of a relation it left out (`skipped_records`):
 `no_subject`, `bad_subject` (one the relation doesn't take), `no_list`,
 `cross_repo`, `bad_list`, `unmatched` (a record whose `when` paths don't
-hold), `bad_record` (not DAG-CBOR), `missing_block`, `bad_block` (its bytes
-don't match its CID).
+hold), `bad_record` (not a DAG-CBOR map), `missing_block`, `bad_block`
+(its bytes don't match its CID).
 
 **Resume.** Rows go in the same files as `scan-scylla`'s, bucketed by repo
 DID prefix. A `listRepos` page is the unit of commit: its repos are fetched

@@ -82,7 +82,8 @@ pub fn extract(did: &str, car: &[u8], wanted: &[Wanted]) -> Result<RepoRows, Bad
         if !vlatproto::car::block_matches(&val, data) {
             return skip("bad_block");
         }
-        let Ok(rec) = ValueRef::decode(data) else { return skip("bad_record") };
+        // a record is a map: a relation can need nothing from it ($self, no when)
+        let Ok(rec @ ValueRef::Map(_)) = ValueRef::decode(data) else { return skip("bad_record") };
         let Ok(path) = std::str::from_utf8(key) else { return skip("bad_uri") };
         uri.clear();
         uri.push_str("at://");

@@ -325,13 +325,14 @@ fn commit(r: &Row, did: &str, w: usize, want: &Wanted, out: &mut Out) {
     let edge = if r.kind == KIND_DELETE {
         Err(None)
     } else {
+        // a record is a map: a relation can need nothing from it ($self, no when)
         match ValueRef::decode(r.payload) {
-            Err(_) => Err(Some("bad_record")),
-            Ok(rec) => want
+            Ok(rec @ ValueRef::Map(_)) => want
                 .rel
                 .edge(&uri, |p| path_of(&rec, p))
                 .map(|e| (e.subject.to_string(), e.list.map(str::to_string)))
                 .map_err(|why| Some(why.as_str())),
+            _ => Err(Some("bad_record")),
         }
     };
     let rows = out.buckets.entry((w, bucket_of(did))).or_default();
