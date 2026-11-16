@@ -61,7 +61,9 @@ That's the default, the one `marco-load build` uses without `--relations`.
 | `when` | optional | Dotted paths and the string each has to hold. A record is an edge only while every one of them does. |
 
 A relation with `list` gets a companion named `<name>.owner`, added for you and never configured.
-There can be 255 relations in all, companions included.
+There can be 255 relations in all, companions included. A key the table above doesn't list is an
+error, and so is a top-level key other than `[[relation]]`. That way a typo like
+`subject_colection` fails the config instead of making a relation that keeps every record or none.
 
 ## Where it lives
 

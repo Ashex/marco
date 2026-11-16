@@ -52,6 +52,11 @@ pub type RelId = u8;
 /// The subject path that names the record's own URI.
 pub const SELF: &str = "$self";
 
+/// A `[[relation]]` table's keys: [`Relation`]'s fields. `owner_of` is a
+/// companion's, which a scan's relations.toml writes back.
+pub const RELATION_KEYS: [&str; 7] =
+    ["name", "collection", "subject", "subject_collection", "list", "owner_of", "when"];
+
 /// What a relation can need a reader to understand before it keeps the
 /// relation's edges right: subjects that are records (`subject_collection`,
 /// `$self`), and `when`. A snapshot's directory lists the ones its
@@ -244,8 +249,21 @@ impl Relations {
         Ok(r)
     }
 
+    /// A config file. A key it doesn't know is an error, so a typo
+    /// (`subject_colection`) can't make a relation that quietly keeps every
+    /// record or none.
     pub fn parse_toml(s: &str) -> Result<Relations> {
-        let r: Relations = toml::from_str(s).context("relations config")?;
+        let t: toml::Table = toml::from_str(s).context("relations config")?;
+        if let Some(k) = t.keys().find(|k| *k != "relation") {
+            bail!("relations config: unknown key {k:?}: relations are [[relation]] tables");
+        }
+        for (i, r) in t.get("relation").and_then(|r| r.as_array()).into_iter().flatten().enumerate() {
+            let name = r.get("name").and_then(|n| n.as_str()).map_or_else(|| i.to_string(), str::to_string);
+            if let Some(k) = r.as_table().and_then(|r| r.keys().find(|k| !RELATION_KEYS.contains(&k.as_str()))) {
+                bail!("relation {name}: unknown key {k:?} (the keys are {})", RELATION_KEYS.join(", "));
+            }
+        }
+        let r: Relations = t.try_into().context("relations config")?;
         Relations::new(r.list)
     }
 
@@ -562,6 +580,43 @@ when = { "kind.name" = "gold", visible = "yes" }
         assert!(own("").is_ok());
         assert!(own("subject_collection = 'com.example.x'").is_err());
         assert!(own("list = 'list'").is_err());
+    }
+
+    /// A key a relation doesn't have is a typo, not a relation that quietly
+    /// keeps every record or none, and so is a table that isn't [[relation]].
+    #[test]
+    fn refuses_unknown_keys() {
+        let one = |extra: &str| {
+            Relations::parse_toml(&format!(
+                "[[relation]]\nname = 'listblock'\ncollection = 'app.bsky.graph.listblock'\nsubject = 'subject'\n{extra}"
+            ))
+        };
+        let e = one("subject_colection = 'app.bsky.graph.list'").unwrap_err().to_string();
+        assert!(e.contains("relation listblock") && e.contains("\"subject_colection\""), "{e}");
+        assert!(one("whne = { purpose = 'x' }").is_err());
+        assert!(one("subject_collection = 'app.bsky.graph.list'").is_ok());
+        assert!(Relations::parse_toml("[[relations]]\nname = 'follow'").is_err(), "a misnamed table");
+        assert!(Relations::parse_toml("version = 2\n[[relation]]\nname = 'f'\ncollection = 'a.b.c'\nsubject = 's'")
+            .is_err());
+        // every key is a field, and every field a key
+        let full = Relation {
+            name: "n".into(),
+            collection: "c".into(),
+            subject: "s".into(),
+            subject_collection: Some("x".into()),
+            list: Some("l".into()),
+            owner_of: Some("o".into()),
+            when: [("p".into(), "v".into())].into(),
+        };
+        let fields = serde_json::to_value(&full).unwrap();
+        let mut keys: Vec<&str> = fields.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        let mut want = RELATION_KEYS.to_vec();
+        want.sort_unstable();
+        assert_eq!(keys, want);
+        // a scan's relations.toml, companions written back, parses again
+        let lists = Relations::parse_toml(LISTS).unwrap();
+        assert_eq!(Relations::parse_toml(&toml::to_string(&lists).unwrap()).unwrap().list, lists.list);
     }
 
     /// A config without the new keys writes the relations it always did, so
