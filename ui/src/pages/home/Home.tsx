@@ -33,7 +33,7 @@ export function Home() {
               </span>
               marco
             </h1>
-            <p className="home-line">A graph database for atproto actor-to-actor edges: follows, blocks, list items and any record whose subject is a DID.</p>
+            <p className="home-line">A graph database for atproto's social graph: follows, blocks, list items and any record whose subject is a DID or a record such as a list.</p>
             <div className="home-cta">
               <Link to="/docs" className="cx-btn primary">
                 Docs

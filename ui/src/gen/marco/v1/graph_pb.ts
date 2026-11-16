@@ -1058,8 +1058,8 @@ export const SetOpSchema: GenEnum<SetOp> = /*@__PURE__*/
   enumDesc(file_marco_v1_graph, 1);
 
 /**
- * The graph API: actor-to-actor edges. Reads are open. Writes need the admin
- * token (`Authorization: Bearer <token>`).
+ * The graph API: edges from actors to actors, and to records such as lists.
+ * Reads are open. Writes need the admin token (`Authorization: Bearer <token>`).
  *
  * Relations are named in config ("follow", "block", "listitem"). A rel field
  * takes a name; an empty rels list means every relation.

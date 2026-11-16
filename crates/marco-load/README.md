@@ -94,6 +94,12 @@ collection, and one whose subject is `$self` takes the row's own record
 URI (`at://<repo>/<collection>/<rkey>`). Those subjects are interned with
 the lists, so a list's URI is one id whichever relation names it.
 
+Rows hold no record, so the build can't check a relation's `when`: it
+keeps every create or update row as an edge. An exporter writes a row only
+for a record whose `when` paths hold, and a delete row for one updated so
+they don't. `scan-jetstream` and `scan-hubble` read the records and do
+that themselves.
+
 **Relations.** The build reads one directory per relation in its
 relations config (`--relations`, default follow, block and listitem), and a
 missing directory is an error. An input that holds only some relations is built
@@ -434,10 +440,10 @@ else's service, so ask its operator before raising `--rate`.
 | `too_big` | a CAR over `--max-car-mb` (1024) |
 
 and every record of a relation it left out (`skipped_records`):
-`no_subject`, `no_list`, `cross_repo`, `bad_list`, `bad_record` (not
-DAG-CBOR), `missing_block`, `bad_block` (its bytes don't match its CID). A
-subject that isn't a DID is left to the build, which counts it as
-`bad_subject`.
+`no_subject`, `bad_subject` (one the relation doesn't take), `no_list`,
+`cross_repo`, `bad_list`, `unmatched` (a record whose `when` paths don't
+hold), `bad_record` (not DAG-CBOR), `missing_block`, `bad_block` (its bytes
+don't match its CID).
 
 **Resume.** Rows go in the same files as `scan-scylla`'s, bucketed by repo
 DID prefix. A `listRepos` page is the unit of commit: its repos are fetched
@@ -585,7 +591,7 @@ come straight from the archive's own fold rules:
 | Archive row | Build input |
 |---|---|
 | create, update, a `#sync`'s replacement create | the record's subject (and list, for a list relation): create or update |
-| a create or update whose record isn't an edge (no subject, a subject that isn't a DID, a list in another repo) | a delete: the key ends empty, as it does live (`skipped` counts the reason) |
+| a create or update whose record isn't an edge (no subject, a subject the relation doesn't take, a list in another repo, `when` paths that don't hold) | a delete: the key ends empty, as it does live (`skipped` counts the reason) |
 | delete | a delete |
 | `#account` deleted, takendown, active | an `accounts.rb.zst` row: 1, 2, 0 |
 | `#account` deactivated, suspended, throttled, desynchronized | nothing: the account comes back as it was |

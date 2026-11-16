@@ -1,4 +1,4 @@
-# marco: a graph database for atproto actor-to-actor edges. The engine
+# marco: a graph database for atproto's social graph. The engine
 # (marco-core), the server (marco-server) and its API (marco-proto), the
 # built-in Jetstream and firehose consumers (marco-ingest) and their harness
 # (marco-harness), and the bulk loader (marco-load). seek, the actor

@@ -2,7 +2,7 @@
 title: Overview
 section: marco
 order: 1
-summary: "A graph database for atproto actor-to-actor edges: follows, blocks, list items and any record whose subject is a DID. The whole network fits on one box."
+summary: "A graph database for atproto's social graph: follows, blocks, list items and any record whose subject is a DID or a record such as a list. The whole network fits on one box."
 ---
 
 ```hero
@@ -59,9 +59,10 @@ edges:
   - "inn.r -> dir.l75"
 ```
 
-marco keeps actor-to-actor edges. A relation is a record collection whose records name a subject
-DID, and relations come from config, so a new app's graph records need no new code. The defaults
-are `follow`, `block` and `listitem` ([Relations](relations.md)).
+marco keeps edges from actors to actors, and to small sets of records such as lists. A relation is
+a record collection whose records name a subject DID (or another record's AT URI), and relations
+come from config, so a new app's graph records need no new code. The defaults are `follow`, `block`
+and `listitem` ([Relations](relations.md)).
 
 An edge is a record, so its identity is the actor, the relation and the rkey. A repeat create is a
 no-op, and a delete removes exactly one record. That matters because about 0.14% of follow records
@@ -111,8 +112,9 @@ source's cursor, and a checkpoint folds the segments into new shard files now an
 
 ## What it isn't
 
-- Record-to-record edges, like likes on posts. Those are post-keyed sets about 5 times the size of
-  the follow graph (12.2B likes).
+- Edges to posts, like likes. A relation can take a record as its subject, but every such record
+  is a directory node, which suits lists and not posts. Likes are post-keyed sets about 5 times the
+  size of the follow graph (12.2B likes).
 - A record store. marco keeps ids, rkeys and subjects. It doesn't store record bodies, profiles or
   list records, and it doesn't search. A list's kind is kept only as a relation
   ([Records as subjects](relations.md#records-as-subjects)).

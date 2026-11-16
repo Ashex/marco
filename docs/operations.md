@@ -159,7 +159,7 @@ A scraper that can't send the token reads the same text from `--ops-listen`, whi
 | `marco_ingest_connected` | `source` | 1 while the stream is open |
 | `marco_ingest_events_total` | `source`, `kind` | Events read |
 | `marco_ingest_ops_total` | `source`, `op` | Ops applied (`add`, `delete`, `status`) |
-| `marco_ingest_skipped_ops_total` | `source`, `reason` | Ops marco couldn't use (`bad_subject`, `bad_list`, `missing_block`…) |
+| `marco_ingest_skipped_ops_total` | `source`, `reason` | Ops marco couldn't use (`bad_subject`, `bad_list`, `missing_block`…), and records a relation's `when` doesn't keep (`unmatched`) |
 | `marco_ingest_decode_errors_total` | `source`, `reason` | Events that didn't decode |
 | `marco_ingest_reconnects_total` | `source`, `reason` | Streams dialled again |
 | `marco_ingest_apply_errors_total` | `source` | Sink writes that failed and were retried |

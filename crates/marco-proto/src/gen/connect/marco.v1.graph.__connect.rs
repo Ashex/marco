@@ -480,8 +480,8 @@ pub const GRAPH_WRITE_BATCH_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::serve
         ::connectrpc::StreamType::Unary,
     )
     .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
-/// The graph API: actor-to-actor edges. Reads are open. Writes need the admin
-/// token (`Authorization: Bearer <token>`).
+/// The graph API: edges from actors to actors, and to records such as lists.
+/// Reads are open. Writes need the admin token (`Authorization: Bearer <token>`).
 ///
 /// Relations are named in config ("follow", "block", "listitem"). A rel field
 /// takes a name; an empty rels list means every relation.

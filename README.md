@@ -1,10 +1,10 @@
 # marco
 
-marco is a graph database for atproto actor-to-actor edges: follows, blocks, list items and any
-record whose subject is a DID. It holds who follows, blocks or lists whom for every account on the
-network, and answers the graph questions an appview asks while it hydrates a page. Does the
-viewer follow this author? Which of these 50 accounts block the viewer? Who are the mutuals? Which
-of these actors are on a mute list?
+marco is a graph database for atproto's social graph: follows, blocks, list items and any record
+whose subject is a DID or a record such as a list. It holds who follows, blocks or lists whom for
+every account on the network, and answers the graph questions an appview asks while it hydrates a
+page. Does the viewer follow this author? Which of these 50 accounts block the viewer? Who are the
+mutuals? Which of these actors are on a mute list?
 
 It's one binary on local disk. The whole network's 2.97B follows and blocks are a 38.5 GB
 snapshot, 13 B an edge, served from a 32-thread box with 61 GiB of RAM at about 1M `Has` calls a

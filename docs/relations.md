@@ -145,8 +145,11 @@ edges:
 
 A relation can name another record in place of a DID. Its subject is then that record's AT URI,
 interned in the directory as a list is. A list's URI gets one id whichever relation names it, so a
-subscription to a list and the list's items meet on that id. Neither relation below is in the
-defaults. Add them after the others and rebuild ([Adding a relation](#adding-a-relation)).
+subscription to a list and the list's items meet on that id. Every subject record is a directory
+node that keeps its URI as a string, so this suits small collections such as lists (1.3M on the
+whole network, [Lists](lists-results.html)). A relation over posts would put every post it names
+in the directory. Neither relation below is in the defaults. Add them after the others and rebuild
+([Adding a relation](#adding-a-relation)).
 
 ```toml
 [[relation]]
@@ -174,6 +177,12 @@ A record whose `when` paths don't all hold isn't an edge, and its key empties li
 `modlist` edge, and one updated back gets it again, since that update is newer than the tombstone.
 Quote a dotted path in `when` (`when = { "a.b" = "x" }`), or TOML reads it as a nested table and
 the config is refused.
+
+Only a path that reads the record can check `when`: Jetstream, the firehose, `scan-jetstream` and
+`scan-hubble`. Build input holds no records, so `marco-load build` keeps every create or update row
+as an edge, and the write API keeps every add. So an exporter writes a row only for a record whose
+`when` paths hold, and a delete row for one updated so they don't. `scan-scylla` reads columns, so
+it refuses a relation with `when` or `$self` ([Rebuilding from Scylla](scylla.md)).
 
 Reads that compare two actors leave these relations out. `Relationships` without `rels` means the
 relations between actors, and `BlockPairs` refuses one in `rels` as it refuses a list relation.

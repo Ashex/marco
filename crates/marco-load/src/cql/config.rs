@@ -224,6 +224,14 @@ impl Config {
                     r.owner_of.as_deref().unwrap_or("")
                 );
             }
+            // a table's columns hold no record, which `when` and `$self` are read from
+            if !r.when.is_empty() || r.is_self() {
+                bail!(
+                    "table {:?}: {:?} has `when` or a $self subject, which only its records hold: scan-scylla reads columns",
+                    t.name,
+                    t.relation
+                );
+            }
             match (&r.list, &t.list) {
                 (Some(_), None) => t.list = Some(DEFAULT_LIST.into()),
                 (None, Some(_)) => {
@@ -313,5 +321,42 @@ mod tests {
             "nodes = [\"x\"]\nkeyspace = \"k\"\nbogus = 1\n[[table]]\nrelation = \"a\"\nname = \"b\""
         )
         .is_err());
+    }
+
+    /// A relation whose subjects are records in a column scans like any
+    /// other, and the build checks them. One with `when` or a `$self`
+    /// subject needs its records, which a table's columns don't hold.
+    #[test]
+    fn record_subjects_from_columns() {
+        let rels = marco_core::Relations::parse_toml(
+            r#"
+[[relation]]
+name = "listblock"
+collection = "app.bsky.graph.listblock"
+subject = "subject"
+subject_collection = "app.bsky.graph.list"
+
+[[relation]]
+name = "modlist"
+collection = "app.bsky.graph.list"
+subject = "$self"
+when = { purpose = "app.bsky.graph.defs#modlist" }
+
+[[relation]]
+name = "starred"
+collection = "com.example.star"
+subject = "subject"
+when = { kind = "gold" }
+"#,
+        )
+        .unwrap();
+        let table = |relation: &str, name: &str| {
+            format!("nodes = [\"x\"]\nkeyspace = \"k\"\n[[table]]\nrelation = \"{relation}\"\nname = \"{name}\"\nsubject = \"list\"\n")
+        };
+        Config::parse(&table("listblock", "listblocks")).unwrap().resolve(&rels).unwrap();
+        for (rel, name) in [("modlist", "lists"), ("starred", "stars")] {
+            let e = Config::parse(&table(rel, name)).unwrap().resolve(&rels).unwrap_err().to_string();
+            assert!(e.contains("only its records hold"), "{rel}: {e}");
+        }
     }
 }

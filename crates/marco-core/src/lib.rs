@@ -1,7 +1,7 @@
-//! marco: a graph database for atproto actor-to-actor edges (follows,
-//! blocks, any record whose subject is a DID). This crate is the engine: the
-//! DID directory, the relation registry, per-actor out logs, per-subject in
-//! sets, and the snapshot file they're frozen into.
+//! marco: a graph database for atproto's social graph (follows, blocks, any
+//! record whose subject is a DID or a record such as a list). This crate is
+//! the engine: the DID directory, the relation registry, per-actor out logs,
+//! per-subject in sets, and the snapshot file they're frozen into.
 
 pub mod did;
 pub mod format6;

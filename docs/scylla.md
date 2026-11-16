@@ -119,7 +119,10 @@ target/release/marco serve --snapshot snap-scylla --memory 3GiB --jetstream wss:
 
 - One row per record: the record's repo DID, its rkey and its subject DID, as text. A list
   relation's table also has the list's AT URI (the `list` column), and only a list relation's
-  table may have one.
+  table may have one. For a relation whose subjects are records, the subject column holds the
+  record's AT URI ([Records as subjects](relations.md#records-as-subjects)).
+- A relation with `when` or a `$self` subject can't be scanned. Its edges depend on the record
+  itself, and the scan reads columns, so the config is refused.
 - The partition key comes from the schema, and the token bounds use all of its columns, so any
   partition key works.
 - The snapshot holds exactly the relations the config's tables name. A relation left out isn't in
@@ -129,7 +132,8 @@ target/release/marco serve --snapshot snap-scylla --memory 3GiB --jetstream wss:
   members, an owner's items and the lists a DID is on. An item whose list is in another repo is
   dropped, as on the live path, and counted as `cross_repo_rows` in the report's table
   ([the owner rule](relations.md#the-owner-rule)).
-- Rows whose repo or subject isn't a DID are counted and skipped. The whole-network run had 13
+- Rows whose repo isn't a DID, or whose subject isn't one the relation takes, are counted and
+  skipped. The whole-network run had 13
   (3 follows, 10 blocks). A row with a null column is skipped and counted as `null_rows`.
 
 ### The primary key
