@@ -72,6 +72,8 @@ impl RelStats {
 /// full write; checkpoints add shard files around it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Meta {
+    /// [`PAGED_FORMAT`], or [`REQUIRES_FORMAT`] when `requires` isn't empty
+    /// ([`dir_format`]).
     pub format: u32,
     /// Every shard file names the directory it belongs to.
     pub build: u64,
@@ -89,7 +91,7 @@ pub struct Meta {
     /// The relation features ([`crate::relation::FEATURES`]) a reader has to
     /// know to open this snapshot: [`crate::Relations::requires`]. Left out
     /// when empty, so a snapshot of relations without them is written as it
-    /// always was.
+    /// always was, format 6 throughout.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub requires: Vec<String>,
 }
@@ -498,6 +500,34 @@ pub fn decode_live(b: &[u8]) -> Result<Vec<crate::did::DidKey>> {
 /// The format of snapshot files ([`PagedFooter`]): what marco serves and writes.
 pub const PAGED_FORMAT: u32 = 6;
 
+/// The directory meta's format when its relations need features (`requires`
+/// isn't empty). A reader that knows only [`PAGED_FORMAT`] refuses it, so a
+/// build from before `requires` can't open a snapshot it would read wrong.
+/// The manifest, the footers and the shard metas stay [`PAGED_FORMAT`].
+pub const REQUIRES_FORMAT: u32 = 7;
+
+/// The directory meta's format for a snapshot whose relations need `requires`.
+pub fn dir_format(requires: &[String]) -> u32 {
+    if requires.is_empty() {
+        PAGED_FORMAT
+    } else {
+        REQUIRES_FORMAT
+    }
+}
+
+/// Refuses a `what` format this build doesn't read, saying which way it's
+/// off: an older one needs a rebuild, a newer one a newer build of marco.
+pub fn check_format(what: &str, found: u64, reads: &[u32]) -> Result<()> {
+    if reads.iter().any(|&r| r as u64 == found) {
+        return Ok(());
+    }
+    let list = reads.iter().map(u32::to_string).collect::<Vec<_>>().join(" or ");
+    if reads.iter().all(|&r| found > r as u64) {
+        bail!("{what} format {found} is newer than this build reads ({list}): open it with a newer build of marco");
+    }
+    bail!("{what} format {found}, this build reads {list}: rebuild the snapshot")
+}
+
 /// Pinned sections start on a multiple of this.
 pub const PINNED_ALIGN: u64 = 64;
 
@@ -636,9 +666,7 @@ impl PagedFooter {
     pub fn parse(json: &[u8], footer_off: u64) -> Result<PagedFooter> {
         let v: serde_json::Value = serde_json::from_slice(json).context("snapshot footer")?;
         let format = v.get("format").and_then(|f| f.as_u64()).unwrap_or(0);
-        if format != PAGED_FORMAT as u64 {
-            bail!("snapshot format {format}, expected {PAGED_FORMAT}");
-        }
+        check_format("snapshot file", format, &[PAGED_FORMAT])?;
         let f: PagedFooter = serde_json::from_value(v).context("snapshot footer")?;
         f.validate(footer_off)?;
         Ok(f)
@@ -657,9 +685,7 @@ impl PagedFooter {
     /// every `.sums` section belongs to a paged one; no two paged sections
     /// share a [`section_tag`]; a base's paged sections start their spaces.
     pub fn validate(&self, body_end: u64) -> Result<()> {
-        if self.format != PAGED_FORMAT {
-            bail!("snapshot format {}, expected {PAGED_FORMAT}", self.format);
-        }
+        check_format("snapshot file", self.format as u64, &[PAGED_FORMAT])?;
         let mut end = 0u64;
         let mut by_name: HashMap<&str, &PagedSection> = HashMap::new();
         let mut tags: HashMap<u64, &str> = HashMap::new();
@@ -1296,7 +1322,7 @@ mod paged_tests {
         let mut b = bytes.clone();
         let at = five + b[five..].windows(10).position(|w| w == b"\"format\":6").unwrap();
         b[at + 9] = b'5';
-        assert!(PagedFooter::read(&b).unwrap_err().to_string().contains("snapshot format 5, expected 6"));
+        assert!(PagedFooter::read(&b).unwrap_err().to_string().contains("snapshot file format 5, this build reads 6"));
     }
 
     #[test]

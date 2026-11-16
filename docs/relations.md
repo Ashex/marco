@@ -79,9 +79,10 @@ Relations page and `Admin.ListRelations` show them as TOML, and `Admin.ListRelat
 relation's keys as fields too (`subjectCollection` and `when` among them).
 
 The snapshot's directory also names the relation features its relations use (`requires`:
-`record_subjects` for `subject_collection` or `$self`, and `when`). marco refuses to open a
-snapshot that needs a feature it doesn't know, since it would read those records as something else
-and change their edges on the next write.
+`record_subjects` for `subject_collection` or `$self`, and `when`), and such a directory is format 7.
+marco refuses to open a snapshot that needs a format or a feature it doesn't know, since it would
+read those records as something else and change their edges on the next write, and so do builds
+from before these keys ([Snapshot formats](operations.md#snapshot-formats)).
 
 ## Adding a relation
 

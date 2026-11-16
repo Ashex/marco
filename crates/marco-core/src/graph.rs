@@ -46,7 +46,6 @@ use crate::rkey::{self, is_tid, key_of};
 use crate::segment::{Rec, Status};
 use crate::snapshot::{
     decode_live, decode_stamps, decode_statuses, decode_tombs, write_directory, BaseDir, DidAt, DirParts, Meta, Side,
-    PAGED_FORMAT,
 };
 use crate::store::{Manifest, ShardFile, Store, DEFAULT_SHARDS};
 use crate::varint::u32_at;
@@ -2140,8 +2139,9 @@ impl Graph {
             m.statuses = body.statuses;
             w.finish("shard", &m)?;
         }
+        let requires = self.rels.requires();
         let meta = Meta {
-            format: PAGED_FORMAT,
+            format: crate::snapshot::dir_format(&requires),
             build: set.build,
             shard_width: set.width,
             n_ids: n,
@@ -2150,7 +2150,7 @@ impl Graph {
             subj_index: self.subj_index as u32,
             relations: self.rels.list.clone(),
             layout: crate::format6::LAYOUT,
-            requires: self.rels.requires(),
+            requires,
         };
         set.finish(&meta, BTreeMap::new())?;
         Ok(())

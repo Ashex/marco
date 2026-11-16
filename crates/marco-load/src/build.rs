@@ -1337,8 +1337,9 @@ pub fn build(o: &Opts) -> Result<Report> {
         metrics::rel(&rr);
         rep.rels.push(rr);
     }
+    let requires = o.rels.requires();
     let meta = Meta {
-        format: PAGED_FORMAT,
+        format: marco_core::snapshot::dir_format(&requires),
         build: set.build,
         shard_width: width,
         n_ids: n,
@@ -1347,7 +1348,7 @@ pub fn build(o: &Opts) -> Result<Report> {
         subj_index: o.subj_index as u32,
         relations: o.rels.list.clone(),
         layout: marco_core::format6::LAYOUT,
-        requires: o.rels.requires(),
+        requires,
     };
     let df = set.finish(&meta, o.cursors.clone())?;
     c.add(5, t);

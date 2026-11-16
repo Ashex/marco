@@ -217,6 +217,20 @@ differed by up to 53 s while marco's own share of the lag stayed under 205 ms, s
 another instance before blaming marco ([Durability and restarts, measured](p1-results.html)). marco doesn't ship a
 Grafana dashboard yet.
 
+## Snapshot formats
+
+A snapshot's manifest, directory and shard files are format 6. The one exception is the directory
+of a snapshot whose relations use `subject_collection`, `$self` or `when`: it's format 7, and it
+names those features in `requires` ([Relations](relations.md#where-it-lives)). marco checks both
+before it serves or writes anything. A format or feature newer than the build fails with
+`... is newer than this build reads ...` or `... which this build doesn't know: open it with a newer
+build of marco`, and an older format with `... rebuild the snapshot`.
+
+Builds of marco from before those relation keys read format 6 alone. They refuse a format 7
+snapshot at open with `snapshot format 7, this build reads 6: rebuild the snapshot`, and serve
+nothing from it. So to roll a server back to such a build, give it a snapshot built without those
+relations first. A snapshot without them is format 6, and builds on either side open it.
+
 ## Checkpoint export
 
 Another process can copy the current checkpoint while marco keeps serving, checkpointing and

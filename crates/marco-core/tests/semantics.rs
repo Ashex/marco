@@ -1046,19 +1046,34 @@ fn records_as_subjects_share_the_list_nodes() {
 }
 
 /// A snapshot names the relation features it needs in its directory meta,
-/// and one naming a feature this binary doesn't know is refused at open. A
-/// snapshot of the defaults names none, so its meta has no `requires`.
+/// and that directory is format 7, which a reader of format 6 alone refuses.
+/// A snapshot of the defaults names none and is format 6 with the meta keys
+/// it always had. A feature or a format this build doesn't know is refused,
+/// saying a newer build is needed.
 #[test]
 fn a_snapshot_requires_its_relation_features() {
-    use marco_core::snapshot::PagedFooter;
+    use marco_core::snapshot::{PagedFooter, PAGED_FORMAT, REQUIRES_FORMAT};
     use marco_core::store::DIR_FILE;
     let dir = tempfile::tempdir().unwrap();
     let footer = |snap: &std::path::Path| PagedFooter::read(&std::fs::read(snap.join(DIR_FILE)).unwrap()).unwrap();
+    // the check a reader of format 6 alone makes of the directory meta, word for word
+    let format_6_reader = |meta: &serde_json::Value| -> Result<(), String> {
+        match meta["format"].as_u64() {
+            Some(6) => Ok(()),
+            f => Err(format!("snapshot format {}, this build reads 6: rebuild the snapshot", f.unwrap_or(0))),
+        }
+    };
     let plain = dir.path().join("plain");
     let mut g = graph();
     g.add(&follow(&did(1), &tid(1)), &did(2)).unwrap();
     g.write_snapshot(&plain).unwrap();
-    assert!(footer(&plain).meta.get("requires").is_none());
+    let meta = footer(&plain).meta;
+    let mut keys: Vec<&str> = meta.as_object().unwrap().keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    let before = ["build", "format", "layout", "n_ids", "n_other", "n_plc", "relations", "shard_width", "subj_index"];
+    assert_eq!(keys, before, "the keys the meta always had, and no requires");
+    assert_eq!((meta["format"].as_u64(), PAGED_FORMAT), (Some(6), 6));
+    assert_eq!(format_6_reader(&meta), Ok(()));
 
     let lists = dir.path().join("lists");
     let mut g = Graph::new(list_subjects());
@@ -1067,22 +1082,37 @@ fn a_snapshot_requires_its_relation_features() {
     g.add_at(&listblock(&did(2), &tid(2)), &l, 2).unwrap();
     g.add_at(&l, &l, 3).unwrap();
     g.write_snapshot(&lists).unwrap();
-    assert_eq!(footer(&lists).meta["requires"], serde_json::json!(["record_subjects", "when"]));
+    let f = footer(&lists);
+    assert_eq!(f.meta["requires"], serde_json::json!(["record_subjects", "when"]));
+    assert_eq!((f.meta["format"].as_u64(), REQUIRES_FORMAT), (Some(7), 7));
+    assert_eq!(f.format, 6, "the file's own format stays 6");
+    assert_eq!(
+        format_6_reader(&f.meta),
+        Err("snapshot format 7, this build reads 6: rebuild the snapshot".into()),
+        "a reader of format 6 refuses it"
+    );
     let g = Graph::open(&lists).unwrap();
     assert_eq!(g.read(|cx| g.has(cx, MODLIST, &did(1), &l)).unwrap(), Some(l.clone()));
     drop(g);
 
-    // a feature from a newer marco: the same directory, its footer rewritten
+    // the same directory, its meta edited as a newer build might write it
     let p = lists.join(DIR_FILE);
-    let bytes = std::fs::read(&p).unwrap();
-    let mut f = PagedFooter::read(&bytes).unwrap();
-    let end = f.sections.iter().map(|s| s.off + s.len()).max().unwrap();
-    f.meta["requires"] = serde_json::json!(["record_subjects", "when", "someday"]);
-    let mut out = bytes[..end as usize].to_vec();
-    out.extend(f.encode(end).unwrap());
-    std::fs::write(&p, out).unwrap();
-    let e = format!("{:#}", Graph::open(&lists).err().expect("a feature it doesn't know"));
-    assert!(e.contains("\"someday\"") && e.contains("doesn't know"), "{e}");
+    let original = std::fs::read(&p).unwrap();
+    let rewrite = |edit: &dyn Fn(&mut serde_json::Value)| {
+        let mut f = PagedFooter::read(&original).unwrap();
+        let end = f.sections.iter().map(|s| s.off + s.len()).max().unwrap();
+        edit(&mut f.meta);
+        let mut out = original[..end as usize].to_vec();
+        out.extend(f.encode(end).unwrap());
+        std::fs::write(&p, out).unwrap();
+        format!("{:#}", Graph::open(&lists).err().expect("refused"))
+    };
+    let e = rewrite(&|m| m["requires"] = serde_json::json!(["record_subjects", "when", "someday"]));
+    assert!(e.contains("\"someday\"") && e.contains("doesn't know") && e.contains("newer build"), "{e}");
+    let e = rewrite(&|m| m["format"] = serde_json::json!(8));
+    assert!(e.contains("format 8 is newer than this build reads (6 or 7)") && e.contains("newer build"), "{e}");
+    let e = rewrite(&|m| m["format"] = serde_json::json!(5));
+    assert!(e.contains("format 5, this build reads 6 or 7: rebuild the snapshot"), "{e}");
 }
 
 #[test]
