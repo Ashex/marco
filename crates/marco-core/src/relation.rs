@@ -52,6 +52,14 @@ pub type RelId = u8;
 /// The subject path that names the record's own URI.
 pub const SELF: &str = "$self";
 
+/// What a relation can need a reader to understand before it keeps the
+/// relation's edges right: subjects that are records (`subject_collection`,
+/// `$self`), and `when`. A snapshot's directory lists the ones its
+/// relations use (`requires`), and a binary that doesn't know one of them
+/// refuses the snapshot, since it would read those records as something
+/// else and change the edges on the next write.
+pub const FEATURES: [&str; 2] = ["record_subjects", "when"];
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Relation {
     pub name: String,
@@ -114,6 +122,18 @@ impl Relation {
     /// Whether the subject is the record's own URI.
     pub fn is_self(&self) -> bool {
         self.subject == SELF
+    }
+
+    /// The [`FEATURES`] this relation needs.
+    pub fn requires(&self) -> Vec<&'static str> {
+        let mut v = Vec::new();
+        if self.subject_records().is_some() {
+            v.push(FEATURES[0]);
+        }
+        if !self.when.is_empty() {
+            v.push(FEATURES[1]);
+        }
+        v
     }
 
     /// The collection a subject URI is in, for a relation whose subjects are
@@ -281,6 +301,12 @@ impl Relations {
             }
         }
         Ok(())
+    }
+
+    /// The [`FEATURES`] any of the relations needs, in that order: what a
+    /// snapshot of them requires of its reader. Empty for the defaults.
+    pub fn requires(&self) -> Vec<String> {
+        FEATURES.iter().filter(|f| self.list.iter().any(|r| r.requires().contains(f))).map(|f| f.to_string()).collect()
     }
 
     /// The relations a caller names: every one but the companions.
@@ -554,6 +580,22 @@ when = { "kind.name" = "gold", visible = "yes" }
         let json = serde_json::to_string(&lists.list).unwrap();
         assert!(json.contains(r#""subject_collection":"app.bsky.graph.list""#), "{json}");
         assert!(json.contains(r#""when":{"purpose":"app.bsky.graph.defs#modlist"}"#), "{json}");
+    }
+
+    /// The features a snapshot of the relations requires: none for the
+    /// defaults, and each new key's.
+    #[test]
+    fn required_features() {
+        assert!(Relations::bsky_default().requires().is_empty());
+        let lists = Relations::parse_toml(LISTS).unwrap();
+        assert_eq!(lists.requires(), ["record_subjects", "when"]);
+        assert_eq!(lists.get(4).requires(), ["record_subjects"], "listblock");
+        assert_eq!(lists.get(5).requires(), ["record_subjects", "when"], "modlist");
+        let only_when = Relations::parse_toml(
+            "[[relation]]\nname = 'x'\ncollection = 'com.example.x'\nsubject = 's'\nwhen = { kind = 'gold' }",
+        )
+        .unwrap();
+        assert_eq!(only_when.requires(), ["when"]);
     }
 
     #[test]

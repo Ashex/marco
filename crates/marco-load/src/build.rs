@@ -1347,6 +1347,7 @@ pub fn build(o: &Opts) -> Result<Report> {
         subj_index: o.subj_index as u32,
         relations: o.rels.list.clone(),
         layout: marco_core::format6::LAYOUT,
+        requires: o.rels.requires(),
     };
     let df = set.finish(&meta, o.cursors.clone())?;
     c.add(5, t);

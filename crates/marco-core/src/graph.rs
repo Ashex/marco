@@ -2150,6 +2150,7 @@ impl Graph {
             subj_index: self.subj_index as u32,
             relations: self.rels.list.clone(),
             layout: crate::format6::LAYOUT,
+            requires: self.rels.requires(),
         };
         set.finish(&meta, BTreeMap::new())?;
         Ok(())

@@ -367,6 +367,11 @@ impl DirFile {
                 crate::format6::LAYOUT
             );
         }
+        if let Some(f) = meta.requires.iter().find(|f| !crate::relation::FEATURES.contains(&f.as_str())) {
+            bail!(
+                "the snapshot's relations need {f:?}, which this marco doesn't know: open it with the marco that wrote it, or a newer one"
+            );
+        }
         if file.sections().iter().any(|s| s.is_paged() || file.pin(&s.name).is_some_and(|p| p.buf != 0)) {
             bail!("{}: a directory file's sections are pinned and contiguous", path.display());
         }

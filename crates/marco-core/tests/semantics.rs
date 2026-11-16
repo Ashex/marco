@@ -1045,6 +1045,46 @@ fn records_as_subjects_share_the_list_nodes() {
     }
 }
 
+/// A snapshot names the relation features it needs in its directory meta,
+/// and one naming a feature this binary doesn't know is refused at open. A
+/// snapshot of the defaults names none, so its meta has no `requires`.
+#[test]
+fn a_snapshot_requires_its_relation_features() {
+    use marco_core::snapshot::PagedFooter;
+    use marco_core::store::DIR_FILE;
+    let dir = tempfile::tempdir().unwrap();
+    let footer = |snap: &std::path::Path| PagedFooter::read(&std::fs::read(snap.join(DIR_FILE)).unwrap()).unwrap();
+    let plain = dir.path().join("plain");
+    let mut g = graph();
+    g.add(&follow(&did(1), &tid(1)), &did(2)).unwrap();
+    g.write_snapshot(&plain).unwrap();
+    assert!(footer(&plain).meta.get("requires").is_none());
+
+    let lists = dir.path().join("lists");
+    let mut g = Graph::new(list_subjects());
+    g.shards = 3;
+    let l = list_uri(&did(1), 1);
+    g.add_at(&listblock(&did(2), &tid(2)), &l, 2).unwrap();
+    g.add_at(&l, &l, 3).unwrap();
+    g.write_snapshot(&lists).unwrap();
+    assert_eq!(footer(&lists).meta["requires"], serde_json::json!(["record_subjects", "when"]));
+    let g = Graph::open(&lists).unwrap();
+    assert_eq!(g.read(|cx| g.has(cx, MODLIST, &did(1), &l)).unwrap(), Some(l.clone()));
+    drop(g);
+
+    // a feature from a newer marco: the same directory, its footer rewritten
+    let p = lists.join(DIR_FILE);
+    let bytes = std::fs::read(&p).unwrap();
+    let mut f = PagedFooter::read(&bytes).unwrap();
+    let end = f.sections.iter().map(|s| s.off + s.len()).max().unwrap();
+    f.meta["requires"] = serde_json::json!(["record_subjects", "when", "someday"]);
+    let mut out = bytes[..end as usize].to_vec();
+    out.extend(f.encode(end).unwrap());
+    std::fs::write(&p, out).unwrap();
+    let e = format!("{:#}", Graph::open(&lists).err().expect("a feature it doesn't know"));
+    assert!(e.contains("\"someday\"") && e.contains("doesn't know"), "{e}");
+}
+
 #[test]
 fn a_graph_with_fewer_ids_than_shards_reopens() {
     let mut g = Graph::new(Relations::bsky_default());

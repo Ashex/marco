@@ -78,6 +78,11 @@ The snapshot carries its relations, so `marco serve` has no relations flag. The 
 Relations page and `Admin.ListRelations` show them as TOML, and `Admin.ListRelations` gives each
 relation's keys as fields too (`subjectCollection` and `when` among them).
 
+The snapshot's directory also names the relation features its relations use (`requires`:
+`record_subjects` for `subject_collection` or `$self`, and `when`). marco refuses to open a
+snapshot that needs a feature it doesn't know, since it would read those records as something else
+and change their edges on the next write.
+
 ## Adding a relation
 
 A new relation needs a rebuild, since every existing record of that collection has to be in the

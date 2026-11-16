@@ -86,6 +86,12 @@ pub struct Meta {
     pub relations: Vec<Relation>,
     /// The block layout ([`crate::format6::LAYOUT`]).
     pub layout: u32,
+    /// The relation features ([`crate::relation::FEATURES`]) a reader has to
+    /// know to open this snapshot: [`crate::Relations::requires`]. Left out
+    /// when empty, so a snapshot of relations without them is written as it
+    /// always was.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requires: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
