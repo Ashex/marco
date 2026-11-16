@@ -1315,6 +1315,16 @@ when = { purpose = "app.bsky.graph.defs#modlist" }
     let r = g.write_batch(w(vec![del(&l)])).await.unwrap().into_owned();
     assert_eq!(outcome(&r.results[0]), format!("removed {l}"), "a list that stopped being a mod list");
     assert_eq!(has(&g, "modlist", &o, &l).await, "");
+
+    // ListRelations gives the new keys as fields, beside the TOML
+    let rl = admin(s.admin, Some(TOKEN)).list_relations(ListRelationsRequest::default()).await.unwrap().into_owned();
+    let by = |n: &str| rl.relations.iter().find(|r| r.name == n).unwrap().clone();
+    assert_eq!(by("listblock").subject_collection, "app.bsky.graph.list");
+    let ml = by("modlist");
+    assert_eq!((ml.subject.as_str(), ml.subject_collection.as_str()), ("$self", ""));
+    assert_eq!(ml.when.get("purpose").map(String::as_str), Some("app.bsky.graph.defs#modlist"));
+    assert!(by("follow").when.is_empty() && by("follow").subject_collection.is_empty());
+    assert!(rl.config.contains("subject_collection = \"app.bsky.graph.list\""), "{}", rl.config);
 }
 
 async fn has(g: &GraphClient<HttpClient>, rel: &str, from: &str, to: &str) -> String {

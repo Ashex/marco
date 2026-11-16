@@ -71,7 +71,20 @@ export function Relations() {
               cols={[
                 { id: 'name', label: 'Name', render: (r) => <b>{r.name}</b> },
                 { id: 'coll', label: 'Collection', fill: true, render: (r) => <span className="mono t2">{r.collection}</span> },
-                { id: 'subj', label: 'Subject path', render: (r) => <span className="mono">{r.subject}</span> },
+                {
+                  id: 'subj',
+                  label: 'Subject path',
+                  title: 'a DID, or a record\'s AT URI in subject_collection; $self is the record\'s own URI. when: the values a record holds while it\'s an edge',
+                  render: (r) => (
+                    <span className="mono">
+                      {r.subject}
+                      {r.subjectCollection ? <span className="muted"> · {r.subjectCollection}</span> : null}
+                      {Object.entries(r.when).map(([k, v]) => (
+                        <span key={k} className="muted"> · {k} = {v}</span>
+                      ))}
+                    </span>
+                  ),
+                },
                 {
                   id: 'from',
                   label: 'From',

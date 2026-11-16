@@ -75,7 +75,8 @@ There can be 255 relations in all, companions included.
 ```
 
 The snapshot carries its relations, so `marco serve` has no relations flag. The console's
-Relations page and `Admin.ListRelations` show them as TOML.
+Relations page and `Admin.ListRelations` show them as TOML, and `Admin.ListRelations` gives each
+relation's keys as fields too (`subjectCollection` and `when` among them).
 
 ## Adding a relation
 
