@@ -813,14 +813,21 @@ async fn durable_write_batch_waits_for_its_segment_but_an_ordinary_batch_does_no
     let (actor, first, second) = (did(5), did(2001), did(2002));
     let first_uri = uri(&actor, FOLLOW, &tid(9_500_000, 2));
     let second_uri = uri(&actor, FOLLOW, &tid(9_500_001, 2));
-    g.write_batch(WriteBatchRequest { ops: vec![add(&first_uri, &first)], cursor: "11".into(), ..Default::default() })
+    let ordinary = g
+        .write_batch(WriteBatchRequest {
+            ops: vec![add(&first_uri, &first)],
+            cursor: "11".into(),
+            ..Default::default()
+        })
         .await
-        .unwrap();
+        .unwrap()
+        .into_owned();
+    assert!(!ordinary.durable);
     let sources = a.list_sources(ListSourcesRequest::default()).await.unwrap().into_owned();
     let api = sources.sources.iter().find(|s| s.name == "api").unwrap();
     assert_eq!((api.cursor.as_str(), api.durable_cursor.as_str()), ("11", "10"));
 
-    tokio::time::timeout(
+    let durable = tokio::time::timeout(
         Duration::from_secs(5),
         g.write_batch(WriteBatchRequest {
             ops: vec![add(&second_uri, &second)],
@@ -831,7 +838,9 @@ async fn durable_write_batch_waits_for_its_segment_but_an_ordinary_batch_does_no
     )
     .await
     .expect("a durable batch cuts a segment without waiting for the interval")
-    .unwrap();
+    .unwrap()
+    .into_owned();
+    assert!(durable.durable);
     let sources = a.list_sources(ListSourcesRequest::default()).await.unwrap().into_owned();
     let api = sources.sources.iter().find(|s| s.name == "api").unwrap();
     assert_eq!(api.durable_cursor, "12");
@@ -844,6 +853,32 @@ async fn durable_write_batch_waits_for_its_segment_but_an_ordinary_batch_does_no
             .into_owned();
         assert_eq!(got.uri, expected);
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_empty_durable_write_batch_persists_its_cursor_and_says_so() {
+    let s = start_configured(|cfg| Config {
+        auth: AuthConfig { token: Some(TOKEN.into()), ..Default::default() },
+        segment_interval: Duration::from_secs(3600),
+        ..cfg
+    })
+    .await;
+    let a = admin(s.admin, Some(TOKEN));
+    let g = graph(s.api, Some(TOKEN));
+    g.write_batch(WriteBatchRequest { cursor: "10".into(), ..Default::default() }).await.unwrap();
+    let durable = tokio::time::timeout(
+        Duration::from_secs(5),
+        g.write_batch(WriteBatchRequest { cursor: "11".into(), durable: true, ..Default::default() }),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .into_owned();
+    let sources = a.list_sources(ListSourcesRequest::default()).await.unwrap().into_owned();
+    let api = sources.sources.iter().find(|s| s.name == "api").unwrap();
+    assert_eq!(api.durable_cursor, "11");
+    assert!(durable.results.is_empty());
+    assert!(durable.durable);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

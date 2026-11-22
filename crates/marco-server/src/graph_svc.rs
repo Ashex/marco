@@ -680,6 +680,6 @@ impl svc::Graph for GraphApi {
         } else {
             self.write_ops(&req.ops, &req.cursor).await?
         };
-        Response::ok(WriteBatchResponse { results, cursor: req.cursor, ..Default::default() })
+        Response::ok(WriteBatchResponse { results, cursor: req.cursor, durable: req.durable, ..Default::default() })
     }
 }

@@ -335,4 +335,6 @@ message WriteBatchRequest {
 message WriteBatchResponse {
   repeated WriteResult results = 1;
   string cursor = 2;
+  // True if the request asked for durability and the batch's change segment was written.
+  bool durable = 3;
 }
