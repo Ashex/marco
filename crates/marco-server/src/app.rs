@@ -314,6 +314,11 @@ pub struct Durability {
     pub checkpoint_failures: u64,
 }
 
+enum WriteAck {
+    Applied,
+    Durable,
+}
+
 pub struct App {
     pub cfg: Config,
     /// The page store every copy of the graph and every snapshot opened
@@ -641,11 +646,20 @@ impl App {
     /// source never restarts from nothing after it began: that segment is
     /// written before its ops apply. An op's `time_us` of 0 becomes now.
     pub async fn apply_from(&self, source: &str, cursor: &str, ops: &[Op]) -> Result<Vec<Outcome>> {
+        self.apply_with_ack(source, cursor, ops, WriteAck::Applied).await
+    }
+
+    /// Applies `ops` and waits for the change segment that makes them durable.
+    pub async fn apply_durable_from(&self, source: &str, cursor: &str, ops: &[Op]) -> Result<Vec<Outcome>> {
+        self.apply_with_ack(source, cursor, ops, WriteAck::Durable).await
+    }
+
+    async fn apply_with_ack(&self, source: &str, cursor: &str, ops: &[Op], ack: WriteAck) -> Result<Vec<Outcome>> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         let now = now_ms() * 1000;
         let ops = ops.iter().map(|o| o.clone().stamped(now)).collect();
         let rec = Rec::Apply { source: source.into(), cursor: cursor.into(), ops };
-        self.send(Req::Apply { rec, durable: false, reply })?;
+        self.send(Req::Apply { rec, durable: matches!(ack, WriteAck::Durable), reply })?;
         match rx.await.context("the writer dropped the write")?? {
             Applied::Ops(o) => Ok(o),
             Applied::Status(_) => unreachable!("an apply answers with outcomes"),

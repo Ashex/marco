@@ -10,7 +10,7 @@ use marco_proto::connect::marco::v1 as svc;
 use marco_proto::v1::__buffa::oneof::{write_op, write_result};
 use marco_proto::v1::*;
 
-use crate::app::{App, Op, Outcome, MAX_BATCH};
+use crate::app::{App, Op, Outcome, API_SOURCE, MAX_BATCH};
 use crate::pool::PoolError;
 
 /// The Graph service; `gate` holds reads until marco is ready (the API
@@ -98,10 +98,15 @@ impl GraphApi {
         Ok(())
     }
 
-    async fn write_ops(&self, ops: &[WriteOp], cursor: &str) -> Result<Vec<WriteResult>, ConnectError> {
+    fn checked_ops(&self, ops: &[WriteOp]) -> Result<Vec<Op>, ConnectError> {
         self.writable()?;
         let ops = ops_of(ops)?;
         App::validate(&self.0.graph(), &ops).map_err(bad)?;
+        Ok(ops)
+    }
+
+    async fn write_ops(&self, ops: &[WriteOp], cursor: &str) -> Result<Vec<WriteResult>, ConnectError> {
+        let ops = self.checked_ops(ops)?;
         let out = self.0.apply(&ops, cursor).await.map_err(|e| ConnectError::unavailable(format!("{e:#}")))?;
         Ok(out.into_iter().map(result_pb).collect())
     }
@@ -663,7 +668,18 @@ impl svc::Graph for GraphApi {
         req: ServiceRequest<'_, WriteBatchRequest>,
     ) -> ServiceResult<WriteBatchResponse> {
         let req = req.to_owned_message();
-        let results = self.write_ops(&req.ops, &req.cursor).await?;
+        let results = if req.durable {
+            let ops = self.checked_ops(&req.ops)?;
+            self.0
+                .apply_durable_from(API_SOURCE, &req.cursor, &ops)
+                .await
+                .map_err(|e| ConnectError::unavailable(format!("{e:#}")))?
+                .into_iter()
+                .map(result_pb)
+                .collect()
+        } else {
+            self.write_ops(&req.ops, &req.cursor).await?
+        };
         Response::ok(WriteBatchResponse { results, cursor: req.cursor, ..Default::default() })
     }
 }

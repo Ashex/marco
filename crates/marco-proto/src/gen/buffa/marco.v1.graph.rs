@@ -6266,6 +6266,15 @@ pub struct WriteBatchRequest {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
     )]
     pub cursor: ::buffa::alloc::string::String,
+    /// If true, answers only once the batch's change segment is written.
+    ///
+    /// Field 3: `durable`
+    #[serde(
+        rename = "durable",
+        with = "::buffa::json_helpers::proto_bool",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_false"
+    )]
+    pub durable: bool,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -6275,6 +6284,7 @@ impl ::core::fmt::Debug for WriteBatchRequest {
         f.debug_struct("WriteBatchRequest")
             .field("ops", &self.ops)
             .field("cursor", &self.cursor)
+            .field("durable", &self.durable)
             .finish()
     }
 }
@@ -6316,6 +6326,9 @@ impl ::buffa::Message for WriteBatchRequest {
         if !self.cursor.is_empty() {
             size += 1u64 + ::buffa::types::string_encoded_len(&self.cursor) as u64;
         }
+        if self.durable {
+            size += 1u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -6336,6 +6349,9 @@ impl ::buffa::Message for WriteBatchRequest {
         }
         if !self.cursor.is_empty() {
             ::buffa::types::put_string_field(2u32, &self.cursor, buf);
+        }
+        if self.durable {
+            ::buffa::types::put_bool_field(3u32, self.durable, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -6369,6 +6385,13 @@ impl ::buffa::Message for WriteBatchRequest {
                 )?;
                 ::buffa::types::merge_string(&mut self.cursor, buf)?;
             }
+            3u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                self.durable = ::buffa::types::decode_bool(buf)?;
+            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -6379,6 +6402,7 @@ impl ::buffa::Message for WriteBatchRequest {
     fn clear(&mut self) {
         self.ops.clear();
         self.cursor.clear();
+        self.durable = false;
         self.__buffa_unknown_fields.clear();
     }
 }

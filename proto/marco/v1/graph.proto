@@ -328,6 +328,8 @@ message WriteBatchRequest {
   // At most 1000.
   repeated WriteOp ops = 1;
   string cursor = 2;
+  // If true, answers only once the batch's change segment is written.
+  bool durable = 3;
 }
 
 message WriteBatchResponse {

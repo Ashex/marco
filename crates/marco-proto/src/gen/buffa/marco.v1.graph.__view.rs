@@ -9967,6 +9967,10 @@ pub struct WriteBatchRequestView<'a> {
     pub ops: ::buffa::RepeatedView<'a, super::super::__buffa::view::WriteOpView<'a>>,
     /// Field 2: `cursor`
     pub cursor: &'a str,
+    /// If true, answers only once the batch's change segment is written.
+    ///
+    /// Field 3: `durable`
+    pub durable: bool,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for WriteBatchRequestView<'a> {
@@ -10005,6 +10009,13 @@ impl<'a> ::buffa::MessageView<'a> for WriteBatchRequestView<'a> {
                     ::buffa::encoding::WireType::LengthDelimited,
                 )?;
                 view.cursor = ::buffa::types::borrow_str(&mut cur)?;
+            }
+            3u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::Varint,
+                )?;
+                view.durable = ::buffa::types::decode_bool(&mut cur)?;
             }
             1u32 => {
                 ::buffa::encoding::check_wire_type(
@@ -10052,6 +10063,7 @@ impl<'a> ::buffa::MessageView<'a> for WriteBatchRequestView<'a> {
                 .map(|v| v.to_owned_from_source(__buffa_src))
                 .collect::<::core::result::Result<_, ::buffa::DecodeError>>()?,
             cursor: self.cursor.to_string(),
+            durable: self.durable,
             __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
@@ -10074,6 +10086,9 @@ impl<'a> ::buffa::ViewEncode<'a> for WriteBatchRequestView<'a> {
         if !self.cursor.is_empty() {
             size += 1u64 + ::buffa::types::string_encoded_len(&self.cursor) as u64;
         }
+        if self.durable {
+            size += 1u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -10095,6 +10110,9 @@ impl<'a> ::buffa::ViewEncode<'a> for WriteBatchRequestView<'a> {
         }
         if !self.cursor.is_empty() {
             ::buffa::types::put_string_field(2u32, &self.cursor, buf);
+        }
+        if self.durable {
+            ::buffa::types::put_bool_field(3u32, self.durable, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -10122,6 +10140,9 @@ impl<'__a> ::serde::Serialize for WriteBatchRequestView<'__a> {
         }
         if !::buffa::json_helpers::skip_if::is_empty_str(self.cursor) {
             __map.serialize_entry("cursor", self.cursor)?;
+        }
+        if self.durable {
+            __map.serialize_entry("durable", &self.durable)?;
         }
         __map.end()
     }
@@ -10231,6 +10252,13 @@ impl WriteBatchRequestOwnedView {
     #[must_use]
     pub fn cursor(&self) -> &'_ str {
         self.0.reborrow().cursor
+    }
+    /// If true, answers only once the batch's change segment is written.
+    ///
+    /// Field 3: `durable`
+    #[must_use]
+    pub fn durable(&self) -> bool {
+        self.0.reborrow().durable
     }
 }
 impl ::core::convert::From<::buffa::OwnedView<WriteBatchRequestView<'static>>>

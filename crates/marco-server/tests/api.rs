@@ -42,11 +42,15 @@ async fn start_with(read_only: bool, proxy: bool, api_read_only: bool) -> Srv {
 }
 
 async fn start_auth(read_only: bool, api_read_only: bool, auth: AuthConfig) -> Srv {
+    start_configured(|cfg| Config { read_only, api_read_only, auth, ..cfg }).await
+}
+
+async fn start_configured(configure: impl FnOnce(Config) -> Config) -> Srv {
     let dir = tempfile::tempdir().unwrap();
     let snap = dir.path().join("snap");
     marco_server::synth::write(&snap, N, 4).unwrap();
-    let cfg = Config { read_only, api_read_only, auth, ops_listen: Some("127.0.0.1:0".into()), ..Config::new(snap) };
-    let app = App::open(cfg).unwrap();
+    let cfg = Config { ops_listen: Some("127.0.0.1:0".into()), ..Config::new(snap) };
+    let app = App::open(configure(cfg)).unwrap();
     let ui = Arc::new(marco_server::ui::Ui::load(None).unwrap());
     let (api, admin) = marco_server::serve(app.clone(), ui).await.unwrap();
     let ops = marco_server::serve_ops(&app).await.unwrap().unwrap();
@@ -792,6 +796,54 @@ async fn proxy_peers_need_a_header() {
     let h = marco_server::peer::encode("127.0.0.1:1".parse().unwrap(), s.admin, "spiffe://mesh/console-proxy/proxy");
     let r = http_after(s.admin, &h, "POST", "/marco.v1.Admin/GetSession", "{}", &op);
     assert_ne!(r.map(|(c, _)| c), Some(200));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn durable_write_batch_waits_for_its_segment_but_an_ordinary_batch_does_not() {
+    let s = start_configured(|cfg| Config {
+        auth: AuthConfig { token: Some(TOKEN.into()), ..Default::default() },
+        segment_interval: Duration::from_secs(3600),
+        ..cfg
+    })
+    .await;
+    let a = admin(s.admin, Some(TOKEN));
+    let g = graph(s.api, Some(TOKEN));
+    g.write_batch(WriteBatchRequest { cursor: "10".into(), ..Default::default() }).await.unwrap();
+
+    let (actor, first, second) = (did(5), did(2001), did(2002));
+    let first_uri = uri(&actor, FOLLOW, &tid(9_500_000, 2));
+    let second_uri = uri(&actor, FOLLOW, &tid(9_500_001, 2));
+    g.write_batch(WriteBatchRequest { ops: vec![add(&first_uri, &first)], cursor: "11".into(), ..Default::default() })
+        .await
+        .unwrap();
+    let sources = a.list_sources(ListSourcesRequest::default()).await.unwrap().into_owned();
+    let api = sources.sources.iter().find(|s| s.name == "api").unwrap();
+    assert_eq!((api.cursor.as_str(), api.durable_cursor.as_str()), ("11", "10"));
+
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        g.write_batch(WriteBatchRequest {
+            ops: vec![add(&second_uri, &second)],
+            cursor: "12".into(),
+            durable: true,
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("a durable batch cuts a segment without waiting for the interval")
+    .unwrap();
+    let sources = a.list_sources(ListSourcesRequest::default()).await.unwrap().into_owned();
+    let api = sources.sources.iter().find(|s| s.name == "api").unwrap();
+    assert_eq!(api.durable_cursor, "12");
+
+    for (subject, expected) in [(first, first_uri), (second, second_uri)] {
+        let got = g
+            .has(HasRequest { rel: "follow".into(), from: actor.clone(), to: subject, ..Default::default() })
+            .await
+            .unwrap()
+            .into_owned();
+        assert_eq!(got.uri, expected);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
