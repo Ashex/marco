@@ -127,6 +127,9 @@ pub struct State {
     pub finished_us: Option<i64>,
     pub secs: f64,
     pub runs: u32,
+    /// Most recent known size of the DID list or active Hubble population.
+    #[serde(default)]
+    pub total: Option<u64>,
     /// The last DID of the last committed page.
     pub cursor: Option<String>,
     /// The listing is done; only the ledger is left.
@@ -430,6 +433,10 @@ async fn sweep(a: &Args, rels: Relations) -> Result<Value> {
         Some(p) => Some(did_list(p, None)?.len() as u64),
         None => s.client.active_repos().await,
     };
+    if total.is_some() {
+        s.st.total = total;
+    }
+    s.st.write(dir)?;
     let retention = Duration::from_secs_f64(a.retention_hours * 3600.0);
     let progress = Arc::new(std::sync::Mutex::new(Instant::now()));
     let report_progress = |st: &State, force: bool| {
