@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::oneshot;
 use vlatproto::cbor::Value;
 
 use super::*;
@@ -41,6 +42,7 @@ struct Fake {
     /// Fails with a 503 while set.
     broken: AtomicBool,
     gets: AtomicU32,
+    first_get: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
 }
 
 fn response(status: &str, headers: &[(&str, String)], body: &[u8]) -> Vec<u8> {
@@ -118,6 +120,13 @@ async fn start(f: Arc<Fake>) -> String {
                 }
                 let line = String::from_utf8_lossy(&buf).lines().next().unwrap_or("").to_string();
                 let path = line.split(' ').nth(1).unwrap_or("/");
+                if path.starts_with("/xrpc/com.atproto.sync.getRepo") {
+                    let gate = f.first_get.lock().unwrap().take();
+                    if let Some((seen, release)) = gate {
+                        let _ = seen.send(());
+                        let _ = release.await;
+                    }
+                }
                 let _ = sock.write_all(&serve(&f, path)).await;
             });
         }
@@ -332,4 +341,62 @@ fn a_built_sweep_leaves_the_revs_beside_the_snapshot() {
         "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb\t3kaaaaaaaaa2r\n",
         "graph-sync needs it after the build"
     );
+}
+
+#[test]
+fn the_did_list_total_is_committed_before_the_first_page_and_survives_resume() {
+    let (seen, first) = oneshot::channel();
+    let (release, hold) = oneshot::channel();
+    let fake = Arc::new(Fake {
+        broken: AtomicBool::new(true),
+        first_get: Mutex::new(Some((seen, hold))),
+        ..Default::default()
+    });
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("sweep");
+    let mut a = args(out.clone(), rt.block_on(start(fake)));
+    let dids = tmp.path().join("dids");
+    std::fs::write(&dids, format!("{A}\n{B}\n{E}\n")).unwrap();
+    a.dids = Some(dids);
+    a.concurrency = 1;
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(|| run(&a));
+        rt.block_on(async { tokio::time::timeout(Duration::from_secs(15), first).await.unwrap().unwrap() });
+        let before = State::read(&out).unwrap();
+        release.send(()).unwrap();
+        assert!(worker.join().unwrap().unwrap_err().to_string().contains("1 repos still failing"));
+        let before = before.expect("state already on disk during the first request");
+        assert_eq!((before.total, before.runs), (Some(3), 1));
+    });
+    let first = State::read(&out).unwrap().unwrap();
+    assert_eq!((first.total, first.runs), (Some(3), 1));
+    assert!(run(&a).unwrap_err().to_string().contains("1 repos still failing"));
+    let second = State::read(&out).unwrap().unwrap();
+    assert_eq!((second.total, second.runs), (Some(3), 2));
+}
+
+#[test]
+fn a_legacy_state_without_a_total_parses_with_none() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut old = json!(State::default());
+    old.as_object_mut().unwrap().remove("total");
+    std::fs::write(tmp.path().join(STATE), old.to_string()).unwrap();
+    let parsed = State::read(tmp.path()).unwrap().unwrap();
+    assert_eq!(parsed.total, None);
+}
+
+#[test]
+fn a_listing_without_an_active_count_keeps_the_last_total() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let a = args(tmp.path().to_owned(), rt.block_on(start(Arc::new(Fake::default()))));
+    run(&a).unwrap();
+    let mut previous = json!(State::read(tmp.path()).unwrap().unwrap());
+    previous["total"] = json!(3);
+    std::fs::write(tmp.path().join(STATE), previous.to_string()).unwrap();
+    run(&a).unwrap();
+    let resumed = State::read(tmp.path()).unwrap().unwrap();
+    assert_eq!(resumed.total, Some(3));
+    assert_eq!(resumed.runs, 2);
 }
